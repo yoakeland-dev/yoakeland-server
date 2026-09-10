@@ -72,3 +72,24 @@ func (t *FileWriteTool) Execute(_ context.Context, execCtx ExecutionContext, arg
 
 	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(args.Content), args.Path), nil
 }
+
+func (t *FileWriteTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "File destination path relative to project root.",
+				},
+				"content": map[string]any{
+					"type":        "string",
+					"description": "Full file content to write.",
+				},
+			},
+			"required": []string{"path", "content"},
+		},
+	}
+}

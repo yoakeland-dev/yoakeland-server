@@ -19,7 +19,7 @@ type ScriptedProvider struct {
 	index int
 }
 
-func (s *ScriptedProvider) StreamTurn(_ context.Context, _ []agent.Message) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (s *ScriptedProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 10)
 	eChan := make(chan error, 1)
 
@@ -47,7 +47,7 @@ func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 	engine := permission.New(norm, nil)
 	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
 	sessStore, _ := agent.NewDiskSessionStore(tempDir)
-	ctxMgr := agent.NewContextManager(100, 20) // Tight token limit to force context management
+	ctxMgr := agent.NewContextManager(100, 20)
 
 	tools := []tool.Tool{
 		tool.NewFileReadTool(norm),
@@ -73,22 +73,19 @@ func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Turn 1
 	if err := ag.RunTurn(ctx, "session-alpha", "turn-1", "Hello 1"); err != nil {
 		t.Fatalf("turn 1 failed: %v", err)
 	}
 
-	// Turn 2
 	if err := ag.RunTurn(ctx, "session-alpha", "turn-2", "Hello 2"); err != nil {
 		t.Fatalf("turn 2 failed: %v", err)
 	}
 
-	// Verify session was persisted on disk
 	savedSession, err := sessStore.Load("session-alpha")
 	if err != nil {
 		t.Fatalf("failed loading saved session: %v", err)
 	}
-	if len(savedSession.History) != 4 { // (user, assistant) * 2
+	if len(savedSession.History) != 4 {
 		t.Fatalf("expected 4 messages in history, got %d", len(savedSession.History))
 	}
 }

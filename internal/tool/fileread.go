@@ -50,3 +50,20 @@ func (t *FileReadTool) Execute(_ context.Context, _ ExecutionContext, argsJSON [
 
 	return string(content), nil
 }
+
+func (t *FileReadTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "The path of the file to read relative to the project root.",
+				},
+			},
+			"required": []string{"path"},
+		},
+	}
+}

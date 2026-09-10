@@ -39,22 +39,24 @@ type ModelStreamChunk struct {
 }
 
 type ModelProvider interface {
-	StreamTurn(ctx context.Context, history []Message) (<-chan ModelStreamChunk, <-chan error)
+	StreamTurn(ctx context.Context, history []Message, tools []tool.ToolDefinition) (<-chan ModelStreamChunk, <-chan error)
 }
 
 type Agent struct {
 	stream         *protocol.IPCStream
 	provider       ModelProvider
 	tools          map[string]tool.Tool
+	toolDefs       []tool.ToolDefinition
 	permEngine     *permission.Engine
 	snapshotStore  snapshot.SnapshotStore
 	sessionStore   SessionStore
 	contextManager *ContextManager
 
-	sessionID    string
-	history      []Message
-	mu           sync.Mutex
-	permRequests map[string]chan bool
+	sessionID       string
+	history         []Message
+	mu              sync.Mutex
+	permRequests    map[string]chan bool
+	permRequestKeys map[string]string // toolCallId -> cacheKey
 }
 
 func NewAgent(
@@ -67,23 +69,27 @@ func NewAgent(
 	ctxMgr *ContextManager,
 ) *Agent {
 	toolMap := make(map[string]tool.Tool)
+	var toolDefs []tool.ToolDefinition
 	for _, t := range tools {
 		toolMap[t.Name()] = t
+		toolDefs = append(toolDefs, t.Definition())
 	}
 	if ctxMgr == nil {
 		ctxMgr = NewContextManager(32000, 2000)
 	}
 
 	return &Agent{
-		stream:         stream,
-		provider:       provider,
-		tools:          toolMap,
-		permEngine:     engine,
-		snapshotStore:  snapStore,
-		sessionStore:   sessStore,
-		contextManager: ctxMgr,
-		history:        make([]Message, 0),
-		permRequests:   make(map[string]chan bool),
+		stream:          stream,
+		provider:        provider,
+		tools:           toolMap,
+		toolDefs:        toolDefs,
+		permEngine:      engine,
+		snapshotStore:   snapStore,
+		sessionStore:    sessStore,
+		contextManager:  ctxMgr,
+		history:         make([]Message, 0),
+		permRequests:    make(map[string]chan bool),
+		permRequestKeys: make(map[string]string),
 	}
 }
 
@@ -97,7 +103,6 @@ func (a *Agent) LoadSession(sessionID string) error {
 
 	state, err := a.sessionStore.Load(sessionID)
 	if err != nil {
-		// New session
 		a.sessionID = sessionID
 		a.history = make([]Message, 0)
 		return nil
@@ -114,14 +119,16 @@ func (a *Agent) CurrentSessionID() string {
 	return a.sessionID
 }
 
-func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool, cacheKey string) {
+func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool) {
 	a.mu.Lock()
 	ch, exists := a.permRequests[toolCallID]
+	cacheKey := a.permRequestKeys[toolCallID]
 	delete(a.permRequests, toolCallID)
+	delete(a.permRequestKeys, toolCallID)
 	a.mu.Unlock()
 
-	if cacheKey != "" {
-		a.permEngine.RecordDecision(cacheKey, allowed, remember)
+	if remember && cacheKey != "" {
+		a.permEngine.RecordDecision(cacheKey, allowed, true)
 	}
 
 	if exists {
@@ -148,7 +155,7 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 		activeContext := a.contextManager.PrepareHistory(a.history)
 		a.mu.Unlock()
 
-		chunks, errs := a.provider.StreamTurn(ctx, activeContext)
+		chunks, errs := a.provider.StreamTurn(ctx, activeContext, a.toolDefs)
 
 		var assistantText string
 		var toolCalls []ToolCall
@@ -194,7 +201,6 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 			break
 		}
 
-		// Execute tools
 		for _, tc := range toolCalls {
 			toolImpl, exists := a.tools[tc.Name]
 			if !exists {
@@ -203,7 +209,6 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 			}
 
 			allowed := true
-			var cacheKey string
 			if toolImpl.RequiresPermission(tc.Args) {
 				var target string
 				if tc.Name == "bash" {
@@ -216,8 +221,7 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 					target = fArgs.Path
 				}
 
-				var decision permission.Decision
-				decision, cacheKey = a.permEngine.Evaluate(tc.Name, target)
+				decision, cacheKey := a.permEngine.Evaluate(tc.Name, target)
 
 				switch decision {
 				case permission.DecisionDeny:
@@ -226,6 +230,7 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 					respCh := make(chan bool, 1)
 					a.mu.Lock()
 					a.permRequests[tc.ID] = respCh
+					a.permRequestKeys[tc.ID] = cacheKey
 					a.mu.Unlock()
 
 					_ = a.stream.SendEvent(protocol.EventPermissionRequest, a.sessionID, turnID, tc.ID, protocol.PermissionRequestData{
@@ -269,7 +274,6 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 		}
 	}
 
-	// Persist session state to disk at the end of each turn
 	a.mu.Lock()
 	if a.sessionStore != nil && a.sessionID != "" {
 		_ = a.sessionStore.Save(&SessionState{

@@ -59,3 +59,20 @@ func (t *BashTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []b
 
 	return res.Stdout, nil
 }
+
+func (t *BashTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{
+					"type":        "string",
+					"description": "The shell command line to run inside the sandbox.",
+				},
+			},
+			"required": []string{"command"},
+		},
+	}
+}

@@ -15,36 +15,24 @@ import (
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/provider"
 	"yoakeland/internal/sandbox"
 	"yoakeland/internal/snapshot"
 	"yoakeland/internal/tool"
 )
 
-type DefaultEchoProvider struct{}
-
-func (p *DefaultEchoProvider) StreamTurn(_ context.Context, history []agent.Message) (<-chan agent.ModelStreamChunk, <-chan error) {
-	cChan := make(chan agent.ModelStreamChunk, 2)
-	eChan := make(chan error, 1)
-
-	go func() {
-		defer close(cChan)
-		defer close(eChan)
-
-		lastMsg := history[len(history)-1]
-		if lastMsg.Role == "user" {
-			cChan <- agent.ModelStreamChunk{
-				Kind:  agent.StreamChunkDelta,
-				Delta: fmt.Sprintf("Yoakeland received: %s", lastMsg.Content),
-			}
-		}
-	}()
-
-	return cChan, eChan
-}
-
 func main() {
 	var projectDir string
+	var providerName string
+	var modelName string
+	var apiKey string
+	var baseURL string
+
 	flag.StringVar(&projectDir, "project", ".", "Project root working directory")
+	flag.StringVar(&providerName, "provider", "auto", "Provider: 'anthropic', 'openai', 'openrouter', or 'auto'")
+	flag.StringVar(&modelName, "model", "", "Model name (defaults: claude-3-5-sonnet-20241022, gpt-4o, etc.)")
+	flag.StringVar(&apiKey, "api-key", "", "API key (or use ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)")
+	flag.StringVar(&baseURL, "base-url", "", "Custom API base URL (e.g. http://localhost:1234/v1 for LM Studio)")
 	flag.Parse()
 
 	norm, err := normalizer.New(projectDir)
@@ -52,7 +40,16 @@ func main() {
 		log.Fatalf("failed to initialize normalizer: %v", err)
 	}
 
-	// Phase 1 Subsystems
+	modelProv, err := provider.ResolveProvider(provider.Config{
+		ProviderName: providerName,
+		Model:        modelName,
+		APIKey:       apiKey,
+		BaseURL:      baseURL,
+	})
+	if err != nil {
+		log.Fatalf("provider initialization failed: %v", err)
+	}
+
 	permStore := permission.NewPersistentStore(norm.ProjectRoot)
 	permEngine := permission.New(norm, permStore)
 
@@ -66,7 +63,7 @@ func main() {
 		log.Fatalf("failed to initialize session store: %v", err)
 	}
 
-	sb := sandbox.NewSandbox(norm.ProjectRoot, 30*time.Second)
+	sb := sandbox.NewSandbox(norm.ProjectRoot, 60*time.Second)
 
 	tools := []tool.Tool{
 		tool.NewFileReadTool(norm),
@@ -75,9 +72,9 @@ func main() {
 		tool.NewBashTool(norm, sb),
 	}
 
-	ctxMgr := agent.NewContextManager(32000, 2000)
+	ctxMgr := agent.NewContextManager(64000, 4000)
 	ipc := protocol.NewIPCStream(os.Stdin, os.Stdout)
-	ag := agent.NewAgent(ipc, &DefaultEchoProvider{}, tools, permEngine, snapStore, sessStore, ctxMgr)
+	ag := agent.NewAgent(ipc, modelProv, tools, permEngine, snapStore, sessStore, ctxMgr)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -129,7 +126,7 @@ func main() {
 		case protocol.EventPermissionResponse:
 			var data protocol.PermissionResponseData
 			if err := json.Unmarshal(env.Data, &data); err == nil {
-				ag.HandlePermissionResponse(env.ToolCallID, data.Allowed, data.Remember, "")
+				ag.HandlePermissionResponse(env.ToolCallID, data.Allowed, data.Remember)
 			}
 
 		case protocol.EventRestoreSnapshot:

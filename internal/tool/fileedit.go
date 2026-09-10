@@ -89,3 +89,32 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 
 	return fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", occurrences, args.Path), nil
 }
+
+func (t *FileEditTool) Definition() ToolDefinition {
+	return ToolDefinition{
+		Name:        t.Name(),
+		Description: t.Description(),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "Target file to edit.",
+				},
+				"oldString": map[string]any{
+					"type":        "string",
+					"description": "Exact text to locate and replace.",
+				},
+				"newString": map[string]any{
+					"type":        "string",
+					"description": "Replacement text.",
+				},
+				"replaceAll": map[string]any{
+					"type":        "boolean",
+					"description": "Whether to replace all occurrences if multiple matches exist.",
+				},
+			},
+			"required": []string{"path", "oldString", "newString"},
+		},
+	}
+}
