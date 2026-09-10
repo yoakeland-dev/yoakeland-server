@@ -15,7 +15,9 @@ import (
 
 func main() {
 	var backendBin string
+	var sessionID string
 	flag.StringVar(&backendBin, "bin", "./yoakeland", "Path to yoakeland backend binary")
+	flag.StringVar(&sessionID, "session", "session-main", "Session ID to join or resume")
 	flag.Parse()
 
 	cmd := exec.Command(backendBin)
@@ -32,23 +34,21 @@ func main() {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start backend process: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to start backend: %v\n", err)
 		os.Exit(1)
 	}
 
 	clientStream := protocol.NewIPCStream(stdoutPipe, stdinPipe)
 	var turnCounter uint64
 
-	// Background listener for events from backend
 	go func() {
 		for {
 			env, err := clientStream.ReadEnvelope()
 			if err != nil {
 				if err == io.EOF {
-					fmt.Println("\n[client] Backend closed IPC channel.")
+					fmt.Println("\n[client] Backend closed.")
 					os.Exit(0)
 				}
-				fmt.Fprintf(os.Stderr, "\n[client] Error reading line: %v\n", err)
 				return
 			}
 
@@ -61,22 +61,25 @@ func main() {
 			case protocol.EventToolCallRequested:
 				var d protocol.ToolCallData
 				_ = json.Unmarshal(env.Data, &d)
-				fmt.Printf("\n[TOOL CALL] %s (id: %s) -> Args: %s\n", d.Name, env.ToolCallID, string(d.Args))
+				fmt.Printf("\n[TOOL CALL] %s -> %s\n", d.Name, string(d.Args))
 
 			case protocol.EventPermissionRequest:
 				var d protocol.PermissionRequestData
 				_ = json.Unmarshal(env.Data, &d)
-				fmt.Printf("\n[PERMISSION REQUIRED] %s (%s)\nAllow? (y/n): ", d.ToolName, d.Description)
+				fmt.Printf("\n[PERMISSION REQUIRED] %s (%s)\nAllow (y/n, append 'r' to remember, e.g. 'yr'): ", d.ToolName, d.Description)
 
 				reader := bufio.NewReader(os.Stdin)
 				line, _ := reader.ReadString('\n')
-				allow := strings.TrimSpace(strings.ToLower(line)) == "y"
+				trimmed := strings.ToLower(strings.TrimSpace(line))
+				allow := strings.HasPrefix(trimmed, "y")
+				remember := strings.Contains(trimmed, "r")
 
 				_ = clientStream.SendEvent(
 					protocol.EventPermissionResponse,
+					env.SessionID,
 					env.TurnID,
 					env.ToolCallID,
-					protocol.PermissionResponseData{Allowed: allow, Remember: false},
+					protocol.PermissionResponseData{Allowed: allow, Remember: remember},
 				)
 
 			case protocol.EventToolResult:
@@ -89,7 +92,12 @@ func main() {
 				}
 
 			case protocol.EventTurnCompleted:
-				fmt.Printf("\n--- [Turn completed: %s] ---\n> ", env.TurnID)
+				fmt.Printf("\n--- [Turn completed (Session: %s)] ---\n> ", env.SessionID)
+
+			case protocol.EventSnapshotRestored:
+				var d protocol.SnapshotEventData
+				_ = json.Unmarshal(env.Data, &d)
+				fmt.Printf("\n[SNAPSHOT RESTORED] Snapshot ID: %s\n> ", d.SnapshotID)
 
 			case protocol.EventError:
 				var d protocol.ErrorData
@@ -100,8 +108,7 @@ func main() {
 	}()
 
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Println("yoakeland test client initialized. Type a prompt:")
-	fmt.Print("> ")
+	fmt.Printf("yoakeland client connected [Session: %s]\nCommands: 'restore <snap_id>' or enter a prompt:\n> ", sessionID)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -114,14 +121,23 @@ func main() {
 			break
 		}
 
-		turnID := fmt.Sprintf("turn-%d", atomic.AddUint64(&turnCounter, 1))
-		err := clientStream.SendEvent(protocol.EventUserPrompt, turnID, "", protocol.UserPromptData{
-			Prompt: line,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to send prompt: %v\n", err)
-			break
+		if strings.HasPrefix(line, "restore ") {
+			snapID := strings.TrimSpace(strings.TrimPrefix(line, "restore "))
+			_ = clientStream.SendEvent(protocol.EventRestoreSnapshot, sessionID, "", "", protocol.RestoreSnapshotData{
+				SnapshotID: snapID,
+			})
+			continue
 		}
+
+		turnID := fmt.Sprintf("turn-%d", atomic.AddUint64(&turnCounter, 1))
+		_ = clientStream.SendEvent(protocol.EventUserPrompt, sessionID, turnID, "", protocol.UserPromptData{
+			Prompt:    line,
+			SessionID: sessionID,
+		})
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
 	}
 
 	_ = cmd.Wait()

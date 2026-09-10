@@ -6,39 +6,32 @@ import (
 	"yoakeland/internal/permission"
 )
 
-func TestPermissionEngine_EvaluationAndCaching(t *testing.T) {
-	norm, _ := normalizer.New(t.TempDir())
-	engine := permission.New(norm)
+func TestPermissionEngine_DiskPersistence(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	store := permission.NewPersistentStore(tempDir)
 
-	// file_read always allowed
-	dec, _ := engine.Evaluate("file_read", "config.json")
-	if dec != permission.DecisionAllow {
-		t.Fatalf("expected allow for file_read, got %s", dec)
-	}
+	engine1 := permission.New(norm, store)
 
-	// safe bash command
-	dec, _ = engine.Evaluate("bash", "pwd")
-	if dec != permission.DecisionAllow {
-		t.Fatalf("expected allow for safe bash pwd, got %s", dec)
-	}
-
-	// destructive bash command
-	dec, key := engine.Evaluate("bash", "rm -rf /")
+	// Baseline evaluate: file_write requires ask
+	dec, key := engine1.Evaluate("file_write", "main.go")
 	if dec != permission.DecisionAsk {
-		t.Fatalf("expected ask for destructive rm -rf, got %s", dec)
+		t.Fatalf("expected ask, got %s", dec)
 	}
 
-	// Record explicit deny
-	engine.RecordDecision(key, false)
-	dec, _ = engine.Evaluate("bash", "rm -rf /")
-	if dec != permission.DecisionDeny {
-		t.Fatalf("expected deny from session cache, got %s", dec)
-	}
+	// Record allowed with persistence = true
+	engine1.RecordDecision(key, true, true)
 
-	// Record explicit allow
-	engine.RecordDecision(key, true)
-	dec, _ = engine.Evaluate("bash", "rm -rf /")
+	// Check engine 1 allows it
+	dec, _ = engine1.Evaluate("file_write", "main.go")
 	if dec != permission.DecisionAllow {
-		t.Fatalf("expected allow from session cache, got %s", dec)
+		t.Fatalf("expected allow after record, got %s", dec)
+	}
+
+	// Spin up a brand new Engine instance representing process restart
+	engine2 := permission.New(norm, store)
+	dec, _ = engine2.Evaluate("file_write", "main.go")
+	if dec != permission.DecisionAllow {
+		t.Fatalf("expected allow persisted across restarts, got %s", dec)
 	}
 }

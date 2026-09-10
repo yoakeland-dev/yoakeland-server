@@ -15,6 +15,7 @@ const (
 	EventUserPrompt         EventType = "user_prompt"
 	EventPermissionResponse EventType = "permission_response"
 	EventCancelTurn         EventType = "cancel_turn"
+	EventRestoreSnapshot    EventType = "restore_snapshot"
 
 	// Outbound (Backend -> Client)
 	EventModelDelta        EventType = "model_delta"
@@ -22,21 +23,23 @@ const (
 	EventPermissionRequest EventType = "permission_request"
 	EventToolResult        EventType = "tool_result"
 	EventTurnCompleted     EventType = "turn_completed"
+	EventSnapshotCreated   EventType = "snapshot_created"
+	EventSnapshotRestored  EventType = "snapshot_restored"
+	EventSessionLoaded     EventType = "session_loaded"
 	EventError             EventType = "error"
 )
 
-// Envelope is the standard top-level JSON-lines frame.
 type Envelope struct {
 	Type       EventType       `json:"type"`
+	SessionID  string          `json:"sessionId,omitempty"`
 	TurnID     string          `json:"turnId,omitempty"`
 	ToolCallID string          `json:"toolCallId,omitempty"`
 	Data       json.RawMessage `json:"data,omitempty"`
 }
 
-// Payload structs
-
 type UserPromptData struct {
-	Prompt string `json:"prompt"`
+	Prompt    string `json:"prompt"`
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 type ModelDeltaData struct {
@@ -68,6 +71,22 @@ type ToolResultData struct {
 
 type TurnCompletedData struct {
 	FinishReason string `json:"finishReason"`
+	SessionID    string `json:"sessionId"`
+}
+
+type SnapshotEventData struct {
+	SnapshotID  string   `json:"snapshotId"`
+	Description string   `json:"description"`
+	Files       []string `json:"files"`
+}
+
+type RestoreSnapshotData struct {
+	SnapshotID string `json:"snapshotId"`
+}
+
+type SessionLoadedData struct {
+	SessionID string `json:"sessionId"`
+	TurnCount int    `json:"turnCount"`
 }
 
 type ErrorData struct {
@@ -75,7 +94,6 @@ type ErrorData struct {
 	Fatal   bool   `json:"fatal"`
 }
 
-// IPCStream manages thread-safe JSON-lines communication over stdio.
 type IPCStream struct {
 	reader *bufio.Scanner
 	writer io.Writer
@@ -84,7 +102,6 @@ type IPCStream struct {
 
 func NewIPCStream(r io.Reader, w io.Writer) *IPCStream {
 	scanner := bufio.NewScanner(r)
-	// Allow large frames (up to 10MB) for file dumps / large tool outputs
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 	return &IPCStream{
@@ -122,13 +139,14 @@ func (s *IPCStream) Send(env *Envelope) error {
 	return err
 }
 
-func (s *IPCStream) SendEvent(evtType EventType, turnID string, toolCallID string, payload any) error {
+func (s *IPCStream) SendEvent(evtType EventType, sessionID, turnID, toolCallID string, payload any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 	return s.Send(&Envelope{
 		Type:       evtType,
+		SessionID:  sessionID,
 		TurnID:     turnID,
 		ToolCallID: toolCallID,
 		Data:       raw,

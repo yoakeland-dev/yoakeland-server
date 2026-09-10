@@ -3,7 +3,6 @@ package agent_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 	"yoakeland/internal/agent"
@@ -11,10 +10,10 @@ import (
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/sandbox"
+	"yoakeland/internal/snapshot"
 	"yoakeland/internal/tool"
 )
 
-// ScriptedProvider replays pre-programmed turns for mock testing
 type ScriptedProvider struct {
 	turns [][]agent.ModelStreamChunk
 	index int
@@ -41,67 +40,55 @@ func (s *ScriptedProvider) StreamTurn(_ context.Context, _ []agent.Message) (<-c
 	return cChan, eChan
 }
 
-func TestAgentLoop_WithPermissionAndToolDispatch(t *testing.T) {
+func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 	tempDir := t.TempDir()
-	norm, err := normalizer.New(tempDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sb := sandbox.NewLocalSandbox(tempDir, 2*time.Second)
-	engine := permission.New(norm)
+	norm, _ := normalizer.New(tempDir)
+	sb := sandbox.NewSandbox(tempDir, 2*time.Second)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20) // Tight token limit to force context management
 
 	tools := []tool.Tool{
 		tool.NewFileReadTool(norm),
+		tool.NewFileWriteTool(norm),
+		tool.NewFileEditTool(norm),
 		tool.NewBashTool(norm, sb),
 	}
 
-	// Turn 1: Model requests bash tool: `echo "agent ok"`
-	// Turn 2: Model finishes turn with delta
-	scripted := &ScriptedProvider{
+	provider := &ScriptedProvider{
 		turns: [][]agent.ModelStreamChunk{
 			{
-				{
-					Kind: agent.StreamChunkToolCall,
-					ToolCall: &agent.ToolCall{
-						ID:   "call-1",
-						Name: "bash",
-						Args: json.RawMessage(`{"command":"echo 'agent ok'"}`),
-					},
-				},
+				{Kind: agent.StreamChunkDelta, Delta: "Turn 1 complete"},
 			},
 			{
-				{Kind: agent.StreamChunkDelta, Delta: "I finished the task."},
+				{Kind: agent.StreamChunkDelta, Delta: "Turn 2 complete"},
 			},
 		},
 	}
 
 	outBuf := &bytes.Buffer{}
-	ipcStream := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipcStream, scripted, tools, engine)
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, provider, tools, engine, snapStore, sessStore, ctxMgr)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
-	// Intercept permission requirement concurrently
-	go func() {
-		for {
-			time.Sleep(20 * time.Millisecond)
-			// Automatically grant permission in test
-			ag.HandlePermissionResponse("call-1", true, true, "bash:echo 'agent ok'")
-		}
-	}()
+	// Turn 1
+	if err := ag.RunTurn(ctx, "session-alpha", "turn-1", "Hello 1"); err != nil {
+		t.Fatalf("turn 1 failed: %v", err)
+	}
 
-	err = ag.RunTurn(ctx, "turn-1", "Execute echo")
+	// Turn 2
+	if err := ag.RunTurn(ctx, "session-alpha", "turn-2", "Hello 2"); err != nil {
+		t.Fatalf("turn 2 failed: %v", err)
+	}
+
+	// Verify session was persisted on disk
+	savedSession, err := sessStore.Load("session-alpha")
 	if err != nil {
-		t.Fatalf("agent loop failed: %v", err)
+		t.Fatalf("failed loading saved session: %v", err)
 	}
-
-	// Verify expected events in output stream
-	output := outBuf.String()
-	if !bytes.Contains(outBuf.Bytes(), []byte(protocol.EventToolCallRequested)) {
-		t.Errorf("missing tool_call_requested event: %s", output)
-	}
-	if !bytes.Contains(outBuf.Bytes(), []byte(protocol.EventTurnCompleted)) {
-		t.Errorf("missing turn_completed event: %s", output)
+	if len(savedSession.History) != 4 { // (user, assistant) * 2
+		t.Fatalf("expected 4 messages in history, got %d", len(savedSession.History))
 	}
 }

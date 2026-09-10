@@ -14,10 +14,10 @@ type BashArgs struct {
 
 type BashTool struct {
 	normalizer *normalizer.Normalizer
-	sandbox    *sandbox.LocalSandbox
+	sandbox    sandbox.Sandbox
 }
 
-func NewBashTool(norm *normalizer.Normalizer, sb *sandbox.LocalSandbox) *BashTool {
+func NewBashTool(norm *normalizer.Normalizer, sb sandbox.Sandbox) *BashTool {
 	return &BashTool{
 		normalizer: norm,
 		sandbox:    sb,
@@ -29,10 +29,10 @@ func (t *BashTool) Name() string {
 }
 
 func (t *BashTool) Description() string {
-	return "Execute a shell command inside the project sandbox."
+	return "Execute a command inside the project sandbox."
 }
 
-func (t *BashTool) RequiresPermission(argsJSON []byte) bool {
+func (t *BashTool) RequiresPermission(_ []byte) bool {
 	return true
 }
 

@@ -1,10 +1,15 @@
 package tool
 
-import "context"
+import (
+	"context"
+	"yoakeland/internal/snapshot"
+)
 
 type ExecutionContext struct {
-	TurnID     string
-	ToolCallID string
+	SessionID     string
+	TurnID        string
+	ToolCallID    string
+	SnapshotStore snapshot.SnapshotStore
 }
 
 type Tool interface {

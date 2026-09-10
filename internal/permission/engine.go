@@ -14,51 +14,65 @@ const (
 )
 
 type Engine struct {
-	mu           sync.RWMutex
-	sessionCache map[string]bool // cacheKey -> allowed (true/false)
-	normalizer   *normalizer.Normalizer
+	mu             sync.RWMutex
+	sessionCache   map[string]bool
+	persistedCache map[string]bool
+	store          *PersistentStore
+	normalizer     *normalizer.Normalizer
 }
 
-func New(norm *normalizer.Normalizer) *Engine {
-	return &Engine{
-		sessionCache: make(map[string]bool),
-		normalizer:   norm,
+func New(norm *normalizer.Normalizer, store *PersistentStore) *Engine {
+	e := &Engine{
+		sessionCache:   make(map[string]bool),
+		persistedCache: make(map[string]bool),
+		store:          store,
+		normalizer:     norm,
 	}
+
+	if store != nil {
+		if loaded, err := store.Load(); err == nil {
+			e.persistedCache = loaded
+		}
+	}
+	return e
 }
 
-// Evaluate determines whether a tool execution is allowed, denied, or requires human authorization.
-func (e *Engine) Evaluate(toolName string, rawCommand string) (Decision, string) {
-	cacheKey := toolName + ":" + rawCommand
+func (e *Engine) Evaluate(toolName string, target string) (Decision, string) {
+	cacheKey := toolName + ":" + target
 
 	e.mu.RLock()
-	cached, found := e.sessionCache[cacheKey]
-	e.mu.RUnlock()
-
-	if found {
-		if cached {
+	// 1. Session decision overrides
+	if allowed, exists := e.sessionCache[cacheKey]; exists {
+		e.mu.RUnlock()
+		if allowed {
 			return DecisionAllow, cacheKey
 		}
 		return DecisionDeny, cacheKey
 	}
 
-	// Rule 1: Read-only operations are unconditionally allowed
+	// 2. Project-persisted decisions (.yoake/permissions.json)
+	if allowed, exists := e.persistedCache[cacheKey]; exists {
+		e.mu.RUnlock()
+		if allowed {
+			return DecisionAllow, cacheKey
+		}
+		return DecisionDeny, cacheKey
+	}
+	e.mu.RUnlock()
+
+	// 3. Static policy rules
 	if toolName == "file_read" {
 		return DecisionAllow, cacheKey
 	}
 
-	// Rule 2: Bash commands
 	if toolName == "bash" {
-		parsed, err := e.normalizer.ParseShellArgv(rawCommand)
+		parsed, err := e.normalizer.ParseShellArgv(target)
 		if err != nil {
 			return DecisionDeny, cacheKey
 		}
-
-		// Destructive bash is forced to ASK
 		if e.normalizer.IsDestructiveBash(parsed) {
 			return DecisionAsk, cacheKey
 		}
-
-		// Basic safe commands (ls, pwd, git status) can be allowed by policy
 		if len(parsed.Argv) > 0 {
 			switch parsed.Argv[0] {
 			case "ls", "pwd", "echo", "whoami":
@@ -69,22 +83,29 @@ func (e *Engine) Evaluate(toolName string, rawCommand string) (Decision, string)
 				}
 			}
 		}
-
-		// Fallthrough for bash defaults to ASK
 		return DecisionAsk, cacheKey
 	}
 
-	// Default fallback rule for unknown tools
+	// Mutating tools (file_write, file_edit) default to ask unless recorded
+	if toolName == "file_write" || toolName == "file_edit" {
+		return DecisionAsk, cacheKey
+	}
+
 	return DecisionAsk, cacheKey
 }
 
-func (e *Engine) RecordDecision(cacheKey string, allowed bool) {
+func (e *Engine) RecordDecision(cacheKey string, allowed bool, persist bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	e.sessionCache[cacheKey] = allowed
+	if persist && e.store != nil {
+		e.persistedCache[cacheKey] = allowed
+		_ = e.store.Save(e.persistedCache)
+	}
 }
 
-func (e *Engine) ClearCache() {
+func (e *Engine) ClearSessionCache() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sessionCache = make(map[string]bool)

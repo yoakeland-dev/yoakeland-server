@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/snapshot"
 	"yoakeland/internal/tool"
 )
 
-// Message structures for LLM history
 type Message struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content,omitempty"`
@@ -37,19 +38,23 @@ type ModelStreamChunk struct {
 	ToolCall *ToolCall
 }
 
-// ModelProvider allows swapping live LLMs (OpenAI/Anthropic) with deterministic mocks.
 type ModelProvider interface {
 	StreamTurn(ctx context.Context, history []Message) (<-chan ModelStreamChunk, <-chan error)
 }
 
 type Agent struct {
-	stream       *protocol.IPCStream
-	provider     ModelProvider
-	tools        map[string]tool.Tool
-	permEngine   *permission.Engine
+	stream         *protocol.IPCStream
+	provider       ModelProvider
+	tools          map[string]tool.Tool
+	permEngine     *permission.Engine
+	snapshotStore  snapshot.SnapshotStore
+	sessionStore   SessionStore
+	contextManager *ContextManager
+
+	sessionID    string
 	history      []Message
 	mu           sync.Mutex
-	permRequests map[string]chan bool // toolCallId -> response channel
+	permRequests map[string]chan bool
 }
 
 func NewAgent(
@@ -57,19 +62,56 @@ func NewAgent(
 	provider ModelProvider,
 	tools []tool.Tool,
 	engine *permission.Engine,
+	snapStore snapshot.SnapshotStore,
+	sessStore SessionStore,
+	ctxMgr *ContextManager,
 ) *Agent {
 	toolMap := make(map[string]tool.Tool)
 	for _, t := range tools {
 		toolMap[t.Name()] = t
 	}
-	return &Agent{
-		stream:       stream,
-		provider:     provider,
-		tools:        toolMap,
-		permEngine:   engine,
-		history:      make([]Message, 0),
-		permRequests: make(map[string]chan bool),
+	if ctxMgr == nil {
+		ctxMgr = NewContextManager(32000, 2000)
 	}
+
+	return &Agent{
+		stream:         stream,
+		provider:       provider,
+		tools:          toolMap,
+		permEngine:     engine,
+		snapshotStore:  snapStore,
+		sessionStore:   sessStore,
+		contextManager: ctxMgr,
+		history:        make([]Message, 0),
+		permRequests:   make(map[string]chan bool),
+	}
+}
+
+func (a *Agent) LoadSession(sessionID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.sessionStore == nil {
+		return nil
+	}
+
+	state, err := a.sessionStore.Load(sessionID)
+	if err != nil {
+		// New session
+		a.sessionID = sessionID
+		a.history = make([]Message, 0)
+		return nil
+	}
+
+	a.sessionID = state.SessionID
+	a.history = state.History
+	return nil
+}
+
+func (a *Agent) CurrentSessionID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionID
 }
 
 func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool, cacheKey string) {
@@ -78,8 +120,8 @@ func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, rememb
 	delete(a.permRequests, toolCallID)
 	a.mu.Unlock()
 
-	if remember && cacheKey != "" {
-		a.permEngine.RecordDecision(cacheKey, allowed)
+	if cacheKey != "" {
+		a.permEngine.RecordDecision(cacheKey, allowed, remember)
 	}
 
 	if exists {
@@ -87,9 +129,13 @@ func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, rememb
 	}
 }
 
-// RunTurn executes an iterative tool loop until the model yields without further tool requests.
-func (a *Agent) RunTurn(ctx context.Context, turnID string, prompt string) error {
+func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) error {
+	a.mu.Lock()
+	if a.sessionID == "" || a.sessionID != sessionID {
+		a.sessionID = sessionID
+	}
 	a.history = append(a.history, Message{Role: "user", Content: prompt})
+	a.mu.Unlock()
 
 	for {
 		select {
@@ -98,12 +144,15 @@ func (a *Agent) RunTurn(ctx context.Context, turnID string, prompt string) error
 		default:
 		}
 
-		chunks, errs := a.provider.StreamTurn(ctx, a.history)
+		a.mu.Lock()
+		activeContext := a.contextManager.PrepareHistory(a.history)
+		a.mu.Unlock()
+
+		chunks, errs := a.provider.StreamTurn(ctx, activeContext)
 
 		var assistantText string
 		var toolCalls []ToolCall
 
-		// Stream tokens from model
 		done := false
 		for !done {
 			select {
@@ -120,12 +169,12 @@ func (a *Agent) RunTurn(ctx context.Context, turnID string, prompt string) error
 				}
 				if chunk.Kind == StreamChunkDelta {
 					assistantText += chunk.Delta
-					_ = a.stream.SendEvent(protocol.EventModelDelta, turnID, "", protocol.ModelDeltaData{
+					_ = a.stream.SendEvent(protocol.EventModelDelta, a.sessionID, turnID, "", protocol.ModelDeltaData{
 						Content: chunk.Delta,
 					})
 				} else if chunk.Kind == StreamChunkToolCall && chunk.ToolCall != nil {
 					toolCalls = append(toolCalls, *chunk.ToolCall)
-					_ = a.stream.SendEvent(protocol.EventToolCallRequested, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
+					_ = a.stream.SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
 						Name: chunk.ToolCall.Name,
 						Args: chunk.ToolCall.Args,
 					})
@@ -133,38 +182,43 @@ func (a *Agent) RunTurn(ctx context.Context, turnID string, prompt string) error
 			}
 		}
 
+		a.mu.Lock()
 		a.history = append(a.history, Message{
 			Role:      "assistant",
 			Content:   assistantText,
 			ToolCalls: toolCalls,
 		})
+		a.mu.Unlock()
 
-		// Exit agent loop if no tool calls were generated
 		if len(toolCalls) == 0 {
 			break
 		}
 
-		// Execute tools sequentially
+		// Execute tools
 		for _, tc := range toolCalls {
 			toolImpl, exists := a.tools[tc.Name]
 			if !exists {
-				errMsg := fmt.Sprintf("tool %s not recognized", tc.Name)
-				a.recordToolResult(turnID, tc, "", errMsg)
+				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s not recognized", tc.Name))
 				continue
 			}
 
-			// Permission handling
 			allowed := true
+			var cacheKey string
 			if toolImpl.RequiresPermission(tc.Args) {
-				var commandStr string
-				// If tool is bash, inspect args for permission cache key
+				var target string
 				if tc.Name == "bash" {
 					var bArgs struct{ Command string }
 					_ = json.Unmarshal(tc.Args, &bArgs)
-					commandStr = bArgs.Command
+					target = bArgs.Command
+				} else {
+					var fArgs struct{ Path string }
+					_ = json.Unmarshal(tc.Args, &fArgs)
+					target = fArgs.Path
 				}
 
-				decision, cacheKey := a.permEngine.Evaluate(tc.Name, commandStr)
+				var decision permission.Decision
+				decision, cacheKey = a.permEngine.Evaluate(tc.Name, target)
+
 				switch decision {
 				case permission.DecisionDeny:
 					allowed = false
@@ -174,14 +228,13 @@ func (a *Agent) RunTurn(ctx context.Context, turnID string, prompt string) error
 					a.permRequests[tc.ID] = respCh
 					a.mu.Unlock()
 
-					_ = a.stream.SendEvent(protocol.EventPermissionRequest, turnID, tc.ID, protocol.PermissionRequestData{
+					_ = a.stream.SendEvent(protocol.EventPermissionRequest, a.sessionID, turnID, tc.ID, protocol.PermissionRequestData{
 						ToolName:    tc.Name,
-						Description: fmt.Sprintf("Run %s with args: %s", tc.Name, string(tc.Args)),
+						Description: fmt.Sprintf("%s on %s", tc.Name, string(tc.Args)),
 						RequiresAsk: true,
 						CacheKey:    cacheKey,
 					})
 
-					// Wait for frontend response or context cancel
 					select {
 					case <-ctx.Done():
 						return ctx.Err()
@@ -198,31 +251,53 @@ func (a *Agent) RunTurn(ctx context.Context, turnID string, prompt string) error
 				continue
 			}
 
-			// Tool Execution
-			execCtx := tool.ExecutionContext{TurnID: turnID, ToolCallID: tc.ID}
+			execCtx := tool.ExecutionContext{
+				SessionID:     a.sessionID,
+				TurnID:        turnID,
+				ToolCallID:    tc.ID,
+				SnapshotStore: a.snapshotStore,
+			}
+
 			output, execErr := toolImpl.Execute(ctx, execCtx, tc.Args)
+			truncatedOutput := a.contextManager.TruncateToolOutput(output)
+
 			if execErr != nil {
 				a.recordToolResult(turnID, tc, "", execErr.Error())
 			} else {
-				a.recordToolResult(turnID, tc, output, "")
+				a.recordToolResult(turnID, tc, truncatedOutput, "")
 			}
 		}
 	}
 
-	_ = a.stream.SendEvent(protocol.EventTurnCompleted, turnID, "", protocol.TurnCompletedData{
+	// Persist session state to disk at the end of each turn
+	a.mu.Lock()
+	if a.sessionStore != nil && a.sessionID != "" {
+		_ = a.sessionStore.Save(&SessionState{
+			SessionID: a.sessionID,
+			CreatedAt: time.Now().UTC(),
+			History:   a.history,
+		})
+	}
+	a.mu.Unlock()
+
+	_ = a.stream.SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", protocol.TurnCompletedData{
 		FinishReason: "stop",
+		SessionID:    a.sessionID,
 	})
 	return nil
 }
 
 func (a *Agent) recordToolResult(turnID string, tc ToolCall, output, errText string) {
+	a.mu.Lock()
 	a.history = append(a.history, Message{
 		Role:       "tool",
 		Content:    output + errText,
 		ToolCallID: tc.ID,
 	})
+	sessID := a.sessionID
+	a.mu.Unlock()
 
-	_ = a.stream.SendEvent(protocol.EventToolResult, turnID, tc.ID, protocol.ToolResultData{
+	_ = a.stream.SendEvent(protocol.EventToolResult, sessID, turnID, tc.ID, protocol.ToolResultData{
 		ToolName: tc.Name,
 		Output:   output,
 		Error:    errText,
