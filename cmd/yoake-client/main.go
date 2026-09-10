@@ -36,15 +36,16 @@ func parseCommandArgs(cmdStr string) []string {
 				current.WriteRune(r)
 			}
 		} else {
-			if r == '\'' || r == '"' {
+			switch r {
+			case '\'', '"':
 				inQuote = true
 				quoteChar = r
-			} else if r == ' ' || r == '\t' {
+			case ' ', '\t':
 				if current.Len() > 0 {
 					args = append(args, current.String())
 					current.Reset()
 				}
-			} else {
+			default:
 				current.WriteRune(r)
 			}
 		}

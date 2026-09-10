@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"yoakeland/internal/diff"
 	"yoakeland/internal/normalizer"
 )
 
@@ -92,4 +93,23 @@ func (t *FileWriteTool) Definition() ToolDefinition {
 			"required": []string{"path", "content"},
 		},
 	}
+}
+
+func (t *FileWriteTool) PreviewDiff(argsJSON []byte) (*diff.FileDiff, error) {
+	var args FileWriteArgs
+	if err := json.Unmarshal(argsJSON, &args); err != nil {
+		return nil, err
+	}
+
+	safePath, err := t.normalizer.ResolveAndValidatePath(args.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	var beforeContent string
+	if existingBytes, err := os.ReadFile(safePath); err == nil {
+		beforeContent = string(existingBytes)
+	}
+
+	return diff.ComputeDiff(args.Path, beforeContent, args.Content), nil
 }

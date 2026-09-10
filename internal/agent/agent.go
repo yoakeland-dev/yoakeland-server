@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
+	"yoakeland/internal/diff"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/snapshot"
@@ -30,12 +32,14 @@ type StreamEventKind string
 const (
 	StreamChunkDelta    StreamEventKind = "delta"
 	StreamChunkToolCall StreamEventKind = "tool_call"
+	StreamChunkUsage    StreamEventKind = "usage"
 )
 
 type ModelStreamChunk struct {
 	Kind     StreamEventKind
 	Delta    string
 	ToolCall *ToolCall
+	Usage    *protocol.UsageData
 }
 
 type ModelProvider interface {
@@ -52,11 +56,12 @@ type Agent struct {
 	sessionStore   SessionStore
 	contextManager *ContextManager
 
-	sessionID       string
-	history         []Message
-	mu              sync.Mutex
-	permRequests    map[string]chan bool
-	permRequestKeys map[string]string // toolCallId -> cacheKey
+	sessionID         string
+	history           []Message
+	mu                sync.Mutex
+	permRequests      map[string]chan bool
+	permRequestKeys   map[string]string
+	activeTurnCancels map[string]context.CancelFunc
 }
 
 func NewAgent(
@@ -75,21 +80,22 @@ func NewAgent(
 		toolDefs = append(toolDefs, t.Definition())
 	}
 	if ctxMgr == nil {
-		ctxMgr = NewContextManager(32000, 2000)
+		ctxMgr = NewContextManager(64000, 4000)
 	}
 
 	return &Agent{
-		stream:          stream,
-		provider:        provider,
-		tools:           toolMap,
-		toolDefs:        toolDefs,
-		permEngine:      engine,
-		snapshotStore:   snapStore,
-		sessionStore:    sessStore,
-		contextManager:  ctxMgr,
-		history:         make([]Message, 0),
-		permRequests:    make(map[string]chan bool),
-		permRequestKeys: make(map[string]string),
+		stream:            stream,
+		provider:          provider,
+		tools:             toolMap,
+		toolDefs:          toolDefs,
+		permEngine:        engine,
+		snapshotStore:     snapStore,
+		sessionStore:      sessStore,
+		contextManager:    ctxMgr,
+		history:           make([]Message, 0),
+		permRequests:      make(map[string]chan bool),
+		permRequestKeys:   make(map[string]string),
+		activeTurnCancels: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -119,6 +125,16 @@ func (a *Agent) CurrentSessionID() string {
 	return a.sessionID
 }
 
+func (a *Agent) CancelTurn(turnID string) {
+	a.mu.Lock()
+	cancel, exists := a.activeTurnCancels[turnID]
+	a.mu.Unlock()
+
+	if exists && cancel != nil {
+		cancel()
+	}
+}
+
 func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool) {
 	a.mu.Lock()
 	ch, exists := a.permRequests[toolCallID]
@@ -136,18 +152,38 @@ func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, rememb
 	}
 }
 
-func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) error {
+func (a *Agent) RunTurn(parentCtx context.Context, sessionID, turnID, prompt string) error {
+	startTime := time.Now()
+
+	turnCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
 	a.mu.Lock()
 	if a.sessionID == "" || a.sessionID != sessionID {
 		a.sessionID = sessionID
 	}
 	a.history = append(a.history, Message{Role: "user", Content: prompt})
+	a.activeTurnCancels[turnID] = cancel
 	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		delete(a.activeTurnCancels, turnID)
+		a.mu.Unlock()
+	}()
+
+	var totalUsage protocol.UsageData
 
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-turnCtx.Done():
+			_ = a.stream.SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", protocol.TurnCompletedData{
+				FinishReason: "cancelled",
+				SessionID:    a.sessionID,
+				Usage:        &totalUsage,
+				DurationMs:   time.Since(startTime).Milliseconds(),
+			})
+			return turnCtx.Err()
 		default:
 		}
 
@@ -155,7 +191,7 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 		activeContext := a.contextManager.PrepareHistory(a.history)
 		a.mu.Unlock()
 
-		chunks, errs := a.provider.StreamTurn(ctx, activeContext, a.toolDefs)
+		chunks, errs := a.provider.StreamTurn(turnCtx, activeContext, a.toolDefs)
 
 		var assistantText string
 		var toolCalls []ToolCall
@@ -163,10 +199,19 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 		done := false
 		for !done {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-turnCtx.Done():
+				_ = a.stream.SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", protocol.TurnCompletedData{
+					FinishReason: "cancelled",
+					SessionID:    a.sessionID,
+					Usage:        &totalUsage,
+					DurationMs:   time.Since(startTime).Milliseconds(),
+				})
+				return turnCtx.Err()
 			case err, ok := <-errs:
 				if ok && err != nil {
+					if errors.Is(err, context.Canceled) {
+						return err
+					}
 					return fmt.Errorf("model stream error: %w", err)
 				}
 			case chunk, ok := <-chunks:
@@ -174,17 +219,26 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 					done = true
 					break
 				}
-				if chunk.Kind == StreamChunkDelta {
+				switch chunk.Kind {
+				case StreamChunkDelta:
 					assistantText += chunk.Delta
 					_ = a.stream.SendEvent(protocol.EventModelDelta, a.sessionID, turnID, "", protocol.ModelDeltaData{
 						Content: chunk.Delta,
 					})
-				} else if chunk.Kind == StreamChunkToolCall && chunk.ToolCall != nil {
-					toolCalls = append(toolCalls, *chunk.ToolCall)
-					_ = a.stream.SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
-						Name: chunk.ToolCall.Name,
-						Args: chunk.ToolCall.Args,
-					})
+				case StreamChunkToolCall:
+					if chunk.ToolCall != nil {
+						toolCalls = append(toolCalls, *chunk.ToolCall)
+						_ = a.stream.SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
+							Name: chunk.ToolCall.Name,
+							Args: chunk.ToolCall.Args,
+						})
+					}
+				case StreamChunkUsage:
+					if chunk.Usage != nil {
+						totalUsage.InputTokens += chunk.Usage.InputTokens
+						totalUsage.OutputTokens += chunk.Usage.OutputTokens
+						totalUsage.TotalTokens += chunk.Usage.TotalTokens
+					}
 				}
 			}
 		}
@@ -233,16 +287,31 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 					a.permRequestKeys[tc.ID] = cacheKey
 					a.mu.Unlock()
 
+					// Compute unified diff preview if tool is diffable
+					var computedDiff *diff.FileDiff
+					if diffTool, isDiffable := toolImpl.(tool.DiffableTool); isDiffable {
+						if d, dErr := diffTool.PreviewDiff(tc.Args); dErr == nil {
+							computedDiff = d
+						}
+					}
+
 					_ = a.stream.SendEvent(protocol.EventPermissionRequest, a.sessionID, turnID, tc.ID, protocol.PermissionRequestData{
 						ToolName:    tc.Name,
 						Description: fmt.Sprintf("%s on %s", tc.Name, string(tc.Args)),
 						RequiresAsk: true,
 						CacheKey:    cacheKey,
+						Diff:        computedDiff,
 					})
 
 					select {
-					case <-ctx.Done():
-						return ctx.Err()
+					case <-turnCtx.Done():
+						_ = a.stream.SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", protocol.TurnCompletedData{
+							FinishReason: "cancelled",
+							SessionID:    a.sessionID,
+							Usage:        &totalUsage,
+							DurationMs:   time.Since(startTime).Milliseconds(),
+						})
+						return turnCtx.Err()
 					case isAllowed := <-respCh:
 						allowed = isAllowed
 					}
@@ -263,7 +332,7 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 				SnapshotStore: a.snapshotStore,
 			}
 
-			output, execErr := toolImpl.Execute(ctx, execCtx, tc.Args)
+			output, execErr := toolImpl.Execute(turnCtx, execCtx, tc.Args)
 			truncatedOutput := a.contextManager.TruncateToolOutput(output)
 
 			if execErr != nil {
@@ -287,6 +356,8 @@ func (a *Agent) RunTurn(ctx context.Context, sessionID, turnID, prompt string) e
 	_ = a.stream.SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", protocol.TurnCompletedData{
 		FinishReason: "stop",
 		SessionID:    a.sessionID,
+		Usage:        &totalUsage,
+		DurationMs:   time.Since(startTime).Milliseconds(),
 	})
 	return nil
 }

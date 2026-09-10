@@ -142,6 +142,15 @@ func main() {
 					})
 				}
 			}
+
+		case protocol.EventCancelTurn:
+			var data protocol.CancelTurnData
+			_ = json.Unmarshal(env.Data, &data)
+			tID := data.TurnID
+			if tID == "" {
+				tID = env.TurnID
+			}
+			ag.CancelTurn(tID)
 		}
 	}
 }

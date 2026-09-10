@@ -40,6 +40,33 @@ func (s *ScriptedProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []
 	return cChan, eChan
 }
 
+type BlockingProvider struct {
+	started chan struct{}
+}
+
+func (b *BlockingProvider) StreamTurn(ctx context.Context, _ []agent.Message, _ []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+	cChan := make(chan agent.ModelStreamChunk, 2)
+	eChan := make(chan error, 1)
+
+	close(b.started)
+	cChan <- agent.ModelStreamChunk{
+		Kind:  agent.StreamChunkUsage,
+		Usage: &protocol.UsageData{InputTokens: 50, OutputTokens: 25, TotalTokens: 75},
+	}
+	cChan <- agent.ModelStreamChunk{
+		Kind:  agent.StreamChunkDelta,
+		Delta: "Beginning work...",
+	}
+
+	go func() {
+		<-ctx.Done()
+		close(cChan)
+		close(eChan)
+	}()
+
+	return cChan, eChan
+}
+
 func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 	tempDir := t.TempDir()
 	norm, _ := normalizer.New(tempDir)
@@ -87,5 +114,36 @@ func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 	}
 	if len(savedSession.History) != 4 {
 		t.Fatalf("expected 4 messages in history, got %d", len(savedSession.History))
+	}
+}
+
+func TestAgent_TurnCancellationAndMetrics(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	sb := sandbox.NewSandbox(tempDir, 5*time.Second)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20)
+
+	provider := &BlockingProvider{started: make(chan struct{})}
+
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, provider, []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr)
+
+	go func() {
+		<-provider.started
+		ag.CancelTurn("turn-cancel-1")
+	}()
+
+	err := ag.RunTurn(context.Background(), "session-test", "turn-cancel-1", "Test cancellation")
+	if err == nil {
+		t.Fatalf("expected error from cancelled turn, got nil")
+	}
+
+	output := outBuf.String()
+	if !bytes.Contains(outBuf.Bytes(), []byte(`"finishReason":"cancelled"`)) {
+		t.Errorf("expected finishReason cancelled in completed event, got: %s", output)
 	}
 }

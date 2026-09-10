@@ -191,12 +191,13 @@ func (p *AnthropicProvider) StreamTurn(
 					} `json:"delta"`
 				}
 				if err := json.Unmarshal([]byte(ev.Data), &delta); err == nil {
-					if delta.Delta.Type == "text_delta" {
+					switch delta.Delta.Type {
+					case "text_delta":
 						cChan <- agent.ModelStreamChunk{
 							Kind:  agent.StreamChunkDelta,
 							Delta: delta.Delta.Text,
 						}
-					} else if delta.Delta.Type == "input_json_delta" {
+					case "input_json_delta":
 						currentArgsBuffer.WriteString(delta.Delta.PartialJSON)
 					}
 				}

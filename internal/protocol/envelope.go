@@ -6,18 +6,17 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"yoakeland/internal/diff"
 )
 
 type EventType string
 
 const (
-	// Inbound (Client -> Backend)
 	EventUserPrompt         EventType = "user_prompt"
 	EventPermissionResponse EventType = "permission_response"
 	EventCancelTurn         EventType = "cancel_turn"
 	EventRestoreSnapshot    EventType = "restore_snapshot"
 
-	// Outbound (Backend -> Client)
 	EventModelDelta        EventType = "model_delta"
 	EventToolCallRequested EventType = "tool_call_requested"
 	EventPermissionRequest EventType = "permission_request"
@@ -25,7 +24,6 @@ const (
 	EventTurnCompleted     EventType = "turn_completed"
 	EventSnapshotCreated   EventType = "snapshot_created"
 	EventSnapshotRestored  EventType = "snapshot_restored"
-	EventSessionLoaded     EventType = "session_loaded"
 	EventError             EventType = "error"
 )
 
@@ -42,6 +40,11 @@ type UserPromptData struct {
 	SessionID string `json:"sessionId,omitempty"`
 }
 
+type CancelTurnData struct {
+	SessionID string `json:"sessionId,omitempty"`
+	TurnID    string `json:"turnId,omitempty"`
+}
+
 type ModelDeltaData struct {
 	Content string `json:"content"`
 }
@@ -52,10 +55,11 @@ type ToolCallData struct {
 }
 
 type PermissionRequestData struct {
-	ToolName    string `json:"toolName"`
-	Description string `json:"description"`
-	RequiresAsk bool   `json:"requiresAsk"`
-	CacheKey    string `json:"cacheKey"`
+	ToolName    string         `json:"toolName"`
+	Description string         `json:"description"`
+	RequiresAsk bool           `json:"requiresAsk"`
+	CacheKey    string         `json:"cacheKey"`
+	Diff        *diff.FileDiff `json:"diff,omitempty"` // For rich UI diff previews
 }
 
 type PermissionResponseData struct {
@@ -69,9 +73,17 @@ type ToolResultData struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type UsageData struct {
+	InputTokens  int `json:"inputTokens"`
+	OutputTokens int `json:"outputTokens"`
+	TotalTokens  int `json:"totalTokens"`
+}
+
 type TurnCompletedData struct {
-	FinishReason string `json:"finishReason"`
-	SessionID    string `json:"sessionId"`
+	FinishReason string     `json:"finishReason"`
+	SessionID    string     `json:"sessionId"`
+	Usage        *UsageData `json:"usage,omitempty"`
+	DurationMs   int64      `json:"durationMs"`
 }
 
 type SnapshotEventData struct {
@@ -82,11 +94,6 @@ type SnapshotEventData struct {
 
 type RestoreSnapshotData struct {
 	SnapshotID string `json:"snapshotId"`
-}
-
-type SessionLoadedData struct {
-	SessionID string `json:"sessionId"`
-	TurnCount int    `json:"turnCount"`
 }
 
 type ErrorData struct {
