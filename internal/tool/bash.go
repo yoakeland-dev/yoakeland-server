@@ -1,0 +1,61 @@
+package tool
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"yoakeland/internal/normalizer"
+	"yoakeland/internal/sandbox"
+)
+
+type BashArgs struct {
+	Command string `json:"command"`
+}
+
+type BashTool struct {
+	normalizer *normalizer.Normalizer
+	sandbox    *sandbox.LocalSandbox
+}
+
+func NewBashTool(norm *normalizer.Normalizer, sb *sandbox.LocalSandbox) *BashTool {
+	return &BashTool{
+		normalizer: norm,
+		sandbox:    sb,
+	}
+}
+
+func (t *BashTool) Name() string {
+	return "bash"
+}
+
+func (t *BashTool) Description() string {
+	return "Execute a shell command inside the project sandbox."
+}
+
+func (t *BashTool) RequiresPermission(argsJSON []byte) bool {
+	return true
+}
+
+func (t *BashTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []byte) (string, error) {
+	var args BashArgs
+	if err := json.Unmarshal(argsJSON, &args); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	parsed, err := t.normalizer.ParseShellArgv(args.Command)
+	if err != nil {
+		return "", fmt.Errorf("command normalization failed: %w", err)
+	}
+
+	res, err := t.sandbox.Execute(ctx, parsed.Argv)
+	if err != nil {
+		return "", fmt.Errorf("sandbox error: %w", err)
+	}
+
+	if res.ExitCode != 0 {
+		return fmt.Sprintf("Command failed (exit code %d)\nSTDOUT:\n%s\nSTDERR:\n%s",
+			res.ExitCode, res.Stdout, res.Stderr), nil
+	}
+
+	return res.Stdout, nil
+}
