@@ -20,25 +20,35 @@ const (
 	CLIKindCodex  CLIKind = "codex"
 )
 
-// disallowedClaudeTools lists every built-in Claude Code tool. Passed to
-// --disallowedTools so the CLI is reduced to pure text completion: yoakeland
-// keeps sole ownership of file/shell access through its own permission-gated
-// tool engine, rather than letting the CLI mutate the project on its own.
-const disallowedClaudeTools = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit,TodoWrite,BashOutput,KillShell,SlashCommand"
+// disallowedClaudeTools lists every built-in Claude Code tool that can
+// mutate the project or spawn further agent work. Passed to
+// --disallowedTools so the CLI is reduced to pure text completion plus
+// (Anthropic-)server-side web search: yoakeland keeps sole ownership of
+// file/shell access through its own permission-gated tool engine, rather
+// than letting the CLI mutate the project on its own. WebFetch/WebSearch
+// are deliberately left enabled — they're read-only and run server-side on
+// Claude's own account, so this gets working web search with no extra
+// setup instead of reimplementing it client-side.
+const disallowedClaudeTools = "Bash,Read,Write,Edit,Glob,Grep,Task,NotebookEdit,TodoWrite,BashOutput,KillShell,SlashCommand"
 
 // commandRunner abstracts process execution so tests can substitute a fake
 // binary instead of requiring the real `claude`/`codex` CLI to be installed.
 type commandRunner func(ctx context.Context, name string, args []string, dir string) ([]byte, error)
 
+// runCommand returns whatever stdout the process produced even when it
+// exits non-zero: both CLIs report turn-level failures (expired auth, usage
+// limits, model errors) as a normal JSON/JSONL result on stdout paired with
+// exit code 1, so the caller needs that output to parse the real reason —
+// discarding it on a non-zero exit leaves only the generic wrapper error.
 func runCommand(ctx context.Context, name string, args []string, dir string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("%s exited with %v: %s", name, err, string(exitErr.Stderr))
+			return out, fmt.Errorf("%s exited with %v: %s", name, err, string(exitErr.Stderr))
 		}
-		return nil, err
+		return out, err
 	}
 	return out, nil
 }
@@ -100,22 +110,32 @@ func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, history []agent.
 			return
 		}
 
-		out, err := p.run()(ctx, binary, args, p.Dir)
-		if err != nil {
-			eChan <- fmt.Errorf("%s subprocess failed: %w", binary, err)
-			return
-		}
+		out, runErr := p.run()(ctx, binary, args, p.Dir)
 
+		// A non-zero exit doesn't mean stdout is useless: try parsing it
+		// first (see runCommand) and only fall back to the raw exec error
+		// — which for these CLIs is often just stderr noise — when there's
+		// nothing on stdout to parse.
 		var text string
 		var usage agent.ModelStreamChunk
+		var parseErr error
 		switch p.Kind {
 		case CLIKindClaude:
-			text, usage, err = parseClaudeOutput(out)
+			text, usage, parseErr = parseClaudeOutput(out)
 		case CLIKindCodex:
-			text, usage, err = parseCodexOutput(out)
+			text, usage, parseErr = parseCodexOutput(out)
 		}
-		if err != nil {
-			eChan <- err
+		if parseErr != nil {
+			// Nothing on stdout to parse at all (binary missing, killed
+			// before printing anything) — the exec-level error is all
+			// there is. Otherwise parseErr already carries the CLI's own
+			// reported reason (auth failure, usage limit, ...); prefer it
+			// over the generic wrapped exec error.
+			if len(bytes.TrimSpace(out)) == 0 && runErr != nil {
+				eChan <- fmt.Errorf("%s subprocess failed: %w", binary, runErr)
+			} else {
+				eChan <- parseErr
+			}
 			return
 		}
 
@@ -138,7 +158,10 @@ func codexArgs(model, prompt string) []string {
 	// --sandbox read-only: same reasoning as --disallowedTools above — the
 	// CLI must not mutate the project on its own, yoakeland's tool engine
 	// does that. ponytail: pure text-completion use, not full agent delegation.
-	args := []string{"exec", "--json", "--sandbox", "read-only"}
+	// tools.web_search=true turns on Codex's own server-side web search
+	// (read-only, runs on the same ChatGPT/OpenAI account already in use)
+	// so search works without a separate API key.
+	args := []string{"exec", "--json", "--sandbox", "read-only", "-c", "tools.web_search=true"}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -209,6 +232,9 @@ type codexCLIEvent struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"` // set on "turn.failed" events
 }
 
 // parseCodexOutput reads the JSON-Lines event stream `codex exec --json`
@@ -243,6 +269,9 @@ func parseCodexOutput(out []byte) (string, agent.ModelStreamChunk, error) {
 				usage.TotalTokens = ev.Usage.InputTokens + ev.Usage.OutputTokens
 			}
 		case "turn.failed":
+			if ev.Error != nil && ev.Error.Message != "" {
+				return "", agent.ModelStreamChunk{}, fmt.Errorf("codex CLI turn failed: %s", ev.Error.Message)
+			}
 			return "", agent.ModelStreamChunk{}, fmt.Errorf("codex CLI turn failed")
 		}
 	}

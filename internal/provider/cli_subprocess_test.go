@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/provider"
@@ -79,6 +80,49 @@ func TestCLISubprocessProvider_SubprocessFailure(t *testing.T) {
 		t.Fatal("expected an error when the subprocess itself fails to run")
 	}
 }
+
+// TestCLISubprocessProvider_TurnErrorSurfacesFromStdout guards against the
+// bug where a non-zero exit caused runCommand's caller to discard stdout
+// entirely: both claude and codex CLIs report turn-level failures (expired
+// auth, usage limits) as ordinary JSON/JSONL on stdout alongside exit code
+// 1, with stderr carrying only unrelated noise. The real reason must reach
+// the caller, not a blank "exited with status 1".
+func TestCLISubprocessProvider_ClaudeTurnErrorSurfacesFromStdout(t *testing.T) {
+	p := &provider.CLISubprocessProvider{
+		Kind: provider.CLIKindClaude,
+		Run: func(_ context.Context, name string, args []string, dir string) ([]byte, error) {
+			return []byte(`{"result":"Failed to authenticate: OAuth session expired","is_error":true}`),
+				&exitErrorStub{}
+		},
+	}
+
+	_, err := drainStreamTurn(t, p)
+	if err == nil || !strings.Contains(err.Error(), "OAuth session expired") {
+		t.Fatalf("expected the CLI's own error message to surface, got: %v", err)
+	}
+}
+
+func TestCLISubprocessProvider_CodexTurnErrorSurfacesFromStdout(t *testing.T) {
+	p := &provider.CLISubprocessProvider{
+		Kind: provider.CLIKindCodex,
+		Run: func(_ context.Context, name string, args []string, dir string) ([]byte, error) {
+			out := "{\"type\":\"turn.started\"}\n" +
+				"{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit.\"}}\n"
+			return []byte(out), &exitErrorStub{}
+		},
+	}
+
+	_, err := drainStreamTurn(t, p)
+	if err == nil || !strings.Contains(err.Error(), "usage limit") {
+		t.Fatalf("expected the CLI's own error message to surface, got: %v", err)
+	}
+}
+
+// exitErrorStub stands in for the *exec.ExitError a real non-zero exit
+// produces, without needing an actual subprocess.
+type exitErrorStub struct{}
+
+func (*exitErrorStub) Error() string { return "exit status 1" }
 
 func TestDetectCLI(t *testing.T) {
 	tempDir := t.TempDir()

@@ -65,6 +65,49 @@ func TestRegistry_SessionsAreIsolated(t *testing.T) {
 	}
 }
 
+// TestRegistry_ContextWindowIsPerSession guards against a shared
+// *ContextManager bug: the registry used to hand every session's Agent the
+// exact same ContextManager pointer, so one session resizing its context
+// window via set_model_options (SetModelOptions's contextWindow) silently
+// resized every *other* concurrent session in the project too — a model
+// picker choosing a small-context model in one chat would make every other
+// chat's "context full" readout wrong.
+func TestRegistry_ContextWindowIsPerSession(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100000, 20)
+
+	provider := &ScriptedProvider{
+		turns: [][]agent.ModelStreamChunk{
+			{{Kind: agent.StreamChunkDelta, Delta: "reply to B"}},
+		},
+	}
+
+	ipcA := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
+	ipcBOut := &bytes.Buffer{}
+	ipcB := protocol.NewIPCStream(bytes.NewBuffer(nil), ipcBOut)
+	registry := agent.NewRegistry(provider, []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+
+	agA := registry.Get(ipcA, "session-A")
+	agB := registry.Get(ipcB, "session-B")
+
+	// Session A picks a small-context model.
+	agA.SetModelOptions(agent.ModelOptions{}, 8000)
+
+	// Session B, untouched, must still report the project's original
+	// (large) context window — not A's.
+	if err := agB.RunTurn(context.Background(), "session-B", "turn-1", "hello from B"); err != nil {
+		t.Fatalf("session B turn failed: %v", err)
+	}
+
+	if !strings.Contains(ipcBOut.String(), `"maxTokens":100000`) {
+		t.Fatalf("session B's context window was clobbered by session A's set_model_options; turn_completed: %s", ipcBOut.String())
+	}
+}
+
 // TestRegistry_ReconnectNotifiesDisplacedConnection guards the reconnect UX:
 // when a second device attaches to a session already bound to another
 // connection, that first connection must be told it lost the session

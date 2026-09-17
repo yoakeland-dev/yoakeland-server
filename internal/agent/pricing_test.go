@@ -19,3 +19,35 @@ func TestEstimateCostUSD(t *testing.T) {
 		t.Fatalf("unknown model: got cost %v, want 0", got)
 	}
 }
+
+// TestEstimateCostUSD_PrefersLiveSourceOverStaticTable guards the wiring
+// SetLivePricingSource exists for: a live-fetched rate (internal/provider's
+// PricingCache, current as of the last daily refresh) must win over the
+// static table's hand-maintained, inevitably-stale numbers — and a model
+// the live source has never heard of must still fall back to the static
+// table rather than pricing at $0.
+func TestEstimateCostUSD_PrefersLiveSourceOverStaticTable(t *testing.T) {
+	t.Cleanup(func() { agent.SetLivePricingSource(nil) })
+
+	agent.SetLivePricingSource(func(model string) (float64, float64, bool) {
+		if model == "claude-3-5-sonnet-20241022" {
+			// Deliberately different from the static table's $3/$15 per
+			// million, so a test failure here can only mean the static
+			// table was used instead of this one.
+			return 0.000001, 0.000002, true
+		}
+		return 0, 0, false
+	})
+
+	usage := protocol.UsageData{InputTokens: 1_000_000, OutputTokens: 1_000_000}
+
+	if got, want := agent.EstimateCostUSD("claude-3-5-sonnet-20241022", usage), 1.0+2.0; got != want {
+		t.Errorf("live-priced model: got cost %v, want %v (the live rate, not the static table's)", got, want)
+	}
+
+	// A model the live source doesn't know still falls back to the static
+	// table rather than pricing at $0 just because a live source exists.
+	if got, want := agent.EstimateCostUSD("gpt-4o", usage), 2.5+10.0; got != want {
+		t.Errorf("live source miss: got cost %v, want %v (the static table's rate)", got, want)
+	}
+}

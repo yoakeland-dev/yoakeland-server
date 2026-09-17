@@ -30,7 +30,11 @@ func (t *BashTool) Name() string {
 }
 
 func (t *BashTool) Description() string {
-	return "Execute a command inside the project sandbox."
+	return "Execute a single command inside the project sandbox. There is no shell: " +
+		"pipes (|), redirects (>, <), command chaining (;, &&, ||), backticks, and $() " +
+		"are not interpreted — they're passed through as literal characters, so a command " +
+		"using them fails or behaves unexpectedly instead of working as in a real shell. " +
+		"Run one command per call and chain multiple calls instead of piping."
 }
 
 func (t *BashTool) RequiresPermission(_ []byte) bool {

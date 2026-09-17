@@ -20,7 +20,7 @@ func TestClaudeArgs(t *testing.T) {
 
 func TestCodexArgs(t *testing.T) {
 	args := codexArgs("gpt-5", "do the thing")
-	want := []string{"exec", "--json", "--sandbox", "read-only", "--model", "gpt-5", "--", "do the thing"}
+	want := []string{"exec", "--json", "--sandbox", "read-only", "-c", "tools.web_search=true", "--model", "gpt-5", "--", "do the thing"}
 	if !equalStrings(args, want) {
 		t.Fatalf("codexArgs = %v, want %v", args, want)
 	}

@@ -63,6 +63,14 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, maxSess
 		tool.NewFileEditTool(norm),
 		tool.NewBashTool(norm, sb),
 	}
+	if braveKey := os.Getenv("BRAVE_API_KEY"); braveKey != "" {
+		tools = append(tools, tool.NewWebSearchTool(braveKey))
+	} else {
+		logWarnDetail(
+			"web_search tool disabled: no BRAVE_API_KEY",
+			"BRAVE_API_KEY is not set, so the web_search tool was not registered for this project. Get a key at https://brave.com/search/api/ and set BRAVE_API_KEY to enable it.",
+		)
+	}
 
 	ctxMgr := agent.NewContextManager(64000, 4000)
 	usageStore, err := agent.NewUsageStore(norm.ProjectRoot)
@@ -92,6 +100,7 @@ func toHistoryMessages(history []agent.Message) []protocol.HistoryMessage {
 		hm := protocol.HistoryMessage{
 			Role:         m.Role,
 			Content:      m.Content,
+			Reasoning:    m.Reasoning,
 			ToolCallID:   m.ToolCallID,
 			Author:       m.AuthorName,
 			AuthorAvatar: m.AuthorAvatar,

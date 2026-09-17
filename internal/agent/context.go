@@ -3,11 +3,19 @@ package agent
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
 type ContextManager struct {
 	MaxHistoryTokens    int
 	MaxToolOutputTokens int
+
+	// mu guards MaxHistoryTokens: set_model_options (SetMaxHistoryTokens)
+	// can land from a different connection/goroutine than an in-flight
+	// turn reading it (PrepareHistory, or the context-fullness report at
+	// turn end), both against the field directly rather than an atomic —
+	// this closes that race.
+	mu sync.Mutex
 }
 
 func NewContextManager(maxHistoryTokens, maxToolOutputTokens int) *ContextManager {
@@ -21,6 +29,23 @@ func NewContextManager(maxHistoryTokens, maxToolOutputTokens int) *ContextManage
 		MaxHistoryTokens:    maxHistoryTokens,
 		MaxToolOutputTokens: maxToolOutputTokens,
 	}
+}
+
+// SetMaxHistoryTokens updates the context-window budget (set_model_options'
+// contextWindow). Safe against a concurrent read from an in-flight turn.
+func (cm *ContextManager) SetMaxHistoryTokens(n int) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.MaxHistoryTokens = n
+}
+
+// GetMaxHistoryTokens reads the context-window budget. Safe against a
+// concurrent SetMaxHistoryTokens from another connection on the same
+// session.
+func (cm *ContextManager) GetMaxHistoryTokens() int {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.MaxHistoryTokens
 }
 
 // EstimateTokens calculates an approximate token count (~4 characters per token heuristic).
@@ -67,7 +92,7 @@ func (cm *ContextManager) PrepareHistory(history []Message) []Message {
 		}
 	}
 
-	if totalTokens <= cm.MaxHistoryTokens || len(history) <= 4 {
+	if totalTokens <= cm.GetMaxHistoryTokens() || len(history) <= 4 {
 		return history
 	}
 

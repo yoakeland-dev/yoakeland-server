@@ -127,6 +127,18 @@ func main() {
 	// the daily background refresh is started further down, once ctx exists.
 	manifestCache := provider.NewManifestCache(stateDir)
 
+	// EstimateCostUSD's spend tracking (internal/agent/pricing.go) prices
+	// against this live-fetched table (LiteLLM's own model_prices_and_
+	// context_window.json — see internal/provider/pricing_cache.go) before
+	// falling back to its small hand-maintained one, same reasoning as the
+	// manifest cache above: a static map silently prices new/renamed models
+	// at $0 with no signal that happened.
+	pricingCache := provider.NewPricingCache(stateDir)
+	agent.SetLivePricingSource(func(model string) (float64, float64, bool) {
+		r, ok := pricingCache.Lookup(model)
+		return r.InputPerToken, r.OutputPerToken, ok
+	})
+
 	// Settings (server identity, remote-access password) are server-level
 	// state like providerStore, persisted under -state-dir so they survive
 	// a restart — see settings.go.
@@ -160,6 +172,7 @@ func main() {
 	defer cancel()
 
 	manifestCache.StartDailyRefresh(ctx)
+	pricingCache.StartDailyRefresh(ctx)
 
 	if stdioMode {
 		serveConnection(ctx, protocol.NewIPCStream(os.Stdin, os.Stdout), deps, "stdio", "", nil)

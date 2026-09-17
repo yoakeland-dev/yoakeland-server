@@ -18,6 +18,7 @@ import (
 type Message struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content,omitempty"`
+	Reasoning  string     `json:"reasoning,omitempty"` // assistant only: the model's own reasoning/chain-of-thought text, if the provider exposed one
 	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string     `json:"toolCallId,omitempty"`
 
@@ -77,6 +78,14 @@ const (
 	StreamChunkDelta    StreamEventKind = "delta"
 	StreamChunkToolCall StreamEventKind = "tool_call"
 	StreamChunkUsage    StreamEventKind = "usage"
+
+	// StreamChunkReasoning carries a chunk of the model's own reasoning/
+	// chain-of-thought text — Anthropic's extended-thinking `thinking_delta`
+	// blocks, or an OpenAI-compatible provider's `reasoning_content` delta
+	// (DeepSeek-reasoner and similar). Kept separate from StreamChunkDelta
+	// so a client can render it as its own collapsible section instead of
+	// mixing it into the visible answer.
+	StreamChunkReasoning StreamEventKind = "reasoning"
 
 	// StreamChunkFinish carries a provider's own stop/finish reason for the
 	// round-trip that just ended. Providers only send it to flag a reason
@@ -293,7 +302,7 @@ func (a *Agent) SetModelOptions(opts ModelOptions, contextWindow int) (didApplyP
 		didApplyProviderOptions = true
 	}
 	if contextWindow > 0 && cm != nil {
-		cm.MaxHistoryTokens = contextWindow
+		cm.SetMaxHistoryTokens(contextWindow)
 	}
 	return didApplyProviderOptions
 }
@@ -456,77 +465,25 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	a.activeTurnCancels[turnID] = cancel
 	a.mu.Unlock()
 
-	var titleCh <-chan string
-	if isNewChat {
-		result := make(chan string, 1)
-		titleCh = result
-		go func() {
-			if !autoGenerateTitle {
-				result <- fallbackTitle(prompt)
-				return
-			}
-			if generator, ok := turnProvider.(TitleGenerator); ok {
-				if title, err := generator.GenerateTitle(turnCtx, prompt); err == nil {
-					result <- normalizeTitle(title)
-					return
-				}
-			}
-			result <- fallbackTitle(prompt)
-		}()
-	}
-
-	// The title channel carries exactly one value and is drained at most once —
-	// by whichever save gets there first — so this can't block a second save.
-	var (
-		titleOnce sync.Once
-		titleText string
-	)
-	takeTitle := func() string {
-		titleOnce.Do(func() {
-			if titleCh != nil {
-				titleText = <-titleCh
-			}
-		})
-		return titleText
-	}
-
-	// persistTurn writes this turn's history to the session store, leaving
-	// metadata changed through set_session_* while this Agent was live intact
-	// (see SessionStore.Update for why that read-modify-write has to be
-	// atomic). Never holds a.mu across the write — CancelTurn takes that mutex,
-	// and a save must not be able to delay an abort.
-	persistTurn := func(applyTitle bool) error {
-		a.mu.Lock()
-		sessID := a.sessionID
-		history := append([]Message(nil), a.history...)
-		a.mu.Unlock()
-		if a.sessionStore == nil || sessID == "" {
-			return nil
+	// applyGeneratedTitle saves `title` (if still empty) and broadcasts the
+	// resulting session_updated — the only place an auto-generated title ever
+	// reaches a connected client, since it has no client-driven
+	// set_session_title to piggyback on.
+	applyGeneratedTitle := func(sessID, title string) {
+		if title == "" || a.sessionStore == nil {
+			return
 		}
 		titleJustSet := false
 		state, err := a.sessionStore.Update(sessID, func(state *SessionState) error {
-			// Re-checked here, under the store's own write lock — the same lock
-			// SessionStore.Delete takes. Either this save lands before the delete
-			// (and the file is removed right after it) or the delete landed first,
-			// in which case writing now would resurrect a session the user just
-			// deleted.
 			if a.isDiscarded() {
 				return errSessionDiscarded
 			}
-			state.History = history
-			if applyTitle && state.Title == "" {
-				state.Title = takeTitle()
-				titleJustSet = state.Title != ""
+			if state.Title == "" {
+				state.Title = title
+				titleJustSet = true
 			}
 			return nil
 		})
-		if errors.Is(err, errSessionDiscarded) {
-			return nil
-		}
-		// Auto-generated titles have no client-driven set_session_title to
-		// broadcast a session_updated for, so this is the only place the new
-		// title ever reaches a connected client — without it, a title only
-		// shows up on the next list_sessions poll.
 		if err == nil && titleJustSet {
 			_ = a.getStream().SendEvent(protocol.EventSessionUpdated, sessID, turnID, "", protocol.SessionSummary{
 				SessionID:       state.SessionID,
@@ -536,6 +493,56 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 				Archived:        state.Archived,
 				LinkedSessionID: state.LinkedSessionID,
 			})
+		}
+	}
+
+	if isNewChat {
+		// Runs — and saves/broadcasts — independently of the turn it started
+		// alongside: a title request is a small, non-streaming call that
+		// resolves in well under a second, so gating it behind the full turn
+		// (which may run many tool calls before it's done) would make title
+		// generation look like it only starts once the answer is already in,
+		// instead of racing it the way SPEC.md §3.1 describes.
+		go func(sessID string) {
+			title := fallbackTitle(prompt)
+			if autoGenerateTitle {
+				if generator, ok := turnProvider.(TitleGenerator); ok {
+					if generated, err := generator.GenerateTitle(turnCtx, prompt); err == nil {
+						title = normalizeTitle(generated)
+					}
+				}
+			}
+			applyGeneratedTitle(sessID, title)
+		}(sessionID)
+	}
+
+	// persistTurn writes this turn's history to the session store, leaving
+	// metadata changed through set_session_* while this Agent was live intact
+	// (see SessionStore.Update for why that read-modify-write has to be
+	// atomic). Never holds a.mu across the write — CancelTurn takes that mutex,
+	// and a save must not be able to delay an abort.
+	persistTurn := func() error {
+		a.mu.Lock()
+		sessID := a.sessionID
+		history := append([]Message(nil), a.history...)
+		a.mu.Unlock()
+		if a.sessionStore == nil || sessID == "" {
+			return nil
+		}
+		_, err := a.sessionStore.Update(sessID, func(state *SessionState) error {
+			// Re-checked here, under the store's own write lock — the same lock
+			// SessionStore.Delete takes. Either this save lands before the delete
+			// (and the file is removed right after it) or the delete landed first,
+			// in which case writing now would resurrect a session the user just
+			// deleted.
+			if a.isDiscarded() {
+				return errSessionDiscarded
+			}
+			state.History = history
+			return nil
+		})
+		if errors.Is(err, errSessionDiscarded) {
+			return nil
 		}
 		return err
 	}
@@ -556,7 +563,7 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	// the turn ends — and it's what makes the session file exist on a first
 	// message, which set_session_title requires (SPEC.md §3.1) and which used to
 	// only appear once a turn had already completed successfully.
-	if err := persistTurn(false); err != nil {
+	if err := persistTurn(); err != nil {
 		// Reported without a turnId on purpose: an error carrying this turn's id
 		// would make the client tear down its streaming state while the model is
 		// still answering. The save below reports it properly if it's still
@@ -575,12 +582,24 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		toolCalls     []ToolCall
 	)
 
+	// emptyLengthRetries caps how many times a round-trip that produced no
+	// visible text and no tool call — just finish_reason "length" — gets
+	// silently retried before giving up and reporting the cutoff. This is
+	// the reasoning-model failure mode: the whole token budget goes to
+	// hidden reasoning before any answer text is written, so what streamed
+	// out is nothing at all rather than a partial answer. A retry is a
+	// fresh, independently-sampled generation, not a resend of the same
+	// doomed request, so it can (and typically does) land differently.
+	const maxEmptyLengthRetries = 2
+	var emptyLengthRetries int
+
 	// One model round-trip per iteration; each iteration either finishes the turn
 	// (no tool calls), runs tools and loops, or breaks out early when the turn is
 	// cancelled or the provider fails mid-stream.
 turn:
 	for {
 		assistantText, toolCalls = "", nil
+		var reasoningText string
 		// ponytail: only surfaced when this round-trip ends with no tool
 		// calls (below) — a round truncated mid tool-call JSON still executes
 		// that (possibly malformed) call instead of being flagged, since
@@ -651,6 +670,11 @@ turn:
 					_ = a.getStream().SendEvent(protocol.EventModelDelta, a.sessionID, turnID, "", protocol.ModelDeltaData{
 						Content: chunk.Delta,
 					})
+				case StreamChunkReasoning:
+					reasoningText += chunk.Delta
+					_ = a.getStream().SendEvent(protocol.EventModelDelta, a.sessionID, turnID, "", protocol.ModelDeltaData{
+						Reasoning: chunk.Delta,
+					})
 				case StreamChunkToolCall:
 					if chunk.ToolCall != nil {
 						toolCalls = append(toolCalls, *chunk.ToolCall)
@@ -679,13 +703,37 @@ turn:
 			break turn
 		}
 
-		a.mu.Lock()
-		a.history = append(a.history, Message{
-			Role:      "assistant",
-			Content:   assistantText,
-			ToolCalls: toolCalls,
-		})
-		a.mu.Unlock()
+		// A round-trip that produced neither text nor a tool call, cut off
+		// by the token limit rather than finishing on its own: nothing was
+		// generated at all (not even a partial answer), so unlike an
+		// ordinary "length" cutoff there's nothing worth keeping — retry
+		// instead of reporting a blank turn. History wasn't touched (the
+		// guard below never runs for an empty round), so this is a fresh
+		// independently-sampled generation, not a resend of the same
+		// doomed request.
+		if assistantText == "" && len(toolCalls) == 0 && providerFinishReason == "length" && emptyLengthRetries < maxEmptyLengthRetries {
+			emptyLengthRetries++
+			continue turn
+		}
+
+		// A round-trip that produced neither text nor a tool call (a
+		// provider can finish_reason="length" with nothing generated —
+		// e.g. a reasoning model that spends its whole token budget on
+		// hidden reasoning before writing any visible content) must not
+		// become an assistant message with no content and no tool_calls:
+		// every provider's wire format requires one or the other, so that
+		// message would make every future request in this session invalid
+		// — the next turn fails outright instead of just this one.
+		if assistantText != "" || len(toolCalls) > 0 {
+			a.mu.Lock()
+			a.history = append(a.history, Message{
+				Role:      "assistant",
+				Content:   assistantText,
+				Reasoning: reasoningText,
+				ToolCalls: toolCalls,
+			})
+			a.mu.Unlock()
+		}
 
 		if len(toolCalls) == 0 {
 			// A provider-reported reason other than a normal completion (e.g.
@@ -815,7 +863,7 @@ turn:
 	// content exists nowhere else, so a failed write means the conversation the
 	// user just had is not on disk, and saying nothing would report a turn that
 	// can't be reloaded as an ordinary success.
-	if saveErr := persistTurn(true); saveErr != nil {
+	if saveErr := persistTurn(); saveErr != nil {
 		_ = a.getStream().SendEvent(protocol.EventError, a.sessionID, turnID, "", protocol.ErrorData{
 			Message: fmt.Sprintf("session %s could not be saved (%v) — this turn will not survive a restart", a.sessionID, saveErr),
 		})
@@ -881,13 +929,25 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 		spend = &protocol.SpendData{SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD}
 	}
 
+	// The provider's own reported token counts (its actual tokenizer) beat
+	// our char/4 heuristic whenever we have them: the heuristic also never
+	// accounts for the system prompt or tool schemas sent with every
+	// request, so it reads as "less full" than the context window actually
+	// is. InputTokens+OutputTokens is what this turn just added to the
+	// history that gets resent next turn, so it's the right number for
+	// "how full is the window now" — not just this round-trip's input.
+	estimatedTokens := a.contextManager.EstimateHistoryTokens(historySnapshot)
+	if usage.InputTokens > 0 {
+		estimatedTokens = usage.InputTokens + usage.OutputTokens
+	}
+
 	return protocol.TurnCompletedData{
 		FinishReason: finishReason,
 		SessionID:    sessionID,
 		Usage:        &usage,
 		Context: &protocol.ContextData{
-			EstimatedTokens: a.contextManager.EstimateHistoryTokens(historySnapshot),
-			MaxTokens:       a.contextManager.MaxHistoryTokens,
+			EstimatedTokens: estimatedTokens,
+			MaxTokens:       a.contextManager.GetMaxHistoryTokens(),
 		},
 		Spend:      spend,
 		DurationMs: time.Since(startTime).Milliseconds(),

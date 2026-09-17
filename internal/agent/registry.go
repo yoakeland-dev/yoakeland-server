@@ -65,7 +65,15 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 		return ag
 	}
 
-	ag := NewAgent(stream, r.provider, r.tools, r.permEngine, r.snapshotStore, r.sessionStore, r.ctxMgr, r.usageStore)
+	// A fresh ContextManager per session, not the registry's shared one:
+	// its MaxHistoryTokens is mutable (set_model_options' contextWindow),
+	// and every session in a project shared the same *ContextManager
+	// before this — one session picking a small-context model silently
+	// resized every other concurrent session's context-window budget too.
+	ag := NewAgent(stream, r.provider, r.tools, r.permEngine, r.snapshotStore, r.sessionStore, &ContextManager{
+		MaxHistoryTokens:    r.ctxMgr.GetMaxHistoryTokens(),
+		MaxToolOutputTokens: r.ctxMgr.MaxToolOutputTokens,
+	}, r.usageStore)
 	ag.SetMaxSessionSpendUSD(r.maxSessionSpendUSD)
 	_ = ag.LoadSession(sessionID)
 	r.sessions[sessionID] = ag

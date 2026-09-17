@@ -376,6 +376,7 @@ type HistoryToolCall struct {
 type HistoryMessage struct {
 	Role       string            `json:"role"`
 	Content    string            `json:"content,omitempty"`
+	Reasoning  string            `json:"reasoning,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
 
@@ -651,7 +652,15 @@ type CancelTurnData struct {
 }
 
 type ModelDeltaData struct {
-	Content string `json:"content"`
+	Content string `json:"content,omitempty"`
+
+	// Reasoning is a chunk of the model's own reasoning/chain-of-thought
+	// text (Anthropic extended thinking, or an OpenAI-compatible provider's
+	// reasoning_content — DeepSeek-reasoner and similar), mutually
+	// exclusive with Content on any one event. A client that doesn't know
+	// this field can safely ignore it; one that does can render it as its
+	// own collapsible section instead of mixing it into the answer.
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 type ToolCallData struct {

@@ -61,7 +61,8 @@ You have access to tools to inspect and modify code in the user's project:
 - file_read: read file content
 - file_write: create or overwrite files
 - file_edit: perform precise search-and-replace edits
-- bash: run commands inside the project sandbox
+- bash: run a single command inside the project sandbox — there is no shell, so pipes,
+  redirects, &&/||/;, backticks, and $() are not interpreted; run one command per call
 
 Rules:
 1. Always read relevant files before proposing edits.

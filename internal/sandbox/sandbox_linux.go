@@ -116,6 +116,15 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 			"--unshare-uts",
 			"--unshare-net",
 			"--die-with-parent",
+			// Puts the sandboxed process in its own terminal session so it
+			// has no controlling tty inherited from yoakeland's own. Without
+			// this, a sandboxed command can use the TIOCSTI ioctl to push
+			// synthetic keystrokes onto the parent's terminal — a
+			// well-documented bwrap/container escape technique (the same
+			// class of issue Flatpak's own bwrap invocation guards against)
+			// that has nothing to do with filesystem/network isolation and
+			// isn't covered by any of the --unshare-* flags above.
+			"--new-session",
 			"--",
 		)
 		bwrapArgs = append(bwrapArgs, execArgv...)
@@ -208,6 +217,7 @@ func probeBubblewrap(testDir string) bool {
 		"--bind", testDir, testDir,
 		"--chdir", testDir,
 		"--die-with-parent",
+		"--new-session",
 		"--",
 		targetBin,
 	)

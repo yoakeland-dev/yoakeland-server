@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
@@ -47,9 +48,25 @@ func NewAnthropic(apiKey, model string) *AnthropicProvider {
 }
 
 type anthropicTool struct {
+	Type        string         `json:"type,omitempty"`
 	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema,omitempty"`
+	MaxUses     int            `json:"max_uses,omitempty"`
+}
+
+// nativeWebSearchTool is Anthropic's server-side web search tool: Claude
+// decides when to search, the API runs it and feeds results back into the
+// same request, and yoakeland never sees a tool_use block for it — it's
+// billed to the same ANTHROPIC_API_KEY already in use, no separate search
+// API key needed. Set ANTHROPIC_DISABLE_WEB_SEARCH=1 for organizations that
+// have disabled it in the Console: including the tool on such an account
+// makes the API reject the whole request with a 400.
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+var nativeWebSearchTool = anthropicTool{
+	Type:    "web_search_20250305",
+	Name:    "web_search",
+	MaxUses: 5,
 }
 
 type anthropicContentBlock struct {
@@ -186,6 +203,9 @@ func (p *AnthropicProvider) StreamTurn(
 
 		// 2. Format tools
 		var anthroTools []anthropicTool
+		if os.Getenv("ANTHROPIC_DISABLE_WEB_SEARCH") == "" {
+			anthroTools = append(anthroTools, nativeWebSearchTool)
+		}
 		for _, t := range tools {
 			anthroTools = append(anthroTools, anthropicTool{
 				Name:        t.Name,
@@ -311,12 +331,19 @@ func (p *AnthropicProvider) StreamTurn(
 					} `json:"content_block"`
 				}
 				if err := json.Unmarshal([]byte(ev.Data), &block); err == nil {
+					// Reset unconditionally: a server_tool_use block (e.g.
+					// the web search query) also streams input_json_delta
+					// into this same buffer, and leaving it unreset would
+					// prefix the next real tool_use call's arguments with
+					// stale bytes from the search query.
+					currentArgsBuffer.Reset()
 					if block.ContentBlock.Type == "tool_use" {
-						currentArgsBuffer.Reset()
 						currentToolCall = &agent.ToolCall{
 							ID:   block.ContentBlock.ID,
 							Name: block.ContentBlock.Name,
 						}
+					} else {
+						currentToolCall = nil
 					}
 				}
 
@@ -326,6 +353,7 @@ func (p *AnthropicProvider) StreamTurn(
 						Type        string `json:"type"`
 						Text        string `json:"text"`
 						PartialJSON string `json:"partial_json"`
+						Thinking    string `json:"thinking"`
 					} `json:"delta"`
 				}
 				if err := json.Unmarshal([]byte(ev.Data), &delta); err == nil {
@@ -334,6 +362,11 @@ func (p *AnthropicProvider) StreamTurn(
 						cChan <- agent.ModelStreamChunk{
 							Kind:  agent.StreamChunkDelta,
 							Delta: delta.Delta.Text,
+						}
+					case "thinking_delta":
+						cChan <- agent.ModelStreamChunk{
+							Kind:  agent.StreamChunkReasoning,
+							Delta: delta.Delta.Thinking,
 						}
 					case "input_json_delta":
 						currentArgsBuffer.WriteString(delta.Delta.PartialJSON)

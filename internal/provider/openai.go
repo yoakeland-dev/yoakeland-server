@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
@@ -18,6 +19,11 @@ type OpenAICompatibleProvider struct {
 	BaseURL      string
 	Client       *http.Client
 	ExtraHeaders map[string]string
+
+	// IsOpenRouter gates OpenRouter's native server-side web_search tool
+	// (see NewOpenRouter): plain OpenAI-compatible endpoints (api.openai.com,
+	// LM Studio, Ollama, ...) don't support it.
+	IsOpenRouter bool
 
 	// reasoningEffort is set via SetModelOptions; empty means omit the field
 	// (the model's own default). OpenRouter accepts the same
@@ -57,10 +63,11 @@ func NewOpenRouter(apiKey, model string) *OpenAICompatibleProvider {
 		model = "anthropic/claude-3.5-sonnet"
 	}
 	return &OpenAICompatibleProvider{
-		APIKey:  apiKey,
-		Model:   model,
-		BaseURL: "https://openrouter.ai/api/v1/chat/completions",
-		Client:  &http.Client{},
+		APIKey:       apiKey,
+		Model:        model,
+		BaseURL:      "https://openrouter.ai/api/v1/chat/completions",
+		Client:       &http.Client{},
+		IsOpenRouter: true,
 		ExtraHeaders: map[string]string{
 			"HTTP-Referer": "https://github.com/yoakeland/yoakeland",
 			"X-Title":      "Yoakeland",
@@ -96,7 +103,17 @@ type openAIRequest struct {
 	Stream          bool                `json:"stream"`
 	StreamOptions   openAIStreamOptions `json:"stream_options"`
 	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
+
+	// MaxTokens defaults to defaultMaxTokens below rather than being left
+	// unset: several OpenAI-compatible backends (DeepSeek's API included)
+	// apply their own low default — around 4096 — when this is omitted,
+	// which a reasoning model can burn through entirely on hidden
+	// reasoning_content before writing any visible content, cutting the
+	// response off with nothing to show for it.
+	MaxTokens int `json:"max_tokens,omitempty"`
 }
+
+const defaultMaxTokens = 8192
 
 // GenerateTitle implements agent.TitleGenerator with a small, non-streaming
 // request on the same model as the session, separate from any in-flight
@@ -202,6 +219,13 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 
 		// 2. Convert tools
 		var openAITools []any
+		if p.IsOpenRouter && os.Getenv("OPENROUTER_DISABLE_WEB_SEARCH") == "" {
+			// OpenRouter's server-side web_search tool: resolved entirely
+			// on OpenRouter's side (like Anthropic's native tool below),
+			// billed to the same OPENROUTER_API_KEY already in use.
+			// https://openrouter.ai/docs/guides/features/server-tools/web-search
+			openAITools = append(openAITools, map[string]any{"type": "openrouter:web_search"})
+		}
 		for _, t := range tools {
 			openAITools = append(openAITools, map[string]any{
 				"type": "function",
@@ -213,6 +237,15 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			})
 		}
 
+		// Genuine OpenAI is left out of the default: its o1/o3/o4/gpt-5
+		// reasoning-family models reject max_tokens outright (they require
+		// max_completion_tokens instead), and this default exists for
+		// DeepSeek/OpenRouter/local backends, not those.
+		maxTokens := defaultMaxTokens
+		if p.BaseURL == "https://api.openai.com/v1/chat/completions" {
+			maxTokens = 0
+		}
+
 		reqBody := openAIRequest{
 			Model:           p.Model,
 			Messages:        msgs,
@@ -220,6 +253,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			Stream:          true,
 			StreamOptions:   openAIStreamOptions{IncludeUsage: true},
 			ReasoningEffort: p.getReasoningEffort(),
+			MaxTokens:       maxTokens,
 		}
 
 		jsonBytes, err := json.Marshal(reqBody)
@@ -272,6 +306,10 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 					Delta struct {
 						Content   string           `json:"content"`
 						ToolCalls []openAIToolCall `json:"tool_calls"`
+						// ReasoningContent is DeepSeek-reasoner's (and
+						// similar reasoning models') chain-of-thought
+						// field, streamed alongside/before Content.
+						ReasoningContent string `json:"reasoning_content"`
 					} `json:"delta"`
 					FinishReason *string `json:"finish_reason"`
 				} `json:"choices"`
@@ -303,6 +341,12 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 				cChan <- agent.ModelStreamChunk{
 					Kind:  agent.StreamChunkDelta,
 					Delta: choice.Delta.Content,
+				}
+			}
+			if choice.Delta.ReasoningContent != "" {
+				cChan <- agent.ModelStreamChunk{
+					Kind:  agent.StreamChunkReasoning,
+					Delta: choice.Delta.ReasoningContent,
 				}
 			}
 
