@@ -169,66 +169,94 @@ func backtrack(trace []map[int]int, a, b []string, n, m int) []editOp {
 	return edits
 }
 
+// buildHunks groups edits into one or more windowed hunks, each trimmed to
+// at most contextLines of unchanged context before/after its changes —
+// rather than one hunk spanning the entire file — merging two changes into
+// the same hunk when the run of context between them is short enough that
+// their context windows would otherwise overlap.
 func buildHunks(edits []editOp, contextLines int) []Hunk {
-	_ = contextLines
 	if len(edits) == 0 {
 		return nil
 	}
 
-	// Check if there are any actual changes
-	hasChanges := false
-	for _, e := range edits {
-		if e.op == LineAdd || e.op == LineDelete {
-			hasChanges = true
-			break
-		}
-	}
-	if !hasChanges {
-		return nil
-	}
-
-	var hunks []Hunk
-	var currentLines []DiffLine
-
-	oldLine := 1
-	newLine := 1
-	hunkOldStart := 1
-	hunkNewStart := 1
-	hunkOldCount := 0
-	hunkNewCount := 0
-
-	for _, e := range edits {
-		diffLine := DiffLine{Type: e.op, Content: e.text}
-
-		if len(currentLines) == 0 {
-			hunkOldStart = oldLine
-			hunkNewStart = newLine
-		}
-
-		currentLines = append(currentLines, diffLine)
-
+	// oldLineAt[i]/newLineAt[i] are the 1-based old/new line numbers "at"
+	// edits[i] — i.e. the position a hunk starting at edits[i] should report
+	// as its OldStart/NewStart.
+	oldLineAt := make([]int, len(edits))
+	newLineAt := make([]int, len(edits))
+	oldLine, newLine := 1, 1
+	for i, e := range edits {
+		oldLineAt[i], newLineAt[i] = oldLine, newLine
 		switch e.op {
 		case LineContext:
 			oldLine++
 			newLine++
-			hunkOldCount++
-			hunkNewCount++
 		case LineDelete:
 			oldLine++
-			hunkOldCount++
 		case LineAdd:
 			newLine++
-			hunkNewCount++
 		}
 	}
 
-	if len(currentLines) > 0 {
+	var changeIdx []int
+	for i, e := range edits {
+		if e.op != LineContext {
+			changeIdx = append(changeIdx, i)
+		}
+	}
+	if len(changeIdx) == 0 {
+		return nil
+	}
+
+	// Merge adjacent changes into one range when the context run between
+	// them is short enough that both changes' context windows would touch.
+	type editRange struct{ start, end int } // inclusive indices into edits
+	var ranges []editRange
+	curStart, curEnd := changeIdx[0], changeIdx[0]
+	for _, idx := range changeIdx[1:] {
+		gap := idx - curEnd - 1
+		if gap <= 2*contextLines {
+			curEnd = idx
+			continue
+		}
+		ranges = append(ranges, editRange{curStart, curEnd})
+		curStart, curEnd = idx, idx
+	}
+	ranges = append(ranges, editRange{curStart, curEnd})
+
+	hunks := make([]Hunk, 0, len(ranges))
+	for _, r := range ranges {
+		lo := r.start - contextLines
+		if lo < 0 {
+			lo = 0
+		}
+		hi := r.end + contextLines
+		if hi > len(edits)-1 {
+			hi = len(edits) - 1
+		}
+
+		lines := make([]DiffLine, 0, hi-lo+1)
+		var oldCount, newCount int
+		for i := lo; i <= hi; i++ {
+			e := edits[i]
+			lines = append(lines, DiffLine{Type: e.op, Content: e.text})
+			switch e.op {
+			case LineContext:
+				oldCount++
+				newCount++
+			case LineDelete:
+				oldCount++
+			case LineAdd:
+				newCount++
+			}
+		}
+
 		hunks = append(hunks, Hunk{
-			OldStart: hunkOldStart,
-			OldLines: hunkOldCount,
-			NewStart: hunkNewStart,
-			NewLines: hunkNewCount,
-			Lines:    currentLines,
+			OldStart: oldLineAt[lo],
+			OldLines: oldCount,
+			NewStart: newLineAt[lo],
+			NewLines: newCount,
+			Lines:    lines,
 		})
 	}
 
