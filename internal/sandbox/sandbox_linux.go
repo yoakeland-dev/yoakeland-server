@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,11 +37,30 @@ func NewSandbox(projectRoot string, defaultTimeout time.Duration) Sandbox {
 	}
 }
 
+// Mode reports the sandbox tier as it should be understood by a caller
+// deciding how much to trust it (project_opened.sandboxTier, and the
+// startup warning log) — as opposed to s.mode, which drives Execute()'s
+// internal branching and can be more optimistic than what's actually safe
+// to report.
+//
+// The namespace-only fallback (CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC, no
+// CLONE_NEWNET, no mount/root restriction) isolates the process tree but
+// grants no real network or filesystem isolation — a command running under
+// it can still reach the network and read/write anything this OS user can.
+// Reporting it as "linux_namespaces" would overclaim a level of isolation
+// it doesn't provide, so it's demoted to the same "local_restricted_fallback"
+// label the no-isolation-at-all case gets, per SPEC.md's own
+// insecure-by-omission-is-always-visible principle. Execute() still applies
+// those namespace flags regardless — free defense in depth — this only
+// changes what's reported, not what's run.
 func (s *LinuxSandbox) Mode() SandboxMode {
+	if s.mode == ModeNamespace {
+		return ModeLocalRestr
+	}
 	return s.mode
 }
 
-func (s *LinuxSandbox) Execute(ctx context.Context, argv []string) (*ExecutionResult, error) {
+func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []string) (*ExecutionResult, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -110,12 +131,12 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string) (*ExecutionRe
 		cmd.Dir = s.projectRoot
 	}
 
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
 		"LANG=en_US.UTF-8",
 		"HOME=" + s.projectRoot,
 		"PWD=" + s.projectRoot,
-	}
+	}, extraEnv...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -152,6 +173,8 @@ func probeBubblewrap(testDir string) bool {
 	if !commandExists("bwrap") {
 		return false
 	}
+
+	checkBubblewrapVersion()
 
 	args := []string{"--ro-bind", "/usr", "/usr"}
 	for _, sysPath := range []string{"/bin", "/sbin", "/lib", "/lib64"} {
@@ -194,6 +217,54 @@ func probeBubblewrap(testDir string) bool {
 
 	cmd := exec.CommandContext(ctx, "bwrap", args...)
 	return cmd.Run() == nil
+}
+
+// checkBubblewrapVersion warns (but never fails) if the installed bwrap is
+// older than 0.12.0, or if its version can't be determined at all. Older
+// bubblewrap releases are known-vulnerable: GHSA-pxhw-h44j-8pfx is a
+// symlink-traversal sandbox escape fixed in 0.12.0, and GHSA-xq78-7hw4-5jvp
+// is a ptrace privilege-escalation issue in setuid installs fixed in
+// 0.11.2. This is warn-only, consistent with how other insecure-by-default
+// states (no TLS, no master key) are surfaced elsewhere in this codebase.
+func checkBubblewrapVersion() {
+	out, err := exec.Command("bwrap", "--version").Output()
+	if err != nil {
+		log.Printf("WARNING: could not determine bubblewrap version (%v) — if it predates 0.12.0 it may be vulnerable to known sandbox-escape CVEs (GHSA-pxhw-h44j-8pfx, GHSA-xq78-7hw4-5jvp). Consider upgrading bubblewrap.", err)
+		return
+	}
+
+	fields := strings.Fields(string(out))
+	version := ""
+	for _, f := range fields {
+		if len(f) > 0 && (f[0] >= '0' && f[0] <= '9') {
+			version = f
+			break
+		}
+	}
+	if version == "" || !bubblewrapVersionAtLeast(version, [3]int{0, 12, 0}) {
+		log.Printf("WARNING: bubblewrap version %q may be vulnerable to known sandbox-escape CVEs — GHSA-pxhw-h44j-8pfx (symlink-traversal escape, fixed in 0.12.0) and GHSA-xq78-7hw4-5jvp (ptrace privilege escalation in setuid installs, fixed in 0.11.2). Recommend upgrading bubblewrap.", strings.TrimSpace(string(out)))
+	}
+}
+
+// bubblewrapVersionAtLeast reports whether version (e.g. "0.11.3") is >=
+// min. An unparseable version is treated as not meeting the minimum, so the
+// caller warns rather than silently trusting it.
+func bubblewrapVersionAtLeast(version string, min [3]int) bool {
+	parts := strings.SplitN(version, ".", 3)
+	var got [3]int
+	for i := 0; i < len(parts) && i < 3; i++ {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return false
+		}
+		got[i] = n
+	}
+	for i := 0; i < 3; i++ {
+		if got[i] != min[i] {
+			return got[i] > min[i]
+		}
+	}
+	return true
 }
 
 func probeNamespaces(testDir string) bool {

@@ -22,7 +22,10 @@ type ExecutionResult struct {
 
 type Sandbox interface {
 	Mode() SandboxMode
-	Execute(ctx context.Context, argv []string) (*ExecutionResult, error)
+	// Execute runs argv inside the sandbox. extraEnv, if non-nil, is
+	// appended to the base environment as-is (e.g. "GIT_AUTHOR_NAME=...")
+	// — nil means no additions, today's exact behavior.
+	Execute(ctx context.Context, argv []string, extraEnv []string) (*ExecutionResult, error)
 }
 
 // Helper to determine if an executable is in $PATH

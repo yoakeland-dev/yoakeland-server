@@ -26,7 +26,7 @@ func (s *NonLinuxSandbox) Mode() SandboxMode {
 	return ModeLocalRestr
 }
 
-func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string) (*ExecutionResult, error) {
+func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []string) (*ExecutionResult, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -36,12 +36,12 @@ func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string) (*Executio
 
 	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
 	cmd.Dir = s.projectRoot
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
 		"LANG=en_US.UTF-8",
 		"HOME=" + s.projectRoot,
 		"PWD=" + s.projectRoot,
-	}
+	}, extraEnv...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

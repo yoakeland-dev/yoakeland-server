@@ -11,7 +11,7 @@ func TestSandbox_ExecutionAndTimeout(t *testing.T) {
 	sb := sandbox.NewSandbox(t.TempDir(), 1*time.Second)
 
 	// Quick execution
-	res, err := sb.Execute(context.Background(), []string{"echo", "sandbox active"})
+	res, err := sb.Execute(context.Background(), []string{"echo", "sandbox active"}, nil)
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -21,7 +21,7 @@ func TestSandbox_ExecutionAndTimeout(t *testing.T) {
 
 	// Timeout enforcement
 	ctx := context.Background()
-	_, err = sb.Execute(ctx, []string{"sleep", "2"})
+	_, err = sb.Execute(ctx, []string{"sleep", "2"}, nil)
 	if err == nil {
 		t.Fatalf("expected timeout error for 2-second sleep in 1-second sandbox")
 	}
