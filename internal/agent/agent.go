@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -509,6 +510,8 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 				if generator, ok := turnProvider.(TitleGenerator); ok {
 					if generated, err := generator.GenerateTitle(turnCtx, prompt); err == nil {
 						title = normalizeTitle(generated)
+					} else {
+						log.Printf("title generation: %v — falling back to a title derived from the prompt", err)
 					}
 				}
 			}

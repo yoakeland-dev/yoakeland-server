@@ -87,7 +87,7 @@ type openAIToolCall struct {
 
 type openAIMessage struct {
 	Role       string           `json:"role"`
-	Content    string           `json:"content,omitempty"`
+	Content    string           `json:"content"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
@@ -101,7 +101,11 @@ type openAIRequest struct {
 	Messages        []openAIMessage     `json:"messages"`
 	Tools           []any               `json:"tools,omitempty"`
 	Stream          bool                `json:"stream"`
-	StreamOptions   openAIStreamOptions `json:"stream_options"`
+	// Pointer, not value: OpenAI 400s if stream_options is present at all
+	// while stream is false (GenerateTitle's case) — a plain struct field
+	// would always serialize since encoding/json's omitempty never treats a
+	// non-pointer struct as empty.
+	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
 	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
 
 	// MaxTokens defaults to defaultMaxTokens below rather than being left
@@ -251,7 +255,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			Messages:        msgs,
 			Tools:           openAITools,
 			Stream:          true,
-			StreamOptions:   openAIStreamOptions{IncludeUsage: true},
+			StreamOptions:   &openAIStreamOptions{IncludeUsage: true},
 			ReasoningEffort: p.getReasoningEffort(),
 			MaxTokens:       maxTokens,
 		}
