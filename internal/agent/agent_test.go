@@ -96,7 +96,7 @@ func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, provider, tools, engine, snapStore, sessStore, ctxMgr)
+	ag := agent.NewAgent(ipc, provider, tools, engine, snapStore, sessStore, ctxMgr, nil)
 
 	ctx := context.Background()
 
@@ -130,7 +130,7 @@ func TestAgent_TurnCancellationAndMetrics(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, provider, []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr)
+	ag := agent.NewAgent(ipc, provider, []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr, nil)
 
 	go func() {
 		<-provider.started
@@ -145,5 +145,41 @@ func TestAgent_TurnCancellationAndMetrics(t *testing.T) {
 	output := outBuf.String()
 	if !bytes.Contains(outBuf.Bytes(), []byte(`"finishReason":"cancelled"`)) {
 		t.Errorf("expected finishReason cancelled in completed event, got: %s", output)
+	}
+}
+
+// TestAgent_ReportsProviderFinishReason guards that a provider's own
+// StreamChunkFinish (e.g. Anthropic's stop_reason "max_tokens" / OpenAI's
+// finish_reason "length", both normalized to "length" by the provider
+// layer) reaches turn_completed instead of being flattened to the default
+// "stop" that a tool-call-free round-trip otherwise always got — the bug
+// that made a truncated answer look identical to a complete one.
+func TestAgent_ReportsProviderFinishReason(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	sb := sandbox.NewSandbox(tempDir, 5*time.Second)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20)
+
+	provider := &ScriptedProvider{turns: [][]agent.ModelStreamChunk{
+		{
+			{Kind: agent.StreamChunkDelta, Delta: "this got cut off"},
+			{Kind: agent.StreamChunkFinish, FinishReason: "length"},
+		},
+	}}
+
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, provider, []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr, nil)
+
+	if err := ag.RunTurn(context.Background(), "session-test", "turn-length-1", "Write me something long"); err != nil {
+		t.Fatalf("RunTurn returned error: %v", err)
+	}
+
+	output := outBuf.String()
+	if !bytes.Contains(outBuf.Bytes(), []byte(`"finishReason":"length"`)) {
+		t.Errorf("expected finishReason length in completed event, got: %s", output)
 	}
 }

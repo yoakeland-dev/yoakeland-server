@@ -28,6 +28,20 @@ func (cm *ContextManager) EstimateTokens(text string) int {
 	return (len(text) + 3) / 4
 }
 
+// EstimateHistoryTokens sums the token estimate across an entire message
+// history, including tool call arguments. Used to report context-window
+// fullness to the frontend.
+func (cm *ContextManager) EstimateHistoryTokens(history []Message) int {
+	total := 0
+	for _, m := range history {
+		total += cm.EstimateTokens(m.Content)
+		for _, tc := range m.ToolCalls {
+			total += cm.EstimateTokens(string(tc.Args))
+		}
+	}
+	return total
+}
+
 // TruncateToolOutput bounds giant file readings or bash stdout dumps.
 func (cm *ContextManager) TruncateToolOutput(raw string) string {
 	maxBytes := cm.MaxToolOutputTokens * 4
@@ -59,14 +73,34 @@ func (cm *ContextManager) PrepareHistory(history []Message) []Message {
 
 	// Always retain the first user message (primary directive) and most recent 4 messages
 	firstUserMsg := history[0]
-	recentTail := history[len(history)-4:]
 
-	// Summarize discarded intermediate turns
-	discardedCount := len(history) - 5
+	// The tail can't start on a "tool" message: both Anthropic and OpenAI
+	// reject a request where a tool result's originating assistant
+	// tool_calls message isn't present too (400 "tool_use ids were found
+	// without tool_result blocks" / "'tool' message must be a response to a
+	// preceding message with 'tool_calls'") — exactly the shape a long,
+	// tool-heavy turn produces once it's long enough to trigger this naive
+	// last-N slice. Widen the tail backward to the nearest assistant/user
+	// message so every retained tool result keeps its pairing intact.
+	tailStart := len(history) - 4
+	for tailStart > 1 && history[tailStart].Role == "tool" {
+		tailStart--
+	}
+
+	recentTail := history[tailStart:]
+	discarded := history[1:tailStart]
+
+	// Summarize discarded intermediate turns using their actual content
+	// (CompactSummary) rather than dropping them with just a count — a bare
+	// "N messages truncated" notice throws away whatever the model did in
+	// the middle of a long session with no trace, which reads to the model
+	// as amnesia rather than a bounded working set. Bound the summary's own
+	// size with the same budget tool-output truncation uses, so a very long
+	// discarded stretch can't blow the budget it exists to protect.
 	summaryMsg := Message{
 		Role: "system",
-		Content: fmt.Sprintf("[Notice: %d intermediate conversation messages truncated to preserve context budget]",
-			discardedCount),
+		Content: fmt.Sprintf("[%d intermediate conversation messages summarized to preserve context budget]\n%s",
+			len(discarded), cm.TruncateToolOutput(cm.CompactSummary(discarded))),
 	}
 
 	compacted := make([]Message, 0, 6)
