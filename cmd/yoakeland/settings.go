@@ -1,0 +1,227 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+// TokenRecord is one named person's TCP auth credential, plus the identity
+// cached against it — see register_token/list_tokens/remove_token. Name is
+// fixed at registration (rename = revoke + re-register, deliberately simple);
+// Avatar is mutable via set_peer_avatar so it survives reconnects instead of
+// resetting every time.
+type TokenRecord struct {
+	Token  string `json:"token"`
+	Email  string `json:"email,omitempty"`
+	Avatar string `json:"avatar,omitempty"`
+}
+
+// ServerSettings persists the small set of runtime knobs a client can change
+// via set_server_identity/set_remote_password/register_token as
+// <stateDir>/server.json, so they survive a restart instead of resetting to
+// flag defaults every time — same directory and 0600-on-write pattern as
+// provider.ProviderStore, since a token is a credential the same way an API
+// key is.
+type ServerSettings struct {
+	mu       sync.Mutex
+	filePath string
+
+	Identity string                 `json:"identity,omitempty"`
+	Tokens   map[string]TokenRecord `json:"tokens,omitempty"`
+
+	// AutoGenerateTitle is the server-wide default for a first user_prompt
+	// that omits its own autoGenerateTitle (SPEC.md §3.1) — nil (the
+	// unset-file case) means "on", matching that same per-request default,
+	// so a fresh server behaves identically whether or not this was ever
+	// touched.
+	AutoGenerateTitle *bool `json:"autoGenerateTitle,omitempty"`
+
+	// Token is the legacy single-secret field from before per-person
+	// tokens existed. Only ever read at load time, to migrate into
+	// Tokens["default"] — GetToken/SetToken/save all operate on Tokens
+	// from then on, so a single-user setup (-token, set_remote_password)
+	// keeps working with zero config changes.
+	Token string `json:"token,omitempty"`
+}
+
+const defaultTokenName = "default"
+
+// NewServerSettings opens (or creates) the settings file in dir. Identity
+// defaults to the machine's hostname when nothing has been persisted or
+// passed via -state-dir yet, so a freshly started server always has a
+// non-empty display name to show peers.
+func NewServerSettings(dir string) (*ServerSettings, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	s := &ServerSettings{filePath: filepath.Join(dir, "server.json"), Tokens: map[string]TokenRecord{}}
+	if data, err := os.ReadFile(s.filePath); err == nil {
+		if err := json.Unmarshal(data, s); err != nil {
+			logWarn("server settings: server.json failed to parse, resetting to empty: %v", err)
+			s.Identity, s.Token, s.Tokens = "", "", map[string]TokenRecord{}
+		}
+	}
+	if s.Tokens == nil {
+		s.Tokens = map[string]TokenRecord{}
+	}
+	if s.Token != "" {
+		if _, ok := s.Tokens[defaultTokenName]; !ok {
+			s.Tokens[defaultTokenName] = TokenRecord{Token: s.Token}
+		}
+		s.Token = ""
+	}
+	if s.Identity == "" {
+		if host, err := os.Hostname(); err == nil {
+			s.Identity = host
+		}
+	}
+	return s, nil
+}
+
+func (s *ServerSettings) GetIdentity() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Identity
+}
+
+func (s *ServerSettings) SetIdentity(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Identity = name
+	return s.save()
+}
+
+// GetAutoGenerateTitle returns the server-wide default, true unless an
+// operator has explicitly turned it off via SetAutoGenerateTitle.
+func (s *ServerSettings) GetAutoGenerateTitle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AutoGenerateTitle == nil || *s.AutoGenerateTitle
+}
+
+func (s *ServerSettings) SetAutoGenerateTitle(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AutoGenerateTitle = &enabled
+	return s.save()
+}
+
+// GetToken returns the "default" token — the one -token/set_remote_password
+// manage, kept for every existing single-shared-token caller.
+func (s *ServerSettings) GetToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Tokens[defaultTokenName].Token
+}
+
+// SetToken overwrites the "default" token, preserving any email/avatar
+// already cached against it.
+func (s *ServerSettings) SetToken(token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.Tokens[defaultTokenName]
+	rec.Token = token
+	s.Tokens[defaultTokenName] = rec
+	return s.save()
+}
+
+// LookupToken resolves a presented token to the name it was registered
+// under, using constantTimeTokenEqual for every comparison so a mismatch
+// doesn't leak timing information about which entry (if any) it's closest
+// to. Safe to call with network == "unix" callers passing an empty token —
+// it simply won't match anything.
+func (s *ServerSettings) LookupToken(token string) (name string, rec TokenRecord, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for n, r := range s.Tokens {
+		if constantTimeTokenEqual(token, r.Token) {
+			return n, r, true
+		}
+	}
+	return "", TokenRecord{}, false
+}
+
+// AddToken registers a new named credential. name must be non-empty and not
+// already registered — rename is deliberately unsupported (revoke + re-add
+// instead), so there's no ambiguity about what "the same person" means.
+func (s *ServerSettings) AddToken(name, token, email string) error {
+	if name == "" {
+		return fmt.Errorf("token name is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.Tokens[name]; exists {
+		return fmt.Errorf("a token named %q already exists", name)
+	}
+	s.Tokens[name] = TokenRecord{Token: token, Email: email}
+	return s.save()
+}
+
+// ListTokenNames returns every registered token's name/email/whether it has
+// a cached avatar — never the raw token, same scrubbing precedent as
+// provider_list's apiKey.
+func (s *ServerSettings) ListTokenNames() []TokenSummaryInternal {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]TokenSummaryInternal, 0, len(s.Tokens))
+	for n, r := range s.Tokens {
+		out = append(out, TokenSummaryInternal{Name: n, Email: r.Email, HasAvatar: r.Avatar != ""})
+	}
+	return out
+}
+
+// TokenSummaryInternal mirrors protocol.TokenSummary — kept as a plain
+// package-local type so settings.go doesn't need to import internal/protocol
+// just for this shape; main.go converts it at the dispatch boundary.
+type TokenSummaryInternal struct {
+	Name      string
+	Email     string
+	HasAvatar bool
+}
+
+// RemoveToken deletes a named credential, idempotently (removing a name
+// that's already gone is a success, not an error — same precedent as
+// remove_provider: revoking access that's already revoked is a benign
+// no-op).
+func (s *ServerSettings) RemoveToken(name string) (existed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, existed = s.Tokens[name]; !existed {
+		return false, nil
+	}
+	delete(s.Tokens, name)
+	return true, s.save()
+}
+
+// SetTokenAvatar persists an avatar against a named token so it survives
+// reconnects — the "cache avatars" half of set_peer_avatar for a tokened
+// (TCP, per-person) peer. No-op success if the name is unknown, mirroring
+// PeerRegistry.SetAvatar's "report whether it existed" shape rather than
+// erroring on a race with a since-removed token.
+func (s *ServerSettings) SetTokenAvatar(name, avatar string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.Tokens[name]
+	if !ok {
+		return false
+	}
+	rec.Avatar = avatar
+	s.Tokens[name] = rec
+	_ = s.save()
+	return true
+}
+
+func (s *ServerSettings) save() error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.filePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.filePath)
+}
