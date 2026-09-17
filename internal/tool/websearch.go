@@ -8,26 +8,34 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
 type WebSearchArgs struct {
 	Query string `json:"query"`
 }
 
-// WebSearchTool queries the Brave Search API. Brave over a scraped
-// DuckDuckGo page because it returns structured JSON instead of HTML that
-// breaks whenever the page markup changes.
+// WebSearchTool searches the web. With a Brave API key it queries Brave's
+// JSON API, which is the reliable path since it returns structured results
+// instead of HTML that breaks whenever page markup changes. With no key it
+// falls back to scraping DuckDuckGo's HTML results — free and keyless, but
+// DuckDuckGo actively bot-checks non-browser/datacenter traffic, so this
+// path can intermittently return a "blocked" error instead of results.
+// Set BRAVE_API_KEY for the reliable path.
 type WebSearchTool struct {
-	apiKey  string
-	client  *http.Client
-	baseURL string // overridden in tests to point at a fake server
+	apiKey     string
+	client     *http.Client
+	baseURL    string // Brave endpoint, overridden in tests
+	ddgBaseURL string // DuckDuckGo endpoint, overridden in tests
 }
 
 func NewWebSearchTool(apiKey string) *WebSearchTool {
 	return &WebSearchTool{
-		apiKey:  apiKey,
-		client:  &http.Client{Timeout: 15 * time.Second},
-		baseURL: "https://api.search.brave.com/res/v1/web/search",
+		apiKey:     apiKey,
+		client:     &http.Client{Timeout: 15 * time.Second},
+		baseURL:    "https://api.search.brave.com/res/v1/web/search",
+		ddgBaseURL: "https://duckduckgo.com/html/",
 	}
 }
 
@@ -62,7 +70,14 @@ func (t *WebSearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSO
 		return "", fmt.Errorf("query must not be empty")
 	}
 
-	reqURL := t.baseURL + "?q=" + url.QueryEscape(args.Query)
+	if t.apiKey == "" {
+		return t.executeDDG(ctx, args.Query)
+	}
+	return t.executeBrave(ctx, args.Query)
+}
+
+func (t *WebSearchTool) executeBrave(ctx context.Context, query string) (string, error) {
+	reqURL := t.baseURL + "?q=" + url.QueryEscape(query)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("building request: %w", err)
@@ -97,6 +112,69 @@ func (t *WebSearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSO
 		fmt.Fprintf(&b, "%d. %s\n%s\n%s\n\n", i+1, r.Title, r.URL, r.Description)
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func (t *WebSearchTool) executeDDG(ctx context.Context, query string) (string, error) {
+	reqURL := t.ddgBaseURL + "?q=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; yoakeland-web-search/1.0)")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("search request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("search request failed: status %d", resp.StatusCode)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("parsing search response: %w", err)
+	}
+
+	if doc.Find(".anomaly-modal").Length() > 0 {
+		return "", fmt.Errorf("DuckDuckGo blocked this request as a bot; set BRAVE_API_KEY for reliable search")
+	}
+
+	var b strings.Builder
+	n := 0
+	doc.Find(".results .web-result").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		if n >= 10 {
+			return false
+		}
+		title := strings.TrimSpace(s.Find(".result__a").Text())
+		link := resolveDDGRedirect(strings.TrimSpace(s.Find(".result__a").AttrOr("href", "")))
+		snippet := strings.TrimSpace(s.Find(".result__snippet").Text())
+		if title == "" || link == "" {
+			return true
+		}
+		n++
+		fmt.Fprintf(&b, "%d. %s\n%s\n%s\n\n", n, title, link, snippet)
+		return true
+	})
+
+	if n == 0 {
+		return "No results found.", nil
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// resolveDDGRedirect unwraps DuckDuckGo's outbound-click redirect
+// (//duckduckgo.com/l/?uddg=<encoded-target>&...) to the real target URL.
+func resolveDDGRedirect(href string) string {
+	u, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	if target := u.Query().Get("uddg"); target != "" {
+		return target
+	}
+	return href
 }
 
 func (t *WebSearchTool) Definition() ToolDefinition {
