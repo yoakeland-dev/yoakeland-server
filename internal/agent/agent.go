@@ -508,7 +508,14 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 			title := fallbackTitle(prompt)
 			if autoGenerateTitle {
 				if generator, ok := turnProvider.(TitleGenerator); ok {
-					if generated, err := generator.GenerateTitle(turnCtx, prompt); err == nil {
+					// parentCtx, not turnCtx: turnCtx is cancelled the moment
+					// this function returns (its deferred cancel) or the user
+					// aborts the turn via CancelTurn, either of which would
+					// otherwise race this goroutine's own HTTP request and
+					// kill it with "context canceled" before it can finish —
+					// defeating the whole point of running independently
+					// (see the comment above this goroutine).
+					if generated, err := generator.GenerateTitle(parentCtx, prompt); err == nil {
 						title = normalizeTitle(generated)
 					} else {
 						log.Printf("title generation: %v — falling back to a title derived from the prompt", err)
