@@ -66,15 +66,8 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 	}
 
 	// Capture snapshot before editing
-	if execCtx.SnapshotStore != nil {
-		_, err := execCtx.SnapshotStore.CapturePreMutation(
-			"file_edit: "+args.Path,
-			t.normalizer.ProjectRoot,
-			safePath,
-		)
-		if err != nil {
-			return "", fmt.Errorf("failed to create snapshot before edit: %w", err)
-		}
+	if err := capturePreMutationSnapshot(execCtx, "file_edit: "+args.Path, t.normalizer.ProjectRoot, safePath); err != nil {
+		return "", fmt.Errorf("failed to create snapshot before edit: %w", err)
 	}
 
 	var updated string
@@ -84,8 +77,20 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 		updated = strings.Replace(content, args.OldString, args.NewString, 1)
 	}
 
-	if err := os.WriteFile(safePath, []byte(updated), 0644); err != nil {
+	// O_NOFOLLOW: refuse a symlink planted at safePath between the read
+	// above and this write, rather than silently writing through it to
+	// wherever it points (possibly outside the project root).
+	f, err := openNoFollow(safePath, os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
 		return "", fmt.Errorf("failed writing edit to disk: %w", err)
+	}
+	_, writeErr := f.Write([]byte(updated))
+	closeErr := f.Close()
+	if writeErr != nil {
+		return "", fmt.Errorf("failed writing edit to disk: %w", writeErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("failed writing edit to disk: %w", closeErr)
 	}
 
 	return fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", occurrences, args.Path), nil

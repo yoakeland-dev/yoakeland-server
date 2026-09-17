@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/sandbox"
 )
@@ -36,7 +37,7 @@ func (t *BashTool) RequiresPermission(_ []byte) bool {
 	return true
 }
 
-func (t *BashTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []byte) (string, error) {
+func (t *BashTool) Execute(ctx context.Context, execCtx ExecutionContext, argsJSON []byte) (string, error) {
 	var args BashArgs
 	if err := json.Unmarshal(argsJSON, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -47,7 +48,7 @@ func (t *BashTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []b
 		return "", fmt.Errorf("command normalization failed: %w", err)
 	}
 
-	res, err := t.sandbox.Execute(ctx, parsed.Argv)
+	res, err := t.sandbox.Execute(ctx, parsed.Argv, gitAuthorEnv(execCtx))
 	if err != nil {
 		return "", fmt.Errorf("sandbox error: %w", err)
 	}
@@ -58,6 +59,29 @@ func (t *BashTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []b
 	}
 
 	return res.Stdout, nil
+}
+
+// gitAuthorEnv returns GIT_AUTHOR_*/GIT_COMMITTER_* env vars for whichever
+// peer's prompt started this turn, or nil when unknown (a unix peer with no
+// registered token) — in which case the sandbox's ambient git config, if
+// any, applies unchanged. Set unconditionally rather than only for commands
+// that look like `git commit`: harmless for anything else, and covers
+// `git commit --amend`, scripted commits, etc. without a detection
+// heuristic.
+func gitAuthorEnv(execCtx ExecutionContext) []string {
+	if execCtx.AuthorName == "" {
+		return nil
+	}
+	email := execCtx.AuthorEmail
+	if email == "" {
+		email = strings.ToLower(strings.ReplaceAll(execCtx.AuthorName, " ", ".")) + "@yoake.local"
+	}
+	return []string{
+		"GIT_AUTHOR_NAME=" + execCtx.AuthorName,
+		"GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + execCtx.AuthorName,
+		"GIT_COMMITTER_EMAIL=" + email,
+	}
 }
 
 func (t *BashTool) Definition() ToolDefinition {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"yoakeland/internal/normalizer"
+	"yoakeland/internal/protocol"
 )
 
 type FileReadArgs struct {
@@ -41,6 +42,14 @@ func (t *FileReadTool) Execute(_ context.Context, _ ExecutionContext, argsJSON [
 	safePath, err := t.normalizer.ResolveAndValidatePath(args.Path)
 	if err != nil {
 		return "", fmt.Errorf("path error: %w", err)
+	}
+
+	info, err := os.Stat(safePath)
+	if err != nil {
+		return "", fmt.Errorf("path error: %w", err)
+	}
+	if info.Size() > protocol.MaxFrameSize {
+		return "", fmt.Errorf("file exceeds maximum readable size (10MB)")
 	}
 
 	content, err := os.ReadFile(safePath)

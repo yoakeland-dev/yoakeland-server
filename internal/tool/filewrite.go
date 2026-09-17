@@ -47,25 +47,30 @@ func (t *FileWriteTool) Execute(_ context.Context, execCtx ExecutionContext, arg
 	}
 
 	// Automatic snapshot before mutation
-	if execCtx.SnapshotStore != nil {
-		_, err := execCtx.SnapshotStore.CapturePreMutation(
-			"file_write: "+args.Path,
-			t.normalizer.ProjectRoot,
-			safePath,
-		)
-		if err != nil {
-			return "", fmt.Errorf("failed to create snapshot before write: %w", err)
-		}
+	if err := capturePreMutationSnapshot(execCtx, "file_write: "+args.Path, t.normalizer.ProjectRoot, safePath); err != nil {
+		return "", fmt.Errorf("failed to create snapshot before write: %w", err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(safePath), 0755); err != nil {
 		return "", err
 	}
 
-	// Atomic write via temp file
+	// Atomic write via temp file. Opened with O_NOFOLLOW so a symlink
+	// planted at tmpPath between path validation and this write (e.g. by a
+	// concurrent tool call or a malicious repo checkout) is refused instead
+	// of silently followed and written through to wherever it points.
 	tmpPath := safePath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(args.Content), 0644); err != nil {
+	f, err := openNoFollow(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
 		return "", fmt.Errorf("failed to write buffer: %w", err)
+	}
+	_, writeErr := f.Write([]byte(args.Content))
+	closeErr := f.Close()
+	if writeErr != nil {
+		return "", fmt.Errorf("failed to write buffer: %w", writeErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("failed to write buffer: %w", closeErr)
 	}
 	if err := os.Rename(tmpPath, safePath); err != nil {
 		return "", fmt.Errorf("failed to commit file write: %w", err)
