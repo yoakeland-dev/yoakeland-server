@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
 )
 
@@ -16,7 +18,27 @@ type OpenAICompatibleProvider struct {
 	BaseURL      string
 	Client       *http.Client
 	ExtraHeaders map[string]string
+
+	// reasoningEffort is set via SetModelOptions; empty means omit the field
+	// (the model's own default). OpenRouter accepts the same
+	// "reasoning_effort" request field for its reasoning-capable models, so
+	// this one field serves both OpenAI and OpenRouter uses of this struct.
+	reasoningEffort atomic.Value // string
 }
+
+// SetModelOptions implements agent.ModelOptionsSetter. ThinkingBudget is
+// ignored — OpenAI/OpenRouter's chat-completions API takes an effort level,
+// not a token budget.
+func (p *OpenAICompatibleProvider) SetModelOptions(opts agent.ModelOptions) {
+	p.reasoningEffort.Store(opts.ReasoningEffort)
+}
+
+func (p *OpenAICompatibleProvider) getReasoningEffort() string {
+	v, _ := p.reasoningEffort.Load().(string)
+	return v
+}
+
+func (p *OpenAICompatibleProvider) ModelName() string { return p.Model }
 
 func NewOpenAI(apiKey, model string) *OpenAICompatibleProvider {
 	if model == "" {
@@ -63,11 +85,72 @@ type openAIMessage struct {
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
+type openAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type openAIRequest struct {
-	Model    string          `json:"model"`
-	Messages []openAIMessage `json:"messages"`
-	Tools    []any           `json:"tools,omitempty"`
-	Stream   bool            `json:"stream"`
+	Model           string              `json:"model"`
+	Messages        []openAIMessage     `json:"messages"`
+	Tools           []any               `json:"tools,omitempty"`
+	Stream          bool                `json:"stream"`
+	StreamOptions   openAIStreamOptions `json:"stream_options"`
+	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
+}
+
+// GenerateTitle implements agent.TitleGenerator with a small, non-streaming
+// request on the same model as the session, separate from any in-flight
+// StreamTurn call.
+func (p *OpenAICompatibleProvider) GenerateTitle(ctx context.Context, prompt string) (string, error) {
+	reqBody := openAIRequest{
+		Model: p.Model,
+		Messages: []openAIMessage{
+			{Role: "system", Content: titleSystemPrompt},
+			{Role: "user", Content: prompt},
+		},
+		Stream: false,
+	}
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(jsonBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range p.ExtraHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Error struct{ Message string } `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&errResp)
+		return "", fmt.Errorf("provider error (%d): %s", resp.StatusCode, errResp.Error.Message)
+	}
+
+	var out struct {
+		Choices []struct {
+			Message openAIMessage `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if len(out.Choices) == 0 || out.Choices[0].Message.Content == "" {
+		return "", fmt.Errorf("provider: no text content in title response")
+	}
+	return out.Choices[0].Message.Content, nil
 }
 
 func (p *OpenAICompatibleProvider) StreamTurn(
@@ -131,10 +214,12 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 		}
 
 		reqBody := openAIRequest{
-			Model:    p.Model,
-			Messages: msgs,
-			Tools:    openAITools,
-			Stream:   true,
+			Model:           p.Model,
+			Messages:        msgs,
+			Tools:           openAITools,
+			Stream:          true,
+			StreamOptions:   openAIStreamOptions{IncludeUsage: true},
+			ReasoningEffort: p.getReasoningEffort(),
 		}
 
 		jsonBytes, err := json.Marshal(reqBody)
@@ -174,8 +259,10 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 		// Accumulator map for streaming tool arguments
 		toolCallAccum := make(map[int]*agent.ToolCall)
 		toolArgBuffers := make(map[int]*bytes.Buffer)
+		var usage protocol.UsageData
+		var finishReason string
 
-		_ = ReadSSESteam(resp.Body, func(ev SSEEvent) error {
+		if readErr := ReadSSESteam(resp.Body, func(ev SSEEvent) error {
 			if ev.Data == "[DONE]" {
 				return nil
 			}
@@ -188,10 +275,23 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 					} `json:"delta"`
 					FinishReason *string `json:"finish_reason"`
 				} `json:"choices"`
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+					TotalTokens      int `json:"total_tokens"`
+				} `json:"usage"`
 			}
 
 			if err := json.Unmarshal([]byte(ev.Data), &chunk); err != nil {
 				return nil
+			}
+
+			// The usage-carrying final chunk (stream_options.include_usage)
+			// has an empty choices array, so check it before the early return.
+			if chunk.Usage != nil {
+				usage.InputTokens = chunk.Usage.PromptTokens
+				usage.OutputTokens = chunk.Usage.CompletionTokens
+				usage.TotalTokens = chunk.Usage.TotalTokens
 			}
 
 			if len(chunk.Choices) == 0 {
@@ -237,8 +337,32 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 				}
 			}
 
+			// "length" means the response was truncated at the token limit
+			// before the model naturally finished — without this, that looks
+			// identical to an ordinary "stop" to the rest of the turn loop.
+			if choice.FinishReason != nil && *choice.FinishReason == "length" {
+				finishReason = "length"
+			}
+
 			return nil
-		})
+		}); readErr != nil {
+			// A stream that ended because it failed (a dropped connection, a
+			// truncated body, our own request context being cancelled) must not be
+			// reported as a clean end-of-stream: without this the caller can't tell
+			// a finished answer from a broken one, and a partial answer gets saved
+			// and shown as a complete turn. context.Canceled here is an ordinary
+			// user cancel, which the agent already recognizes as such.
+			eChan <- readErr
+			return
+		}
+
+		if finishReason != "" {
+			cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkFinish, FinishReason: finishReason}
+		}
+
+		if usage.TotalTokens > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 {
+			cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &usage}
+		}
 	}()
 
 	return cChan, eChan
