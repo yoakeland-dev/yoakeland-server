@@ -35,6 +35,28 @@ type Message struct {
 	// nothing else to draw from. Either a short emoji glyph or a data URL
 	// (SPEC.md §2a's conventions, devolved to whichever the client uses).
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
+
+	// Provider/Model are the registered provider name and model id that
+	// generated this message (assistant only — empty for user/tool
+	// messages). Stamped once per round-trip so a session's model footer
+	// stays correct in get_session_history even after the session's own
+	// provider/model selection has since changed.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+
+	// CreatedAt is when this message was produced. GenerationMs is how long
+	// the model round-trip that produced it took (assistant only — the
+	// provider request/stream itself, not any tool execution before or
+	// after it in the same turn).
+	CreatedAt    time.Time `json:"createdAt,omitempty"`
+	GenerationMs int64     `json:"generationMs,omitempty"`
+
+	// Usage is this round-trip's own token/cost accounting (assistant only)
+	// — not the whole turn's. A provider's InputTokens is already the full
+	// conversation resent as this request's input, so it's naturally "tokens
+	// in up to this point" with no separate running total to track;
+	// OutputTokens is naturally just this round-trip's own reply.
+	Usage *protocol.UsageData `json:"usage,omitempty"`
 }
 
 // Author identifies which peer's user_prompt started the current turn —
@@ -144,6 +166,7 @@ var planModeReadOnlyTools = map[string]bool{
 type Agent struct {
 	stream           *protocol.IPCStream
 	provider         ModelProvider
+	providerName     string // registered name of `provider` (SPEC.md §3.1 set_provider) — stamped onto each assistant Message, not just kept for internal use
 	tools            map[string]tool.Tool
 	toolDefs         []tool.ToolDefinition
 	toolDefsReadOnly []tool.ToolDefinition
@@ -181,6 +204,7 @@ type Agent struct {
 func NewAgent(
 	stream *protocol.IPCStream,
 	provider ModelProvider,
+	providerName string,
 	tools []tool.Tool,
 	engine *permission.Engine,
 	snapStore snapshot.SnapshotStore,
@@ -206,6 +230,7 @@ func NewAgent(
 	return &Agent{
 		stream:            stream,
 		provider:          provider,
+		providerName:      providerName,
 		tools:             toolMap,
 		toolDefs:          toolDefs,
 		toolDefsReadOnly:  toolDefsReadOnly,
@@ -274,17 +299,34 @@ func (a *Agent) getStream() *protocol.IPCStream {
 
 // SetProvider hot-swaps the model/provider a session uses. Takes effect on
 // the next turn; an in-flight turn keeps using whichever provider it started
-// with.
-func (a *Agent) SetProvider(p ModelProvider) {
+// with. name is the registered provider name (set_provider's providerName)
+// stamped onto every assistant Message this provider goes on to generate.
+func (a *Agent) SetProvider(p ModelProvider, name string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.provider = p
+	a.providerName = name
 }
 
 func (a *Agent) getProvider() ModelProvider {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.provider
+}
+
+func (a *Agent) getProviderName() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.providerName
+}
+
+// getModelName reports the current provider's active model id, or "" if the
+// provider doesn't expose one (see ModelName() implementations).
+func (a *Agent) getModelName() string {
+	if modelNamer, ok := a.getProvider().(interface{ ModelName() string }); ok {
+		return modelNamer.ModelName()
+	}
+	return ""
 }
 
 // SetModelOptions applies reasoning/thinking options to the current provider
@@ -462,6 +504,7 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		Content:      prompt,
 		AuthorName:   author.Name,
 		AuthorAvatar: author.Avatar,
+		CreatedAt:    startTime,
 	})
 	a.activeTurnCancels[turnID] = cancel
 	a.mu.Unlock()
@@ -584,12 +627,14 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	}
 
 	var (
-		totalUsage    protocol.UsageData
-		finishReason  string
-		streamErr     error
-		cutShort      bool
-		assistantText string
-		toolCalls     []ToolCall
+		totalUsage     protocol.UsageData
+		roundTripUsage protocol.UsageData
+		finishReason   string
+		streamErr      error
+		cutShort       bool
+		assistantText  string
+		toolCalls      []ToolCall
+		roundTripStart time.Time
 	)
 
 	// emptyLengthRetries caps how many times a round-trip that produced no
@@ -609,6 +654,8 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 turn:
 	for {
 		assistantText, toolCalls = "", nil
+		roundTripStart = time.Now()
+		roundTripUsage = protocol.UsageData{}
 		var reasoningText string
 		// ponytail: only surfaced when this round-trip ends with no tool
 		// calls (below) — a round truncated mid tool-call JSON still executes
@@ -698,9 +745,19 @@ turn:
 						totalUsage.InputTokens += chunk.Usage.InputTokens
 						totalUsage.OutputTokens += chunk.Usage.OutputTokens
 						totalUsage.TotalTokens += chunk.Usage.TotalTokens
+						// This round-trip's own usage, not the whole turn's — a
+						// provider's InputTokens is already the full conversation
+						// resent as this request's input, so it's naturally "tokens
+						// in up to this point" with no separate accumulation needed;
+						// OutputTokens is naturally just this round-trip's own reply.
+						roundTripUsage.InputTokens += chunk.Usage.InputTokens
+						roundTripUsage.OutputTokens += chunk.Usage.OutputTokens
+						roundTripUsage.TotalTokens += chunk.Usage.TotalTokens
 						if chunk.Usage.CostKnown {
 							totalUsage.CostUSD += chunk.Usage.CostUSD
 							totalUsage.CostKnown = true
+							roundTripUsage.CostUSD += chunk.Usage.CostUSD
+							roundTripUsage.CostKnown = true
 						}
 					}
 				case StreamChunkFinish:
@@ -735,12 +792,22 @@ turn:
 		// message would make every future request in this session invalid
 		// — the next turn fails outright instead of just this one.
 		if assistantText != "" || len(toolCalls) > 0 {
+			providerName, modelName := a.getProviderName(), a.getModelName()
+			usage := roundTripUsage
+			if !usage.CostKnown && modelName != "" {
+				usage.CostUSD = EstimateCostUSD(modelName, usage)
+			}
 			a.mu.Lock()
 			a.history = append(a.history, Message{
-				Role:      "assistant",
-				Content:   assistantText,
-				Reasoning: reasoningText,
-				ToolCalls: toolCalls,
+				Role:         "assistant",
+				Content:      assistantText,
+				Reasoning:    reasoningText,
+				ToolCalls:    toolCalls,
+				Provider:     providerName,
+				Model:        modelName,
+				CreatedAt:    time.Now(),
+				GenerationMs: time.Since(roundTripStart).Milliseconds(),
+				Usage:        &usage,
 			})
 			a.mu.Unlock()
 		}
@@ -859,11 +926,21 @@ turn:
 	// completed round-trip already appended its assistant message above.) A
 	// cut-short turn that produced nothing adds no empty assistant message.
 	if (cutShort || streamErr != nil) && (assistantText != "" || len(toolCalls) > 0) {
+		providerName, modelName := a.getProviderName(), a.getModelName()
+		usage := roundTripUsage
+		if !usage.CostKnown && modelName != "" {
+			usage.CostUSD = EstimateCostUSD(modelName, usage)
+		}
 		a.mu.Lock()
 		a.history = append(a.history, Message{
-			Role:      "assistant",
-			Content:   assistantText,
-			ToolCalls: toolCalls,
+			Role:         "assistant",
+			Content:      assistantText,
+			ToolCalls:    toolCalls,
+			Provider:     providerName,
+			Model:        modelName,
+			CreatedAt:    time.Now(),
+			GenerationMs: time.Since(roundTripStart).Milliseconds(),
+			Usage:        &usage,
 		})
 		a.mu.Unlock()
 	}
@@ -928,8 +1005,8 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 	// cost; only fall back to the pricing table when it hasn't (CostKnown
 	// distinguishes "no cost reported" from "provider reported a real $0").
 	if !usage.CostKnown {
-		if modelNamer, ok := a.getProvider().(interface{ ModelName() string }); ok {
-			usage.CostUSD = EstimateCostUSD(modelNamer.ModelName(), usage)
+		if modelName := a.getModelName(); modelName != "" {
+			usage.CostUSD = EstimateCostUSD(modelName, usage)
 		}
 	}
 

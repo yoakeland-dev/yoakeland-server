@@ -59,7 +59,7 @@ func testAgent(t *testing.T, provider agent.ModelProvider) (*agent.Agent, agent.
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	tools := []tool.Tool{tool.NewBashTool(norm, sb)}
-	ag := agent.NewAgent(ipc, provider, tools, engine, snapStore, sessStore, agent.NewContextManager(1000, 100), nil)
+	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, agent.NewContextManager(1000, 100), nil)
 	return ag, sessStore, outBuf
 }
 

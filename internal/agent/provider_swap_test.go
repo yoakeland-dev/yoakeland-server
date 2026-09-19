@@ -31,7 +31,7 @@ func TestAgent_SetProviderTakesEffectOnNextTurn(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, providerA, nil, engine, snapStore, sessStore, ctxMgr, nil)
+	ag := agent.NewAgent(ipc, providerA, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
 
 	if err := ag.RunTurn(context.Background(), "session-swap", "turn-1", "hi"); err != nil {
 		t.Fatalf("turn 1: %v", err)
@@ -40,7 +40,7 @@ func TestAgent_SetProviderTakesEffectOnNextTurn(t *testing.T) {
 		t.Fatalf("expected turn 1 to consume providerA, providerA.index = %d", providerA.index)
 	}
 
-	ag.SetProvider(providerB)
+	ag.SetProvider(providerB, "test-provider-b")
 
 	if err := ag.RunTurn(context.Background(), "session-swap", "turn-2", "hi again"); err != nil {
 		t.Fatalf("turn 2: %v", err)

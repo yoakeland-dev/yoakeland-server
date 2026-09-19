@@ -76,7 +76,7 @@ func TestAgent_PlanModeRestrictsToolsGivenToModel(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, provider, tools, engine, snapStore, sessStore, ctxMgr, nil)
+	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
 
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "hi"); err != nil {
 		t.Fatalf("turn 1: %v", err)
@@ -127,7 +127,7 @@ func TestAgent_PlanModeBlocksMutatingToolCall(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, provider, tools, engine, snapStore, sessStore, ctxMgr, nil)
+	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
 	ag.SetPlanMode(true)
 
 	if err := ag.RunTurn(context.Background(), "s2", "t1", "try to write"); err != nil {

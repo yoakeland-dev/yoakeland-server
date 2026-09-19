@@ -18,15 +18,32 @@ type Normalizer struct {
 	ProjectRoot string
 }
 
-func New(projectRoot string) (*Normalizer, error) {
-	absRoot, err := filepath.Abs(projectRoot)
+// CanonicalRoot resolves path to an absolute, symlink-resolved form — the
+// one canonicalization every piece of code that identifies a project by its
+// filesystem path (the project registry's map key, what gets echoed back on
+// the wire, what this Normalizer itself roots at) must agree on. Two
+// differently-spelled paths to the same real directory (a symlink vs. its
+// target, a trailing slash, `..` segments) must always canonicalize to the
+// same string, or callers that key state off it end up treating one project
+// as two.
+func CanonicalRoot(path string) (string, error) {
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolving root: %w", err)
+		return "", fmt.Errorf("resolving root: %w", err)
 	}
-	realRoot, err := filepath.EvalSymlinks(absRoot)
+	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		// If root itself does not exist yet, fallback to clean absolute path
-		realRoot = filepath.Clean(absRoot)
+		// Root doesn't exist yet (or a broken symlink) — fall back to the
+		// clean absolute path rather than failing outright.
+		return filepath.Clean(abs), nil
+	}
+	return real, nil
+}
+
+func New(projectRoot string) (*Normalizer, error) {
+	realRoot, err := CanonicalRoot(projectRoot)
+	if err != nil {
+		return nil, err
 	}
 	return &Normalizer{ProjectRoot: realRoot}, nil
 }

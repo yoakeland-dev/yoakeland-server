@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.9)
+# Yoakeland Backend IPC Specification (v2.10)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -430,8 +430,16 @@ Opens (if not already open) and validates a project path, without starting any t
 - Response: `project_opened` on success, `error` if the path doesn't exist/isn't a directory/isn't accessible.
 
 #### `list_projects`
-Enumerates every project opened on this server process since it started (not a filesystem scan — see §4b). Takes no data (`{}` is fine).
+Enumerates every project this server has ever opened, most-recently-opened first — persisted server-side (not a filesystem scan — see §4b). Takes no data (`{}` is fine).
 - Response: `project_list`.
+
+#### `remove_project`
+Forgets a project: drops it from the server's known-projects list (so it stops appearing in `project_list`) and tears down its live state if it currently has any — every session bound to it is cancelled (as if `cancel_turn` had been sent for any turn in flight) and evicted, the same way `delete_session` evicts a single session. This is **not** a filesystem delete: nothing under `<path>/.yoake/` is touched, and the path can simply be `open_project`ed again later to pick up right where its on-disk state (permissions, sessions, snapshots) left off.
+```json
+{"type": "remove_project", "data": {"path": "/home/user/projects/my-repo"}}
+```
+- Response: `project_removed` on success, `error` if the path can't be resolved.
+- No other connected peer is notified in real time — same convention as `set_session_layout`/`session_updated` (§3.2): another connection picks up a removal on its own next `list_projects`.
 
 #### `list_files`
 Enumerates every regular file under **one project**'s root, for client-side `@file` mention autocomplete.
@@ -892,8 +900,15 @@ Confirms `open_project`.
 ```json
 {"type": "project_opened", "data": {"path": "/home/user/projects/my-repo", "sandboxTier": "bubblewrap"}}
 ```
-- `path` is the resolved absolute path, which may differ in form from whatever relative/unclean path was sent.
+- `path` is the resolved, **canonicalized** absolute path (symlinks resolved, same as the project's own `.yoake/` location) — every other project-scoped response (`session_list`, `file_list`, `snapshot_list`, `project_removed`) echoes this identical canonical form for the same root, so a client keying its own caches off `projectPath` never sees two different spellings for what the server treats as one project.
 - `sandboxTier`: one of `"bubblewrap"`, `"linux_namespaces"`, or `"local_restricted_fallback"` (§1) — the isolation level `bash` tool calls in this project actually get. *UI Action*: surface a warning (e.g. in a status bar) when this is `"local_restricted_fallback"`, mirroring the backend's own startup log line, rather than only relying on that log line being visible to whoever's running the server.
+
+#### `project_removed`
+Confirms `remove_project`.
+```json
+{"type": "project_removed", "data": {"path": "/home/user/projects/my-repo"}}
+```
+*UI Action*: Remove the corresponding entry from a project switcher/sidebar. If it was the currently-open project, navigate away — any session that was live in it has already been cancelled server-side (see `remove_project`, §3.1).
 
 #### `directory_list`
 Response to `list_directory`.
@@ -918,7 +933,8 @@ Response to `list_projects`.
 ```json
 {"type": "project_list", "data": {"paths": ["/home/user/projects/my-repo", "/home/user/projects/other-repo"]}}
 ```
-*UI Action*: Populate a project switcher — but see §4b's caveat: this reflects only what's been opened this run, not "everywhere the user has ever worked."
+- `paths` is sorted most-recently-opened first, and is backed by `<-state-dir>/projects.json` (§4b) — it survives a server restart, and (over the TCP/remote path, §2a) is visible to every device connected to this server, not just the one that opened a given project.
+*UI Action*: Populate a project switcher. A client's own local "recent projects" cache should treat this response as authoritative and reconcile against it, rather than the other way around — this is the one place a second device learns about a project another device added.
 
 #### `file_list`
 Response to `list_files`.
@@ -1084,10 +1100,11 @@ A single `yoakeland` process is **not** limited to one project. Every project (i
 - Sending a *different* `projectPath` for an already-bound session is a conflict, not a switch: the backend rejects it with an `error` rather than silently moving the session. A session's project never changes; if the user wants to work on a different folder, that's a new session.
 - If a session never specifies `projectPath` and the server has a default project (`-project`), it falls back to that — this is what keeps single-project usage exactly as simple as it's always been. If there's no explicit path *and* no default, the backend returns an `error` (there's nothing to resolve against). Unlike an explicit `projectPath`, this fallback does **not** bind the session: it's resolved fresh on every envelope that omits `projectPath`, so a session that only ever hit the default project this way is still free to bind to a different one the first time it *does* send an explicit `projectPath`. Only an explicit path (`user_prompt`'s, or one of the three above) is ever recorded as a binding.
 - `open_project` (§3.1) does the same "open if needed" step without starting a turn, e.g. to validate a folder before creating a session in it, or to call `list_sessions` against it to show existing threads first.
+- Every project path is canonicalized (made absolute, symlinks resolved) before it's used as this binding's key, as the project registry's own key, or as anything echoed back on the wire — `project_opened.path`, `session_list.projectPath`, `file_list.projectPath`, `snapshot_list.projectPath`, and `project_removed.path` all agree on the exact same canonical string for a given real directory, however it was originally spelled (relative, trailing slash, a symlink). A client keying its own local caches off a `projectPath` string can rely on it being stable across every call that touches the same project.
 
 **What this means for a frontend:** the flow described in the intro — "download the UI, pick a folder to work on, on the fly, from a list, and have multiple folders' sessions running at once against different models" — maps directly onto this. A client managing several open folders is not managing several server processes; it's opening several projects on **one** connection to **one** server, and routing UI state by `sessionId` (whose project is whatever it happens to be bound to) exactly as it already does for concurrent sessions in general.
 
-**What this does *not* do:** `list_projects` only reports what's been opened since the process started — it is not a filesystem scan, and it is not persisted, so a freshly restarted server has no memory of which projects a client cares about; a client that wants "reopen where I left off" needs to remember its own list of project paths and either call `open_project` or send a `user_prompt`/`list_sessions` with `projectPath` for each on reconnect.
+**What *is* persisted, and what isn't:** the *list of known project paths* is persisted server-side, at `<-state-dir>/projects.json` — `list_projects` (§3.1) reflects every project this server has ever opened, most-recently-used first, and survives a restart; this is what makes it safe for a client to treat the server as the authority on "which projects exist" rather than maintaining its own durable list (see `remove_project`/`project_list`, §3.1/§3.2). What is **not** persisted is everything *live* about a project — its in-memory `ProjectContext` (sandbox handle, session registry) is still built lazily on first reference each run and discarded on restart — and, within a project, a session's *binding* to it and a session's *runtime settings* (the provider/model `set_provider` selected, plan mode, model options) are server-memory-only, gone on restart or on that project's `remove_project`. A client resuming a session after either event must re-assert `set_provider`/`set_model_options`/`set_plan_mode` from its own cache before that session's next prompt — the same way it already unconditionally calls `get_session_history` to repaint a session's transcript on open, since the wire protocol never pushes past turns unprompted (§3.1 `get_session_history`). Treat this as the documented recovery contract for resuming a session, not an incidental side effect of how the client happens to cache things.
 
 ---
 

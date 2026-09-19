@@ -76,7 +76,7 @@ func TestAgent_RunTurn_SerializesConcurrentTurnsForSameSession(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, provider, nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	ag := agent.NewAgent(ipc, provider, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
 
 	const numTurns = 5
 	var wg sync.WaitGroup

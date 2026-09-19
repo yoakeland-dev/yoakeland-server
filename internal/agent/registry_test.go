@@ -33,7 +33,7 @@ func TestRegistry_SessionsAreIsolated(t *testing.T) {
 	}
 
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
-	registry := agent.NewRegistry(provider, []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
 
 	agA := registry.Get(ipc, "session-A")
 	agB := registry.Get(ipc, "session-B")
@@ -89,7 +89,7 @@ func TestRegistry_ContextWindowIsPerSession(t *testing.T) {
 	ipcA := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
 	ipcBOut := &bytes.Buffer{}
 	ipcB := protocol.NewIPCStream(bytes.NewBuffer(nil), ipcBOut)
-	registry := agent.NewRegistry(provider, []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
 
 	agA := registry.Get(ipcA, "session-A")
 	agB := registry.Get(ipcB, "session-B")
@@ -120,7 +120,7 @@ func TestRegistry_ReconnectNotifiedDisplacedConnection(t *testing.T) {
 	sessStore, _ := agent.NewDiskSessionStore(tempDir)
 	ctxMgr := agent.NewContextManager(100, 20)
 
-	registry := agent.NewRegistry(&ScriptedProvider{}, []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+	registry := agent.NewRegistry(&ScriptedProvider{}, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
 
 	firstOut := &bytes.Buffer{}
 	firstConn := protocol.NewIPCStream(bytes.NewBuffer(nil), firstOut)

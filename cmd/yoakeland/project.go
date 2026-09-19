@@ -12,6 +12,7 @@ import (
 	"yoakeland/internal/agent"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/permission"
+	"yoakeland/internal/projectstore"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/sandbox"
 	"yoakeland/internal/snapshot"
@@ -31,7 +32,7 @@ type ProjectContext struct {
 	SandboxTier string
 }
 
-func newProjectContext(root string, defaultProvider agent.ModelProvider, maxSessionSpendUSD float64) (*ProjectContext, error) {
+func newProjectContext(root string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64) (*ProjectContext, error) {
 	norm, err := normalizer.New(root)
 	if err != nil {
 		return nil, fmt.Errorf("normalizer: %w", err)
@@ -78,7 +79,7 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, maxSess
 		return nil, fmt.Errorf("usage store: %w", err)
 	}
 
-	registry := agent.NewRegistry(defaultProvider, tools, permEngine, snapStore, sessStore, ctxMgr, usageStore)
+	registry := agent.NewRegistry(defaultProvider, defaultProviderName, tools, permEngine, snapStore, sessStore, ctxMgr, usageStore)
 	registry.SetMaxSessionSpendUSD(maxSessionSpendUSD)
 
 	return &ProjectContext{
@@ -104,6 +105,11 @@ func toHistoryMessages(history []agent.Message) []protocol.HistoryMessage {
 			ToolCallID:   m.ToolCallID,
 			Author:       m.AuthorName,
 			AuthorAvatar: m.AuthorAvatar,
+			Provider:     m.Provider,
+			Model:        m.Model,
+			CreatedAt:    m.CreatedAt,
+			GenerationMs: m.GenerationMs,
+			Usage:        m.Usage,
 		}
 		for _, tc := range m.ToolCalls {
 			hm.ToolCalls = append(hm.ToolCalls, protocol.HistoryToolCall{
@@ -223,28 +229,42 @@ func listDirectory(path string) (string, []protocol.DirEntry, error) {
 // the right one. This is what makes one server process able to serve many
 // projects at once, opened on demand as clients ask for them.
 type ProjectRegistry struct {
-	mu              sync.Mutex
-	projects        map[string]*ProjectContext // key: cleaned absolute path
-	sessionProject  map[string]string          // sessionID -> project key
-	defaultProvider agent.ModelProvider
-	maxSpendUSD     float64
+	mu                  sync.Mutex
+	projects            map[string]*ProjectContext // key: canonicalized project root
+	sessionProject      map[string]string          // sessionID -> project key
+	defaultProvider     agent.ModelProvider
+	defaultProviderName string
+	maxSpendUSD         float64
+	known               *projectstore.Store // persisted "which projects exist", server-wide
 }
 
-func NewProjectRegistry(defaultProvider agent.ModelProvider, maxSessionSpendUSD float64) *ProjectRegistry {
-	return &ProjectRegistry{
-		projects:        make(map[string]*ProjectContext),
-		sessionProject:  make(map[string]string),
-		defaultProvider: defaultProvider,
-		maxSpendUSD:     maxSessionSpendUSD,
-	}
-}
-
-func projectKey(root string) (string, error) {
-	abs, err := filepath.Abs(root)
+// NewProjectRegistry builds a project registry backed by a persisted list of
+// known projects under stateDir (<-state-dir>/projects.json, alongside
+// providers.json) — this is what makes list_projects reflect every project
+// this server has ever opened, not just ones opened in the current process's
+// lifetime.
+func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64, stateDir string) (*ProjectRegistry, error) {
+	known, err := projectstore.New(stateDir)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("project list store: %w", err)
 	}
-	return filepath.Clean(abs), nil
+	return &ProjectRegistry{
+		projects:            make(map[string]*ProjectContext),
+		sessionProject:      make(map[string]string),
+		defaultProvider:     defaultProvider,
+		defaultProviderName: defaultProviderName,
+		maxSpendUSD:         maxSessionSpendUSD,
+		known:               known,
+	}, nil
+}
+
+// projectKey canonicalizes root the same way normalizer.New does (symlinks
+// resolved, not just made absolute) so the registry's map key always agrees
+// with ProjectContext.Root — otherwise a symlinked path and its real-path
+// equivalent silently become two independent ProjectContexts pointed at the
+// same on-disk .yoake directory.
+func projectKey(root string) (string, error) {
+	return normalizer.CanonicalRoot(root)
 }
 
 // Get returns the ProjectContext for root, opening (creating on-disk state
@@ -262,11 +282,20 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		return pc, nil
 	}
 
-	pc, err := newProjectContext(key, r.defaultProvider, r.maxSpendUSD)
+	pc, err := newProjectContext(key, r.defaultProvider, r.defaultProviderName, r.maxSpendUSD)
 	if err != nil {
 		return nil, err
 	}
 	r.projects[key] = pc
+
+	// Only recorded on an actual fresh open (not the map-hit fast path
+	// above), so a hot session doesn't turn every envelope it touches into
+	// a projects.json rewrite. ponytail: LastOpenedAt only advances once
+	// per process-lifetime per project, not per request — fine for a
+	// "recent projects" sort, not meant as a precise last-touched clock.
+	if err := r.known.Upsert(key); err != nil {
+		logWarn("failed to record project %q in projects.json: %v", key, err)
+	}
 	return pc, nil
 }
 
@@ -279,15 +308,56 @@ func (r *ProjectRegistry) Unbind(sessionID string) {
 	delete(r.sessionProject, sessionID)
 }
 
-// List returns every project opened on this server process since it
-// started (not a filesystem scan, not persisted).
-func (r *ProjectRegistry) List() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// Remove forgets root: drops it from the known-projects list (projects.json)
+// so it stops being offered back to clients via List/project_list, and tears
+// down its live ProjectContext if one exists — cancelling every session
+// bound to it (via agent.Registry.Remove, the same helper delete_session
+// already uses) before dropping the ProjectContext itself. This is what
+// closes the "session outlives its project" gap: without it, a session still
+// bound to a removed project would silently rebuild a brand-new
+// ProjectContext (new sandbox, new agent.Registry) on its next reference
+// while the old one — possibly mid-turn — kept running, unreferenced but
+// alive. It does not touch anything on disk under the project root itself
+// (.yoake/ stays put); "remove" means "stop tracking," not "delete."
+func (r *ProjectRegistry) Remove(root string) error {
+	key, err := projectKey(root)
+	if err != nil {
+		return fmt.Errorf("resolving project path %q: %w", root, err)
+	}
 
-	out := make([]string, 0, len(r.projects))
-	for key := range r.projects {
-		out = append(out, key)
+	r.mu.Lock()
+	pc, ok := r.projects[key]
+	delete(r.projects, key)
+	var boundSessions []string
+	for sessID, projKey := range r.sessionProject {
+		if projKey == key {
+			boundSessions = append(boundSessions, sessID)
+			delete(r.sessionProject, sessID)
+		}
+	}
+	r.mu.Unlock()
+
+	if ok {
+		for _, sessID := range boundSessions {
+			pc.Registry.Remove(sessID)
+		}
+	}
+
+	return r.known.Remove(key)
+}
+
+// List returns every project this server has ever opened, most-recently-used
+// first — backed by projects.json, so it survives a restart. This is no
+// longer a snapshot of "opened this run"; see projectstore.Store.
+func (r *ProjectRegistry) List() []string {
+	known, err := r.known.List()
+	if err != nil {
+		logWarn("failed to read projects.json: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(known))
+	for _, p := range known {
+		out = append(out, p.Path)
 	}
 	return out
 }

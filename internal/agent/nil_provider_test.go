@@ -27,7 +27,7 @@ func TestAgent_RunTurnWithNilProvider(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, nil, nil, engine, snapStore, sessStore, ctxMgr, nil)
+	ag := agent.NewAgent(ipc, nil, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
 
 	err := ag.RunTurn(context.Background(), "session-no-provider", "turn-1", "hello")
 	if err == nil {
@@ -51,12 +51,12 @@ func TestAgent_SetProviderThenRunTurn(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, nil, nil, engine, snapStore, sessStore, ctxMgr, nil)
+	ag := agent.NewAgent(ipc, nil, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
 
 	scripted := &ScriptedProvider{
 		turns: [][]agent.ModelStreamChunk{{{Kind: agent.StreamChunkDelta, Delta: "now it works"}}},
 	}
-	ag.SetProvider(scripted)
+	ag.SetProvider(scripted, "test-provider")
 
 	if err := ag.RunTurn(context.Background(), "session-recovered", "turn-1", "hello"); err != nil {
 		t.Fatalf("expected the turn to succeed once a provider is set: %v", err)

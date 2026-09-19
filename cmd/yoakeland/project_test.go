@@ -14,7 +14,7 @@ func TestProjectRegistry_GetIsIdempotentAndIsolated(t *testing.T) {
 	rootA := t.TempDir()
 	rootB := t.TempDir()
 
-	projects := NewProjectRegistry(nil, 0)
+	projects := newTestRegistry(t)
 
 	pcA1, err := projects.Get(rootA)
 	if err != nil {
@@ -47,7 +47,7 @@ func TestProjectRegistry_GetIsIdempotentAndIsolated(t *testing.T) {
 func TestProjectRegistry_ResolveBindsSessionOnFirstUse(t *testing.T) {
 	rootA := t.TempDir()
 	rootB := t.TempDir()
-	projects := NewProjectRegistry(nil, 0)
+	projects := newTestRegistry(t)
 
 	pc, err := projects.Resolve("session-1", rootA, "")
 	if err != nil {
@@ -77,7 +77,7 @@ func TestProjectRegistry_ResolveBindsSessionOnFirstUse(t *testing.T) {
 // works, using the server's default project.
 func TestProjectRegistry_ResolveFallsBackToDefault(t *testing.T) {
 	defaultRoot := t.TempDir()
-	projects := NewProjectRegistry(nil, 0)
+	projects := newTestRegistry(t)
 
 	pc, err := projects.Resolve("session-no-path", "", defaultRoot)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestProjectRegistry_ResolveFallsBackToDefault(t *testing.T) {
 func TestProjectRegistry_DefaultFallbackDoesNotLockSession(t *testing.T) {
 	defaultRoot := t.TempDir()
 	otherRoot := t.TempDir()
-	projects := NewProjectRegistry(nil, 0)
+	projects := newTestRegistry(t)
 
 	if _, err := projects.Resolve("session-shared", "", defaultRoot); err != nil {
 		t.Fatalf("Resolve with default fallback: %v", err)
@@ -115,7 +115,7 @@ func TestProjectRegistry_DefaultFallbackDoesNotLockSession(t *testing.T) {
 // explicit multi-tenant case: if the server has no default project and a
 // session never named one, that's a real error, not a silent guess.
 func TestProjectRegistry_ResolveErrorsWithNoPathAndNoDefault(t *testing.T) {
-	projects := NewProjectRegistry(nil, 0)
+	projects := newTestRegistry(t)
 	if _, err := projects.Resolve("session-x", "", ""); err == nil {
 		t.Fatal("expected an error when neither an explicit path nor a default project is available")
 	}
@@ -124,7 +124,7 @@ func TestProjectRegistry_ResolveErrorsWithNoPathAndNoDefault(t *testing.T) {
 // TestProjectRegistry_List guards that only projects actually opened show
 // up — this is a live registry, not a filesystem scan.
 func TestProjectRegistry_List(t *testing.T) {
-	projects := NewProjectRegistry(nil, 0)
+	projects := newTestRegistry(t)
 	if got := projects.List(); len(got) != 0 {
 		t.Fatalf("expected an empty list before opening anything, got %v", got)
 	}
@@ -137,6 +137,119 @@ func TestProjectRegistry_List(t *testing.T) {
 	got := projects.List()
 	if len(got) != 1 || got[0] != mustAbs(t, rootA) {
 		t.Fatalf("List() = %v, want [%q]", got, rootA)
+	}
+}
+
+func TestProjectRegistry_Remove(t *testing.T) {
+	projects := newTestRegistry(t)
+	root := t.TempDir()
+	if _, err := projects.Get(root); err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if got := projects.List(); len(got) != 1 {
+		t.Fatalf("List() before Remove = %v, want 1 entry", got)
+	}
+
+	if err := projects.Remove(root); err != nil {
+		t.Fatalf("Remove(root): %v", err)
+	}
+	if got := projects.List(); len(got) != 0 {
+		t.Fatalf("List() after Remove = %v, want empty", got)
+	}
+
+	// Re-opening after removal must work fresh, not error.
+	if _, err := projects.Get(root); err != nil {
+		t.Fatalf("Get(root) after Remove: %v", err)
+	}
+}
+
+// TestProjectRegistry_RemoveEvictsBoundSessions guards the orphaned-agent
+// bug: removing a project used to leave any session bound to it fully alive
+// (in-memory Agent uncancelled, still in sessionProject) even though the
+// project no longer showed up in List() — a session that later got a fresh
+// ProjectContext for the same root, and the old Agent, if it had a turn in
+// flight, kept running unreferenced. Remove must now evict every bound
+// session's Agent and clear its binding.
+func TestProjectRegistry_RemoveEvictsBoundSessions(t *testing.T) {
+	projects := newTestRegistry(t)
+	root := t.TempDir()
+
+	pc, err := projects.Resolve("session-1", root, "")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	agentBefore := pc.Registry.Get(nil, "session-1")
+
+	if err := projects.Remove(root); err != nil {
+		t.Fatalf("Remove(root): %v", err)
+	}
+
+	// The old ProjectContext's own registry must have evicted the session's
+	// Agent — fetching it again constructs a brand new one rather than
+	// returning the same (potentially still-running) instance.
+	agentAfter := pc.Registry.Get(nil, "session-1")
+	if agentAfter == agentBefore {
+		t.Fatal("expected Remove to evict the bound session's Agent from its old registry")
+	}
+
+	// The binding itself must be cleared too: an unbound session with no
+	// explicit path and no default project is an error, not a silent reuse
+	// of the removed project.
+	if _, err := projects.Resolve("session-1", "", ""); err == nil {
+		t.Fatal("expected session-1's binding to be cleared by Remove")
+	}
+}
+
+// TestProjectRegistry_ListSurvivesRestart guards the actual ownership-model
+// fix: the known-projects list is backed by projects.json under the state
+// dir, not just this process's in-memory map — a brand new ProjectRegistry
+// pointed at the same state dir must see projects opened by a previous one.
+func TestProjectRegistry_ListSurvivesRestart(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+
+	first, err := NewProjectRegistry(nil, "", 0, stateDir)
+	if err != nil {
+		t.Fatalf("NewProjectRegistry: %v", err)
+	}
+	if _, err := first.Get(root); err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+
+	second, err := NewProjectRegistry(nil, "", 0, stateDir)
+	if err != nil {
+		t.Fatalf("NewProjectRegistry (restart): %v", err)
+	}
+	got := second.List()
+	if len(got) != 1 || got[0] != mustAbs(t, root) {
+		t.Fatalf("List() after restart = %v, want [%q]", got, root)
+	}
+}
+
+// TestProjectKey_ResolvesSymlinksLikeNormalizer guards the fix for the
+// symlink bug: projectKey must canonicalize a path exactly like
+// normalizer.New does (both call normalizer.CanonicalRoot), so a symlinked
+// project path and its real-path equivalent always collapse to the same
+// registry key instead of building two independent ProjectContexts that
+// both write to the same on-disk .yoake directory.
+func TestProjectKey_ResolvesSymlinksLikeNormalizer(t *testing.T) {
+	realDir := t.TempDir()
+	parent := t.TempDir()
+	symlinkPath := filepath.Join(parent, "link")
+	if err := os.Symlink(realDir, symlinkPath); err != nil {
+		t.Skipf("symlinks unsupported in this environment: %v", err)
+	}
+
+	keyReal, err := projectKey(realDir)
+	if err != nil {
+		t.Fatalf("projectKey(realDir): %v", err)
+	}
+	keySymlink, err := projectKey(symlinkPath)
+	if err != nil {
+		t.Fatalf("projectKey(symlinkPath): %v", err)
+	}
+	if keyReal != keySymlink {
+		t.Fatalf("projectKey(real) = %q, projectKey(symlink) = %q, want equal", keyReal, keySymlink)
 	}
 }
 
@@ -186,4 +299,15 @@ func mustAbs(t *testing.T, path string) string {
 		t.Fatalf("projectKey(%q): %v", path, err)
 	}
 	return key
+}
+
+// newTestRegistry builds a ProjectRegistry backed by a scratch -state-dir, so
+// each test's projects.json is isolated from every other test's.
+func newTestRegistry(t *testing.T) *ProjectRegistry {
+	t.Helper()
+	projects, err := NewProjectRegistry(nil, "", 0, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProjectRegistry: %v", err)
+	}
+	return projects
 }

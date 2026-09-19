@@ -20,7 +20,10 @@ func newTestDeps(t *testing.T) connDeps {
 	tempDir := t.TempDir()
 	stateDir := t.TempDir()
 
-	projects := NewProjectRegistry(nil, 0)
+	projects, err := NewProjectRegistry(nil, "", 0, stateDir)
+	if err != nil {
+		t.Fatalf("project registry: %v", err)
+	}
 	if _, err := projects.Get(tempDir); err != nil {
 		t.Fatalf("opening default test project: %v", err)
 	}

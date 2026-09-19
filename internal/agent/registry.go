@@ -15,6 +15,7 @@ type Registry struct {
 	sessions map[string]*Agent
 
 	provider      ModelProvider
+	providerName  string
 	tools         []tool.Tool
 	permEngine    *permission.Engine
 	snapshotStore snapshot.SnapshotStore
@@ -27,6 +28,7 @@ type Registry struct {
 
 func NewRegistry(
 	provider ModelProvider,
+	providerName string,
 	tools []tool.Tool,
 	permEngine *permission.Engine,
 	snapshotStore snapshot.SnapshotStore,
@@ -37,6 +39,7 @@ func NewRegistry(
 	return &Registry{
 		sessions:      make(map[string]*Agent),
 		provider:      provider,
+		providerName:  providerName,
 		tools:         tools,
 		permEngine:    permEngine,
 		snapshotStore: snapshotStore,
@@ -70,7 +73,7 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	// and every session in a project shared the same *ContextManager
 	// before this — one session picking a small-context model silently
 	// resized every other concurrent session's context-window budget too.
-	ag := NewAgent(stream, r.provider, r.tools, r.permEngine, r.snapshotStore, r.sessionStore, &ContextManager{
+	ag := NewAgent(stream, r.provider, r.providerName, r.tools, r.permEngine, r.snapshotStore, r.sessionStore, &ContextManager{
 		MaxHistoryTokens:    r.ctxMgr.GetMaxHistoryTokens(),
 		MaxToolOutputTokens: r.ctxMgr.MaxToolOutputTokens,
 	}, r.usageStore)

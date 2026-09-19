@@ -39,6 +39,7 @@ const (
 	EventPing                 EventType = "ping"
 	EventOpenProject          EventType = "open_project"
 	EventListProjects         EventType = "list_projects"
+	EventRemoveProject        EventType = "remove_project"
 	EventListFiles            EventType = "list_files"
 	EventSetPlanMode          EventType = "set_plan_mode"
 	EventGetSessionHistory    EventType = "get_session_history"
@@ -86,6 +87,7 @@ const (
 	EventPong               EventType = "pong"
 	EventProjectOpened      EventType = "project_opened"
 	EventProjectList        EventType = "project_list"
+	EventProjectRemoved     EventType = "project_removed"
 	EventFileList           EventType = "file_list"
 	EventPlanModeSet        EventType = "plan_mode_set"
 	EventSessionHistory     EventType = "session_history"
@@ -390,6 +392,26 @@ type HistoryMessage struct {
 	// the sending client uses (SPEC.md §2a's avatar conventions). Omitted for
 	// an assistant/tool message, and for a sender who never set one.
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
+
+	// Provider/Model are the registered provider name and model id that
+	// generated this message (assistant only). Empty for a message
+	// persisted before this field existed, or for user/tool messages —
+	// treat absence as "unknown", not an error.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+
+	// CreatedAt is when this message was produced. GenerationMs is how long
+	// the model round-trip that produced it took (assistant only).
+	CreatedAt    time.Time `json:"createdAt,omitempty"`
+	GenerationMs int64     `json:"generationMs,omitempty"`
+
+	// Usage is this round-trip's own token/cost accounting (assistant
+	// only) — not the whole turn's. InputTokens is already the full
+	// conversation resent as this round-trip's request, so it doubles as
+	// "tokens in up to this point"; OutputTokens is just this round-trip's
+	// own reply. Omitted for user/tool messages and for a message
+	// persisted before this field existed.
+	Usage *UsageData `json:"usage,omitempty"`
 }
 
 // SessionHistoryData is the response to get_session_history: the session's
@@ -586,6 +608,18 @@ type ListProjectsData struct{}
 // it started — not a filesystem scan, and not persisted across restarts.
 type ProjectListData struct {
 	Paths []string `json:"paths"`
+}
+
+// RemoveProjectData drops a project from this server process's opened set
+// (see ProjectRegistry.Remove) — "stop offering/tracking this one", not a
+// filesystem delete. A session still bound to it keeps working; the project
+// just gets re-opened fresh on its next reference.
+type RemoveProjectData struct {
+	Path string `json:"path"`
+}
+
+type ProjectRemovedData struct {
+	Path string `json:"path"`
 }
 
 // ListFilesData requests every file path under a project, for client-side

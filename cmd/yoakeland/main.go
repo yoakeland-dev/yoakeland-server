@@ -107,7 +107,15 @@ func main() {
 	// many of them at once, each fully isolated from the others. -project is
 	// pre-opened eagerly so it fails fast on a bad path, and doubles as the
 	// fallback project for anything that doesn't specify its own.
-	projects := NewProjectRegistry(modelProv, maxSessionCostUSD)
+	// providerName here is the -provider flag value ("auto", "anthropic",
+	// ...), not a providerStore-registered name — this is the fallback
+	// path for a session that never called set_provider, so there's no
+	// registered name to stamp; it's still better than leaving every such
+	// message's Provider blank.
+	projects, err := NewProjectRegistry(modelProv, providerName, maxSessionCostUSD, stateDir)
+	if err != nil {
+		logFatal("failed to open project list store: %v", err)
+	}
 	defaultProject, err := projects.Get(projectDir)
 	if err != nil {
 		logFatal("failed to open default project %q: %v", projectDir, err)
@@ -931,7 +939,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		pc.Registry.Get(ipc, sessID).SetProvider(built)
+		pc.Registry.Get(ipc, sessID).SetProvider(built, data.ProviderName)
 		_ = ipc.SendEvent(protocol.EventProviderSet, sessID, env.TurnID, "", protocol.ProviderSetData{
 			SessionID:    sessID,
 			ProviderName: data.ProviderName,
@@ -1114,7 +1122,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			summaries = append(summaries, sessionSummaryFrom(state))
 		}
 		_ = ipc.SendEvent(protocol.EventSessionList, env.SessionID, env.TurnID, "", protocol.SessionListData{
-			ProjectPath: projectPath,
+			ProjectPath: pc.Root,
 			Sessions:    summaries,
 		})
 
@@ -1298,7 +1306,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 		}
 		_ = ipc.SendEvent(protocol.EventSnapshotList, env.SessionID, env.TurnID, "", protocol.SnapshotListData{
-			ProjectPath: projectPath,
+			ProjectPath: pc.Root,
 			Snapshots:   summaries,
 		})
 
@@ -1331,12 +1339,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message:     fmt.Sprintf("failed to list files: %v", err),
-				ProjectPath: projectPath,
+				ProjectPath: pc.Root,
 			})
 			return
 		}
 		_ = ipc.SendEvent(protocol.EventFileList, env.SessionID, env.TurnID, "", protocol.FileListData{
-			ProjectPath: projectPath,
+			ProjectPath: pc.Root,
 			Files:       files,
 		})
 
@@ -1363,6 +1371,31 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListProjects:
 		_ = ipc.SendEvent(protocol.EventProjectList, env.SessionID, env.TurnID, "", protocol.ProjectListData{
 			Paths: deps.projects.List(),
+		})
+
+	case protocol.EventRemoveProject:
+		var data protocol.RemoveProjectData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed remove_project payload",
+			})
+			return
+		}
+		key, err := projectKey(data.Path)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("failed to remove project %q: %v", data.Path, err),
+			})
+			return
+		}
+		if err := deps.projects.Remove(data.Path); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("failed to remove project %q: %v", data.Path, err),
+			})
+			return
+		}
+		_ = ipc.SendEvent(protocol.EventProjectRemoved, env.SessionID, env.TurnID, "", protocol.ProjectRemovedData{
+			Path: key,
 		})
 
 	case protocol.EventDetectCLI:
