@@ -32,6 +32,16 @@ type ServerSettings struct {
 	Identity string                 `json:"identity,omitempty"`
 	Tokens   map[string]TokenRecord `json:"tokens,omitempty"`
 
+	// ServerID is a stable identifier minted once, the first time this
+	// -state-dir is ever used, and never changed or exposed via any setter
+	// — unlike Identity (a mutable display name), its only value is that it
+	// can't change, so a client reaching this server under two different
+	// addresses (a LAN IP one time, a VPN hostname another) can still tell
+	// it's the same daemon, and so a client holding several simultaneous
+	// connections has a stable key to store per-server state under instead
+	// of an address string.
+	ServerID string `json:"serverId,omitempty"`
+
 	// AutoGenerateTitle is the server-wide default for a first user_prompt
 	// that omits its own autoGenerateTitle (SPEC.md §3.1) — nil (the
 	// unset-file case) means "on", matching that same per-request default,
@@ -78,6 +88,21 @@ func NewServerSettings(dir string) (*ServerSettings, error) {
 			s.Identity = host
 		}
 	}
+	if s.ServerID == "" {
+		id, err := generateAuthToken() // same crypto/rand+hex idiom, same package
+		if err != nil {
+			return nil, fmt.Errorf("generating server id: %w", err)
+		}
+		s.ServerID = id
+		// Unlike Identity, which is allowed to re-derive from hostname every
+		// launch until explicitly set, this must persist immediately — the
+		// whole point of ServerID is that it's stable from the moment it's
+		// first minted, including on an existing install's first launch
+		// after upgrading to a version that has this field at all.
+		if err := s.save(); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -92,6 +117,14 @@ func (s *ServerSettings) SetIdentity(name string) error {
 	defer s.mu.Unlock()
 	s.Identity = name
 	return s.save()
+}
+
+// GetServerID returns this server's stable identifier. Deliberately no
+// setter: a client relies on this value never changing.
+func (s *ServerSettings) GetServerID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ServerID
 }
 
 // GetAutoGenerateTitle returns the server-wide default, true unless an

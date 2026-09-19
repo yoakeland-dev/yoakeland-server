@@ -451,7 +451,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 			go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout)
 			onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
 
-			_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity()})
+			_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
 			_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
 
 			if pending != nil {
@@ -1495,7 +1495,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		for _, p := range deps.peers.All() {
-			_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: data.Name})
+			_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: data.Name, ServerID: deps.settings.GetServerID()})
 		}
 
 	case protocol.EventSetAutoGenerateTitle:

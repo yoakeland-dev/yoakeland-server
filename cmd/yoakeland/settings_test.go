@@ -14,6 +14,38 @@ func TestServerSettings_DefaultsIdentityToHostname(t *testing.T) {
 	}
 }
 
+// TestServerSettings_ServerIDIsStableAndUnique guards the whole point of
+// ServerID: two independent state dirs get different ids, and reopening the
+// same dir returns the exact same one rather than minting a new one every
+// launch (which would defeat its purpose as a stable cross-reconnect key).
+func TestServerSettings_ServerIDIsStableAndUnique(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+
+	a, err := NewServerSettings(dirA)
+	if err != nil {
+		t.Fatalf("NewServerSettings(dirA): %v", err)
+	}
+	b, err := NewServerSettings(dirB)
+	if err != nil {
+		t.Fatalf("NewServerSettings(dirB): %v", err)
+	}
+	idA, idB := a.GetServerID(), b.GetServerID()
+	if idA == "" || idB == "" {
+		t.Fatalf("expected non-empty server ids, got %q and %q", idA, idB)
+	}
+	if idA == idB {
+		t.Fatalf("expected two fresh state dirs to get different server ids, both got %q", idA)
+	}
+
+	reopened, err := NewServerSettings(dirA)
+	if err != nil {
+		t.Fatalf("reopening NewServerSettings(dirA): %v", err)
+	}
+	if got := reopened.GetServerID(); got != idA {
+		t.Fatalf("GetServerID() after reopen = %q, want the original %q", got, idA)
+	}
+}
+
 // TestServerSettings_PersistsAcrossReopen guards the actual point of this
 // store: set_server_identity/set_remote_password must survive a restart,
 // not reset to flag defaults every time (the whole reason they're here

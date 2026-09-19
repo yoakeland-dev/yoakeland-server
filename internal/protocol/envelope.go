@@ -586,6 +586,16 @@ type SetServerIdentityData struct {
 // whenever the identity changes.
 type ServerIdentityData struct {
 	Identity string `json:"identity"`
+
+	// ServerID is this server's stable, never-changing identifier — unlike
+	// Identity, it never changes and is only ever included, never set via
+	// the wire (there is no set_server_id). A client uses it to recognize
+	// "the same daemon" across reconnects and across different addresses,
+	// and as a stable key for any per-server state it keeps. Omitted (older
+	// server) rather than absent-as-error — a client talking to a server
+	// that predates this field should treat that connection as unknown/
+	// legacy rather than failing.
+	ServerID string `json:"serverId,omitempty"`
 }
 
 // SetAutoGenerateTitleData sets the server-wide default applied to a first

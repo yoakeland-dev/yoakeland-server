@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.10)
+# Yoakeland Backend IPC Specification (v2.11)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -980,9 +980,10 @@ Pushed to **every** connected peer whenever the connection roster changes (conne
 #### `server_identity`
 Pushed to a peer right after it connects, and to every peer whenever `set_server_identity` changes it.
 ```json
-{"type": "server_identity", "data": {"identity": "aveline's living room"}}
+{"type": "server_identity", "data": {"identity": "aveline's living room", "serverId": "a1b2c3d4e5f6..."}}
 ```
-*UI Action*: Show this as the server's display name (e.g. in a connection list or title bar) rather than a raw address.
+- `identity`: a mutable display name — *UI Action*: show this as the server's display name (e.g. in a connection list or title bar) rather than a raw address.
+- `serverId`: a stable identifier minted once, the first time this server's `-state-dir` is ever used, and never changed — there is no `set_server_id`. Unlike `identity`, its entire value is that it *doesn't* change: a client reaching this same daemon under two different addresses (a LAN IP one time, a VPN hostname another) sees the same `serverId` both times, and a client holding several simultaneous connections (to different servers) should key any per-server state it keeps by this, not by address. Omitted by a server that predates this field — treat that connection as unknown/legacy rather than erroring.
 
 #### `auto_generate_title`
 Pushed to a peer right after it connects, and to every peer whenever `set_auto_generate_title` changes it.

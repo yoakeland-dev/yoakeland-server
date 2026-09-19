@@ -154,6 +154,12 @@ func TestServeConnection_SetServerIdentity(t *testing.T) {
 			_ = json.Unmarshal(env.Data, &data)
 			if data.Identity == "living-room-server" {
 				saw = true
+				if data.ServerID == "" {
+					t.Fatal("expected the server_identity push to also carry a non-empty serverId")
+				}
+				if data.ServerID != deps.settings.GetServerID() {
+					t.Fatalf("pushed serverId %q != deps.settings.GetServerID() %q", data.ServerID, deps.settings.GetServerID())
+				}
 			}
 		}
 	}
