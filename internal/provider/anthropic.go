@@ -157,6 +157,7 @@ func (p *AnthropicProvider) StreamTurn(
 	ctx context.Context,
 	history []agent.Message,
 	tools []tool.ToolDefinition,
+	systemPrompt string,
 ) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 64)
 	eChan := make(chan error, 1)
@@ -226,7 +227,7 @@ func (p *AnthropicProvider) StreamTurn(
 
 		reqBody := anthropicRequest{
 			Model:     p.Model,
-			System:    DefaultSystemPrompt,
+			System:    systemPrompt,
 			Messages:  msgs,
 			Tools:     anthroTools,
 			Stream:    true,

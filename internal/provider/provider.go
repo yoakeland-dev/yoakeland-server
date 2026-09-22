@@ -10,7 +10,7 @@ import (
 )
 
 type Provider interface {
-	StreamTurn(ctx context.Context, history []agent.Message, tools []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error)
+	StreamTurn(ctx context.Context, history []agent.Message, tools []tool.ToolDefinition, systemPrompt string) (<-chan agent.ModelStreamChunk, <-chan error)
 }
 
 type SSEEvent struct {
@@ -54,17 +54,3 @@ func ReadSSESteam(r io.Reader, handle func(ev SSEEvent) error) error {
 	}
 	return scanner.Err()
 }
-
-// DefaultSystemPrompt establishes coding agent conventions
-const DefaultSystemPrompt = `You are Yoakeland, an autonomous software engineering agent.
-You have access to tools to inspect and modify code in the user's project:
-- file_read: read file content
-- file_write: create or overwrite files
-- file_edit: perform precise search-and-replace edits
-- bash: run a single command inside the project sandbox — there is no shell, so pipes,
-  redirects, &&/||/;, backticks, and $() are not interpreted; run one command per call
-
-Rules:
-1. Always read relevant files before proposing edits.
-2. Ensure file edits are minimal and targeted.
-3. Be concise. Deliver actionable responses without unnecessary preamble.`

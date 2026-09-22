@@ -19,7 +19,7 @@ type ScriptedProvider struct {
 	index int
 }
 
-func (s *ScriptedProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (s *ScriptedProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 10)
 	eChan := make(chan error, 1)
 
@@ -48,16 +48,16 @@ type HistoryRecordingProvider struct {
 	seenHistory [][]agent.Message
 }
 
-func (h *HistoryRecordingProvider) StreamTurn(ctx context.Context, history []agent.Message, tools []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (h *HistoryRecordingProvider) StreamTurn(ctx context.Context, history []agent.Message, tools []tool.ToolDefinition, systemPrompt string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	h.seenHistory = append(h.seenHistory, history)
-	return h.ScriptedProvider.StreamTurn(ctx, history, tools)
+	return h.ScriptedProvider.StreamTurn(ctx, history, tools, systemPrompt)
 }
 
 type BlockingProvider struct {
 	started chan struct{}
 }
 
-func (b *BlockingProvider) StreamTurn(ctx context.Context, _ []agent.Message, _ []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (b *BlockingProvider) StreamTurn(ctx context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 2)
 	eChan := make(chan error, 1)
 

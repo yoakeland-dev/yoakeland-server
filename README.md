@@ -264,8 +264,11 @@ Turn history is **server-side state**, persisted per-project at `.yoake/sessions
 | `file_write` | **Ask** | Creates or overwrites a file. Triggers a pre-mutation snapshot. |
 | `file_edit` | **Ask** | Exact string search-and-replace (`oldString` -> `newString`). Validates single vs multiple occurrences. Triggers a snapshot. |
 | `bash` | **Ask / Dynamic** | Executes shell commands through the sandbox tier described above. |
+| `web_search` / `web_fetch` | **Allow** | Client-side web search/fetch; togglable per project (`set_web_tools_enabled`), output wrapped as untrusted content. |
+| `ask_user_question` | **Allow** | Pauses the turn for user input; available in every mode. |
+| `write_plan` | **Allow** | Plan mode's own output channel — records a plan to `.yoake/plans/<sessionId>.md`. |
 
-**Plan mode** (`set_plan_mode`, [SPEC.md §4c](SPEC.md)) restricts a session to `file_read` only by not sending the model any other tool's definition at all, rather than exposing every tool and denying mutations at call time — so the model can't attempt a write it doesn't know exists.
+**Four session modes** (`set_mode`, [SPEC.md §4c](SPEC.md)) — `read_only`, `read_write` (the default), `autonomous`, and `plan` — control which tools the model is even given and how bash's permission behaves: `read_only`/`plan` restrict the model to a read-only allowlist by not sending the model any other tool's definition at all, rather than exposing every tool and denying mutations at call time; `read_write` forces `bash` to always ask (bypassing the safe-command auto-allowlist, with `remember` never persisted for that forced ask); `autonomous` bypasses every permission check outright; `plan` additionally swaps in a distinct system prompt themed around producing a plan, and allowlists `write_plan` for recording it.
 
 ---
 

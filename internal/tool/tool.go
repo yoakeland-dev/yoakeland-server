@@ -21,10 +21,11 @@ type ExecutionContext struct {
 
 	// Stream, if non-nil, lets a tool emit its own wire events (currently
 	// just snapshot_capturing/snapshot_created/error around a pre-mutation
-	// snapshot capture) directly to whichever connection currently owns
-	// this session — the same delivery path model_delta/tool_call_requested/
-	// etc. already use. nil in contexts that don't care (most tests).
-	Stream *protocol.IPCStream
+	// snapshot capture) to every connection currently subscribed to this
+	// session — the same delivery path model_delta/tool_call_requested/etc.
+	// already use (see protocol.StreamSet). nil in contexts that don't care
+	// (most tests).
+	Stream protocol.EventSender
 
 	// AuthorName/AuthorEmail identify which peer's prompt started this
 	// turn, if known (see agent.Author) — the bash tool uses these to set
@@ -34,6 +35,12 @@ type ExecutionContext struct {
 	// case nothing is injected and today's ambient git config applies.
 	AuthorName  string
 	AuthorEmail string
+
+	// AskUser, if non-nil, lets a tool (ask_user_question) pause the turn to
+	// solicit input from the user and block until they answer or the turn
+	// is cancelled. Injected by Agent per dispatch — internal/tool never
+	// imports internal/agent, same reasoning as Stream/AuthorName above.
+	AskUser func(question string, options []string) (string, error)
 }
 
 type Tool interface {

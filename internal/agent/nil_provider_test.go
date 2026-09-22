@@ -65,3 +65,52 @@ func TestAgent_SetProviderThenRunTurn(t *testing.T) {
 		t.Fatalf("expected a normal completion, got: %s", outBuf.String())
 	}
 }
+
+// TestAgent_EditRetryWithNilProvider guards EditMessage/RetryMessage against
+// the same no-provider case RunTurn already guards, via the shared
+// beginTurn — a session with no provider configured must reject an edit or
+// a retry cleanly too, not just a fresh prompt.
+func TestAgent_EditRetryWithNilProvider(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20)
+
+	scripted := &ScriptedProvider{
+		turns: [][]agent.ModelStreamChunk{{{Kind: agent.StreamChunkDelta, Delta: "hi there"}}},
+	}
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, scripted, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+
+	if err := ag.RunTurn(context.Background(), "session-edit-no-provider", "turn-1", "hello"); err != nil {
+		t.Fatalf("initial turn: %v", err)
+	}
+	state, err := sessStore.Load("session-edit-no-provider")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	userID := state.History[0].ID
+	assistantID := state.History[1].ID
+
+	// Simulate the provider having been unset since (e.g. remove_provider).
+	ag.SetProvider(nil, "")
+	outBuf.Reset()
+
+	if err := ag.EditMessage(context.Background(), "session-edit-no-provider", "turn-2", userID, "hello again", false); err == nil {
+		t.Fatal("expected EditMessage to be refused with no provider configured")
+	}
+	if !strings.Contains(outBuf.String(), `"finishReason":"no_provider"`) {
+		t.Fatalf("expected a turn_completed with finishReason no_provider, got: %s", outBuf.String())
+	}
+
+	outBuf.Reset()
+	if err := ag.RetryMessage(context.Background(), "session-edit-no-provider", "turn-3", assistantID); err == nil {
+		t.Fatal("expected RetryMessage to be refused with no provider configured")
+	}
+	if !strings.Contains(outBuf.String(), `"finishReason":"no_provider"`) {
+		t.Fatalf("expected a turn_completed with finishReason no_provider, got: %s", outBuf.String())
+	}
+}

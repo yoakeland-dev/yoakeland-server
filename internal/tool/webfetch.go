@@ -120,9 +120,9 @@ func (t *WebFetchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON
 
 	title := strings.TrimSpace(article.Title)
 	if title == "" {
-		return text, nil
+		return WrapUntrusted(args.URL, text), nil
 	}
-	return title + "\n\n" + text, nil
+	return WrapUntrusted(args.URL, title+"\n\n"+text), nil
 }
 
 func (t *WebFetchTool) Definition() ToolDefinition {

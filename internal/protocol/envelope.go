@@ -21,6 +21,9 @@ type EventType string
 
 const (
 	EventUserPrompt           EventType = "user_prompt"
+	EventEditMessage          EventType = "edit_message"
+	EventRetryMessage         EventType = "retry_message"
+	EventSwitchBranch         EventType = "switch_branch"
 	EventPermissionResponse   EventType = "permission_response"
 	EventCancelTurn           EventType = "cancel_turn"
 	EventRestoreSnapshot      EventType = "restore_snapshot"
@@ -41,7 +44,9 @@ const (
 	EventListProjects         EventType = "list_projects"
 	EventRemoveProject        EventType = "remove_project"
 	EventListFiles            EventType = "list_files"
-	EventSetPlanMode          EventType = "set_plan_mode"
+	EventSetMode              EventType = "set_mode"
+	EventSetWebToolsEnabled   EventType = "set_web_tools_enabled"
+	EventAskUserAnswer        EventType = "ask_user_answer"
 	EventGetSessionHistory    EventType = "get_session_history"
 	EventSetSessionTitle      EventType = "set_session_title"
 	EventSetSessionArchived   EventType = "set_session_archived"
@@ -60,45 +65,47 @@ const (
 	EventListTokens           EventType = "list_tokens"
 	EventRemoveToken          EventType = "remove_token"
 
-	EventModelDelta         EventType = "model_delta"
-	EventToolCallRequested  EventType = "tool_call_requested"
-	EventPermissionRequest  EventType = "permission_request"
-	EventToolResult         EventType = "tool_result"
-	EventTurnCompleted      EventType = "turn_completed"
-	EventSnapshotCapturing  EventType = "snapshot_capturing"
-	EventSnapshotCreated    EventType = "snapshot_created"
-	EventSnapshotRestored   EventType = "snapshot_restored"
-	EventError              EventType = "error"
-	EventSessionTakenOver   EventType = "session_taken_over"
-	EventProviderRegistered EventType = "provider_registered"
-	EventProviderList       EventType = "provider_list"
-	EventProviderSet        EventType = "provider_set"
-	EventModelOptionsSet    EventType = "model_options_set"
-	EventOAuthURL           EventType = "openrouter_oauth_url"
-	EventProviderRemoved    EventType = "provider_removed"
-	EventModelList          EventType = "model_list"
-	EventFavoriteModelsSet  EventType = "favorite_models_set"
-	EventSessionList        EventType = "session_list"
-	EventSessionUpdated     EventType = "session_updated"
-	EventSessionDeleted     EventType = "session_deleted"
-	EventDirectoryList      EventType = "directory_list"
-	EventSnapshotList       EventType = "snapshot_list"
-	EventCLIAvailability    EventType = "cli_availability"
-	EventPong               EventType = "pong"
-	EventProjectOpened      EventType = "project_opened"
-	EventProjectList        EventType = "project_list"
-	EventProjectRemoved     EventType = "project_removed"
-	EventFileList           EventType = "file_list"
-	EventPlanModeSet        EventType = "plan_mode_set"
-	EventSessionHistory     EventType = "session_history"
-	EventPeerList           EventType = "peer_list"
-	EventRemoteAccessSet    EventType = "remote_access_set"
-	EventRemotePasswordSet  EventType = "remote_password_set"
-	EventServerIdentity     EventType = "server_identity"
-	EventAutoGenerateTitle  EventType = "auto_generate_title"
-	EventTokenRegistered    EventType = "token_registered"
-	EventTokenList          EventType = "token_list"
-	EventTokenRemoved       EventType = "token_removed"
+	EventModelDelta               EventType = "model_delta"
+	EventToolCallRequested        EventType = "tool_call_requested"
+	EventPermissionRequest        EventType = "permission_request"
+	EventToolResult               EventType = "tool_result"
+	EventTurnCompleted            EventType = "turn_completed"
+	EventSnapshotCapturing        EventType = "snapshot_capturing"
+	EventSnapshotCreated          EventType = "snapshot_created"
+	EventSnapshotRestored         EventType = "snapshot_restored"
+	EventError                    EventType = "error"
+	EventProviderRegistered       EventType = "provider_registered"
+	EventProviderList             EventType = "provider_list"
+	EventProviderSet              EventType = "provider_set"
+	EventModelOptionsSet          EventType = "model_options_set"
+	EventOAuthURL                 EventType = "openrouter_oauth_url"
+	EventProviderRemoved          EventType = "provider_removed"
+	EventModelList                EventType = "model_list"
+	EventFavoriteModelsSet        EventType = "favorite_models_set"
+	EventSessionList              EventType = "session_list"
+	EventSessionUpdated           EventType = "session_updated"
+	EventSessionDeleted           EventType = "session_deleted"
+	EventDirectoryList            EventType = "directory_list"
+	EventSnapshotList             EventType = "snapshot_list"
+	EventCLIAvailability          EventType = "cli_availability"
+	EventPong                     EventType = "pong"
+	EventProjectOpened            EventType = "project_opened"
+	EventProjectList              EventType = "project_list"
+	EventProjectRemoved           EventType = "project_removed"
+	EventFileList                 EventType = "file_list"
+	EventModeSet                  EventType = "mode_set"
+	EventWebToolsEnabledSet       EventType = "web_tools_enabled_set"
+	EventAskUserQuestionRequested EventType = "ask_user_question_requested"
+	EventPlanWritten              EventType = "plan_written"
+	EventSessionHistory           EventType = "session_history"
+	EventPeerList                 EventType = "peer_list"
+	EventRemoteAccessSet          EventType = "remote_access_set"
+	EventRemotePasswordSet        EventType = "remote_password_set"
+	EventServerIdentity           EventType = "server_identity"
+	EventAutoGenerateTitle        EventType = "auto_generate_title"
+	EventTokenRegistered          EventType = "token_registered"
+	EventTokenList                EventType = "token_list"
+	EventTokenRemoved             EventType = "token_removed"
 )
 
 type Envelope struct {
@@ -248,23 +255,57 @@ type ModelOptionsSetData struct {
 	ContextWindow   int    `json:"contextWindow,omitempty"`
 }
 
-// SetPlanModeData toggles a session between normal execution and plan mode
-// on its next turn: while enabled, the model only sees read-only tool
-// definitions (file_read), so it can investigate and propose an approach
-// without being able to write files or run commands (see SPEC.md §4c).
-type SetPlanModeData struct {
+// SetModeData switches a session between the four tiers on its next turn —
+// "read_only", "read_write", "autonomous", or "plan" (see SPEC.md §4c).
+type SetModeData struct {
 	SessionID string `json:"sessionId,omitempty"`
-	Enabled   bool   `json:"enabled"`
+	Mode      string `json:"mode"`
 
-	// ProjectPath — see SetProviderData.ProjectPath; same reason, since plan
-	// mode can be toggled on a brand-new chat before its first prompt binds
-	// the session to a project.
+	// ProjectPath — see SetProviderData.ProjectPath; same reason, since mode
+	// can be toggled on a brand-new chat before its first prompt binds the
+	// session to a project.
 	ProjectPath string `json:"projectPath,omitempty"`
 }
 
-type PlanModeSetData struct {
+type ModeSetData struct {
 	SessionID string `json:"sessionId"`
-	Enabled   bool   `json:"enabled"`
+	Mode      string `json:"mode"`
+}
+
+// SetWebToolsEnabledData toggles whether web_search/web_fetch are exposed to
+// the model for an entire project (all sessions), independent of mode.
+// Persisted to .yoake/settings.json — unlike mode, survives a restart.
+type SetWebToolsEnabledData struct {
+	ProjectPath string `json:"projectPath,omitempty"`
+	Enabled     bool   `json:"enabled"`
+}
+
+type WebToolsEnabledSetData struct {
+	ProjectPath string `json:"projectPath,omitempty"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// AskUserAnswerData answers an outstanding ask_user_question_requested
+// event — correlated by the envelope's own toolCallId field, exactly like
+// PermissionResponseData.
+type AskUserAnswerData struct {
+	Answer string `json:"answer"`
+}
+
+// AskUserQuestionRequestedData is sent when the model calls ask_user_question
+// — pauses the turn until an ask_user_answer (correlated by toolCallId)
+// resolves it (see Agent.HandleAskUserAnswer).
+type AskUserQuestionRequestedData struct {
+	Question string   `json:"question"`
+	Options  []string `json:"options,omitempty"`
+}
+
+// PlanWrittenData is sent when the write_plan tool records a plan — Path is
+// relative to the project root, at .yoake/plans/<sessionId>.md. A frontend
+// should open this file in a sidebar pane rather than relying only on
+// model_delta prose narrating the plan.
+type PlanWrittenData struct {
+	Path string `json:"path"`
 }
 
 // OAuthStartData begins an OpenRouter PKCE login; Name is the provider name
@@ -301,6 +342,9 @@ type SessionSummary struct {
 	Title           string    `json:"title,omitempty"`
 	Archived        bool      `json:"archived,omitempty"`
 	LinkedSessionID *string   `json:"linkedSessionId,omitempty"`
+	// Mode is the session's persisted current mode ("read_only"/"read_write"/
+	// "autonomous"/"plan"), empty for the default (read_write) — see §4c.
+	Mode string `json:"mode,omitempty"`
 }
 
 // SetSessionTitleData renames a persisted session. The server never
@@ -376,11 +420,24 @@ type HistoryToolCall struct {
 }
 
 type HistoryMessage struct {
+	// ID addresses this message for edit_message/retry_message/
+	// switch_branch. Empty only for a message persisted before this field
+	// existed and never since migrated (see agent.LoadSession) — treat
+	// absence as "not addressable" rather than an error.
+	ID         string            `json:"id,omitempty"`
 	Role       string            `json:"role"`
 	Content    string            `json:"content,omitempty"`
 	Reasoning  string            `json:"reasoning,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
+
+	// AlternateIDs lists the OTHER versions that exist at this point in the
+	// conversation — other edits of this same user message, or other
+	// retried responses to the same prompt — each individually addressable
+	// via switch_branch. Omitted when this message has no alternates (the
+	// common case, and always true for a message that was never edited or
+	// retried). This message's own ID is never included in its own list.
+	AlternateIDs []string `json:"alternateIds,omitempty"`
 
 	// Author is who actually sent this message, for a shared session with
 	// more than one connected peer — set only on a user message whose
@@ -421,6 +478,12 @@ type HistoryMessage struct {
 type SessionHistoryData struct {
 	SessionID string           `json:"sessionId"`
 	Messages  []HistoryMessage `json:"messages"`
+	// Mode is this session's persisted current mode — see SessionSummary.Mode.
+	// This is the authoritative value a client should adopt on session open,
+	// rather than replaying its own possibly-stale cached mode (§4b/§4c):
+	// another peer may have changed it since this client last had the
+	// session open.
+	Mode string `json:"mode,omitempty"`
 }
 
 // OpenProjectData validates and lazily initializes a project (its own
@@ -614,8 +677,9 @@ type AutoGenerateTitleData struct {
 // ListProjectsData takes no fields; it's a request marker.
 type ListProjectsData struct{}
 
-// ProjectListData enumerates projects opened on this server process since
-// it started — not a filesystem scan, and not persisted across restarts.
+// ProjectListData enumerates every project this server has ever opened, most-
+// recently-opened first — not a filesystem scan, backed by projects.json so
+// it survives a restart (see projectstore.Store).
 type ProjectListData struct {
 	Paths []string `json:"paths"`
 }
@@ -690,6 +754,43 @@ type UserPromptData struct {
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
 }
 
+// EditMessageData replaces a past user message's content and regenerates
+// everything after it, as a fresh turn — same streaming events
+// (model_delta/tool_call_requested/permission_request/tool_result/
+// turn_completed) and cancel_turn semantics as user_prompt. Unlike
+// user_prompt, SessionID is required: this acts on a specific, already-
+// existing session, the same resolution rule as set_session_title (§3.1).
+// MessageID must name a user-role message currently in that session's active
+// history — its old content and everything generated after it are archived
+// as a recoverable branch (see switch_branch), never deleted.
+type EditMessageData struct {
+	SessionID         string `json:"sessionId"`
+	MessageID         string `json:"messageId"`
+	Content           string `json:"content"`
+	AutoGenerateTitle *bool  `json:"autoGenerateTitle,omitempty"`
+}
+
+// RetryMessageData discards a past assistant message and regenerates a
+// fresh response from the same point, as a fresh turn — same streaming
+// events and cancel_turn semantics as user_prompt/edit_message. MessageID
+// must name an assistant-role message currently in the session's active
+// history; it need not be the last message — retrying an earlier round-trip
+// inside a multi-tool-call turn discards that round-trip and everything
+// after it too. Same archive-not-delete guarantee as edit_message.
+type RetryMessageData struct {
+	SessionID string `json:"sessionId"`
+	MessageID string `json:"messageId"`
+}
+
+// SwitchBranchData makes the branch containing MessageID the active one for
+// SessionID, swapping out whatever was active at that branch point (which
+// becomes recoverable in its place). Pure navigation: no model call, no
+// cost. Response: session_history, same as get_session_history.
+type SwitchBranchData struct {
+	SessionID string `json:"sessionId"`
+	MessageID string `json:"messageId"`
+}
+
 type CancelTurnData struct {
 	SessionID string `json:"sessionId,omitempty"`
 	TurnID    string `json:"turnId,omitempty"`
@@ -761,12 +862,26 @@ type SpendData struct {
 }
 
 type TurnCompletedData struct {
-	FinishReason string       `json:"finishReason"`
-	SessionID    string       `json:"sessionId"`
-	Usage        *UsageData   `json:"usage,omitempty"`
-	Context      *ContextData `json:"context,omitempty"`
-	Spend        *SpendData   `json:"spend,omitempty"`
-	DurationMs   int64        `json:"durationMs"`
+	FinishReason string `json:"finishReason"`
+	SessionID    string `json:"sessionId"`
+	// UserMessageID is the id of the prompt this turn is anchored to: the
+	// message just created by user_prompt/edit_message, or — for
+	// retry_message, which creates no new user message — the existing user
+	// message the retried reply followed. Empty when the turn ended before
+	// any message existed to anchor to (no_provider/budget_exceeded on a
+	// session's very first message would be the only case).
+	UserMessageID string `json:"userMessageId,omitempty"`
+	// MessageID is the id of the last message this turn appended — normally
+	// the final assistant reply. Empty if the turn ended before appending
+	// one (no_provider/budget_exceeded, or a cancel before any content
+	// streamed). This — not a follow-up get_session_history — is how a
+	// client learns the id to target with a later edit_message/
+	// retry_message/switch_branch for the message it just watched stream in.
+	MessageID  string       `json:"messageId,omitempty"`
+	Usage      *UsageData   `json:"usage,omitempty"`
+	Context    *ContextData `json:"context,omitempty"`
+	Spend      *SpendData   `json:"spend,omitempty"`
+	DurationMs int64        `json:"durationMs"`
 }
 
 // SnapshotCapturingData announces that a pre-mutation snapshot capture is
@@ -794,12 +909,6 @@ type SnapshotEventData struct {
 type RestoreSnapshotData struct {
 	SnapshotID  string `json:"snapshotId"`
 	ProjectPath string `json:"projectPath,omitempty"`
-}
-
-// SessionTakenOverData notifies a previously connected client that another
-// connection has taken over its session (last-writer-wins reconnect).
-type SessionTakenOverData struct {
-	SessionID string `json:"sessionId"`
 }
 
 type ErrorData struct {

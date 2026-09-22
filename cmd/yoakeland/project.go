@@ -15,6 +15,7 @@ import (
 	"yoakeland/internal/projectstore"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/sandbox"
+	"yoakeland/internal/settings"
 	"yoakeland/internal/snapshot"
 	"yoakeland/internal/tool"
 )
@@ -25,11 +26,12 @@ import (
 // any of this — a tool call in one project's sandbox can't touch another
 // project's files, and one project's sessions are invisible to another's.
 type ProjectContext struct {
-	Root        string
-	SnapStore   snapshot.SnapshotStore
-	SessStore   agent.SessionStore
-	Registry    *agent.Registry
-	SandboxTier string
+	Root          string
+	SnapStore     snapshot.SnapshotStore
+	SessStore     agent.SessionStore
+	Registry      *agent.Registry
+	SandboxTier   string
+	SettingsStore *settings.Store
 }
 
 func newProjectContext(root string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64) (*ProjectContext, error) {
@@ -40,6 +42,12 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, default
 
 	permStore := permission.NewPersistentStore(norm.ProjectRoot)
 	permEngine := permission.New(norm, permStore)
+
+	settingsStore := settings.NewStore(norm.ProjectRoot)
+	projSettings, err := settingsStore.Load()
+	if err != nil {
+		return nil, fmt.Errorf("settings store: %w", err)
+	}
 
 	snapStore, err := snapshot.NewDiskSnapshotStore(norm.ProjectRoot)
 	if err != nil {
@@ -63,6 +71,8 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, default
 		tool.NewFileWriteTool(norm),
 		tool.NewFileEditTool(norm),
 		tool.NewBashTool(norm, sb),
+		tool.NewAskUserQuestionTool(),
+		tool.NewWritePlanTool(norm),
 	}
 	braveKey := os.Getenv("BRAVE_API_KEY")
 	if braveKey == "" {
@@ -79,30 +89,41 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, default
 		return nil, fmt.Errorf("usage store: %w", err)
 	}
 
-	registry := agent.NewRegistry(defaultProvider, defaultProviderName, tools, permEngine, snapStore, sessStore, ctxMgr, usageStore)
+	registry := agent.NewRegistry(defaultProvider, defaultProviderName, tools, permEngine, snapStore, sessStore, ctxMgr, usageStore, projSettings.WebToolsEnabled)
 	registry.SetMaxSessionSpendUSD(maxSessionSpendUSD)
 
 	return &ProjectContext{
-		Root:        norm.ProjectRoot,
-		SnapStore:   snapStore,
-		SessStore:   sessStore,
-		Registry:    registry,
-		SandboxTier: string(sb.Mode()),
+		Root:          norm.ProjectRoot,
+		SnapStore:     snapStore,
+		SessStore:     sessStore,
+		Registry:      registry,
+		SandboxTier:   string(sb.Mode()),
+		SettingsStore: settingsStore,
 	}, nil
 }
 
 // toHistoryMessages converts a session's stored agent.Message history into
 // the wire shape for get_session_history's response. agent.Message can't be
 // used directly on the wire since internal/protocol can't import
-// internal/agent (agent already imports protocol).
-func toHistoryMessages(history []agent.Message) []protocol.HistoryMessage {
+// internal/agent (agent already imports protocol). branches is the same
+// session's stashed alternates (SessionState.Branches, possibly nil) — used
+// to compute each message's AlternateIDs at read time rather than storing a
+// second, derivable copy of that on agent.Message itself (nothing to drift
+// out of sync with Branches that way).
+func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Message) []protocol.HistoryMessage {
 	out := make([]protocol.HistoryMessage, 0, len(history))
-	for _, m := range history {
+	for i, m := range history {
+		branchPoint := ""
+		if i > 0 {
+			branchPoint = history[i-1].ID
+		}
 		hm := protocol.HistoryMessage{
+			ID:           m.ID,
 			Role:         m.Role,
 			Content:      m.Content,
 			Reasoning:    m.Reasoning,
 			ToolCallID:   m.ToolCallID,
+			AlternateIDs: alternateIDs(branches[branchPoint]),
 			Author:       m.AuthorName,
 			AuthorAvatar: m.AuthorAvatar,
 			Provider:     m.Provider,
@@ -123,6 +144,22 @@ func toHistoryMessages(history []agent.Message) []protocol.HistoryMessage {
 	return out
 }
 
+// alternateIDs returns the head-message ID of each stashed alternate at one
+// branch point — the other versions a client can switch_branch to. nil (and
+// so omitted on the wire) when there are none.
+func alternateIDs(alts [][]agent.Message) []string {
+	if len(alts) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(alts))
+	for _, alt := range alts {
+		if len(alt) > 0 {
+			ids = append(ids, alt[0].ID)
+		}
+	}
+	return ids
+}
+
 // sessionSummaryFrom builds the wire summary shared by session_list and
 // session_updated from a persisted session's state.
 func sessionSummaryFrom(state *agent.SessionState) protocol.SessionSummary {
@@ -133,6 +170,7 @@ func sessionSummaryFrom(state *agent.SessionState) protocol.SessionSummary {
 		Title:           state.Title,
 		Archived:        state.Archived,
 		LinkedSessionID: state.LinkedSessionID,
+		Mode:            state.Mode,
 	}
 }
 

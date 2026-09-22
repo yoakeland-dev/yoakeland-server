@@ -27,7 +27,7 @@ func TestAnthropicProvider_SetModelOptions_SetsThinkingBudget(t *testing.T) {
 	p.BaseURL = srv.URL
 	p.SetModelOptions(agent.ModelOptions{ThinkingBudget: 4096})
 
-	cChan, eChan := p.StreamTurn(context.Background(), nil, nil)
+	cChan, eChan := p.StreamTurn(context.Background(), nil, nil, "")
 	for range cChan {
 	}
 	if err := <-eChan; err != nil {
@@ -58,7 +58,7 @@ func TestOpenAICompatibleProvider_SetModelOptions_SetsReasoningEffort(t *testing
 	p.BaseURL = srv.URL
 	p.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high"})
 
-	cChan, eChan := p.StreamTurn(context.Background(), nil, nil)
+	cChan, eChan := p.StreamTurn(context.Background(), nil, nil, "")
 	for range cChan {
 	}
 	if err := <-eChan; err != nil {
@@ -87,7 +87,7 @@ func TestOpenAICompatibleProvider_DefaultsMaxTokens(t *testing.T) {
 	p := provider.NewOpenAI("test-key", "deepseek-reasoner")
 	p.BaseURL = srv.URL
 
-	cChan, eChan := p.StreamTurn(context.Background(), nil, nil)
+	cChan, eChan := p.StreamTurn(context.Background(), nil, nil, "")
 	for range cChan {
 	}
 	if err := <-eChan; err != nil {
@@ -121,7 +121,7 @@ func TestOpenAICompatibleProvider_OmitsMaxTokensForRealOpenAI(t *testing.T) {
 	// on — a RoundTripper swap is the only way to do that.
 	p.Client.Transport = redirectTransport{to: srv.URL}
 
-	cChan, eChan := p.StreamTurn(context.Background(), nil, nil)
+	cChan, eChan := p.StreamTurn(context.Background(), nil, nil, "")
 	for range cChan {
 	}
 	if err := <-eChan; err != nil {
@@ -170,7 +170,7 @@ func TestAnthropicProvider_CapturesThinkingDelta(t *testing.T) {
 	p := provider.NewAnthropic("test-key", "claude-3-5-sonnet-20241022")
 	p.BaseURL = srv.URL
 
-	cChan, eChan := p.StreamTurn(context.Background(), nil, nil)
+	cChan, eChan := p.StreamTurn(context.Background(), nil, nil, "")
 	var reasoning, text string
 	for c := range cChan {
 		switch c.Kind {
@@ -208,7 +208,7 @@ func TestOpenAICompatibleProvider_CapturesReasoningContent(t *testing.T) {
 	p := provider.NewOpenAI("test-key", "deepseek-reasoner")
 	p.BaseURL = srv.URL
 
-	cChan, eChan := p.StreamTurn(context.Background(), nil, nil)
+	cChan, eChan := p.StreamTurn(context.Background(), nil, nil, "")
 	var reasoning, text string
 	for c := range cChan {
 		switch c.Kind {

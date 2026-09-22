@@ -12,7 +12,7 @@ import (
 
 func drainStreamTurn(t *testing.T, p *provider.CLISubprocessProvider) ([]agent.ModelStreamChunk, error) {
 	t.Helper()
-	chunks, errs := p.StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil)
+	chunks, errs := p.StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
 
 	var got []agent.ModelStreamChunk
 	for {

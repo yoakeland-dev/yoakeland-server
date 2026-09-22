@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ import (
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
+	"yoakeland/internal/settings"
 	"yoakeland/internal/sockpath"
 	"yoakeland/internal/tlsca"
 )
@@ -52,7 +54,7 @@ func main() {
 	var masterKey string
 	var stdioMode bool
 
-	flag.StringVar(&projectDir, "project", ".", "Default project root — pre-opened at startup and used as the fallback project for sessions/requests that don't specify their own projectPath. Additional projects can be opened on demand via open_project/user_prompt.")
+	flag.StringVar(&projectDir, "project", "", "Default project root — pre-opened at startup and used as the fallback project for sessions/requests that don't specify their own projectPath. Unset by default: a server launched with no -project has no fallback and every request must give its own projectPath. Additional projects can be opened on demand via open_project/user_prompt.")
 	flag.StringVar(&stateDir, "state-dir", sockpath.DefaultStateDir(), "Directory for server-level state that isn't tied to any one project: providers.json, and the fallback unix socket path. Defaults to ~/.yoake (Linux), ~/Library/Application Support/yoake (macOS), or %AppData%\\yoake (Windows).")
 	flag.StringVar(&providerName, "provider", "auto", "Provider: 'anthropic', 'openai', 'openrouter', or 'auto'")
 	flag.StringVar(&modelName, "model", "", "Model name (defaults: claude-3-5-sonnet-20241022, gpt-4o, etc.)")
@@ -104,9 +106,14 @@ func main() {
 
 	// Projects (sandbox boundary, permissions, snapshots, sessions) are
 	// opened on demand and cached here — a single server process can serve
-	// many of them at once, each fully isolated from the others. -project is
-	// pre-opened eagerly so it fails fast on a bad path, and doubles as the
-	// fallback project for anything that doesn't specify its own.
+	// many of them at once, each fully isolated from the others. If -project
+	// is given, it's pre-opened eagerly so it fails fast on a bad path, and
+	// doubles as the fallback project for anything that doesn't specify its
+	// own. Left unset (the default), no project is opened at startup and no
+	// implicit fallback exists — a GUI client that never passes -project
+	// (yoake-gui doesn't; projects are opened on demand over the wire, §4b)
+	// must not have its own launch cwd silently adopted and persisted into
+	// projects.json as a "known project".
 	// providerName here is the -provider flag value ("auto", "anthropic",
 	// ...), not a providerStore-registered name — this is the fallback
 	// path for a session that never called set_provider, so there's no
@@ -116,9 +123,13 @@ func main() {
 	if err != nil {
 		logFatal("failed to open project list store: %v", err)
 	}
-	defaultProject, err := projects.Get(projectDir)
-	if err != nil {
-		logFatal("failed to open default project %q: %v", projectDir, err)
+	var defaultProjectRoot string
+	if projectDir != "" {
+		defaultProject, err := projects.Get(projectDir)
+		if err != nil {
+			logFatal("failed to open default project %q: %v", projectDir, err)
+		}
+		defaultProjectRoot = defaultProject.Root
 	}
 
 	// Providers/credentials belong to whoever is running the server, not to
@@ -165,7 +176,7 @@ func main() {
 	rc := &remoteControl{tlsCert: tlsCert, tlsKey: tlsKey, stateDir: stateDir, settings: settings}
 	deps := connDeps{
 		projects:           projects,
-		defaultProjectRoot: defaultProject.Root,
+		defaultProjectRoot: defaultProjectRoot,
 		providerStore:      providerStore,
 		oauthStore:         oauthStore,
 		manifestCache:      manifestCache,
@@ -655,8 +666,20 @@ func serveConnection(ctx context.Context, ipc *protocol.IPCStream, deps connDeps
 		if onActivity != nil {
 			onActivity()
 		}
-		handleEnvelope(ctx, ipc, deps, network, peerID, env)
+		dispatchEnvelope(ctx, ipc, deps, network, peerID, env)
 	}
+}
+
+// dispatchEnvelope runs handleEnvelope with panic recovery: every other
+// request/response event (set_session_title, delete_session, ...) is
+// handled synchronously right here, on this connection's own goroutine, so
+// an unrecovered panic anywhere in there would previously take the whole
+// process down — every other session's connection with it — same failure
+// mode recoverTurnPanic closes for the async turn goroutines, and reused
+// here rather than duplicated.
+func dispatchEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
+	defer recoverTurnPanic(ipc, env.SessionID, env.TurnID)
+	handleEnvelope(ctx, ipc, deps, network, peerID, env)
 }
 
 // sessionWriteError renders a session-store failure for the client, keeping the
@@ -667,6 +690,50 @@ func sessionWriteError(sessionID, verb string, err error) string {
 		return fmt.Sprintf("session %s not found", sessionID)
 	}
 	return fmt.Sprintf("failed to %s session: %v", verb, err)
+}
+
+// resolveAuthor determines who to attribute a new user message (and any git
+// commits its tool calls make) to, in priority order. A token-backed
+// identity is a real credential, so it wins over anything the client says
+// about itself (SPEC.md §2a). Failing that, a client may self-report via
+// authorName/authorAvatar — the local unix socket has no credential to
+// attribute to (file permissions are its boundary), so this is the only way
+// a message from it is ever attributed, and without it the transcript has no
+// sender to render. A client (or event, like retry_message, which carries
+// neither field) that declares nothing is stored unattributed rather than
+// rejected. Shared by user_prompt, edit_message, and retry_message.
+func resolveAuthor(deps connDeps, peerID, authorName, authorAvatar string) agent.Author {
+	if p, ok := deps.peers.Get(peerID); ok && p.TokenName != "" {
+		return agent.Author{Name: p.Name, Email: p.Email}
+	}
+	if authorName != "" || authorAvatar != "" {
+		avatar := authorAvatar
+		// Cosmetic, so an oversized one is dropped rather than failing the
+		// prompt — same rule the peer registry applies to `auth` (§2a). It's
+		// stored per message, so a huge data URL would also be duplicated
+		// across a whole session file.
+		if len(avatar) > maxAvatarLen {
+			avatar = ""
+		}
+		return agent.Author{Name: authorName, Avatar: avatar}
+	}
+	return agent.Author{}
+}
+
+// recoverTurnPanic catches a panic from a turn goroutine (user_prompt/
+// edit_message/retry_message all run one) and reports it as an ordinary
+// turn error instead of letting it crash the whole process — every other
+// session on this server dies with it otherwise, which is what turned a
+// single bad turn into "chat deletion sometimes fails, restart fixes it":
+// there was no server left to answer the delete. Deferred first thing in
+// each such goroutine, after any turnWG.Done() defer so that still runs.
+func recoverTurnPanic(ipc *protocol.IPCStream, sessionID, turnID string) {
+	if r := recover(); r != nil {
+		logError("turn %s (session %s) panicked: %v\n%s", turnID, sessionID, r, debug.Stack())
+		_ = ipc.SendEvent(protocol.EventError, sessionID, turnID, "", protocol.ErrorData{
+			Message: fmt.Sprintf("internal error: %v", r),
+		})
+	}
 }
 
 // handleEnvelope dispatches one already-read envelope. Split out of
@@ -712,30 +779,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
-		// Attribution, in priority order. A token-backed identity is a real
-		// credential, so it wins over anything the client says about itself
-		// (SPEC.md §2a) and is also what git commits are attributed to. Failing
-		// that, a client may declare who it is on the prompt itself
-		// (authorName/authorAvatar) — the local unix socket has no credential to
-		// attribute to (file permissions are its boundary), so this is the only
-		// way a message from it is ever attributed, and without it the transcript
-		// has no sender to render. A client that declares nothing (the older
-		// behavior, and any third-party client that doesn't care) is stored
-		// unattributed rather than rejected.
-		var author agent.Author
-		if p, ok := deps.peers.Get(peerID); ok && p.TokenName != "" {
-			author = agent.Author{Name: p.Name, Email: p.Email}
-		} else if data.AuthorName != "" || data.AuthorAvatar != "" {
-			avatar := data.AuthorAvatar
-			// Cosmetic, so an oversized one is dropped rather than failing the
-			// prompt — same rule the peer registry applies to `auth` (§2a). It's
-			// stored per message, so a huge data URL would also be duplicated
-			// across a whole session file.
-			if len(avatar) > maxAvatarLen {
-				avatar = ""
-			}
-			author = agent.Author{Name: data.AuthorName, Avatar: avatar}
-		}
+		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
 		turnCtx := agent.WithAuthor(ctx, author)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
 		if data.AutoGenerateTitle != nil {
@@ -745,6 +789,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if deps.turnWG != nil {
 				defer deps.turnWG.Done()
 			}
+			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RunTurnWithTitleGeneration(turnCtx, sID, tID, prompt, autoGenerateTitle); err != nil {
 				logError("turn %s (session %s) failed: %v", tID, sID, err)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
@@ -781,9 +826,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 					Message: fmt.Sprintf("failed to restore snapshot %s: %v", data.SnapshotID, rErr),
 				})
 			} else {
-				_ = ipc.SendEvent(protocol.EventSnapshotRestored, env.SessionID, env.TurnID, "", protocol.SnapshotEventData{
-					SnapshotID: data.SnapshotID,
-				})
+				restored := protocol.SnapshotEventData{SnapshotID: data.SnapshotID}
+				_ = ipc.SendEvent(protocol.EventSnapshotRestored, env.SessionID, env.TurnID, "", restored)
+				// This reverted real files on disk — every other peer with
+				// this session open needs to know its file view just went
+				// stale, not just the connection that asked for the revert.
+				deps.peers.BroadcastEvent(peerID, protocol.EventSnapshotRestored, env.SessionID, restored)
 			}
 		}
 
@@ -830,9 +878,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", protocol.ProviderRegisteredData{
-			Name: cfg.Name,
-		})
+		registered := protocol.ProviderRegisteredData{Name: cfg.Name}
+		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", registered)
+		// Server-wide state (§6b/§6c) — every peer's provider list needs it,
+		// not just this connection's.
+		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRegistered, "", registered)
 
 	case protocol.EventListProviders:
 		var summaries []protocol.ProviderSummary
@@ -898,10 +948,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventFavoriteModelsSet, env.SessionID, env.TurnID, "", protocol.FavoriteModelsSetData{
+		favoritesSet := protocol.FavoriteModelsSetData{
 			ProviderName: data.ProviderName,
 			Models:       data.Models,
-		})
+		}
+		_ = ipc.SendEvent(protocol.EventFavoriteModelsSet, env.SessionID, env.TurnID, "", favoritesSet)
+		deps.peers.BroadcastEvent(peerID, protocol.EventFavoriteModelsSet, "", favoritesSet)
 
 	case protocol.EventSetProvider:
 		var data protocol.SetProviderData
@@ -940,11 +992,13 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		pc.Registry.Get(ipc, sessID).SetProvider(built, data.ProviderName)
-		_ = ipc.SendEvent(protocol.EventProviderSet, sessID, env.TurnID, "", protocol.ProviderSetData{
+		providerSet := protocol.ProviderSetData{
 			SessionID:    sessID,
 			ProviderName: data.ProviderName,
 			Model:        data.Model,
-		})
+		}
+		_ = ipc.SendEvent(protocol.EventProviderSet, sessID, env.TurnID, "", providerSet)
+		deps.peers.BroadcastEvent(peerID, protocol.EventProviderSet, sessID, providerSet)
 
 	case protocol.EventSetModelOptions:
 		var data protocol.SetModelOptionsData
@@ -970,18 +1024,29 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			ReasoningEffort: data.ReasoningEffort,
 			ThinkingBudget:  data.ThinkingBudget,
 		}, data.ContextWindow)
-		_ = ipc.SendEvent(protocol.EventModelOptionsSet, sessID, env.TurnID, "", protocol.ModelOptionsSetData{
+		modelOptsSet := protocol.ModelOptionsSetData{
 			SessionID:       sessID,
 			ReasoningEffort: data.ReasoningEffort,
 			ThinkingBudget:  data.ThinkingBudget,
 			ContextWindow:   data.ContextWindow,
-		})
+		}
+		_ = ipc.SendEvent(protocol.EventModelOptionsSet, sessID, env.TurnID, "", modelOptsSet)
+		deps.peers.BroadcastEvent(peerID, protocol.EventModelOptionsSet, sessID, modelOptsSet)
 
-	case protocol.EventSetPlanMode:
-		var data protocol.SetPlanModeData
+	case protocol.EventSetMode:
+		var data protocol.SetModeData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed set_plan_mode payload",
+				Message: "malformed set_mode payload",
+			})
+			return
+		}
+		mode := agent.Mode(data.Mode)
+		switch mode {
+		case agent.ModeReadOnly, agent.ModeReadWrite, agent.ModeAutonomous, agent.ModePlan:
+		default:
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("unknown mode %q", data.Mode),
 			})
 			return
 		}
@@ -997,11 +1062,61 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
-		pc.Registry.Get(ipc, sessID).SetPlanMode(data.Enabled)
-		_ = ipc.SendEvent(protocol.EventPlanModeSet, sessID, env.TurnID, "", protocol.PlanModeSetData{
+		pc.Registry.Get(ipc, sessID).SetMode(mode)
+		modeSet := protocol.ModeSetData{
 			SessionID: sessID,
-			Enabled:   data.Enabled,
-		})
+			Mode:      string(mode),
+		}
+		_ = ipc.SendEvent(protocol.EventModeSet, sessID, env.TurnID, "", modeSet)
+		// Every other live peer with this session open must see the change
+		// too — not just the connection that sent set_mode. Same reasoning
+		// as session_updated/session_deleted below: several peers can have
+		// the same session open at once and must sync seamlessly.
+		deps.peers.BroadcastEvent(peerID, protocol.EventModeSet, sessID, modeSet)
+
+	case protocol.EventSetWebToolsEnabled:
+		var data protocol.SetWebToolsEnabledData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed set_web_tools_enabled payload",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(env.SessionID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		if sErr := pc.SettingsStore.Save(settings.ProjectSettings{Version: 1, WebToolsEnabled: data.Enabled}); sErr != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("saving settings: %v", sErr),
+			})
+			return
+		}
+		pc.Registry.SetWebToolsEnabled(data.Enabled)
+		webToolsSet := protocol.WebToolsEnabledSetData{
+			ProjectPath: data.ProjectPath,
+			Enabled:     data.Enabled,
+		}
+		_ = ipc.SendEvent(protocol.EventWebToolsEnabledSet, env.SessionID, env.TurnID, "", webToolsSet)
+		// Project-wide, not session-scoped — every peer that might have this
+		// project open anywhere needs to know, same as project_list below.
+		deps.peers.BroadcastEvent(peerID, protocol.EventWebToolsEnabledSet, "", webToolsSet)
+
+	case protocol.EventAskUserAnswer:
+		var data protocol.AskUserAnswerData
+		if err := json.Unmarshal(env.Data, &data); err == nil {
+			sessID := env.SessionID
+			if sessID == "" {
+				sessID = "default"
+			}
+			pc, err := deps.projects.Resolve(sessID, "", deps.defaultProjectRoot)
+			if err != nil {
+				_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+				return
+			}
+			pc.Registry.Get(ipc, sessID).HandleAskUserAnswer(env.ToolCallID, data.Answer)
+		}
 
 	case protocol.EventOAuthStart:
 		var data protocol.OAuthStartData
@@ -1058,9 +1173,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", protocol.ProviderRegisteredData{
-			Name: cfg.Name,
-		})
+		oauthRegistered := protocol.ProviderRegisteredData{Name: cfg.Name}
+		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", oauthRegistered)
+		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRegistered, "", oauthRegistered)
 
 	case protocol.EventRemoveProvider:
 		var data protocol.RemoveProviderData
@@ -1076,9 +1191,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventProviderRemoved, env.SessionID, env.TurnID, "", protocol.ProviderRemovedData{
-			Name: data.Name,
-		})
+		removed := protocol.ProviderRemovedData{Name: data.Name}
+		_ = ipc.SendEvent(protocol.EventProviderRemoved, env.SessionID, env.TurnID, "", removed)
+		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRemoved, "", removed)
 
 	case protocol.EventListSessions:
 		var data protocol.ListSessionsData
@@ -1141,12 +1256,115 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		state, err := pc.SessStore.Load(data.SessionID)
 		var history []agent.Message
+		var branches map[string][][]agent.Message
+		var mode string
 		if err == nil {
 			history = state.History
+			branches = state.Branches
+			mode = state.Mode
 		} // a session with no persisted history yet isn't an error — it just has none
 		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
 			SessionID: data.SessionID,
-			Messages:  toHistoryMessages(history),
+			Messages:  toHistoryMessages(history, branches),
+			Mode:      mode,
+		})
+
+	case protocol.EventEditMessage:
+		var data protocol.EditMessageData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" || data.MessageID == "" || data.Content == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed edit_message payload (sessionId, messageId, and content are required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, "", deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		ag := pc.Registry.Get(ipc, data.SessionID)
+		author := resolveAuthor(deps, peerID, "", "")
+		turnCtx := agent.WithAuthor(ctx, author)
+		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
+		if data.AutoGenerateTitle != nil {
+			autoGenerateTitle = *data.AutoGenerateTitle
+		}
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func(sID, tID, msgID, content string, autoGenerateTitle bool) {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			defer recoverTurnPanic(ipc, sID, tID)
+			if err := ag.EditMessage(turnCtx, sID, tID, msgID, content, autoGenerateTitle); err != nil {
+				logError("edit_message turn %s (session %s): %v", tID, sID, err)
+				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
+					Message: err.Error(),
+				})
+			}
+		}(data.SessionID, env.TurnID, data.MessageID, data.Content, autoGenerateTitle)
+
+	case protocol.EventRetryMessage:
+		var data protocol.RetryMessageData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" || data.MessageID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed retry_message payload (sessionId and messageId are required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, "", deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		ag := pc.Registry.Get(ipc, data.SessionID)
+		author := resolveAuthor(deps, peerID, "", "")
+		turnCtx := agent.WithAuthor(ctx, author)
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func(sID, tID, msgID string) {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			defer recoverTurnPanic(ipc, sID, tID)
+			if err := ag.RetryMessage(turnCtx, sID, tID, msgID); err != nil {
+				logError("retry_message turn %s (session %s): %v", tID, sID, err)
+				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
+					Message: err.Error(),
+				})
+			}
+		}(data.SessionID, env.TurnID, data.MessageID)
+
+	case protocol.EventSwitchBranch:
+		var data protocol.SwitchBranchData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" || data.MessageID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed switch_branch payload (sessionId and messageId are required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, "", deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		ag := pc.Registry.Get(ipc, data.SessionID)
+		if err := ag.SwitchBranch(data.SessionID, data.MessageID); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		state, err := pc.SessStore.Load(data.SessionID)
+		var history []agent.Message
+		var branches map[string][][]agent.Message
+		if err == nil {
+			history = state.History
+			branches = state.Branches
+		}
+		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
+			SessionID: data.SessionID,
+			Messages:  toHistoryMessages(history, branches),
 		})
 
 	case protocol.EventSetSessionTitle:
@@ -1171,6 +1389,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(state))
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(state))
 
 	case protocol.EventSetSessionArchived:
 		var data protocol.SetSessionArchivedData
@@ -1200,6 +1419,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(state))
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(state))
 
 	case protocol.EventSetSessionLayout:
 		var data protocol.SetSessionLayoutData
@@ -1223,6 +1443,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(state))
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(state))
 
 	case protocol.EventDeleteSession:
 		var data protocol.DeleteSessionData
@@ -1246,6 +1467,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		deps.projects.Unbind(data.SessionID)
 		_ = ipc.SendEvent(protocol.EventSessionDeleted, data.SessionID, env.TurnID, "", protocol.SessionDeletedData{
+			SessionID: data.SessionID,
+		})
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionDeleted, data.SessionID, protocol.SessionDeletedData{
 			SessionID: data.SessionID,
 		})
 
@@ -1367,6 +1591,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Path:        pc.Root,
 			SandboxTier: pc.SandboxTier,
 		})
+		deps.peers.BroadcastEvent(peerID, protocol.EventProjectList, "", protocol.ProjectListData{
+			Paths: deps.projects.List(),
+		})
 
 	case protocol.EventListProjects:
 		_ = ipc.SendEvent(protocol.EventProjectList, env.SessionID, env.TurnID, "", protocol.ProjectListData{
@@ -1395,6 +1622,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		_ = ipc.SendEvent(protocol.EventProjectRemoved, env.SessionID, env.TurnID, "", protocol.ProjectRemovedData{
+			Path: key,
+		})
+		deps.peers.BroadcastEvent(peerID, protocol.EventProjectRemoved, "", protocol.ProjectRemovedData{
 			Path: key,
 		})
 

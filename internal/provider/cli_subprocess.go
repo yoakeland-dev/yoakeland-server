@@ -70,6 +70,10 @@ func runCommand(ctx context.Context, name string, args []string, dir string) ([]
 // partial-message JSON stream (e.g. `claude --output-format stream-json`)
 // wired through; that's unverified surface area, not implemented here — see
 // SPEC.md §6b.
+//
+// systemPrompt (mode-selected by Agent, see agent.activeSystemPrompt) is
+// accepted but ignored here: the CLI subprocess owns its own baked-in
+// system prompt end-to-end, this process has no hook to override it.
 type CLISubprocessProvider struct {
 	Kind  CLIKind
 	Model string
@@ -86,7 +90,7 @@ func (p *CLISubprocessProvider) run() commandRunner {
 	return runCommand
 }
 
-func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, history []agent.Message, _ []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, history []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 2)
 	eChan := make(chan error, 1)
 

@@ -22,6 +22,28 @@ type SessionState struct {
 	// layout (e.g. "session-main" paired with "session-scratch"). Purely a
 	// client layout hint — the backend never reads or acts on it.
 	LinkedSessionID *string `json:"linkedSessionId,omitempty"`
+
+	// Mode mirrors the live Agent's current Mode (empty means the default,
+	// ModeReadWrite). Persisted — unlike the in-memory-only Agent.mode this
+	// backs — specifically so a peer connecting or reconnecting after
+	// another peer already changed it (get_session_history, §3.1) reads the
+	// true current value from disk instead of a stale client-side guess.
+	// Kept in sync with the live Agent by SetMode itself (agent.go).
+	Mode string `json:"mode,omitempty"`
+
+	// Branches holds every suffix that used to be active in History but got
+	// swapped out by an edit_message/retry_message, keyed by the ID of the
+	// message immediately before the branch point ("" for the start of the
+	// session). Never pruned — an edit or retry only ever stashes here, it
+	// never deletes, so a branch that already cost real money to generate is
+	// always recoverable via switch_branch. See agent.go's Branches doc.
+	Branches map[string][][]Message `json:"branches,omitempty"`
+
+	// NextMsgSeq is the counter behind every Message.ID minted for this
+	// session ("m1", "m2", ...). Persisted explicitly rather than derived
+	// from len(History) because Branches also consumes IDs that may no
+	// longer appear in History at all.
+	NextMsgSeq int `json:"nextMsgSeq,omitempty"`
 }
 
 type SessionStore interface {

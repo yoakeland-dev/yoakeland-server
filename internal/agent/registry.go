@@ -24,6 +24,7 @@ type Registry struct {
 	usageStore    *UsageStore
 
 	maxSessionSpendUSD float64
+	webToolsEnabled    bool
 }
 
 func NewRegistry(
@@ -35,17 +36,19 @@ func NewRegistry(
 	sessionStore SessionStore,
 	ctxMgr *ContextManager,
 	usageStore *UsageStore,
+	webToolsEnabled bool,
 ) *Registry {
 	return &Registry{
-		sessions:      make(map[string]*Agent),
-		provider:      provider,
-		providerName:  providerName,
-		tools:         tools,
-		permEngine:    permEngine,
-		snapshotStore: snapshotStore,
-		sessionStore:  sessionStore,
-		ctxMgr:        ctxMgr,
-		usageStore:    usageStore,
+		sessions:        make(map[string]*Agent),
+		provider:        provider,
+		providerName:    providerName,
+		tools:           tools,
+		permEngine:      permEngine,
+		snapshotStore:   snapshotStore,
+		sessionStore:    sessionStore,
+		ctxMgr:          ctxMgr,
+		usageStore:      usageStore,
+		webToolsEnabled: webToolsEnabled,
 	}
 }
 
@@ -58,13 +61,33 @@ func (r *Registry) SetMaxSessionSpendUSD(limit float64) {
 	r.maxSessionSpendUSD = limit
 }
 
+// SetWebToolsEnabled applies the project-wide web_search/web_fetch toggle
+// (persisted in .yoake/settings.json, see cmd/yoakeland's set_web_tools_enabled
+// handler) to every session created from here on, AND to every session
+// already live — unlike SetMaxSessionSpendUSD, this is a live per-project
+// setting a client can flip mid-session, not just a construction-time
+// default.
+func (r *Registry) SetWebToolsEnabled(enabled bool) {
+	r.mu.Lock()
+	r.webToolsEnabled = enabled
+	agents := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		agents = append(agents, ag)
+	}
+	r.mu.Unlock()
+
+	for _, ag := range agents {
+		ag.SetWebToolsEnabled(enabled)
+	}
+}
+
 // Get returns the Agent for sessionID, creating and loading it on first use.
 func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if ag, ok := r.sessions[sessionID]; ok {
-		ag.SetStream(stream) // rebind to latest connection (last writer wins on reconnect)
+		ag.SetStream(stream) // subscribe this connection too — see Agent.SetStream
 		return ag
 	}
 
@@ -78,6 +101,7 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 		MaxToolOutputTokens: r.ctxMgr.MaxToolOutputTokens,
 	}, r.usageStore)
 	ag.SetMaxSessionSpendUSD(r.maxSessionSpendUSD)
+	ag.SetWebToolsEnabled(r.webToolsEnabled)
 	_ = ag.LoadSession(sessionID)
 	r.sessions[sessionID] = ag
 	return ag

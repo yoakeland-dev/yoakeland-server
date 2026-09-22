@@ -66,7 +66,7 @@ func TestAnthropicProvider_StreamTurn_ReportsMaxTokensAsLength(t *testing.T) {
 	p := provider.NewAnthropic("test-key", "claude-sonnet-5")
 	p.BaseURL = srv.URL
 
-	chunks, errs := p.StreamTurn(context.Background(), nil, nil)
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
 	got, _ := drainStream(t, chunks, errs, false)
 
 	var finishReason string
@@ -97,7 +97,7 @@ func TestAnthropicProvider_StreamTurn_SurfacesMidStreamError(t *testing.T) {
 	p := provider.NewAnthropic("test-key", "claude-sonnet-5")
 	p.BaseURL = srv.URL
 
-	chunks, errs := p.StreamTurn(context.Background(), nil, nil)
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
 	_, streamErr := drainStream(t, chunks, errs, true)
 
 	if !strings.Contains(streamErr.Error(), "overloaded_error") {
@@ -121,7 +121,7 @@ func TestOpenAICompatibleProvider_StreamTurn_ReportsLengthFinish(t *testing.T) {
 	p := provider.NewOpenAI("test-key", "gpt-4o")
 	p.BaseURL = srv.URL
 
-	chunks, errs := p.StreamTurn(context.Background(), nil, nil)
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
 	got, _ := drainStream(t, chunks, errs, false)
 
 	var finishReason string

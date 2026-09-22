@@ -81,3 +81,50 @@ func TestAgent_MaxSessionSpendUSD_Unlimited(t *testing.T) {
 		t.Fatalf("expected an unconfigured cap to never block a turn: %v", err)
 	}
 }
+
+// TestAgent_MaxSessionSpendUSD_AppliesToEditAndRetry guards that
+// EditMessage/RetryMessage go through the same beginTurn budget check
+// RunTurn does — an edit or a retry is just as billed as an ordinary turn,
+// so the cap must refuse it identically once a session is already over.
+func TestAgent_MaxSessionSpendUSD_AppliesToEditAndRetry(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20)
+	usageStore, err := agent.NewUsageStore(tempDir)
+	if err != nil {
+		t.Fatalf("NewUsageStore: %v", err)
+	}
+
+	provider := &ScriptedProvider{
+		turns: [][]agent.ModelStreamChunk{{
+			{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{InputTokens: 1_000_000, OutputTokens: 1_000_000}},
+			{Kind: agent.StreamChunkDelta, Delta: "expensive turn"},
+		}},
+	}
+
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, provider, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	ag.SetMaxSessionSpendUSD(1.0)
+
+	if err := ag.RunTurn(context.Background(), "session-budget-2", "turn-1", "do something expensive"); err != nil {
+		t.Fatalf("first turn should be allowed to run: %v", err)
+	}
+
+	state, err := sessStore.Load("session-budget-2")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	userID := state.History[0].ID
+	assistantID := state.History[1].ID
+
+	if err := ag.EditMessage(context.Background(), "session-budget-2", "turn-2", userID, "do it differently", false); err == nil {
+		t.Fatal("expected EditMessage to be refused once the session is over its spend cap")
+	}
+	if err := ag.RetryMessage(context.Background(), "session-budget-2", "turn-3", assistantID); err == nil {
+		t.Fatal("expected RetryMessage to be refused once the session is over its spend cap")
+	}
+}

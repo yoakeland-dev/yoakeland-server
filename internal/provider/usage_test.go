@@ -27,7 +27,7 @@ func TestAnthropicProvider_StreamTurn_EmitsUsage(t *testing.T) {
 	p := provider.NewAnthropic("test-key", "claude-3-5-sonnet-20241022")
 	p.BaseURL = srv.URL
 
-	chunks, errs := p.StreamTurn(context.Background(), nil, nil)
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
 
 	var gotUsage *agent.ModelStreamChunk
 	for chunks != nil || errs != nil {
@@ -80,7 +80,7 @@ func TestOpenAICompatibleProvider_StreamTurn_EmitsUsage(t *testing.T) {
 	p := provider.NewOpenAI("test-key", "gpt-4o")
 	p.BaseURL = srv.URL
 
-	chunks, errs := p.StreamTurn(context.Background(), nil, nil)
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
 
 	var gotUsage *agent.ModelStreamChunk
 	for chunks != nil || errs != nil {

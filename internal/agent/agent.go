@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,11 @@ import (
 )
 
 type Message struct {
+	// ID addresses this message for edit_message/retry_message/switch_branch
+	// — minted once, at append time, from the session's own counter
+	// (nextMessageIDLocked). Empty only for a message persisted before this
+	// field existed; LoadSession migrates those in place on first load.
+	ID         string     `json:"id,omitempty"`
 	Role       string     `json:"role"`
 	Content    string     `json:"content,omitempty"`
 	Reasoning  string     `json:"reasoning,omitempty"` // assistant only: the model's own reasoning/chain-of-thought text, if the provider exposed one
@@ -89,6 +95,15 @@ func AuthorFromContext(ctx context.Context) Author {
 // was still finishing. Internal control flow, never surfaced to a client.
 var errSessionDiscarded = errors.New("session was deleted")
 
+// Sentinel errors for EditMessage/RetryMessage/SwitchBranch, matching
+// ErrSessionNotFound's pattern so a dispatcher can report a stable reason
+// without string-matching.
+var (
+	ErrMessageNotFound     = errors.New("message not found")
+	ErrMessageNotEditable  = errors.New("only a user message can be edited")
+	ErrMessageNotRetryable = errors.New("only an assistant message can be retried")
+)
+
 type ToolCall struct {
 	ID   string          `json:"id"`
 	Name string          `json:"name"`
@@ -127,7 +142,7 @@ type ModelStreamChunk struct {
 }
 
 type ModelProvider interface {
-	StreamTurn(ctx context.Context, history []Message, tools []tool.ToolDefinition) (<-chan ModelStreamChunk, <-chan error)
+	StreamTurn(ctx context.Context, history []Message, tools []tool.ToolDefinition, systemPrompt string) (<-chan ModelStreamChunk, <-chan error)
 }
 
 // TitleGenerator is implemented by providers that can make a separate,
@@ -153,24 +168,46 @@ type ModelOptionsSetter interface {
 	SetModelOptions(ModelOptions)
 }
 
-// planModeReadOnlyTools is the allowlist of tools available while a session
-// is in plan mode. Deliberately an allowlist, not a denylist, so a new
-// mutating tool added later is excluded by default instead of accidentally
-// exposed. See SPEC.md §4c: the model isn't given the write/bash tool
-// definitions at all in plan mode, rather than being given them and denied
-// at call time — it can't attempt a mutation there's nothing to intercept.
-var planModeReadOnlyTools = map[string]bool{
-	"file_read": true,
+// Mode selects which tools the model is even given (SPEC.md §4c) and, for
+// bash specifically, whether the permission engine's normal decision is
+// overridden. Four values, no bool — see SPEC.md §4c for the tier
+// descriptions.
+type Mode string
+
+const (
+	ModeReadOnly   Mode = "read_only"
+	ModeReadWrite  Mode = "read_write"
+	ModeAutonomous Mode = "autonomous"
+	ModePlan       Mode = "plan"
+)
+
+// readOnlyTools is the allowlist of tools available in ModeReadOnly and
+// ModePlan. Deliberately an allowlist, not a denylist, so a new mutating
+// tool added later is excluded by default instead of accidentally exposed.
+// See SPEC.md §4c: the model isn't given the write/bash tool definitions at
+// all, rather than being given them and denied at call time — it can't
+// attempt a mutation there's nothing to intercept.
+var readOnlyTools = map[string]bool{
+	"file_read":         true,
+	"ask_user_question": true,
+}
+
+// planExtraTools is unioned into readOnlyTools for ModePlan only — its own
+// designated output channel, not available in ModeReadOnly.
+var planExtraTools = map[string]bool{
+	"write_plan": true,
 }
 
 type Agent struct {
-	stream           *protocol.IPCStream
+	stream           *protocol.StreamSet
 	provider         ModelProvider
 	providerName     string // registered name of `provider` (SPEC.md §3.1 set_provider) — stamped onto each assistant Message, not just kept for internal use
 	tools            map[string]tool.Tool
 	toolDefs         []tool.ToolDefinition
 	toolDefsReadOnly []tool.ToolDefinition
-	planMode         bool
+	toolDefsPlan     []tool.ToolDefinition
+	mode             Mode
+	webToolsEnabled  bool
 	permEngine       *permission.Engine
 	snapshotStore    snapshot.SnapshotStore
 	sessionStore     SessionStore
@@ -181,9 +218,12 @@ type Agent struct {
 
 	sessionID         string
 	history           []Message
+	branches          map[string][][]Message // see SessionState.Branches
+	nextMsgSeq        int                    // see SessionState.NextMsgSeq
 	mu                sync.Mutex
 	permRequests      map[string]chan permDecision
 	permRequestKeys   map[string]string
+	askUserRequests   map[string]chan string
 	activeTurnCancels map[string]context.CancelFunc
 
 	// discarded marks the session this Agent serves as deleted (see Discard):
@@ -215,33 +255,45 @@ func NewAgent(
 	toolMap := make(map[string]tool.Tool)
 	var toolDefs []tool.ToolDefinition
 	var toolDefsReadOnly []tool.ToolDefinition
+	var toolDefsPlan []tool.ToolDefinition
 	for _, t := range tools {
 		toolMap[t.Name()] = t
 		def := t.Definition()
 		toolDefs = append(toolDefs, def)
-		if planModeReadOnlyTools[t.Name()] {
+		if readOnlyTools[t.Name()] {
 			toolDefsReadOnly = append(toolDefsReadOnly, def)
+			toolDefsPlan = append(toolDefsPlan, def)
+		} else if planExtraTools[t.Name()] {
+			toolDefsPlan = append(toolDefsPlan, def)
 		}
 	}
 	if ctxMgr == nil {
 		ctxMgr = NewContextManager(64000, 4000)
 	}
 
+	streams := protocol.NewStreamSet()
+	streams.Add(stream)
+
 	return &Agent{
-		stream:            stream,
+		stream:            streams,
 		provider:          provider,
 		providerName:      providerName,
 		tools:             toolMap,
 		toolDefs:          toolDefs,
 		toolDefsReadOnly:  toolDefsReadOnly,
+		toolDefsPlan:      toolDefsPlan,
+		mode:              ModeReadWrite,
+		webToolsEnabled:   true,
 		permEngine:        engine,
 		snapshotStore:     snapStore,
 		sessionStore:      sessStore,
 		contextManager:    ctxMgr,
 		usageStore:        usageStore,
 		history:           make([]Message, 0),
+		branches:          make(map[string][][]Message),
 		permRequests:      make(map[string]chan permDecision),
 		permRequestKeys:   make(map[string]string),
+		askUserRequests:   make(map[string]chan string),
 		activeTurnCancels: make(map[string]context.CancelFunc),
 	}
 }
@@ -258,12 +310,46 @@ func (a *Agent) LoadSession(sessionID string) error {
 	if err != nil {
 		a.sessionID = sessionID
 		a.history = make([]Message, 0)
+		a.branches = make(map[string][][]Message)
 		return nil
 	}
 
 	a.sessionID = state.SessionID
 	a.history = state.History
+	a.branches = state.Branches
+	if a.branches == nil {
+		a.branches = make(map[string][][]Message)
+	}
+	a.nextMsgSeq = state.NextMsgSeq
+	switch Mode(state.Mode) {
+	case ModeReadOnly, ModeReadWrite, ModeAutonomous, ModePlan:
+		a.mode = Mode(state.Mode)
+	default:
+		// Empty (never set) or from a session file older than this field —
+		// keep the constructor's default (ModeReadWrite) rather than an
+		// unrecognized/zero value.
+	}
+
+	// Migration: a session persisted before Message.ID existed has none —
+	// assign them now, once. Every message this Agent appends from here on
+	// gets an ID at append time (nextMessageIDLocked), so this never needs
+	// to run twice. Old sessions never have Branches, so there's nothing to
+	// migrate there.
+	for i := range a.history {
+		if a.history[i].ID == "" {
+			a.history[i].ID = a.nextMessageIDLocked()
+		}
+	}
 	return nil
+}
+
+// nextMessageIDLocked mints the next message ID for this session. Caller
+// must already hold a.mu (same convention as session.go's saveLocked/
+// loadLocked) — every append site (RunTurn's user message, the two
+// assistant-message appends, recordToolResult, EditMessage) already does.
+func (a *Agent) nextMessageIDLocked() string {
+	a.nextMsgSeq++
+	return fmt.Sprintf("m%d", a.nextMsgSeq)
 }
 
 func (a *Agent) CurrentSessionID() string {
@@ -272,28 +358,19 @@ func (a *Agent) CurrentSessionID() string {
 	return a.sessionID
 }
 
-// SetStream rebinds the agent to a new connection, e.g. when a client
-// reconnects to an already-running session from a different device. The
-// previously bound connection (if any and if different) is notified that it
-// lost the session, since otherwise it would sit waiting for events that
-// will now go to the new connection instead.
+// SetStream subscribes another connection to this session, e.g. a second
+// device/tab opening a chat that's already live elsewhere, or the same
+// session reached over a different transport (unix socket and TCP both
+// hitting this process). Every subscribed connection keeps receiving this
+// session's events — model_delta/tool_call_requested/permission_request/
+// tool_result/turn_completed, and session_updated/etc. — for as long as it
+// stays subscribed; nothing displaces an earlier one any more (see
+// protocol.StreamSet). Safe to call more than once with the same stream.
 func (a *Agent) SetStream(stream *protocol.IPCStream) {
-	a.mu.Lock()
-	old := a.stream
-	sessionID := a.sessionID
-	a.stream = stream
-	a.mu.Unlock()
-
-	if old != nil && old != stream {
-		_ = old.SendEvent(protocol.EventSessionTakenOver, sessionID, "", "", protocol.SessionTakenOverData{
-			SessionID: sessionID,
-		})
-	}
+	a.stream.Add(stream)
 }
 
-func (a *Agent) getStream() *protocol.IPCStream {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (a *Agent) getStream() *protocol.StreamSet {
 	return a.stream
 }
 
@@ -350,30 +427,124 @@ func (a *Agent) SetModelOptions(opts ModelOptions, contextWindow int) (didApplyP
 	return didApplyProviderOptions
 }
 
-// SetPlanMode toggles a session between normal execution and plan mode.
-// Takes effect on the next turn; an in-flight turn keeps whatever tool set
-// it started with.
-func (a *Agent) SetPlanMode(enabled bool) {
+// SetMode switches a session between the four tiers (SPEC.md §4c). Takes
+// effect on the next turn; an in-flight turn keeps whatever tool set and
+// permission behavior it started with.
+//
+// Persisted immediately (not just held in memory) so a peer that connects
+// or reconnects after another peer already changed it reads the true
+// current value via get_session_history rather than a stale client-side
+// cache — the same "server is the source of truth, not whoever reconnects
+// last" reasoning applies here as it does everywhere else session state is
+// shared across peers.
+func (a *Agent) SetMode(m Mode) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.planMode = enabled
+	a.mode = m
+	sessID := a.sessionID
+	a.mu.Unlock()
+
+	if a.sessionStore == nil || sessID == "" {
+		return
+	}
+	_, _ = a.sessionStore.Update(sessID, func(state *SessionState) error {
+		if a.isDiscarded() {
+			return errSessionDiscarded
+		}
+		state.Mode = string(m)
+		return nil
+	})
 }
 
-func (a *Agent) PlanMode() bool {
+func (a *Agent) Mode() Mode {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.planMode
+	return a.mode
+}
+
+// SetWebToolsEnabled toggles whether web_search/web_fetch are exposed to the
+// model, independent of mode. Takes effect on the next turn.
+func (a *Agent) SetWebToolsEnabled(enabled bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.webToolsEnabled = enabled
+}
+
+func (a *Agent) WebToolsEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.webToolsEnabled
+}
+
+// webToolNames is filtered out of activeToolDefs when web tools are
+// disabled, regardless of mode.
+var webToolNames = map[string]bool{
+	"web_search": true,
+	"web_fetch":  true,
 }
 
 // activeToolDefs returns the tool definitions to hand the model this turn —
-// the read-only subset in plan mode, everything otherwise.
+// the mode-restricted subset, further filtered by the web-tools toggle.
 func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.planMode {
-		return a.toolDefsReadOnly
+	base := a.toolDefsForModeLocked()
+	webEnabled := a.webToolsEnabled
+	a.mu.Unlock()
+
+	if webEnabled {
+		return base
 	}
-	return a.toolDefs
+	filtered := make([]tool.ToolDefinition, 0, len(base))
+	for _, def := range base {
+		if !webToolNames[def.Name] {
+			filtered = append(filtered, def)
+		}
+	}
+	return filtered
+}
+
+// toolDefsForModeLocked returns the precomputed slice for the current mode.
+// Caller must hold a.mu.
+func (a *Agent) toolDefsForModeLocked() []tool.ToolDefinition {
+	switch a.mode {
+	case ModeReadOnly:
+		return a.toolDefsReadOnly
+	case ModePlan:
+		return a.toolDefsPlan
+	default: // ModeReadWrite, ModeAutonomous
+		return a.toolDefs
+	}
+}
+
+// isToolAllowedInMode mirrors activeToolDefs' filtering, for the
+// defense-in-depth check at dispatch time (a stale/misbehaving provider
+// might still request a tool that was withheld from it, or a toggle flipped
+// mid-turn).
+func (a *Agent) isToolAllowedInMode(name string) bool {
+	a.mu.Lock()
+	mode := a.mode
+	webEnabled := a.webToolsEnabled
+	a.mu.Unlock()
+
+	if webToolNames[name] && !webEnabled {
+		return false
+	}
+	switch mode {
+	case ModeReadOnly:
+		return readOnlyTools[name]
+	case ModePlan:
+		return readOnlyTools[name] || planExtraTools[name]
+	default: // ModeReadWrite, ModeAutonomous
+		return true
+	}
+}
+
+// activeSystemPrompt returns the system prompt to send this turn — Plan
+// mode's distinct planning-purpose prompt, DefaultSystemPrompt otherwise.
+func (a *Agent) activeSystemPrompt() string {
+	if a.Mode() == ModePlan {
+		return PlanSystemPrompt
+	}
+	return DefaultSystemPrompt
 }
 
 // SetMaxSessionSpendUSD caps how much this session may have already spent
@@ -456,6 +627,21 @@ func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, rememb
 	}
 }
 
+// HandleAskUserAnswer resolves an outstanding ask_user_question tool call
+// (the ask_user_answer wire event, correlated by toolCallId, same shape as
+// HandlePermissionResponse minus the remember/cache concept, which doesn't
+// apply here).
+func (a *Agent) HandleAskUserAnswer(toolCallID string, answer string) {
+	a.mu.Lock()
+	ch, exists := a.askUserRequests[toolCallID]
+	delete(a.askUserRequests, toolCallID)
+	a.mu.Unlock()
+
+	if exists {
+		ch <- answer
+	}
+}
+
 func (a *Agent) RunTurn(parentCtx context.Context, sessionID, turnID, prompt string) error {
 	return a.RunTurnWithTitleGeneration(parentCtx, sessionID, turnID, prompt, true)
 }
@@ -465,13 +651,47 @@ func (a *Agent) RunTurn(parentCtx context.Context, sessionID, turnID, prompt str
 func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID, turnID, prompt string, autoGenerateTitle bool) error {
 	// Serialize turns within this session: see turnMu's doc comment. This
 	// must wrap the budget check through the final usageStore.Record write
-	// (both happen below) so the check-then-record isn't itself racy.
+	// (both happen below) so the check-then-record isn't itself racy. Also
+	// serializes against EditMessage/RetryMessage/SwitchBranch on the same
+	// Agent — all four mutate a.history/a.branches and must never interleave.
 	a.turnMu.Lock()
 	defer a.turnMu.Unlock()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
 
+	turnProvider, err := a.beginTurn(sessionID, turnID, startTime)
+	if err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	isNewChat := len(a.history) == 0
+	userMessageID := a.nextMessageIDLocked()
+	a.history = append(a.history, Message{
+		ID:           userMessageID,
+		Role:         "user",
+		Content:      prompt,
+		AuthorName:   author.Name,
+		AuthorAvatar: author.Avatar,
+		CreatedAt:    startTime,
+	})
+	a.mu.Unlock()
+
+	if isNewChat {
+		go a.runTitleGeneration(parentCtx, sessionID, turnID, prompt, autoGenerateTitle, turnProvider)
+	}
+
+	return a.runGenerationLoop(parentCtx, turnID, startTime, author, turnProvider, userMessageID)
+}
+
+// beginTurn resolves and binds sessionID, then runs the two checks that can
+// fail a turn before any generation starts: no provider configured, or the
+// session's spend cap already reached. Either failure emits the same
+// turn_completed a normal exit would, so a client always gets exactly one
+// terminal event per turn — shared by RunTurn, EditMessage, and
+// RetryMessage, which all start a turn the same way.
+func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (ModelProvider, error) {
 	a.mu.Lock()
 	if a.sessionID == "" || a.sessionID != sessionID {
 		a.sessionID = sessionID
@@ -480,8 +700,8 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 
 	turnProvider := a.getProvider()
 	if turnProvider == nil {
-		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("no_provider", protocol.UsageData{}, startTime))
-		return fmt.Errorf("session %s has no provider configured — call register_provider and set_provider first", sessionID)
+		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("no_provider", protocol.UsageData{}, startTime, "", ""))
+		return nil, fmt.Errorf("session %s has no provider configured — call register_provider and set_provider first", sessionID)
 	}
 
 	a.mu.Lock()
@@ -489,116 +709,154 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	a.mu.Unlock()
 	if a.usageStore != nil && spendCap > 0 {
 		if spent := a.usageStore.SessionTotal(sessionID).CostUSD; spent >= spendCap {
-			_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("budget_exceeded", protocol.UsageData{}, startTime))
-			return fmt.Errorf("session %s has already spent $%.4f, at or above its $%.4f cap", sessionID, spent, spendCap)
+			_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("budget_exceeded", protocol.UsageData{}, startTime, "", ""))
+			return nil, fmt.Errorf("session %s has already spent $%.4f, at or above its $%.4f cap", sessionID, spent, spendCap)
 		}
 	}
+	return turnProvider, nil
+}
+
+// runTitleGeneration runs — and saves/broadcasts — independently of the turn
+// it started alongside: a title request is a small, non-streaming call that
+// resolves in well under a second, so gating it behind the full turn (which
+// may run many tool calls before it's done) would make title generation
+// look like it only starts once the answer is already in, instead of racing
+// it the way SPEC.md §3.1 describes. Called for a brand-new chat's first
+// prompt, and for an edit of a session's very first message (which is, from
+// the title's point of view, the same situation).
+func (a *Agent) runTitleGeneration(parentCtx context.Context, sessID, turnID, prompt string, autoGenerateTitle bool, turnProvider ModelProvider) {
+	// Runs unsupervised in its own goroutine (see the two call sites) — a
+	// panic here (e.g. from a misbehaving TitleGenerator) must not take the
+	// whole process down along with every other session's connection.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("title generation for session %s panicked: %v\n%s", sessID, r, debug.Stack())
+		}
+	}()
+	title := fallbackTitle(prompt)
+	if autoGenerateTitle {
+		if generator, ok := turnProvider.(TitleGenerator); ok {
+			// parentCtx, not a turn-scoped context: that would be cancelled the
+			// moment the turn's own RunTurn/EditMessage/RetryMessage call
+			// returns, or the user aborts the turn via CancelTurn, either of
+			// which would otherwise race this goroutine's own HTTP request and
+			// kill it with "context canceled" before it can finish — defeating
+			// the whole point of running independently (see above).
+			if generated, err := generator.GenerateTitle(parentCtx, prompt); err == nil {
+				title = normalizeTitle(generated)
+			} else {
+				log.Printf("title generation: %v — falling back to a title derived from the prompt", err)
+			}
+		}
+	}
+	a.applyGeneratedTitle(sessID, turnID, title)
+}
+
+// applyGeneratedTitle saves `title` (if still empty) and broadcasts the
+// resulting session_updated — the only place an auto-generated title ever
+// reaches a connected client, since it has no client-driven
+// set_session_title to piggyback on.
+func (a *Agent) applyGeneratedTitle(sessID, turnID, title string) {
+	if title == "" || a.sessionStore == nil {
+		return
+	}
+	titleJustSet := false
+	state, err := a.sessionStore.Update(sessID, func(state *SessionState) error {
+		if a.isDiscarded() {
+			return errSessionDiscarded
+		}
+		if state.Title == "" {
+			state.Title = title
+			titleJustSet = true
+		}
+		return nil
+	})
+	if err == nil && titleJustSet {
+		_ = a.getStream().SendEvent(protocol.EventSessionUpdated, sessID, turnID, "", protocol.SessionSummary{
+			SessionID:       state.SessionID,
+			UpdatedAt:       state.UpdatedAt,
+			MessageCount:    len(state.History),
+			Title:           state.Title,
+			Archived:        state.Archived,
+			LinkedSessionID: state.LinkedSessionID,
+			Mode:            state.Mode,
+		})
+	}
+}
+
+// persistCurrentState writes this Agent's live history/branches/ID counter
+// to the session store, leaving metadata changed through set_session_*
+// while this Agent was live intact (see SessionStore.Update for why that
+// read-modify-write has to be atomic). Never holds a.mu across the write —
+// CancelTurn takes that mutex, and a save must not be able to delay an
+// abort. Shared by runGenerationLoop (every turn persists on the way out)
+// and SwitchBranch (a branch swap persists immediately, with no turn of its
+// own to attach the write to).
+func (a *Agent) persistCurrentState() error {
+	a.mu.Lock()
+	sessID := a.sessionID
+	history := append([]Message(nil), a.history...)
+	branches := cloneBranches(a.branches)
+	nextMsgSeq := a.nextMsgSeq
+	a.mu.Unlock()
+	if a.sessionStore == nil || sessID == "" {
+		return nil
+	}
+	_, err := a.sessionStore.Update(sessID, func(state *SessionState) error {
+		// Re-checked here, under the store's own write lock — the same lock
+		// SessionStore.Delete takes. Either this save lands before the delete
+		// (and the file is removed right after it) or the delete landed first,
+		// in which case writing now would resurrect a session the user just
+		// deleted.
+		if a.isDiscarded() {
+			return errSessionDiscarded
+		}
+		state.History = history
+		state.Branches = branches
+		state.NextMsgSeq = nextMsgSeq
+		return nil
+	})
+	if errors.Is(err, errSessionDiscarded) {
+		return nil
+	}
+	return err
+}
+
+// cloneBranches deep-copies a branches map so a snapshot taken under a.mu
+// (for persistCurrentState) can't be mutated by a later edit/retry/switch
+// while the write is still in flight.
+func cloneBranches(b map[string][][]Message) map[string][][]Message {
+	if b == nil {
+		return nil
+	}
+	out := make(map[string][][]Message, len(b))
+	for bp, alts := range b {
+		cp := make([][]Message, len(alts))
+		for i, alt := range alts {
+			cp[i] = append([]Message(nil), alt...)
+		}
+		out[bp] = cp
+	}
+	return out
+}
+
+// runGenerationLoop is the shared core of every turn — RunTurn (after
+// appending the user's new message), EditMessage (after truncating to the
+// edited message), and RetryMessage (after truncating to the retried
+// point) all converge here: run model round-trips against whatever
+// a.history currently is, executing tool calls in between, until the turn
+// finishes, is cancelled, or the provider fails, then persist and report
+// turn_completed exactly once.
+func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, startTime time.Time, author Author, turnProvider ModelProvider, userMessageID string) error {
+	sessionID := a.CurrentSessionID()
+	var lastMessageID string
 
 	turnCtx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
 	a.mu.Lock()
-	isNewChat := len(a.history) == 0
-	a.history = append(a.history, Message{
-		Role:         "user",
-		Content:      prompt,
-		AuthorName:   author.Name,
-		AuthorAvatar: author.Avatar,
-		CreatedAt:    startTime,
-	})
 	a.activeTurnCancels[turnID] = cancel
 	a.mu.Unlock()
-
-	// applyGeneratedTitle saves `title` (if still empty) and broadcasts the
-	// resulting session_updated — the only place an auto-generated title ever
-	// reaches a connected client, since it has no client-driven
-	// set_session_title to piggyback on.
-	applyGeneratedTitle := func(sessID, title string) {
-		if title == "" || a.sessionStore == nil {
-			return
-		}
-		titleJustSet := false
-		state, err := a.sessionStore.Update(sessID, func(state *SessionState) error {
-			if a.isDiscarded() {
-				return errSessionDiscarded
-			}
-			if state.Title == "" {
-				state.Title = title
-				titleJustSet = true
-			}
-			return nil
-		})
-		if err == nil && titleJustSet {
-			_ = a.getStream().SendEvent(protocol.EventSessionUpdated, sessID, turnID, "", protocol.SessionSummary{
-				SessionID:       state.SessionID,
-				UpdatedAt:       state.UpdatedAt,
-				MessageCount:    len(state.History),
-				Title:           state.Title,
-				Archived:        state.Archived,
-				LinkedSessionID: state.LinkedSessionID,
-			})
-		}
-	}
-
-	if isNewChat {
-		// Runs — and saves/broadcasts — independently of the turn it started
-		// alongside: a title request is a small, non-streaming call that
-		// resolves in well under a second, so gating it behind the full turn
-		// (which may run many tool calls before it's done) would make title
-		// generation look like it only starts once the answer is already in,
-		// instead of racing it the way SPEC.md §3.1 describes.
-		go func(sessID string) {
-			title := fallbackTitle(prompt)
-			if autoGenerateTitle {
-				if generator, ok := turnProvider.(TitleGenerator); ok {
-					// parentCtx, not turnCtx: turnCtx is cancelled the moment
-					// this function returns (its deferred cancel) or the user
-					// aborts the turn via CancelTurn, either of which would
-					// otherwise race this goroutine's own HTTP request and
-					// kill it with "context canceled" before it can finish —
-					// defeating the whole point of running independently
-					// (see the comment above this goroutine).
-					if generated, err := generator.GenerateTitle(parentCtx, prompt); err == nil {
-						title = normalizeTitle(generated)
-					} else {
-						log.Printf("title generation: %v — falling back to a title derived from the prompt", err)
-					}
-				}
-			}
-			applyGeneratedTitle(sessID, title)
-		}(sessionID)
-	}
-
-	// persistTurn writes this turn's history to the session store, leaving
-	// metadata changed through set_session_* while this Agent was live intact
-	// (see SessionStore.Update for why that read-modify-write has to be
-	// atomic). Never holds a.mu across the write — CancelTurn takes that mutex,
-	// and a save must not be able to delay an abort.
-	persistTurn := func() error {
-		a.mu.Lock()
-		sessID := a.sessionID
-		history := append([]Message(nil), a.history...)
-		a.mu.Unlock()
-		if a.sessionStore == nil || sessID == "" {
-			return nil
-		}
-		_, err := a.sessionStore.Update(sessID, func(state *SessionState) error {
-			// Re-checked here, under the store's own write lock — the same lock
-			// SessionStore.Delete takes. Either this save lands before the delete
-			// (and the file is removed right after it) or the delete landed first,
-			// in which case writing now would resurrect a session the user just
-			// deleted.
-			if a.isDiscarded() {
-				return errSessionDiscarded
-			}
-			state.History = history
-			return nil
-		})
-		if errors.Is(err, errSessionDiscarded) {
-			return nil
-		}
-		return err
-	}
 
 	defer func() {
 		a.mu.Lock()
@@ -609,14 +867,15 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		}
 	}()
 
-	// Write the user's own message to disk before the model is asked anything at
-	// all. Every way out of this function below persists again (the final save),
-	// so this first write is what makes the prompt itself durable against a
-	// cancel, a provider that never responds, or the process being killed before
-	// the turn ends — and it's what makes the session file exist on a first
-	// message, which set_session_title requires (SPEC.md §3.1) and which used to
-	// only appear once a turn had already completed successfully.
-	if err := persistTurn(); err != nil {
+	// Write this turn's starting point to disk before the model is asked
+	// anything at all. Every way out of this function below persists again
+	// (the final save), so this first write is what makes the prompt/edit/
+	// retry itself durable against a cancel, a provider that never responds,
+	// or the process being killed before the turn ends — and it's what makes
+	// the session file exist on a first message, which set_session_title
+	// requires (SPEC.md §3.1) and which used to only appear once a turn had
+	// already completed successfully.
+	if err := a.persistCurrentState(); err != nil {
 		// Reported without a turnId on purpose: an error carrying this turn's id
 		// would make the client tear down its streaming state while the model is
 		// still answering. The save below reports it properly if it's still
@@ -675,7 +934,7 @@ turn:
 		activeContext := a.contextManager.PrepareHistory(a.history)
 		a.mu.Unlock()
 
-		chunks, errs := turnProvider.StreamTurn(turnCtx, activeContext, a.activeToolDefs())
+		chunks, errs := turnProvider.StreamTurn(turnCtx, activeContext, a.activeToolDefs(), a.activeSystemPrompt())
 
 		done := false
 		for !done {
@@ -798,7 +1057,9 @@ turn:
 				usage.CostUSD = EstimateCostUSD(modelName, usage)
 			}
 			a.mu.Lock()
+			lastMessageID = a.nextMessageIDLocked()
 			a.history = append(a.history, Message{
+				ID:           lastMessageID,
 				Role:         "assistant",
 				Content:      assistantText,
 				Reasoning:    reasoningText,
@@ -830,14 +1091,18 @@ turn:
 				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s not recognized", tc.Name))
 				continue
 			}
-			if a.PlanMode() && !planModeReadOnlyTools[tc.Name] {
-				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s is unavailable while in plan mode", tc.Name))
+			mode := a.Mode()
+			if !a.isToolAllowedInMode(tc.Name) {
+				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s is unavailable in the current mode", tc.Name))
 				continue
 			}
 
 			allowed := true
 			var denyFeedback string
-			if toolImpl.RequiresPermission(tc.Args) {
+			if mode == ModeAutonomous {
+				// Autonomous: every permission check is bypassed outright,
+				// permission.Engine is never consulted (SPEC.md §4c).
+			} else if toolImpl.RequiresPermission(tc.Args) {
 				var target string
 				if tc.Name == "bash" {
 					var bArgs struct{ Command string }
@@ -849,7 +1114,20 @@ turn:
 					target = fArgs.Path
 				}
 
-				decision, cacheKey := a.permEngine.Evaluate(tc.Name, target)
+				var decision permission.Decision
+				var cacheKey string
+				if mode == ModeReadWrite && tc.Name == "bash" {
+					// Read/Write+Prompts: bash always asks, bypassing the
+					// engine's safe-command auto-allowlist. cacheKey is left
+					// empty so a "remember" answer here is never persisted
+					// (HandlePermissionResponse only calls RecordDecision
+					// when cacheKey != "") — otherwise a remembered bash
+					// command would silently auto-allow itself again later,
+					// including in other modes.
+					decision, cacheKey = permission.DecisionAsk, ""
+				} else {
+					decision, cacheKey = a.permEngine.Evaluate(tc.Name, target)
+				}
 
 				switch decision {
 				case permission.DecisionDeny:
@@ -899,14 +1177,36 @@ turn:
 				continue
 			}
 
+			toolCallID := tc.ID
 			execCtx := tool.ExecutionContext{
 				SessionID:     a.sessionID,
 				TurnID:        turnID,
-				ToolCallID:    tc.ID,
+				ToolCallID:    toolCallID,
 				SnapshotStore: a.snapshotStore,
 				Stream:        a.getStream(),
 				AuthorName:    author.Name,
 				AuthorEmail:   author.Email,
+				AskUser: func(question string, options []string) (string, error) {
+					respCh := make(chan string, 1)
+					a.mu.Lock()
+					a.askUserRequests[toolCallID] = respCh
+					a.mu.Unlock()
+
+					_ = a.getStream().SendEvent(protocol.EventAskUserQuestionRequested, a.sessionID, turnID, toolCallID, protocol.AskUserQuestionRequestedData{
+						Question: question,
+						Options:  options,
+					})
+
+					select {
+					case <-turnCtx.Done():
+						a.mu.Lock()
+						delete(a.askUserRequests, toolCallID)
+						a.mu.Unlock()
+						return "", turnCtx.Err()
+					case answer := <-respCh:
+						return answer, nil
+					}
+				},
 			}
 
 			output, execErr := toolImpl.Execute(turnCtx, execCtx, tc.Args)
@@ -932,7 +1232,9 @@ turn:
 			usage.CostUSD = EstimateCostUSD(modelName, usage)
 		}
 		a.mu.Lock()
+		lastMessageID = a.nextMessageIDLocked()
 		a.history = append(a.history, Message{
+			ID:           lastMessageID,
 			Role:         "assistant",
 			Content:      assistantText,
 			ToolCalls:    toolCalls,
@@ -950,7 +1252,7 @@ turn:
 	// content exists nowhere else, so a failed write means the conversation the
 	// user just had is not on disk, and saying nothing would report a turn that
 	// can't be reloaded as an ordinary success.
-	if saveErr := persistTurn(); saveErr != nil {
+	if saveErr := a.persistCurrentState(); saveErr != nil {
 		_ = a.getStream().SendEvent(protocol.EventError, a.sessionID, turnID, "", protocol.ErrorData{
 			Message: fmt.Sprintf("session %s could not be saved (%v) — this turn will not survive a restart", a.sessionID, saveErr),
 		})
@@ -960,7 +1262,7 @@ turn:
 	// the `error` frame for it (§3.2 has no "error" finish reason), so
 	// turn_completed is reserved for the reasons it does define.
 	if finishReason != "" {
-		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", a.buildTurnCompletedData(finishReason, totalUsage, startTime))
+		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, a.sessionID, turnID, "", a.buildTurnCompletedData(finishReason, totalUsage, startTime, userMessageID, lastMessageID))
 	}
 
 	if streamErr != nil {
@@ -970,6 +1272,201 @@ turn:
 		return turnCtx.Err()
 	}
 	return nil
+}
+
+// EditMessage replaces a past user message with new content and regenerates
+// everything after it. The message's old content and whatever was generated
+// after it aren't deleted — they're stashed under Branches (keyed by the ID
+// of the message right before it) and stay recoverable via SwitchBranch,
+// since that content may already have cost real money to generate. Only a
+// message currently reachable from the active history can be targeted; a
+// message buried in an inactive branch needs SwitchBranch first (walking
+// the tree one hop at a time composes correctly without a full recursive
+// lookup — see the plan's scope note).
+func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messageID, content string, autoGenerateTitle bool) error {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+
+	startTime := time.Now()
+	author := AuthorFromContext(parentCtx)
+
+	turnProvider, err := a.beginTurn(sessionID, turnID, startTime)
+	if err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	idx, found := indexOfMessageLocked(a.history, messageID)
+	if !found {
+		a.mu.Unlock()
+		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotFound)
+	}
+	if a.history[idx].Role != "user" {
+		a.mu.Unlock()
+		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotEditable)
+	}
+	branchPoint := ""
+	if idx > 0 {
+		branchPoint = a.history[idx-1].ID
+	}
+	if a.branches == nil {
+		a.branches = make(map[string][][]Message)
+	}
+	a.branches[branchPoint] = append(a.branches[branchPoint], append([]Message(nil), a.history[idx:]...))
+	isNewChat := idx == 0
+	userMessageID := a.nextMessageIDLocked()
+	a.history = append(a.history[:idx:idx], Message{
+		ID:           userMessageID,
+		Role:         "user",
+		Content:      content,
+		AuthorName:   author.Name,
+		AuthorAvatar: author.Avatar,
+		CreatedAt:    startTime,
+	})
+	a.mu.Unlock()
+
+	if isNewChat {
+		// Editing the very first message leaves the session with no history
+		// again, same as a brand-new chat — and a title generated from the
+		// original prompt no longer describes what's actually being asked, so
+		// this re-runs title generation exactly like a fresh chat would.
+		// applyGeneratedTitle's own "only fills in an empty title" rule (SPEC.md
+		// §3.1) still applies unchanged: a session that already got a real
+		// title (its own set_session_title, or a previous generation) keeps it.
+		go a.runTitleGeneration(parentCtx, sessionID, turnID, content, autoGenerateTitle, turnProvider)
+	}
+
+	return a.runGenerationLoop(parentCtx, turnID, startTime, author, turnProvider, userMessageID)
+}
+
+// RetryMessage discards a past assistant message and regenerates a fresh
+// response from the same point — everything from that message onward is
+// stashed under Branches (recoverable via SwitchBranch), same as
+// EditMessage. messageID may name any assistant message in the active
+// history, not just the last one: retrying an earlier round-trip inside a
+// multi-tool-call turn discards that round-trip and everything after it too.
+//
+// This never undoes real side effects a discarded branch's tool calls already
+// made (files written, commands run) — only conversation history moves.
+// restore_snapshot (SPEC.md §3.1) is the tool for reverting the filesystem
+// itself, and is orthogonal to this.
+func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messageID string) error {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+
+	startTime := time.Now()
+	author := AuthorFromContext(parentCtx)
+
+	turnProvider, err := a.beginTurn(sessionID, turnID, startTime)
+	if err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	idx, found := indexOfMessageLocked(a.history, messageID)
+	if !found {
+		a.mu.Unlock()
+		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotFound)
+	}
+	if a.history[idx].Role != "assistant" {
+		a.mu.Unlock()
+		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotRetryable)
+	}
+	branchPoint := ""
+	userMessageID := ""
+	if idx > 0 {
+		branchPoint = a.history[idx-1].ID
+		userMessageID = branchPoint
+	}
+	if a.branches == nil {
+		a.branches = make(map[string][][]Message)
+	}
+	a.branches[branchPoint] = append(a.branches[branchPoint], append([]Message(nil), a.history[idx:]...))
+	a.history = a.history[:idx:idx]
+	a.mu.Unlock()
+
+	return a.runGenerationLoop(parentCtx, turnID, startTime, author, turnProvider, userMessageID)
+}
+
+// SwitchBranch makes the branch containing messageID the active one,
+// stashing whatever suffix was active at that branch point back into
+// Branches in its place. Pure navigation — no model call, no cost. Blocks
+// on turnMu so it never races a concurrently in-flight turn on the same
+// session; it simply waits for one to finish rather than switching out the
+// history a turn is actively appending to.
+//
+// messageID may be any message within a stashed alternate, not just its
+// first one. Only branches reachable from the current active history can be
+// switched to — a branch nested behind another branch point becomes
+// reachable only after switching to that outer one first, which is just
+// walking the (implicit) tree one hop at a time.
+func (a *Agent) SwitchBranch(sessionID, messageID string) error {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+
+	a.mu.Lock()
+	if a.sessionID == "" || a.sessionID != sessionID {
+		a.sessionID = sessionID
+	}
+
+	branchPoint, altIdx, found := findBranchLocked(a.branches, a.history, messageID)
+	if !found {
+		a.mu.Unlock()
+		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotFound)
+	}
+
+	branchStart := 0
+	if branchPoint != "" {
+		idx, ok := indexOfMessageLocked(a.history, branchPoint)
+		if !ok {
+			// findBranchLocked only ever returns a branchPoint it already
+			// confirmed is reachable from a.history, so this can't happen.
+			a.mu.Unlock()
+			return fmt.Errorf("message %s: %w", messageID, ErrMessageNotFound)
+		}
+		branchStart = idx + 1
+	}
+
+	currentSuffix := append([]Message(nil), a.history[branchStart:]...)
+	newSuffix := a.branches[branchPoint][altIdx]
+	a.branches[branchPoint][altIdx] = currentSuffix
+	a.history = append(a.history[:branchStart:branchStart], newSuffix...)
+	a.mu.Unlock()
+
+	return a.persistCurrentState()
+}
+
+// indexOfMessageLocked finds id's position in history. Caller must already
+// hold a.mu when history is the live a.history.
+func indexOfMessageLocked(history []Message, id string) (int, bool) {
+	for i, m := range history {
+		if m.ID == id {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// findBranchLocked locates which stashed alternate contains targetID,
+// restricted to branch points currently reachable from history (bp == ""
+// — the very start of the session — is always reachable; anything else
+// must itself be an ID in history). Caller must already hold a.mu.
+func findBranchLocked(branches map[string][][]Message, history []Message, targetID string) (branchPoint string, altIndex int, found bool) {
+	for bp, alts := range branches {
+		if bp != "" {
+			if _, ok := indexOfMessageLocked(history, bp); !ok {
+				continue
+			}
+		}
+		for i, alt := range alts {
+			for _, m := range alt {
+				if m.ID == targetID {
+					return bp, i, true
+				}
+			}
+		}
+	}
+	return "", 0, false
 }
 
 func fallbackTitle(prompt string) string {
@@ -995,7 +1492,7 @@ func limitTitle(title string) string {
 // buildTurnCompletedData assembles a turn_completed payload including the
 // context-window fullness and running spend, so every emission point (normal
 // completion and each cancellation path) reports the same enriched data.
-func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.UsageData, startTime time.Time) protocol.TurnCompletedData {
+func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.UsageData, startTime time.Time, userMessageID, messageID string) protocol.TurnCompletedData {
 	a.mu.Lock()
 	sessionID := a.sessionID
 	historySnapshot := a.history
@@ -1029,9 +1526,11 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 	}
 
 	return protocol.TurnCompletedData{
-		FinishReason: finishReason,
-		SessionID:    sessionID,
-		Usage:        &usage,
+		FinishReason:  finishReason,
+		SessionID:     sessionID,
+		UserMessageID: userMessageID,
+		MessageID:     messageID,
+		Usage:         &usage,
 		Context: &protocol.ContextData{
 			EstimatedTokens: estimatedTokens,
 			MaxTokens:       a.contextManager.GetMaxHistoryTokens(),
@@ -1044,6 +1543,7 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 func (a *Agent) recordToolResult(turnID string, tc ToolCall, output, errText string) {
 	a.mu.Lock()
 	a.history = append(a.history, Message{
+		ID:         a.nextMessageIDLocked(),
 		Role:       "tool",
 		Content:    output + errText,
 		ToolCallID: tc.ID,

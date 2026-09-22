@@ -70,10 +70,17 @@ func (t *WebSearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSO
 		return "", fmt.Errorf("query must not be empty")
 	}
 
+	var results string
+	var err error
 	if t.apiKey == "" {
-		return t.executeDDG(ctx, args.Query)
+		results, err = t.executeDDG(ctx, args.Query)
+	} else {
+		results, err = t.executeBrave(ctx, args.Query)
 	}
-	return t.executeBrave(ctx, args.Query)
+	if err != nil {
+		return "", err
+	}
+	return WrapUntrusted("web search results", results), nil
 }
 
 func (t *WebSearchTool) executeBrave(ctx context.Context, query string) (string, error) {

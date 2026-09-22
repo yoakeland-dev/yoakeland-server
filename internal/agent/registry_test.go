@@ -33,7 +33,7 @@ func TestRegistry_SessionsAreIsolated(t *testing.T) {
 	}
 
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
-	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil, true)
 
 	agA := registry.Get(ipc, "session-A")
 	agB := registry.Get(ipc, "session-B")
@@ -89,7 +89,7 @@ func TestRegistry_ContextWindowIsPerSession(t *testing.T) {
 	ipcA := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
 	ipcBOut := &bytes.Buffer{}
 	ipcB := protocol.NewIPCStream(bytes.NewBuffer(nil), ipcBOut)
-	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil, true)
 
 	agA := registry.Get(ipcA, "session-A")
 	agB := registry.Get(ipcB, "session-B")
@@ -108,11 +108,12 @@ func TestRegistry_ContextWindowIsPerSession(t *testing.T) {
 	}
 }
 
-// TestRegistry_ReconnectNotifiesDisplacedConnection guards the reconnect UX:
-// when a second device attaches to a session already bound to another
-// connection, that first connection must be told it lost the session
-// instead of silently going dark.
-func TestRegistry_ReconnectNotifiedDisplacedConnection(t *testing.T) {
+// TestRegistry_ReconnectBroadcastsToEveryConnection guards the multi-peer
+// sync fix: when a second device attaches to a session already open on
+// another connection, both must keep receiving that session's events —
+// neither is displaced any more (see protocol.StreamSet, which replaced the
+// old single-stream "last writer wins" behavior this used to test).
+func TestRegistry_ReconnectBroadcastsToEveryConnection(t *testing.T) {
 	tempDir := t.TempDir()
 	norm, _ := normalizer.New(tempDir)
 	engine := permission.New(norm, nil)
@@ -120,7 +121,8 @@ func TestRegistry_ReconnectNotifiedDisplacedConnection(t *testing.T) {
 	sessStore, _ := agent.NewDiskSessionStore(tempDir)
 	ctxMgr := agent.NewContextManager(100, 20)
 
-	registry := agent.NewRegistry(&ScriptedProvider{}, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil)
+	provider := &ScriptedProvider{turns: [][]agent.ModelStreamChunk{{{Kind: agent.StreamChunkDelta, Delta: "hi"}}}}
+	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil, true)
 
 	firstOut := &bytes.Buffer{}
 	firstConn := protocol.NewIPCStream(bytes.NewBuffer(nil), firstOut)
@@ -128,12 +130,20 @@ func TestRegistry_ReconnectNotifiedDisplacedConnection(t *testing.T) {
 
 	secondOut := &bytes.Buffer{}
 	secondConn := protocol.NewIPCStream(bytes.NewBuffer(nil), secondOut)
-	registry.Get(secondConn, "session-shared")
+	ag := registry.Get(secondConn, "session-shared")
 
-	if !strings.Contains(firstOut.String(), `"type":"session_taken_over"`) {
-		t.Fatalf("expected displaced connection to receive a session_taken_over event, got: %s", firstOut.String())
+	if strings.Contains(firstOut.String(), `"type":"session_taken_over"`) {
+		t.Fatalf("no connection should be displaced any more, got: %s", firstOut.String())
 	}
-	if strings.Contains(secondOut.String(), `"type":"session_taken_over"`) {
-		t.Fatalf("the connection that took over the session should not receive its own notice, got: %s", secondOut.String())
+
+	if err := ag.RunTurn(context.Background(), "session-shared", "turn-1", "hello"); err != nil {
+		t.Fatalf("turn failed: %v", err)
+	}
+
+	if !strings.Contains(firstOut.String(), `"type":"turn_completed"`) {
+		t.Fatalf("expected the first connection to still receive this turn's events, got: %s", firstOut.String())
+	}
+	if !strings.Contains(secondOut.String(), `"type":"turn_completed"`) {
+		t.Fatalf("expected the second connection to receive this turn's events, got: %s", secondOut.String())
 	}
 }

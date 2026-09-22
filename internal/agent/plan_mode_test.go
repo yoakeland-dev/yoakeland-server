@@ -24,7 +24,7 @@ type capturingProvider struct {
 	index           int
 }
 
-func (c *capturingProvider) StreamTurn(_ context.Context, _ []agent.Message, tools []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (c *capturingProvider) StreamTurn(_ context.Context, _ []agent.Message, tools []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	var names []string
 	for _, td := range tools {
 		names = append(names, td.Name)
@@ -50,11 +50,11 @@ func (c *capturingProvider) StreamTurn(_ context.Context, _ []agent.Message, too
 	return cChan, eChan
 }
 
-// TestAgent_PlanModeRestrictsToolsGivenToModel guards the primary safety
-// mechanism: while plan mode is on, the model isn't handed the write tool's
-// definition at all, so it has nothing to call — not just something that
-// gets denied after the fact.
-func TestAgent_PlanModeRestrictsToolsGivenToModel(t *testing.T) {
+// TestAgent_ModeRestrictsToolsGivenToModel guards the primary safety
+// mechanism for each of the four tiers: the model isn't handed a
+// restricted tool's definition at all, so it has nothing to call — not
+// just something that gets denied after the fact.
+func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {
 	tempDir := t.TempDir()
 	norm, _ := normalizer.New(tempDir)
 	engine := permission.New(norm, nil)
@@ -65,12 +65,15 @@ func TestAgent_PlanModeRestrictsToolsGivenToModel(t *testing.T) {
 	tools := []tool.Tool{
 		tool.NewFileReadTool(norm),
 		tool.NewFileWriteTool(norm),
+		tool.NewWritePlanTool(norm),
 	}
 
 	provider := &capturingProvider{
 		turns: [][]agent.ModelStreamChunk{
-			{{Kind: agent.StreamChunkDelta, Delta: "normal turn"}},
+			{{Kind: agent.StreamChunkDelta, Delta: "read/write turn"}},
+			{{Kind: agent.StreamChunkDelta, Delta: "read-only turn"}},
 			{{Kind: agent.StreamChunkDelta, Delta: "plan turn"}},
+			{{Kind: agent.StreamChunkDelta, Delta: "autonomous turn"}},
 		},
 	}
 
@@ -79,29 +82,56 @@ func TestAgent_PlanModeRestrictsToolsGivenToModel(t *testing.T) {
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
 
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "hi"); err != nil {
-		t.Fatalf("turn 1: %v", err)
+		t.Fatalf("turn 1 (read/write): %v", err)
 	}
-	if len(provider.toolNamesByTurn[0]) != 2 {
-		t.Fatalf("expected both tools in normal mode, got %v", provider.toolNamesByTurn[0])
+	if got := provider.toolNamesByTurn[0]; len(got) != 3 {
+		t.Fatalf("expected all 3 tools in read/write mode, got %v", got)
 	}
 
-	ag.SetPlanMode(true)
-	if !ag.PlanMode() {
-		t.Fatal("expected PlanMode() to report true after SetPlanMode(true)")
+	ag.SetMode(agent.ModeReadOnly)
+	if ag.Mode() != agent.ModeReadOnly {
+		t.Fatal("expected Mode() to report ModeReadOnly")
 	}
-	if err := ag.RunTurn(context.Background(), "s1", "t2", "plan this"); err != nil {
-		t.Fatalf("turn 2: %v", err)
+	if err := ag.RunTurn(context.Background(), "s1", "t2", "read only"); err != nil {
+		t.Fatalf("turn 2 (read-only): %v", err)
 	}
-	got := provider.toolNamesByTurn[1]
-	if len(got) != 1 || got[0] != "file_read" {
-		t.Fatalf("expected only file_read in plan mode, got %v", got)
+	if got := provider.toolNamesByTurn[1]; len(got) != 1 || got[0] != "file_read" {
+		t.Fatalf("expected only file_read in read-only mode, got %v", got)
+	}
+
+	ag.SetMode(agent.ModePlan)
+	if err := ag.RunTurn(context.Background(), "s1", "t3", "plan this"); err != nil {
+		t.Fatalf("turn 3 (plan): %v", err)
+	}
+	got := provider.toolNamesByTurn[2]
+	if len(got) != 2 {
+		t.Fatalf("expected file_read + write_plan in plan mode, got %v", got)
+	}
+	for _, want := range []string{"file_read", "write_plan"} {
+		found := false
+		for _, name := range got {
+			if name == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected %q among plan mode tools, got %v", want, got)
+		}
+	}
+
+	ag.SetMode(agent.ModeAutonomous)
+	if err := ag.RunTurn(context.Background(), "s1", "t4", "go"); err != nil {
+		t.Fatalf("turn 4 (autonomous): %v", err)
+	}
+	if got := provider.toolNamesByTurn[3]; len(got) != 3 {
+		t.Fatalf("expected all 3 tools in autonomous mode, got %v", got)
 	}
 }
 
-// TestAgent_PlanModeBlocksMutatingToolCall guards the defense-in-depth
+// TestAgent_ReadOnlyModeBlocksMutatingToolCall guards the defense-in-depth
 // backstop: even if a tool call for a mutating tool somehow arrives while in
-// plan mode, it's rejected rather than executed.
-func TestAgent_PlanModeBlocksMutatingToolCall(t *testing.T) {
+// a restricted mode, it's rejected rather than executed.
+func TestAgent_ReadOnlyModeBlocksMutatingToolCall(t *testing.T) {
 	tempDir := t.TempDir()
 	norm, _ := normalizer.New(tempDir)
 	engine := permission.New(norm, nil)
@@ -128,16 +158,16 @@ func TestAgent_PlanModeBlocksMutatingToolCall(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
-	ag.SetPlanMode(true)
+	ag.SetMode(agent.ModeReadOnly)
 
 	if err := ag.RunTurn(context.Background(), "s2", "t1", "try to write"); err != nil {
 		t.Fatalf("RunTurn: %v", err)
 	}
 
 	if _, err := os.Stat(filepath.Join(tempDir, "should-not-exist.txt")); !os.IsNotExist(err) {
-		t.Fatalf("expected file_write to be blocked in plan mode, but the file exists")
+		t.Fatalf("expected file_write to be blocked in read-only mode, but the file exists")
 	}
-	if !strings.Contains(outBuf.String(), "unavailable while in plan mode") {
-		t.Fatalf("expected tool_result to report the plan-mode rejection, got: %s", outBuf.String())
+	if !strings.Contains(outBuf.String(), "unavailable in the current mode") {
+		t.Fatalf("expected tool_result to report the mode rejection, got: %s", outBuf.String())
 	}
 }

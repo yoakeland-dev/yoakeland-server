@@ -181,6 +181,28 @@ func (r *PeerRegistry) All() []*Peer {
 	return out
 }
 
+// BroadcastEvent pushes one event to every live peer except exceptPeerID —
+// the requester, who already got its own direct response inline. This is
+// the live-sync half of chat-list/project-list consistency: any other
+// connection currently attached to this process learns about a mutation
+// (a session's title/archive/delete, a project opened/removed) made
+// elsewhere without polling. exceptPeerID may be "" to exclude nobody.
+func (r *PeerRegistry) BroadcastEvent(exceptPeerID string, eventType protocol.EventType, sessionID string, data any) {
+	r.mu.Lock()
+	peers := make([]*Peer, 0, len(r.peers))
+	for id, p := range r.peers {
+		if id == exceptPeerID {
+			continue
+		}
+		peers = append(peers, p)
+	}
+	r.mu.Unlock()
+
+	for _, p := range peers {
+		_ = p.ipc.SendEvent(eventType, sessionID, "", "", data)
+	}
+}
+
 // Broadcast pushes the current roster to every live peer.
 func (r *PeerRegistry) Broadcast() {
 	r.mu.Lock()

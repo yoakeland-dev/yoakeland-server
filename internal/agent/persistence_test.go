@@ -22,7 +22,7 @@ type ErrorProvider struct {
 	err error
 }
 
-func (e *ErrorProvider) StreamTurn(context.Context, []agent.Message, []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (e *ErrorProvider) StreamTurn(context.Context, []agent.Message, []tool.ToolDefinition, string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 1)
 	eChan := make(chan error, 1)
 	// Buffered and closed before this returns, the way a request that fails

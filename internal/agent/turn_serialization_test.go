@@ -23,7 +23,7 @@ type blockingCostProvider struct {
 	costUSD float64
 }
 
-func (p *blockingCostProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition) (<-chan agent.ModelStreamChunk, <-chan error) {
+func (p *blockingCostProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 2)
 	eChan := make(chan error, 1)
 	go func() {

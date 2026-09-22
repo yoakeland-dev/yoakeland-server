@@ -97,16 +97,16 @@ type openAIStreamOptions struct {
 }
 
 type openAIRequest struct {
-	Model           string              `json:"model"`
-	Messages        []openAIMessage     `json:"messages"`
-	Tools           []any               `json:"tools,omitempty"`
-	Stream          bool                `json:"stream"`
+	Model    string          `json:"model"`
+	Messages []openAIMessage `json:"messages"`
+	Tools    []any           `json:"tools,omitempty"`
+	Stream   bool            `json:"stream"`
 	// Pointer, not value: OpenAI 400s if stream_options is present at all
 	// while stream is false (GenerateTitle's case) — a plain struct field
 	// would always serialize since encoding/json's omitempty never treats a
 	// non-pointer struct as empty.
-	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
-	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
+	StreamOptions   *openAIStreamOptions `json:"stream_options,omitempty"`
+	ReasoningEffort string               `json:"reasoning_effort,omitempty"`
 
 	// MaxTokens defaults to defaultMaxTokens below rather than being left
 	// unset: several OpenAI-compatible backends (DeepSeek's API included)
@@ -178,6 +178,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 	ctx context.Context,
 	history []agent.Message,
 	tools []tool.ToolDefinition,
+	systemPrompt string,
 ) (<-chan agent.ModelStreamChunk, <-chan error) {
 	cChan := make(chan agent.ModelStreamChunk, 64)
 	eChan := make(chan error, 1)
@@ -188,7 +189,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 
 		// 1. Convert messages
 		msgs := []openAIMessage{
-			{Role: "system", Content: DefaultSystemPrompt},
+			{Role: "system", Content: systemPrompt},
 		}
 
 		for _, m := range history {
