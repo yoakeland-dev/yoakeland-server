@@ -74,7 +74,18 @@ func DefaultRuntimeDir(stateDir string) string {
 	return stateDir
 }
 
-// DefaultSocketPath returns <dir>/yoakeland.sock.
+// PipePrefix is the named-pipe namespace every local path lives in on
+// Windows, where the local transport is a named pipe instead of a socket file.
+const PipePrefix = `\\.\pipe\`
+
+// DefaultSocketPath returns <dir>/yoakeland.sock, or on Windows the named
+// pipe \\.\pipe\yoakeland-<username> (dir unused). The pipe namespace is
+// machine-global, so the name is per-user only to keep two users' servers
+// apart — what keeps other users out is the pipe's owner-only ACL, and
+// clients check the pipe's owner before trusting it (see Dial, SPEC.md §2a).
 func DefaultSocketPath(dir string) string {
+	if runtime.GOOS == "windows" {
+		return PipePrefix + "yoakeland-" + os.Getenv("USERNAME")
+	}
 	return filepath.Join(dir, SocketName)
 }

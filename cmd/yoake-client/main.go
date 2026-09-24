@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -137,7 +136,7 @@ func main() {
 		if connect == "local" {
 			socketPath = sockpath.DefaultSocketPath(sockpath.DefaultRuntimeDir(sockpath.DefaultStateDir()))
 		}
-		conn, err := net.Dial("unix", socketPath)
+		conn, err := sockpath.Dial(socketPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to connect to %s: %v\n", socketPath, err)
 			os.Exit(1)

@@ -1,3 +1,5 @@
+//go:build unix
+
 package main
 
 import (
@@ -8,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 	"yoakeland/internal/protocol"
@@ -150,7 +153,7 @@ func TestServerMode_UnixSocketNeedsNoToken(t *testing.T) {
 func TestSetupUnixListener_CreatesOwnerOnlySocket(t *testing.T) {
 	sockPath := filepath.Join(t.TempDir(), "nested", "yoakeland.sock")
 
-	ln, err := setupUnixListener(sockPath)
+	ln, err := setupUnixListener(sockPath, true)
 	if err != nil {
 		t.Fatalf("setupUnixListener: %v", err)
 	}
@@ -214,5 +217,69 @@ func TestSetupTCPListener_GeneratesTokenWhenEmpty(t *testing.T) {
 
 	if token == "" {
 		t.Fatal("expected a non-empty auto-generated token")
+	}
+}
+
+// The socket's directory is tightened to owner-only, a live server's socket
+// is never taken over, and a non-socket file at the path is never deleted.
+func TestSetupUnixListener_Hardening(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only")
+	}
+	dir := filepath.Join(t.TempDir(), "run")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "yoakeland.sock")
+	ln, err := setupUnixListener(sock, true)
+	if err != nil {
+		t.Fatalf("setupUnixListener: %v", err)
+	}
+	defer ln.Close()
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("dir mode = %o, want 0700", fi.Mode().Perm())
+	}
+
+	if _, err := setupUnixListener(sock, true); err == nil || !strings.Contains(err.Error(), "already listening") {
+		t.Fatalf("second listener on a live socket: err = %v", err)
+	}
+
+	// A crashed run's socket (nothing answering) is replaced.
+	stale := filepath.Join(dir, "stale.sock")
+	sl, err := net.Listen("unix", stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl.(*net.UnixListener).SetUnlinkOnClose(false)
+	sl.Close()
+	ln2, err := setupUnixListener(stale, true)
+	if err != nil {
+		t.Fatalf("stale socket not replaced: %v", err)
+	}
+	ln2.Close()
+
+	file := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(file, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupUnixListener(file, true); err == nil {
+		t.Fatal("expected refusal to replace a regular file")
+	}
+	if b, _ := os.ReadFile(file); string(b) != "keep me" {
+		t.Fatal("regular file was touched")
+	}
+
+	// An override's parent (not ours to manage) keeps its mode.
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ln3, err := setupUnixListener(filepath.Join(shared, "y.sock"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln3.Close()
+	if fi, _ := os.Stat(shared); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("override dir mode changed to %o", fi.Mode().Perm())
 	}
 }
