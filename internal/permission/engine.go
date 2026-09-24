@@ -58,7 +58,7 @@ func (e *Engine) Evaluate(toolName string, target string) (Decision, string) {
 		return DecisionDeny, cacheKey
 	}
 
-	// 2. Project-persisted decisions (.yoake/permissions.json)
+	// 2. Project-persisted decisions (permissions.json)
 	if allowed, exists := e.persistedCache[cacheKey]; exists {
 		e.mu.RUnlock()
 		if allowed {

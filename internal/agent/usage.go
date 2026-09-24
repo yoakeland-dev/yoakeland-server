@@ -20,7 +20,7 @@ type usageModel struct {
 	Project  UsageTotals            `json:"project"`
 }
 
-// UsageStore persists running token/cost totals in <project>/.yoake/usage.json,
+// UsageStore persists running token/cost totals in usage.json,
 // following the same pattern as DiskSessionStore and PersistentStore.
 type UsageStore struct {
 	mu       sync.Mutex
@@ -28,8 +28,8 @@ type UsageStore struct {
 	model    usageModel
 }
 
-func NewUsageStore(projectRoot string) (*UsageStore, error) {
-	dir := filepath.Join(projectRoot, ".yoake")
+func NewUsageStore(dataDir string) (*UsageStore, error) {
+	dir := dataDir
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}

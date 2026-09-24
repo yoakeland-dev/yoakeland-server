@@ -3,7 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"yoakeland/internal/projectstore"
 )
 
 // TestProjectRegistry_GetIsIdempotentAndIsolated guards the core promise of
@@ -200,6 +203,27 @@ func TestProjectRegistry_RemoveEvictsBoundSessions(t *testing.T) {
 	}
 }
 
+func TestProjectRegistry_KeepsStateOutOfTheProject(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+
+	reg, err := NewProjectRegistry(nil, "", 0, stateDir)
+	if err != nil {
+		t.Fatalf("NewProjectRegistry: %v", err)
+	}
+	pc, err := reg.Get(root)
+	if err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 0 {
+		t.Fatalf("opening a project wrote into it: %v", entries)
+	}
+	meta, err := os.ReadFile(filepath.Join(projectstore.DataDir(stateDir, pc.Root), "project.json"))
+	if err != nil || !strings.Contains(string(meta), pc.Root) {
+		t.Fatalf("data dir should name its project, got %q (%v)", meta, err)
+	}
+}
+
 // TestProjectRegistry_ListSurvivesRestart guards the actual ownership-model
 // fix: the known-projects list is backed by projects.json under the state
 // dir, not just this process's in-memory map — a brand new ProjectRegistry
@@ -231,7 +255,7 @@ func TestProjectRegistry_ListSurvivesRestart(t *testing.T) {
 // normalizer.New does (both call normalizer.CanonicalRoot), so a symlinked
 // project path and its real-path equivalent always collapse to the same
 // registry key instead of building two independent ProjectContexts that
-// both write to the same on-disk .yoake directory.
+// both write to different data dirs for the same project.
 func TestProjectKey_ResolvesSymlinksLikeNormalizer(t *testing.T) {
 	realDir := t.TempDir()
 	parent := t.TempDir()

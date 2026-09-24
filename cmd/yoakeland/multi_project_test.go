@@ -37,7 +37,7 @@ func envelopeJSONWithSession(t *testing.T, envType protocol.EventType, sessionID
 // of the scenario multi-project support exists for: one server, two
 // sessions opened against two different folders, each restricted to its
 // own directory and its own persisted session history — not just two
-// Agents in memory, but two separate .yoake/ trees on disk.
+// Agents in memory, but two separate data dirs on disk.
 func TestServeConnection_TwoProjectsAreFullyIsolated(t *testing.T) {
 	rootA := t.TempDir()
 	rootB := t.TempDir()

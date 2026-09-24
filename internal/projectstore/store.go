@@ -8,6 +8,8 @@
 package projectstore
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,6 +18,14 @@ import (
 	"sync"
 	"time"
 )
+
+// DataDir holds a project's state, outside the project. The id hashes the
+// canonical root, so re-adding a removed project finds its history; after a
+// move, rename the folder to the new id.
+func DataDir(stateDir, root string) string {
+	sum := sha256.Sum256([]byte(root))
+	return filepath.Join(stateDir, "projects", hex.EncodeToString(sum[:8]))
+}
 
 // KnownProject is one entry in the persisted list.
 type KnownProject struct {

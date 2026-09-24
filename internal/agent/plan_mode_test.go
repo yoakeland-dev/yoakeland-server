@@ -65,7 +65,7 @@ func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {
 	tools := []tool.Tool{
 		tool.NewFileReadTool(norm),
 		tool.NewFileWriteTool(norm),
-		tool.NewWritePlanTool(norm),
+		tool.NewWritePlanTool(t.TempDir()),
 	}
 
 	provider := &capturingProvider{

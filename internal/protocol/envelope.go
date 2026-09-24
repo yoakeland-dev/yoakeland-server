@@ -330,7 +330,7 @@ type ModeSetData struct {
 
 // SetWebToolsEnabledData toggles whether web_search/web_fetch are exposed to
 // the model for an entire project (all sessions), independent of mode.
-// Persisted to .yoake/settings.json — unlike mode, survives a restart.
+// Persisted, so unlike mode it survives a restart.
 type SetWebToolsEnabledData struct {
 	ProjectPath string `json:"projectPath,omitempty"`
 	Enabled     bool   `json:"enabled"`
@@ -356,12 +356,11 @@ type AskUserQuestionRequestedData struct {
 	Options  []string `json:"options,omitempty"`
 }
 
-// PlanWrittenData is sent when the write_plan tool records a plan — Path is
-// relative to the project root, at .yoake/plans/<sessionId>.md. A frontend
-// should open this file in a sidebar pane rather than relying only on
-// model_delta prose narrating the plan.
+// PlanWrittenData carries the plan, so clients never read the server's disk.
+// Path is where the server stored it.
 type PlanWrittenData struct {
-	Path string `json:"path"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 
 // OAuthStartData begins an OpenRouter PKCE login; Name is the provider name

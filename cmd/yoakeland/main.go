@@ -136,8 +136,7 @@ func main() {
 	}
 
 	// Providers/credentials belong to whoever is running the server, not to
-	// any one project, so they live in their own state directory rather than
-	// inside a project's .yoake/.
+	// any one project.
 	providerStore, err := provider.NewProviderStore(stateDir, masterKey)
 	if err != nil {
 		logFatal("failed to initialize provider store: %v", err)

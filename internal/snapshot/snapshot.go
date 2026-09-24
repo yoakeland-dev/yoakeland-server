@@ -103,8 +103,8 @@ type DiskSnapshotStore struct {
 	openByTurn map[string]string
 }
 
-func NewDiskSnapshotStore(projectRoot string) (*DiskSnapshotStore, error) {
-	baseDir := filepath.Join(projectRoot, ".yoake", "snapshots")
+func NewDiskSnapshotStore(dataDir string) (*DiskSnapshotStore, error) {
+	baseDir := filepath.Join(dataDir, "snapshots")
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating snapshot dir: %w", err)
 	}

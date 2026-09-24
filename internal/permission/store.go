@@ -24,8 +24,8 @@ type PersistentStore struct {
 	filePath string
 }
 
-func NewPersistentStore(projectRoot string) *PersistentStore {
-	dir := filepath.Join(projectRoot, ".yoake")
+func NewPersistentStore(dataDir string) *PersistentStore {
+	dir := dataDir
 	_ = os.MkdirAll(dir, 0755)
 	return &PersistentStore{
 		filePath: filepath.Join(dir, "permissions.json"),

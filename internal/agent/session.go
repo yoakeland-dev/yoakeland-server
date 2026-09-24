@@ -78,8 +78,8 @@ type DiskSessionStore struct {
 	baseDir string
 }
 
-func NewDiskSessionStore(projectRoot string) (*DiskSessionStore, error) {
-	dir := filepath.Join(projectRoot, ".yoake", "sessions")
+func NewDiskSessionStore(dataDir string) (*DiskSessionStore, error) {
+	dir := filepath.Join(dataDir, "sessions")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("creating session dir: %w", err)
 	}

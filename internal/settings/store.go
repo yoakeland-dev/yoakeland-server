@@ -1,8 +1,5 @@
-// Package settings persists small per-project toggles under .yoake/ — today
-// just whether the web_search/web_fetch tools are exposed to the model
-// (see SPEC.md §4c's mode discussion for why this is a separate, orthogonal
-// setting rather than folded into mode itself). Load-whole-file/
-// save-via-temp-then-rename, the same shape permission.PersistentStore uses.
+// Package settings persists per-project toggles: currently whether
+// web_search/web_fetch are exposed (SPEC.md §4c says why that isn't a mode).
 package settings
 
 import (
@@ -23,9 +20,8 @@ type Store struct {
 	filePath string
 }
 
-// NewStore returns a settings store rooted at <projectRoot>/.yoake/settings.json.
-func NewStore(projectRoot string) *Store {
-	dir := filepath.Join(projectRoot, ".yoake")
+func NewStore(dataDir string) *Store {
+	dir := dataDir
 	_ = os.MkdirAll(dir, 0755)
 	return &Store{
 		filePath: filepath.Join(dir, "settings.json"),

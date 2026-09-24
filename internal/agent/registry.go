@@ -128,7 +128,7 @@ func (r *Registry) SetMaxSessionSpendUSD(limit float64) {
 }
 
 // SetWebToolsEnabled applies the project-wide web_search/web_fetch toggle
-// (persisted in .yoake/settings.json, see cmd/yoakeland's set_web_tools_enabled
+// (persisted in settings.json, see cmd/yoakeland's set_web_tools_enabled
 // handler) to every session created from here on, AND to every session
 // already live — unlike SetMaxSessionSpendUSD, this is a live per-project
 // setting a client can flip mid-session, not just a construction-time

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -36,27 +37,34 @@ type ProjectContext struct {
 	Terminals     *terminal.Manager
 }
 
-func newProjectContext(root string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64) (*ProjectContext, error) {
+func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64) (*ProjectContext, error) {
 	norm, err := normalizer.New(root)
 	if err != nil {
 		return nil, fmt.Errorf("normalizer: %w", err)
 	}
 
-	permStore := permission.NewPersistentStore(norm.ProjectRoot)
+	// The folder name is a hash; this says which project it is.
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("project data dir: %w", err)
+	}
+	meta, _ := json.Marshal(map[string]string{"path": norm.ProjectRoot})
+	_ = os.WriteFile(filepath.Join(dataDir, "project.json"), meta, 0o600)
+
+	permStore := permission.NewPersistentStore(dataDir)
 	permEngine := permission.New(norm, permStore)
 
-	settingsStore := settings.NewStore(norm.ProjectRoot)
+	settingsStore := settings.NewStore(dataDir)
 	projSettings, err := settingsStore.Load()
 	if err != nil {
 		return nil, fmt.Errorf("settings store: %w", err)
 	}
 
-	snapStore, err := snapshot.NewDiskSnapshotStore(norm.ProjectRoot)
+	snapStore, err := snapshot.NewDiskSnapshotStore(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot store: %w", err)
 	}
 
-	sessStore, err := agent.NewDiskSessionStore(norm.ProjectRoot)
+	sessStore, err := agent.NewDiskSessionStore(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("session store: %w", err)
 	}
@@ -74,7 +82,7 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, default
 		tool.NewFileEditTool(norm),
 		tool.NewBashTool(norm, sb),
 		tool.NewAskUserQuestionTool(),
-		tool.NewWritePlanTool(norm),
+		tool.NewWritePlanTool(filepath.Join(dataDir, "plans")),
 	}
 	braveKey := os.Getenv("BRAVE_API_KEY")
 	if braveKey == "" {
@@ -86,7 +94,7 @@ func newProjectContext(root string, defaultProvider agent.ModelProvider, default
 	tools = append(tools, tool.NewWebSearchTool(braveKey), tool.NewWebFetchTool())
 
 	ctxMgr := agent.NewContextManager(64000, 4000)
-	usageStore, err := agent.NewUsageStore(norm.ProjectRoot)
+	usageStore, err := agent.NewUsageStore(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("usage store: %w", err)
 	}
@@ -283,6 +291,7 @@ type ProjectRegistry struct {
 	defaultProviderName string
 	maxSpendUSD         float64
 	known               *projectstore.Store // persisted "which projects exist", server-wide
+	stateDir            string
 	notify              *NotificationFeed
 	hub                 *statusHub
 	// gits watches every known project's git state, open or not, so a
@@ -473,6 +482,7 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 		defaultProviderName: defaultProviderName,
 		maxSpendUSD:         maxSessionSpendUSD,
 		known:               known,
+		stateDir:            stateDir,
 		gits:                make(map[string]*gitWatcher),
 	}, nil
 }
@@ -480,8 +490,8 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 // projectKey canonicalizes root the same way normalizer.New does (symlinks
 // resolved, not just made absolute) so the registry's map key always agrees
 // with ProjectContext.Root — otherwise a symlinked path and its real-path
-// equivalent silently become two independent ProjectContexts pointed at the
-// same on-disk .yoake directory.
+// equivalent silently become two independent ProjectContexts pointed at
+// different data dirs for the same project.
 func projectKey(root string) (string, error) {
 	return normalizer.CanonicalRoot(root)
 }
@@ -501,7 +511,7 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		return pc, nil
 	}
 
-	pc, err := newProjectContext(key, r.defaultProvider, r.defaultProviderName, r.maxSpendUSD)
+	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.maxSpendUSD)
 	if err != nil {
 		return nil, err
 	}
@@ -537,8 +547,7 @@ func (r *ProjectRegistry) Unbind(sessionID string) {
 // bound to a removed project would silently rebuild a brand-new
 // ProjectContext (new sandbox, new agent.Registry) on its next reference
 // while the old one — possibly mid-turn — kept running, unreferenced but
-// alive. It does not touch anything on disk under the project root itself
-// (.yoake/ stays put); "remove" means "stop tracking," not "delete."
+// alive. Its data dir stays, so re-adding the project finds its history.
 func (r *ProjectRegistry) Remove(root string) error {
 	key, err := projectKey(root)
 	if err != nil {

@@ -200,7 +200,7 @@ func TestFileWrite_CaptureFailure_EmitsErrorEvent(t *testing.T) {
 
 	// Make the snapshot store's base directory unwritable so the next
 	// capture's os.MkdirAll/os.WriteFile inside it fails deterministically.
-	snapshotsDir := filepath.Join(tempDir, ".yoake", "snapshots")
+	snapshotsDir := filepath.Join(tempDir, "snapshots")
 	if err := os.Chmod(snapshotsDir, 0o500); err != nil {
 		t.Fatal(err)
 	}

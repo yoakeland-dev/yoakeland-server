@@ -208,16 +208,15 @@ func TestDiskSnapshotStore_RestoreSnapshot_RejectsTraversalID(t *testing.T) {
 
 func TestDiskSnapshotStore_RestoreSnapshot_RejectsTraversalRelPath(t *testing.T) {
 	projectRoot := t.TempDir()
-	store, err := snapshot.NewDiskSnapshotStore(projectRoot)
+	storeDir := t.TempDir()
+	store, err := snapshot.NewDiskSnapshotStore(storeDir)
 	if err != nil {
 		t.Fatalf("failed to init snapshot store: %v", err)
 	}
 
 	// Craft a snapshot manifest by hand whose relPath escapes projectRoot,
-	// simulating a malicious file_write to .yoake/snapshots/evil/manifest.json
-	// followed by a restore_snapshot call — this must not be able to write
-	// outside projectRoot.
-	snapDir := filepath.Join(projectRoot, ".yoake", "snapshots", "evil")
+	// followed by restore_snapshot: it must not write outside projectRoot.
+	snapDir := filepath.Join(storeDir, "snapshots", "evil")
 	dataDir := filepath.Join(snapDir, "data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		t.Fatal(err)

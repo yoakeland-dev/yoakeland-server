@@ -82,7 +82,7 @@ type encryptedProviderFile struct {
 // ProviderStore persists named provider configs as <dir>/providers.json.
 // Providers are server-level state (they belong to whoever runs the
 // server, not to any one project someone connects to work on), so dir is
-// typically a server-wide state directory, not a project's .yoake/. Unlike
+// typically the server's state directory. Unlike
 // sessions/permissions, this file can hold API keys, so it's written with
 // 0600 rather than the usual 0644 — and, if a passphrase is given, encrypted
 // at rest (AES-256-GCM, key derived via scrypt) rather than left plaintext,

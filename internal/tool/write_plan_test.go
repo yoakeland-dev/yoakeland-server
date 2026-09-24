@@ -8,19 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
 )
 
 func TestWritePlanTool_WritesPerSessionFileAndEmitsEvent(t *testing.T) {
 	tempDir := t.TempDir()
-	norm, err := normalizer.New(tempDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	wt := tool.NewWritePlanTool(norm)
+	wt := tool.NewWritePlanTool(tempDir)
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
@@ -35,11 +29,11 @@ func TestWritePlanTool_WritesPerSessionFileAndEmitsEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if !strings.Contains(out, ".yoake/plans/session-123.md") {
-		t.Fatalf("expected the result to name the written path, got: %q", out)
+	if strings.Contains(out, tempDir) {
+		t.Fatalf("the model's result shouldn't point at a path its file tools can't reach, got: %q", out)
 	}
 
-	written, err := os.ReadFile(filepath.Join(tempDir, ".yoake", "plans", "session-123.md"))
+	written, err := os.ReadFile(filepath.Join(tempDir, "session-123.md"))
 	if err != nil {
 		t.Fatalf("reading plan file: %v", err)
 	}
@@ -47,8 +41,14 @@ func TestWritePlanTool_WritesPerSessionFileAndEmitsEvent(t *testing.T) {
 		t.Fatalf("plan file content mismatch: %q", written)
 	}
 
-	if !strings.Contains(outBuf.String(), "plan_written") || !strings.Contains(outBuf.String(), "session-123.md") {
-		t.Fatalf("expected a plan_written event naming the path, got: %s", outBuf.String())
+	var env protocol.Envelope
+	if err := json.Unmarshal(outBuf.Bytes(), &env); err != nil || env.Type != protocol.EventPlanWritten {
+		t.Fatalf("expected a plan_written event, got: %s", outBuf.String())
+	}
+	var data protocol.PlanWrittenData
+	_ = json.Unmarshal(env.Data, &data)
+	if data.Content != "# The Plan\n\nStep one." || !strings.HasSuffix(data.Path, "session-123.md") {
+		t.Fatalf("plan_written should carry the plan and its path, got: %+v", data)
 	}
 }
 
@@ -57,8 +57,7 @@ func TestWritePlanTool_WritesPerSessionFileAndEmitsEvent(t *testing.T) {
 // Plan-mode sessions in the same project must not overwrite each other.
 func TestWritePlanTool_TwoSessionsDoNotClobber(t *testing.T) {
 	tempDir := t.TempDir()
-	norm, _ := normalizer.New(tempDir)
-	wt := tool.NewWritePlanTool(norm)
+	wt := tool.NewWritePlanTool(tempDir)
 
 	argsA, _ := json.Marshal(tool.WritePlanArgs{Content: "plan A"})
 	argsB, _ := json.Marshal(tool.WritePlanArgs{Content: "plan B"})
@@ -70,8 +69,8 @@ func TestWritePlanTool_TwoSessionsDoNotClobber(t *testing.T) {
 		t.Fatalf("Execute B: %v", err)
 	}
 
-	a, _ := os.ReadFile(filepath.Join(tempDir, ".yoake", "plans", "session-A.md"))
-	b, _ := os.ReadFile(filepath.Join(tempDir, ".yoake", "plans", "session-B.md"))
+	a, _ := os.ReadFile(filepath.Join(tempDir, "session-A.md"))
+	b, _ := os.ReadFile(filepath.Join(tempDir, "session-B.md"))
 	if string(a) != "plan A" || string(b) != "plan B" {
 		t.Fatalf("expected independent per-session plan files, got A=%q B=%q", a, b)
 	}
