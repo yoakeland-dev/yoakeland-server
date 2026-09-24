@@ -23,6 +23,16 @@ type EventSender interface {
 type StreamSet struct {
 	mu      sync.Mutex
 	streams map[*IPCStream]struct{}
+	tap     func(evtType EventType, sessionID, turnID string, payload any)
+}
+
+// SetTap installs an observer that sees every event sent through this set,
+// after it's fanned out — e.g. the server's notification feed watching for
+// turn_completed/permission_request without every emit site knowing about it.
+func (s *StreamSet) SetTap(tap func(evtType EventType, sessionID, turnID string, payload any)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tap = tap
 }
 
 // NewStreamSet returns an empty set. Add at least one stream before sending
@@ -68,7 +78,11 @@ func (s *StreamSet) SendEvent(evtType EventType, sessionID, turnID, toolCallID s
 	for st := range s.streams {
 		streams = append(streams, st)
 	}
+	tap := s.tap
 	s.mu.Unlock()
+	if tap != nil {
+		defer tap(evtType, sessionID, turnID, payload)
+	}
 
 	var firstErr error
 	for _, st := range streams {

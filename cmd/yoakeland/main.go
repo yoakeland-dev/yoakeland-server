@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,7 +16,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -61,7 +61,7 @@ func main() {
 	flag.StringVar(&apiKey, "api-key", "", "API key (or use ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)")
 	flag.StringVar(&baseURL, "base-url", "", "Custom API base URL (e.g. http://localhost:1234/v1 for LM Studio)")
 	flag.BoolVar(&stdioMode, "stdio", false, "Speak the protocol directly over this process's own stdin/stdout and exit when stdin closes, instead of running as a daemon. This is the spawn-a-subprocess-per-client contract (what yoake-client's default -bin mode uses under the hood). Most local usage wants the default instead: a long-running process that always has a local unix socket open, exiting on SIGINT/SIGTERM rather than stdin EOF. Mutually exclusive with -listen.")
-	flag.StringVar(&listenAddr, "listen", "", "Optionally ALSO listen here, in addition to the always-on local unix socket (ignored if -stdio is set): a TCP address (e.g. ':7890') for remote/multi-device access, or 'unix:/path/to/socket' to override where the local socket itself lives. A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent.")
+	flag.StringVar(&listenAddr, "listen", "", "Optionally ALSO listen here, in addition to the always-on local unix socket (a named pipe on Windows; ignored if -stdio is set): a TCP address (e.g. ':7890') for remote/multi-device access, or 'unix:/path/to/socket' to override where the local socket itself lives. A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent.")
 	flag.StringVar(&authToken, "token", "", "Shared auth token required from clients of the optional TCP listener (auto-generated if empty). Not used for any unix socket.")
 	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate file for the optional TCP listener (requires -tls-key). Without both, yoakeland auto-generates and uses its own self-managed CA under -state-dir/tls/ instead — the listener is always TLS, never plaintext.")
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key file for the optional TCP listener (requires -tls-cert)")
@@ -172,6 +172,14 @@ func main() {
 		_ = settings.SetToken(authToken)
 	}
 	peers := NewPeerRegistry()
+	notify := NewNotificationFeed(peers)
+	projects.SetNotifications(notify)
+	hub := newStatusHub(peers, stateDir)
+	projects.SetStatusHub(hub)
+	uploads, err := NewUploadStore(stateDir)
+	if err != nil {
+		logFatal("failed to initialize upload store: %v", err)
+	}
 
 	rc := &remoteControl{tlsCert: tlsCert, tlsKey: tlsKey, stateDir: stateDir, settings: settings}
 	deps := connDeps{
@@ -181,17 +189,23 @@ func main() {
 		oauthStore:         oauthStore,
 		manifestCache:      manifestCache,
 		peers:              peers,
+		notify:             notify,
+		presence:           newPresenceNotes(notify),
+		uploads:            uploads,
 		settings:           settings,
 		remote:             rc,
+		status:             hub,
 		turnWG:             &sync.WaitGroup{},
 	}
 	rc.deps = deps
+	hub.status = func() *protocol.ServerStatus { return serverStatus(deps) }
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	manifestCache.StartDailyRefresh(ctx)
 	pricingCache.StartDailyRefresh(ctx)
+	hub.StartUsagePolling(ctx, providerStore)
 
 	if stdioMode {
 		serveConnection(ctx, protocol.NewIPCStream(os.Stdin, os.Stdout), deps, "stdio", "", nil)
@@ -208,7 +222,8 @@ func main() {
 	// there ADDS an optional, remote-reachable second listener, and a
 	// 'unix:<path>' there only overrides where the always-on local socket
 	// lives.
-	localSocketPath := sockpath.DefaultSocketPath(sockpath.DefaultRuntimeDir(stateDir))
+	defaultSocketPath := sockpath.DefaultSocketPath(sockpath.DefaultRuntimeDir(stateDir))
+	localSocketPath := defaultSocketPath
 	var tcpAddr string
 	if listenAddr != "" {
 		network, address := parseListenAddr(listenAddr, stateDir)
@@ -219,11 +234,13 @@ func main() {
 		}
 	}
 
-	unixLn, err := setupUnixListener(localSocketPath)
+	localLn, err := setupLocalListener(localSocketPath, localSocketPath == defaultSocketPath)
 	if err != nil {
 		logFatal("failed to listen on local socket %s: %v", localSocketPath, err)
 	}
-	go acceptLoop(ctx, unixLn, "unix", deps, nil, nil)
+	// "unix" network semantics (no token) for the Windows named pipe too:
+	// its owner-only ACL is the same boundary the socket file's 0600 is.
+	go acceptLoop(ctx, localLn, "unix", deps, nil, nil)
 
 	if tcpAddr != "" {
 		rc.addr = tcpAddr
@@ -268,31 +285,6 @@ func drainTurns(wg *sync.WaitGroup) {
 	}
 }
 
-// setupUnixListener binds a unix domain socket at path, creating its parent
-// directory (0700) and clearing any stale socket left by a previous crashed
-// run, then chmods the socket file itself 0600 — its owner-only permission
-// is the whole auth boundary for connections through it, so no token or
-// handshake is needed (see SPEC.md §2a).
-func setupUnixListener(path string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return nil, fmt.Errorf("creating directory for unix socket: %w", err)
-	}
-	_ = os.Remove(path) // clear a stale socket left by a previous crashed run
-
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return nil, fmt.Errorf("setting permissions on unix socket: %w", err)
-	}
-	logInfoDetail(
-		fmt.Sprintf("local socket listening at %s", path),
-		fmt.Sprintf("yoakeland local socket listening at %s (mode 0600 — no auth token needed, owner-only file permissions are the auth boundary)", path),
-	)
-	return ln, nil
-}
-
 // generateAuthToken produces a fresh random TCP auth token — 16 bytes of
 // crypto/rand, hex-encoded — shared by setupTCPListener's auto-generation
 // and register_token, so there's exactly one place defining what "a token"
@@ -303,6 +295,21 @@ func generateAuthToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// pairingCode bundles a token with a CA certificate (omitted if empty, the
+// operator-supplied-real-cert case) into one opaque, copy-pasteable string —
+// the exact {"t","ca"} JSON-then-base64 shape src/lib/pairing.ts decodes
+// client-side, so a code printed here pastes directly into a client's "Add a
+// server" pairing-code field: no separate CA file to hand over, whoever's
+// pairing just reads this one line off the server's own console.
+func pairingCode(token, caPem string) string {
+	payload := struct {
+		Token string `json:"t"`
+		CA    string `json:"ca,omitempty"`
+	}{Token: token, CA: caPem}
+	b, _ := json.Marshal(payload) // an all-string struct — Marshal can't fail
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 // setupTCPListener binds addr for the optional remote listener and
@@ -326,24 +333,30 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 		return nil, "", err
 	}
 
-	cert, usingAutoCA, caPEMPath, caFingerprint, err := resolveServerCert(stateDir, tlsCert, tlsKey)
+	cert, usingAutoCA, caPEMPath, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
 	if err != nil {
 		_ = ln.Close()
 		return nil, "", fmt.Errorf("resolving TLS certificate: %w", err)
 	}
 	ln = wrapTLS(ln, cert)
 
+	var caPEM string
 	if usingAutoCA {
-		logInfoDetail(
-			fmt.Sprintf("remote listener on %s (TLS, self-managed CA, token: %s)", ln.Addr(), authToken),
-			fmt.Sprintf("yoakeland remote listener on %s over TLS (self-managed CA, fingerprint %s, CA cert at %s — copy this file to a client for pairing; the client should trust only this CA, not the public trust store) (token: %s)", ln.Addr(), caFingerprint, caPEMPath, authToken),
-		)
-	} else {
-		logInfoDetail(
-			fmt.Sprintf("remote listener on %s (TLS, token: %s)", ln.Addr(), authToken),
-			fmt.Sprintf("yoakeland remote listener on %s over TLS (token: %s)", ln.Addr(), authToken),
-		)
+		// Best-effort: worst case the printed code just omits the CA (same as
+		// the operator-real-cert branch below), not a listener failure.
+		if b, err := os.ReadFile(caPEMPath); err == nil {
+			caPEM = string(b)
+		}
 	}
+	carries := "the token"
+	if usingAutoCA {
+		carries = "the token and this server's CA"
+	}
+	code := pairingCode(authToken, caPEM)
+	logInfoDetail(
+		fmt.Sprintf("remote listener on %s (TLS) — pairing code: %s", ln.Addr(), code),
+		fmt.Sprintf("yoakeland remote listener on %s over TLS — paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
+	)
 	return ln, authToken, nil
 }
 
@@ -440,30 +453,41 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 			}
 
 			ipc := protocol.NewIPCStream(conn, conn)
-			name, deviceType, avatar, tokenName, email, pending, ok := handshake(ipc, network, lookupToken)
+			who, pending, ok := handshake(ipc, network, lookupToken)
 			if !ok {
 				return
 			}
-			if deviceType == "" {
-				deviceType = "desktop"
+			if who.DeviceType == "" {
+				who.DeviceType = "desktop"
 			}
 
-			peer := deps.peers.Add(ipc, conn, network, name, deviceType, avatar)
-			if tokenName != "" {
-				deps.peers.SetTokenIdentity(peer.ID, tokenName, email)
-			}
+			peer := deps.peers.Add(ipc, conn, network, who)
 			defer deps.peers.Remove(peer.ID)
+			defer deps.uploads.DropPeer(peer.ID)
+			// The poller idles with nobody connected; catch up for this client.
+			deps.status.KickUsage()
+			if network == "tcp" {
+				// Remote devices only: a local GUI reconnecting is routine noise.
+				deps.presence.Joined(peer)
+				defer deps.presence.Left(peer)
+			}
 
 			var lastSeen atomic.Int64
 			lastSeen.Store(time.Now().UnixNano())
 
 			hbCtx, stopHeartbeat := context.WithCancel(ctx)
 			defer stopHeartbeat()
-			go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout)
+			status := func() *protocol.ServerStatus { return serverStatus(deps) }
+			go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
 			onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
 
 			_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
 			_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
+			deps.status.SendPendingAsks(ipc)
+			for _, st := range deps.projects.GitStatuses() {
+				_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
+			}
+			deps.status.SendTerminals(ipc)
 
 			if pending != nil {
 				onActivity()
@@ -483,9 +507,22 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 // itself (callers that need the connection closed on ctx cancellation, e.g.
 // remoteControl.Stop(), do that themselves; see acceptLoop's connection
 // tracking).
-func runHeartbeat(ctx context.Context, ipc *protocol.IPCStream, closer io.Closer, lastSeen *atomic.Int64, interval, timeout time.Duration) {
+// status, if non-nil, is sampled into every ping (SPEC.md §2a) — and once
+// immediately, so a fresh connection's status bar isn't blank for a whole
+// interval.
+func runHeartbeat(ctx context.Context, ipc *protocol.IPCStream, closer io.Closer, lastSeen *atomic.Int64, interval, timeout time.Duration, status func() *protocol.ServerStatus) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	ping := func() error {
+		data := protocol.PingData{}
+		if status != nil {
+			data.Status = status()
+		}
+		return ipc.SendEvent(protocol.EventPing, "", "", "", data)
+	}
+	if status != nil {
+		_ = ping()
+	}
 
 	for {
 		select {
@@ -496,7 +533,7 @@ func runHeartbeat(ctx context.Context, ipc *protocol.IPCStream, closer io.Closer
 				_ = closer.Close()
 				return
 			}
-			if err := ipc.SendEvent(protocol.EventPing, "", "", "", protocol.PingData{}); err != nil {
+			if err := ping(); err != nil {
 				_ = closer.Close()
 				return
 			}
@@ -567,21 +604,21 @@ func constantTimeTokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare(ah[:], bh[:]) == 1
 }
 
-func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) (name, deviceType, avatar, tokenName, email string, pending *protocol.Envelope, ok bool) {
+func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) (who peerIdentity, pending *protocol.Envelope, ok bool) {
 	env, err := ipc.ReadEnvelope()
 	if err != nil {
-		return "", "", "", "", "", nil, false
+		return who, nil, false
 	}
 
 	if env.Type != protocol.EventAuth {
 		if network == "unix" {
-			return "", "", "", "", "", env, true
+			return who, env, true
 		}
 		_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 			Message: "expected auth as first frame",
 			Fatal:   true,
 		})
-		return "", "", "", "", "", nil, false
+		return who, nil, false
 	}
 
 	var data protocol.AuthData
@@ -590,10 +627,11 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 			Message: "malformed auth payload",
 			Fatal:   true,
 		})
-		return "", "", "", "", "", nil, false
+		return who, nil, false
 	}
+	who = peerIdentity{Name: data.Name, DeviceType: data.DeviceType, Avatar: data.Avatar, DeviceID: data.DeviceID}
 	if network == "unix" {
-		return data.Name, data.DeviceType, data.Avatar, "", "", nil, true
+		return who, nil, true
 	}
 
 	resolvedName, rec, found := "", TokenRecord{}, false
@@ -605,13 +643,14 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 			Message: "authentication failed",
 			Fatal:   true,
 		})
-		return "", "", "", "", "", nil, false
+		return peerIdentity{}, nil, false
 	}
 	// The persisted, token-tied name/avatar always wins over whatever the
 	// client self-reported (SPEC.md §2a's per-person tokens) — a name is
 	// fixed at register_token time, and the avatar is cached via
 	// set_peer_avatar, not re-typed every connection.
-	return resolvedName, data.DeviceType, rec.Avatar, resolvedName, rec.Email, nil, true
+	who.Name, who.Avatar, who.TokenName, who.Email = resolvedName, rec.Avatar, resolvedName, rec.Email
+	return who, nil, true
 }
 
 // connDeps bundles the pieces every connection's dispatch loop shares
@@ -626,8 +665,12 @@ type connDeps struct {
 	oauthStore         *provider.OAuthSessionStore
 	manifestCache      *provider.ManifestCache
 	peers              *PeerRegistry
+	notify             *NotificationFeed
+	presence           *presenceNotes
+	uploads            *UploadStore
 	settings           *ServerSettings
 	remote             *remoteControl
+	status             *statusHub
 
 	// turnWG, if non-nil, is Add(1)'d before every RunTurn goroutine is
 	// spawned and Done() when it returns. Production leaves this nil (the
@@ -740,6 +783,35 @@ func recoverTurnPanic(ipc *protocol.IPCStream, sessionID, turnID string) {
 // serveConnection so acceptLoop can run a unix connection's optional pending
 // first envelope (see handshake) through the identical dispatch path before
 // entering serveConnection's own read loop.
+// resolveTerminalSession resolves the (project, sessionId) a terminal_*/
+// list_terminals envelope targets — terminals are bound to a chat session
+// (deleting the chat kills its terminals, see ProjectContext.Terminals'
+// CloseSession callers), so this mirrors user_prompt's own resolution
+// exactly: an explicit sessionId, falling back to the envelope's own
+// sessionId, then resolved against ProjectRegistry the same way
+// deps.projects.Resolve handles every other session-scoped event. On
+// failure it sends the error envelope itself and returns a non-nil error so
+// the caller can just `return`.
+func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protocol.Envelope, sessionID, projectPath string) (*ProjectContext, string, error) {
+	sessID := sessionID
+	if sessID == "" {
+		sessID = env.SessionID
+	}
+	if sessID == "" {
+		err := fmt.Errorf("terminal requires a sessionId")
+		_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+			Message: err.Error(),
+		})
+		return nil, "", err
+	}
+	pc, err := deps.projects.Resolve(sessID, projectPath, deps.defaultProjectRoot)
+	if err != nil {
+		_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+		return nil, "", err
+	}
+	return pc, sessID, nil
+}
+
 func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
 	switch env.Type {
 	case protocol.EventUserPrompt:
@@ -767,6 +839,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 
+		if err := validateAttachments(network, deps.uploads, pc.Root, data.Attachments); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+
 		ag := pc.Registry.Get(ipc, sessID)
 		// Create the session's file before the turn goroutine starts, so the
 		// set_session_title a client pushes alongside a first message (SPEC.md
@@ -780,7 +857,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			deps.turnWG.Add(1)
 		}
 		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
-		turnCtx := agent.WithAuthor(ctx, author)
+		turnCtx := agent.WithAttachments(agent.WithAuthor(ctx, author), data.Attachments)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
 		if data.AutoGenerateTitle != nil {
 			autoGenerateTitle = *data.AutoGenerateTitle
@@ -792,6 +869,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RunTurnWithTitleGeneration(turnCtx, sID, tID, prompt, autoGenerateTitle); err != nil {
 				logError("turn %s (session %s) failed: %v", tID, sID, err)
+				deps.notify.turnFailed(pc, sID, err)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -883,6 +961,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// Server-wide state (§6b/§6c) — every peer's provider list needs it,
 		// not just this connection's.
 		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRegistered, "", registered)
+		if _, cli := provider.CLIKindOf(cfg.Kind); cli {
+			deps.status.KickUsage()
+		}
 
 	case protocol.EventListProviders:
 		var summaries []protocol.ProviderSummary
@@ -990,6 +1071,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				Message: fmt.Sprintf("failed to activate provider %q: %v", data.ProviderName, err),
 			})
 			return
+		}
+		if cli, ok := built.(*provider.CLISubprocessProvider); ok && deps.status != nil {
+			name := data.ProviderName
+			kind := string(cfg.Kind)
+			cli.OnRateLimits = func(rl protocol.ProviderRateLimits) {
+				rl.Kind = kind
+				deps.status.SetRateLimits(name, rl)
+			}
 		}
 		pc.Registry.Get(ipc, sessID).SetProvider(built, data.ProviderName)
 		providerSet := protocol.ProviderSetData{
@@ -1191,6 +1280,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.status.ForgetRateLimits(data.Name)
 		removed := protocol.ProviderRemovedData{Name: data.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRemoved, env.SessionID, env.TurnID, "", removed)
 		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRemoved, "", removed)
@@ -1254,6 +1344,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
+		deps.peers.SetActivity(peerID, data.SessionID, pc.Root)
 		state, err := pc.SessStore.Load(data.SessionID)
 		var history []agent.Message
 		var branches map[string][][]agent.Message
@@ -1262,6 +1353,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			history = state.History
 			branches = state.Branches
 			mode = state.Mode
+		} else if ag := pc.Registry.Lookup(data.SessionID); ag != nil {
+			// Not prompted yet, so no file (set_mode doesn't create one) —
+			// the live mode is still the truth a client should adopt.
+			mode = string(ag.Mode())
 		} // a session with no persisted history yet isn't an error — it just has none
 		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
 			SessionID: data.SessionID,
@@ -1299,6 +1394,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.EditMessage(turnCtx, sID, tID, msgID, content, autoGenerateTitle); err != nil {
 				logError("edit_message turn %s (session %s): %v", tID, sID, err)
+				deps.notify.turnFailed(pc, sID, err)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -1331,6 +1427,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RetryMessage(turnCtx, sID, tID, msgID); err != nil {
 				logError("retry_message turn %s (session %s): %v", tID, sID, err)
+				deps.notify.turnFailed(pc, sID, err)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -1459,6 +1556,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		pc.Registry.Remove(data.SessionID)
+		pc.Terminals.CloseSession(data.SessionID)
 		if err := pc.SessStore.Delete(data.SessionID); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("failed to delete session: %v", err),
@@ -1478,8 +1576,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = json.Unmarshal(env.Data, &data)
 		abs, entries, err := listDirectory(data.Path)
 		if err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to list directory %q: %v", data.Path, err),
+			_ = ipc.SendEvent(protocol.EventDirectoryList, env.SessionID, env.TurnID, "", protocol.DirectoryListData{
+				Path:    data.Path,
+				Entries: []protocol.DirEntry{},
+				Error:   err.Error(),
 			})
 			return
 		}
@@ -1487,6 +1587,48 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Path:    abs,
 			Entries: entries,
 		})
+
+	case protocol.EventListNotifications:
+		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", protocol.NotificationListData{Notifications: deps.notify.List()})
+
+	case protocol.EventDismissNotification:
+		var data protocol.DismissNotificationData
+		_ = json.Unmarshal(env.Data, &data)
+		deps.notify.Dismiss(data.ID)
+
+	case protocol.EventUploadBegin:
+		var data protocol.UploadBeginData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventUploadDone, "", "", "", protocol.UploadDoneData{Error: "malformed upload_begin payload"})
+			return
+		}
+		path, done, err := deps.uploads.Begin(peerID, data)
+		switch {
+		case err != nil:
+			_ = ipc.SendEvent(protocol.EventUploadDone, "", "", "", protocol.UploadDoneData{UploadID: data.UploadID, Error: err.Error()})
+		case done:
+			_ = ipc.SendEvent(protocol.EventUploadDone, "", "", "", protocol.UploadDoneData{UploadID: data.UploadID, Path: path})
+		default:
+			_ = ipc.SendEvent(protocol.EventUploadProgress, "", "", "", protocol.UploadProgressData{UploadID: data.UploadID})
+		}
+
+	case protocol.EventUploadChunk:
+		var data protocol.UploadChunkData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventUploadDone, "", "", "", protocol.UploadDoneData{Error: "malformed upload_chunk payload"})
+			return
+		}
+		path, received, err := deps.uploads.Chunk(peerID, data)
+		switch {
+		case err != nil:
+			_ = ipc.SendEvent(protocol.EventUploadDone, "", "", "", protocol.UploadDoneData{UploadID: data.UploadID, Error: err.Error()})
+		case path != "":
+			_ = ipc.SendEvent(protocol.EventUploadDone, "", "", "", protocol.UploadDoneData{UploadID: data.UploadID, Path: path})
+		default:
+			// The ack doubles as flow control: a client sends its next chunk
+			// once this arrives, so a big upload never queues ahead of chat.
+			_ = ipc.SendEvent(protocol.EventUploadProgress, "", "", "", protocol.UploadProgressData{UploadID: data.UploadID, Received: received})
+		}
 
 	case protocol.EventListSnapshots:
 		var data protocol.ListSnapshotsData
@@ -1532,6 +1674,110 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = ipc.SendEvent(protocol.EventSnapshotList, env.SessionID, env.TurnID, "", protocol.SnapshotListData{
 			ProjectPath: pc.Root,
 			Snapshots:   summaries,
+		})
+
+	case protocol.EventTerminalOpen:
+		var data protocol.TerminalOpenData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed terminal_open payload",
+			})
+			return
+		}
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		snap, err := pc.Terminals.Open(ctx, ipc, sessID, data.TerminalID, data.Cwd, data.Cols, data.Rows, data.Env)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventTerminalError, sessID, env.TurnID, "", protocol.TerminalErrorData{
+				TerminalID: data.TerminalID,
+				Message:    err.Error(),
+			})
+			return
+		}
+		_ = ipc.SendEvent(protocol.EventTerminalSnapshot, sessID, env.TurnID, "", snap)
+
+	case protocol.EventTerminalAttach:
+		var data protocol.TerminalAttachData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed terminal_attach payload",
+			})
+			return
+		}
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		snap, err := pc.Terminals.Attach(ctx, ipc, sessID, data.TerminalID, data.Cols, data.Rows, data.RestartIfExited)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventTerminalError, sessID, env.TurnID, "", protocol.TerminalErrorData{
+				TerminalID: data.TerminalID,
+				Message:    err.Error(),
+			})
+			return
+		}
+		_ = ipc.SendEvent(protocol.EventTerminalSnapshot, sessID, env.TurnID, "", snap)
+
+	case protocol.EventTerminalInput:
+		var data protocol.TerminalInputData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return
+		}
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		if err := pc.Terminals.Input(sessID, data.TerminalID, data.Data); err != nil {
+			_ = ipc.SendEvent(protocol.EventTerminalError, sessID, env.TurnID, "", protocol.TerminalErrorData{
+				TerminalID: data.TerminalID,
+				Message:    err.Error(),
+			})
+		}
+
+	case protocol.EventTerminalResize:
+		var data protocol.TerminalResizeData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return
+		}
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		if err := pc.Terminals.Resize(sessID, data.TerminalID, data.Cols, data.Rows); err != nil {
+			_ = ipc.SendEvent(protocol.EventTerminalError, sessID, env.TurnID, "", protocol.TerminalErrorData{
+				TerminalID: data.TerminalID,
+				Message:    err.Error(),
+			})
+		}
+
+	case protocol.EventTerminalClose:
+		var data protocol.TerminalCloseData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return
+		}
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		if err := pc.Terminals.Close(sessID, data.TerminalID); err != nil {
+			_ = ipc.SendEvent(protocol.EventTerminalError, sessID, env.TurnID, "", protocol.TerminalErrorData{
+				TerminalID: data.TerminalID,
+				Message:    err.Error(),
+			})
+		}
+
+	case protocol.EventListTerminals:
+		var data protocol.ListTerminalsData
+		_ = json.Unmarshal(env.Data, &data)
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		_ = ipc.SendEvent(protocol.EventTerminalList, sessID, env.TurnID, "", protocol.TerminalListData{
+			SessionID: sessID,
+			Terminals: pc.Terminals.List(sessID),
 		})
 
 	case protocol.EventListFiles:
@@ -1591,6 +1837,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Path:        pc.Root,
 			SandboxTier: pc.SandboxTier,
 		})
+		if st := deps.projects.GitStatus(pc.Root); st != nil {
+			_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", *st)
+		}
 		deps.peers.BroadcastEvent(peerID, protocol.EventProjectList, "", protocol.ProjectListData{
 			Paths: deps.projects.List(),
 		})
@@ -1629,9 +1878,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		})
 
 	case protocol.EventDetectCLI:
+		agents := map[string]bool{}
+		for _, k := range provider.CLIKinds() {
+			agents["cli_"+string(k)] = provider.DetectCLI(k)
+		}
 		_ = ipc.SendEvent(protocol.EventCLIAvailability, env.SessionID, env.TurnID, "", protocol.CLIAvailabilityData{
-			Claude: provider.DetectCLI(provider.CLIKindClaude),
-			Codex:  provider.DetectCLI(provider.CLIKindCodex),
+			Claude: agents["cli_claude"],
+			Codex:  agents["cli_codex"],
+			Agents: agents,
 		})
 
 	case protocol.EventPing:
@@ -1825,10 +2079,15 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		// Best-effort: a client can still pair by pasting the CA separately
+		// (or doesn't need one at all, on an operator-supplied cert) if this
+		// fails, so a CA read error shouldn't fail token registration itself.
+		caPem, _ := deps.remote.CAPEM()
 		_ = ipc.SendEvent(protocol.EventTokenRegistered, env.SessionID, env.TurnID, "", protocol.TokenRegisteredData{
 			Name:  data.Name,
 			Token: token,
 			Email: data.Email,
+			CaPem: caPem,
 		})
 
 	case protocol.EventListTokens:
@@ -1865,6 +2124,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		// Revocation should actually end the session, not just block the next
+		// handshake — otherwise someone already connected on this credential
+		// stays connected until they happen to disconnect on their own.
+		deps.peers.DisconnectByToken(data.Name)
 		_ = ipc.SendEvent(protocol.EventTokenRemoved, env.SessionID, env.TurnID, "", protocol.TokenRemovedData{
 			Name: data.Name,
 		})

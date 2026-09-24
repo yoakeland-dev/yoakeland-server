@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.13)
+# Yoakeland Backend IPC Specification (v2.15)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -31,7 +31,9 @@ All three carry the *identical* newline-delimited JSON envelope protocol and dis
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Sandbox tier is a best-effort ladder, not a guarantee.** `bash` tool calls run inside bubblewrap if it's installed, else Linux user/mount namespaces if the kernel allows them, else — if neither is available — directly on the host with **no isolation at all** beyond the path-escape checks the normalizer already does on `file_read`/`file_write`/`file_edit`. The server logs a startup warning per project when it falls back to this last tier, the same pattern as the no-master-key warning (§6c) — insecure-by-omission is always visible, never silent. A frontend that cares about this (e.g. before offering `bash` on an unfamiliar host) can also read `sandboxTier` off `project_opened` (§3.2) rather than only watching the backend's own log output.
+**Sandbox tier is a best-effort ladder, not a guarantee.** On Linux, `bash` tool calls run inside bubblewrap if it's installed, else Linux user/mount namespaces if the kernel allows them, else — if neither is available — directly on the host with **no isolation at all** beyond the path-escape checks the normalizer already does on `file_read`/`file_write`/`file_edit`. On macOS, `sandbox-exec` (Seatbelt) is used if available, falling back to the same unconfined tier. Windows has no bubblewrap/Seatbelt equivalent wired up (`ModeLocalRestr` always) — the built-in terminal's shell sessions there still get a resource cap (memory/process-count via a Windows Job Object) but no filesystem/process isolation. The server logs a startup warning per project when it falls back to the unconfined tier, the same pattern as the no-master-key warning (§6c) — insecure-by-omission is always visible, never silent. A frontend that cares about this (e.g. before offering `bash` on an unfamiliar host) can also read `sandboxTier` off `project_opened` (§3.2) rather than only watching the backend's own log output.
+
+The built-in terminal (§3.1's `terminal_open` et al.) runs through this same sandbox tier, with one deliberate difference: the `bash` tool denies outbound network by default (an agent-issued command shouldn't reach the network unprompted), while a terminal a human explicitly opened allows it — git clone, curl, npm install, ssh, and everything else a normal terminal is expected to do. Both still get the same filesystem confinement (project root only) and, on Linux with cgroup v2 delegation available, a memory/process-count cap the terminal path applies (opportunistically, logged once if unavailable rather than failing the spawn — see the sandbox package's `applyCgroupLimits`).
 
 ### Process Lifecycle
 Two fundamentally different contracts, chosen by whether `-stdio` is passed:
@@ -102,13 +104,14 @@ Any `yoakeland` invocation that isn't `-stdio` opens a Unix domain socket automa
 
 - **Default path**: `<runtime-dir>/yoakeland.sock`, where `runtime-dir` prefers the OS's own per-session runtime/temp directory over `-state-dir` — `$XDG_RUNTIME_DIR/yoake` on Linux (tmpfs, per-user, already `0700`, the same convention `ssh-agent`/`pipewire` use for their own sockets), `$TMPDIR/yoake` on macOS (set per login session by the OS) — falling back to `<-state-dir>/yoakeland.sock` when neither env var is set (plain SSH sessions, cron, minimal containers without a login session exporting those vars). The reasoning: a socket is ephemeral runtime state, not persistent data, so it shouldn't default to sitting next to `providers.json` in a directory that gets backed up or may live on a network-mounted home directory, when the OS already offers a better-suited location.
 - **Overriding the path**: pass `-listen unix:/path/to/socket` (or bare `-listen unix`/`unix:` to name the default path explicitly). This *replaces* where the local socket lives; it does not toggle whether one exists — one always does, unless `-stdio` is set.
-- The parent directory is created (`0700`) if missing, and any stale socket file left by a previous crashed run is removed before binding — a fresh `net.Listen` on a path that already exists otherwise fails with "address already in use."
+- The parent directory is created (`0700`) if missing. For the default path it must also be a real directory owned by the server's user, and is tightened to `0700` if group/others had access; a `-listen unix:<path>` override's parent (e.g. `/tmp`) is left as is.
+- A socket already at the path is only replaced if nothing answers on it (a previous run crashed); a live one makes startup fail with "another yoakeland is already listening", and a path holding anything other than a socket is never deleted.
 - `-tls-cert`/`-tls-key` don't apply to a unix socket (there's no network segment for TLS to protect) and are ignored if the local socket path is overridden alongside them.
 
 **Why this is safe without a token:** a TCP listener can't tell *who* dialed it — even bound to `127.0.0.1`, any local process (or, via DNS rebinding, a browser tab) can open it, which is why the token exists there. A Unix domain socket is a filesystem object: the kernel checks the connecting process's UID/GID against the socket file's permissions *before* the connection is even accepted, the same mechanism `dockerd`, PostgreSQL, and `ssh-agent` all rely on for their local sockets. yoakeland creates the socket file at mode `0600` (owner read/write only) — so only the user account that started the server can connect, full stop. There's no analogous per-client credential to check on top of that, which is why the `auth` step is skipped entirely rather than just made optional.
 
 - This only ever means "local" in the sense of "same machine, same OS user." It is not a substitute for the TCP+token+TLS path below for anything crossing a process/user/machine boundary — including a container boundary, where "the same machine" doesn't imply "the same trust domain."
-- Cross-platform note: `net.Listen("unix", ...)` is POSIX (Linux/macOS); Windows would need a named-pipe equivalent, which yoakeland does not currently provide — daemon mode on Windows today means the *optional* TCP listener (below) is the only way to reach it locally too, until that gap is closed.
+- **Windows: a named pipe instead.** A socket file's mode bits mean nothing there, so on Windows the always-on local listener is the named pipe `\\.\pipe\yoakeland-<USERNAME>` (`-state-dir`/runtime dir play no part; `-listen unix:<name>` overrides it, with `\\.\pipe\` prepended if missing). Everything else above holds — same "no token" semantics, same "another yoakeland is already listening" refusal — with the pipe's security descriptor as the boundary in place of `0600`: this user is the pipe's owner, and its protected DACL has a single ACE granting access to this user's SID and nobody else (no SYSTEM, no Administrators, nothing inherited). Remote (SMB) clients are rejected outright (`PIPE_REJECT_REMOTE_CLIENTS`). Because the pipe namespace is machine-global, another user could create the name first; the server's own create fails in that case (first instance is `FILE_CREATE`), and **clients must check that the pipe they connected to is owned by their own user SID before sending anything** — yoake-client and yoake-gui both do, and refuse the connection otherwise.
 
 ### `-stdio` mode
 The opt-in alternative to the daemon above: no socket at all. The first envelope the frontend writes to the child process's `stdin` can be a `user_prompt` directly, same as the unix socket. See §1 Process Lifecycle for why this is a different embedding contract, not a lighter version of the same one.
@@ -117,13 +120,13 @@ The opt-in alternative to the daemon above: no socket at all. The first envelope
 `-listen <addr>` (anything not starting with `unix`) **adds** a TCP listener alongside the always-on local socket — it's the one genuinely optional transport, for reaching the daemon across machines or devices. It can also be opened/closed *live*, without restarting the process — see `set_remote_access` (§3.1). Every new TCP connection **must** send an `auth` envelope as its very first frame, before anything else:
 
 ```json
-{"type": "auth", "data": {"token": "<the -token value>", "name": "aveline's phone", "deviceType": "web", "avatar": "data:image/png;base64,..."}}
+{"type": "auth", "data": {"token": "<the -token value>", "name": "aveline's phone", "deviceType": "web", "avatar": "data:image/png;base64,...", "deviceId": "3f2a…"}}
 ```
 
 - If the token matches, the connection proceeds exactly like a local-socket session from that point on — same envelope types, same semantics.
 - If it doesn't match (or the first frame isn't `auth`, or it's malformed), the server sends one `error` envelope with `data.fatal: true` and closes the connection. No other envelope type is processed before authentication succeeds.
 - One shared token authenticates all TCP clients; there is currently no per-client/per-user token or revocation. Treat the token like a root password to the project: anyone who has it can read/write any file in the project and run shell commands in the sandbox. It can be rotated live via `set_remote_password` (§3.1) — already-connected TCP clients keep their session, only the *next* handshake needs the new one.
-- `name`/`deviceType`/`avatar` are optional self-reported identity for the peer registry (§3.2 `peer_list`) — `"web"`, `"desktop"`, or `"server"` for `deviceType`; the backend can't otherwise tell what kind of client dialed in from a raw socket. An omitted `name` gets a generated placeholder.
+- `name`/`deviceType`/`avatar` are optional self-reported identity for the peer registry (§3.2 `peer_list`) — `"web"`, `"desktop"`, or `"server"` for `deviceType`; the backend can't otherwise tell what kind of client dialed in from a raw socket. An omitted `name` gets a generated placeholder. `deviceId` is an optional stable id the client generates once and keeps (same value for every server it connects to), so its peer rows can be recognized across reconnects and servers.
 - `avatar` is a data URL (`data:image/png;base64,...` or similar) — **the client is responsible for downscaling it before sending**, the server does no image processing at all. 96x96 is the house convention (small enough that a base64 PNG comes in well under a kilobyte to a few KB). An oversized value (over ~200KB encoded — see `maxAvatarLen`) is silently dropped rather than failing the whole connection, since it's cosmetic, not functional; the peer just shows up without a picture. This travels in every `peer_list` push to every other peer, so don't send a full-resolution image "just in case" — it costs everyone's bandwidth, not just yours.
 
 ### Transport encryption
@@ -137,7 +140,7 @@ This is **not** TOFU/pinning — a client isn't trusting "whatever cert it saw f
 Passing both `-tls-cert`/`-tls-key` overrides all of the above with an operator-supplied real certificate instead (unchanged from before) — useful if you have a domain and a certificate from a real CA, or your own internal PKI already. This has no bearing on the local unix socket, which is never wrapped in TLS (there's no network segment to protect).
 
 ### Keeping a connection alive
-Once connected, a local-socket or TCP connection that's been idle may receive an unsolicited `ping` (§3.2) from the backend roughly every 30 seconds; reply with `pong` echoing the same `nonce` (a client can also send its own `ping` at any time and expects a `pong` back, e.g. to measure round-trip time). Any traffic at all — a real `ping`/`pong`, or just ordinary chat activity — resets the backend's liveness clock for that connection. If nothing is heard from a connection for about 90 seconds, the backend closes it outright, on the assumption it dropped without a clean close (e.g. a phone losing wifi). The backend also closes the connection immediately, without waiting out the 90 seconds, if sending one of these periodic pings itself fails (the write erroring means the connection is already gone). A client that wants to detect a dead backend rather than wait to be dropped should apply the same idea in reverse: if it doesn't hear anything (data or `ping`) from the backend for a while, treat the connection as dead and reconnect. (`-stdio` mode gets no heartbeat — it's a single dedicated pipe, not a pool of independent connections, and EOF is already the liveness signal there.)
+Once connected, a local-socket or TCP connection that's been idle may receive an unsolicited `ping` (§3.2) from the backend roughly every 30 seconds (plus an extra one whenever the status it carries changes — `ping`'s `data.status`, §3.1: queued turns, subscription rate limits, today/month spend, budgets); reply with `pong` echoing the same `nonce` (a client can also send its own `ping` at any time and expects a `pong` back, e.g. to measure round-trip time). Any traffic at all — a real `ping`/`pong`, or just ordinary chat activity — resets the backend's liveness clock for that connection. If nothing is heard from a connection for about 90 seconds, the backend closes it outright, on the assumption it dropped without a clean close (e.g. a phone losing wifi). The backend also closes the connection immediately, without waiting out the 90 seconds, if sending one of these periodic pings itself fails (the write erroring means the connection is already gone). A client that wants to detect a dead backend rather than wait to be dropped should apply the same idea in reverse: if it doesn't hear anything (data or `ping`) from the backend for a while, treat the connection as dead and reconnect. (`-stdio` mode gets no heartbeat — it's a single dedicated pipe, not a pool of independent connections, and EOF is already the liveness signal there.)
 - A server process has exactly one auth token (for its optional TCP listener) and one provider registry (§6b/§6c), shared by every session and every connected client — but **not** exactly one project: it can open and serve many projects at once, opened on demand, alongside many concurrent sessions (§4a) and connections, local-socket and TCP alike. See §4b for the full model; don't assume "one project per server" when designing a client.
 
 ### Reconnection & session ownership
@@ -164,7 +167,7 @@ A `set_*` request's confirmation event (`mode_set`, `web_tools_enabled_set`, `pr
 
 ### Mode is persisted, not just broadcast — the server is the source of truth, not whoever reconnects last
 
-A session's mode (§4c) is written to `.yoake/sessions/<id>.json` the moment `set_mode` takes effect (`SessionState.Mode`), not held only in the live `Agent`'s memory. `get_session_history`'s response (§3.1) carries this value (`data.mode`), and it's included in `SessionSummary` too (so `session_list`/`session_updated` also carry it). A client should treat this as authoritative on session open — adopt `data.mode` from `get_session_history`, rather than replaying its own cached last-known mode over the top of it via `set_mode`. This matters specifically because of multi-peer: with two peers open on the same session, "each client re-asserts its own cached settings on reconnect" (the pattern `set_provider`/`set_model_options` still follow — they remain session-memory-only) has a last-reconnect-wins race baked in, where a stale cache can clobber a value another peer set more recently. Mode avoids that race by having the server remember the true value itself; a client's own cache of it should be treated as a fallback for a session that's never been opened on this server before, not as an override once the server has an answer.
+A session's mode (§4c) is written to `.yoake/sessions/<id>.json` the moment `set_mode` takes effect (`SessionState.Mode`), not held only in the live `Agent`'s memory. The one exception is a chat that has never been prompted: `set_mode` does **not** create its session file (that used to leave an empty, untitled ghost chat in `list_sessions` for every new chat whose mode was picked before its first message). Its mode is held live until the first turn writes the file, mode included, and `get_session_history` reports that live value in the meantime. `get_session_history`'s response (§3.1) carries this value (`data.mode`), and it's included in `SessionSummary` too (so `session_list`/`session_updated` also carry it). A client should treat this as authoritative on session open — adopt `data.mode` from `get_session_history`, rather than replaying its own cached last-known mode over the top of it via `set_mode`. This matters specifically because of multi-peer: with two peers open on the same session, "each client re-asserts its own cached settings on reconnect" (the pattern `set_provider`/`set_model_options` still follow — they remain session-memory-only) has a last-reconnect-wins race baked in, where a stale cache can clobber a value another peer set more recently. Mode avoids that race by having the server remember the true value itself; a client's own cache of it should be treated as a fallback for a session that's never been opened on this server before, not as an override once the server has an answer.
 
 ---
 
@@ -192,6 +195,7 @@ Initiates a new conversational turn or prompt submission.
   }
 }
 ```
+- **`attachments`** *(optional, v2.14)*: absolute paths **on the server's machine** that `file_read` may read for the rest of this session — even outside the project root, and anything beneath an attached directory. The model is told about them in a note appended to this message for the provider only; the stored message `content` stays exactly what the user typed, and `session_history` echoes them back as `attachments`. An `edit_message` keeps the edited message's attachments. Where they may point depends on the transport: over the unix socket (same OS user) any path is accepted — a local client should attach a file in place rather than copy it; over TCP each path must resolve (symlinks followed) inside the project root or the server's upload store, so a remote client attaches the `path` an upload returned (`upload_begin`, below). Anything else is rejected with `error` before the turn starts.
 - **`autoGenerateTitle`** *(optional, default the server's own setting — itself `true` unless changed via `set_auto_generate_title`)*: only meaningful on a session's first prompt (the one that leaves it with an empty title) — see "Auto-generated titles" under `set_session_title` below. Ignored on every later prompt in the same session, the same way `projectPath` is.
 
 #### `edit_message`
@@ -323,7 +327,7 @@ Registers (or overwrites) a named provider **credential** — not a model choice
   }
 }
 ```
-- `kind`: `"api_key"` (needs `httpProvider` + `apiKey`), `"cli_claude"`, or `"cli_codex"` (subscription-billed, no credential — see §6b).
+- `kind`: `"api_key"` (needs `httpProvider` + `apiKey`), or one of the `cli_*` coding-agent kinds — `"cli_claude"`, `"cli_codex"`, `"cli_cursor"`, `"cli_kimi"`, `"cli_opencode"`, `"cli_gemini"`, `"cli_grok"`, `"cli_deepseek"` (subscription-billed, no credential, run with their own tools — see §6b).
 - Response: `provider_registered` on success, `error` on failure (e.g. missing `name`).
 
 #### `list_providers`
@@ -335,7 +339,7 @@ Requests the models available through one registered provider's own credential �
 ```json
 {"type": "list_models", "data": {"providerName": "my-anthropic"}}
 ```
-- For `api_key` providers this calls that HTTP backend's own models endpoint live (Anthropic/OpenAI/OpenRouter each expose one, keyed by the same credential used for chat completions) — so newly released models show up with no server-side changes. `cli_claude`/`cli_codex` have no key to query, so their list instead comes from a cached copy of [T3 Code's](https://github.com/pingdotgg/t3code) `model-manifest.json` (MIT-licensed, public, no auth) — see §6c.
+- For `api_key` providers this calls that HTTP backend's own models endpoint live (Anthropic/OpenAI/OpenRouter each expose one, keyed by the same credential used for chat completions) — so newly released models show up with no server-side changes. `cli_claude`/`cli_codex` have no key to query, so their list instead comes from a cached copy of [T3 Code's](https://github.com/pingdotgg/t3code) `model-manifest.json` (MIT-licensed, public, no auth) — see §6c. The ACP `cli_*` kinds ask the agent itself (a throwaway ACP session, so this call can take several seconds) — see §6b.
 - For OpenRouter, any entry whose upstream record carries a populated `alias_target` (a floating alias for another, pinned model — e.g. `anthropic/claude-3.7-sonnet` aliasing `anthropic/claude-3-7-sonnet`) is filtered out server-side, rather than left for the frontend to recognize by convention (the `~` prefix is only how you'd *reference* a floating alias when calling chat completions, not how the `/models` listing marks one). Entries whose `id` collides case-insensitively with one already returned are also deduped, keeping the first.
 - Response: `model_list` on success, `error` if `providerName` isn't registered or the upstream call fails (e.g. a revoked key). Each returned model carries `isFavorite`, set from that provider's server-persisted favorites (see `set_favorite_models` below), and an optional `capabilities` object — see `model_list` (§3.2) for its shape.
 
@@ -357,7 +361,7 @@ Hot-swaps the provider **and model** a session uses, effective on that session's
   "data": {"providerName": "my-anthropic", "model": "claude-sonnet-5"}
 }
 ```
-- `model` should be one of the `id`s from that provider's `list_models` response. Omit it only for `cli_claude`/`cli_codex`, which fall back to their tool's own default model.
+- `model` should be one of the `id`s from that provider's `list_models` response. Omit it only for a `cli_*` kind, which falls back to that agent's own default model.
 - **`projectPath`** *(optional)*: resolves this session against the project its turns will actually run in, binding the session if it wasn't bound yet — the same rules as `user_prompt` above (§4b). Send it when configuring a session that hasn't been prompted yet: a client normally picks a model for a brand-new chat *before* its first message, and since each project keeps its own session registry (§4b), a provider set against the server's default-project fallback lands on a registry that session's turn will never use. The turn then runs unconfigured and comes back `finishReason: "no_provider"`, contradicting a provider the client could see selected.
 - Response: `provider_set` on success (echoing back the `model` that was set), `error` if `providerName` isn't registered or fails to build (e.g. a `cli_claude` provider on a machine without `claude` on `PATH`).
 
@@ -374,7 +378,7 @@ Tunes the *current* provider's request shape for a session's next turn — reaso
 - `reasoningEffort` is sent through as OpenAI/OpenRouter's `reasoning_effort` request parameter; ignored by Anthropic providers.
 - `thinkingBudget` (tokens) is sent through as Anthropic's extended-thinking `thinking: {type: "enabled", budget_tokens}` block; ignored by OpenAI/OpenRouter providers.
 - `contextWindow` resizes the session's own context-fullness budget (`ContextManager.MaxHistoryTokens`, reported back via `turn_completed.context`, §3.2) — this is local bookkeeping, not a provider request field. When a turn's history grows past this budget, the server compacts it (first user message kept verbatim, an in-between stretch summarized, the most recent messages kept intact) before the next round-trip — and that most-recent window is always widened backward far enough that it never starts on a lone tool result whose originating tool-call message got summarized away, since both Anthropic and OpenAI reject a request shaped like that outright (a 400 error, not a graceful degradation) rather than just ignoring the orphaned entry. A long, tool-heavy turn is the case this matters for: it's the one shape naive fixed-size compaction would otherwise slice through.
-- Both `reasoningEffort` and `thinkingBudget` are silently ignored by `cli_claude`/`cli_codex` providers, which have no request shape to tune (the CLI subprocess owns that). `sessionId` may be given in `data.sessionId` instead of at the envelope level, same fallback rules as `set_mode` below.
+- `cli_*` providers take `reasoningEffort` (Claude's `--effort`, Codex's turn `effort`, an ACP agent's `thought_level` option) and silently ignore `thinkingBudget`. `sessionId` may be given in `data.sessionId` instead of at the envelope level, same fallback rules as `set_mode` below.
 - **`projectPath`** *(optional)*: resolves the session the same way `set_provider` above does, and matters for the same reason — model options can be tuned on a brand-new chat before its first prompt has bound the session to a project.
 - Response: `model_options_set`, always — it doesn't report whether the active provider actually understood `reasoningEffort`/`thinkingBudget`; check `capabilities` on the model you set (from `model_list`) before assuming either one takes effect.
 
@@ -390,6 +394,7 @@ Switches a session between the four tiers (§4c), effective on that session's *n
 - `data.mode` is one of `"read_only"`, `"read_write"`, `"autonomous"`, `"plan"` — any other value is rejected with `error`.
 - `sessionId` may be given in `data.sessionId` instead of at the envelope level (`data.sessionId` wins if both are set); if neither is given, it falls back to `"default"`.
 - **`projectPath`** *(optional)*: resolves the session the same way `set_provider` above does — mode can be toggled on a brand-new chat before its first prompt has bound the session to a project, and applying it to the wrong project's registry would leave the session's actual turn unrestricted.
+- On a session that has no persisted file yet (never prompted), this does not create one — see "Mode is persisted" (§2a). A chat only appears in `list_sessions` once its first `user_prompt` arrives.
 - Response: `mode_set`.
 
 #### `set_web_tools_enabled`
@@ -499,6 +504,7 @@ Permanently deletes a persisted session — archived or not. Unlike `set_session
 ```
 - `sessionId`: required, same existence/resolution rules as `set_session_title` — `error` if there's no persisted session by that id. Idempotency matches `set_session_title`/`set_session_archived` rather than `remove_provider`: deleting an id that's already gone is an `error`, not a silent success, since (unlike a provider credential) there's no natural "absent" state for a session id to already be in — a second `delete_session` almost always means a client's local state is stale, which is worth surfacing rather than swallowing.
 - If the session has a turn in flight, that turn is cancelled first (as if `cancel_turn` had been sent) and its in-memory `Agent` is dropped, then the persisted file is removed — deletion always wins over "let it finish."
+- Every terminal (tab) open in this chat is killed too — the shell process, not just the bookkeeping entry — the same teardown `terminal_close` does, just for all of them at once. A `terminal_closed` is broadcast per tab to whoever had it attached. Terminals are bound to their chat (§3.1's `terminal_open`); this is the other half of that contract.
 - Response: `session_deleted`, echoing `sessionId` back.
 
 #### `list_directory`
@@ -506,7 +512,7 @@ Lists one directory's immediate entries on **the machine running the backend** �
 ```json
 {"type": "list_directory", "data": {"path": "/home/user/projects"}}
 ```
-- `path`: optional; omitted (or `""`) lists the server process's own home directory, a reasonable starting point for a picker.
+- `path`: optional; omitted (or `""`) lists the server process's own home directory, a reasonable starting point for a picker. A leading `~` / `~/` is expanded to that home directory (v2.14).
 - Response: `directory_list`.
 
 #### `open_project`
@@ -539,14 +545,57 @@ Enumerates every regular file under **one project**'s root, for client-side `@fi
 - Response: `file_list`.
 
 #### `detect_cli`
-Checks whether the `claude`/`codex` binaries are on `PATH` **on the machine running the backend** — relevant before offering `cli_claude`/`cli_codex` as a provider kind (§6b). Takes no data (`{}` is fine).
+Checks whether each coding-agent CLI's binary is on `PATH` **on the machine running the backend** — relevant before offering a `cli_*` provider kind (§6b). Takes no data (`{}` is fine).
 - Response: `cli_availability`.
+
+#### `upload_begin` / `upload_chunk` *(v2.14)*
+Uploads a client-side file to the server so it can be attached to a `user_prompt` — the remote (TCP) counterpart of attaching a local path. Storage is content-addressed and server-wide: `<-state-dir>/uploads/<sha256>/<name>`, so the same bytes uploaded again, from any device or for any project, are stored once and never re-sent. An upload unused (neither uploaded nor re-used) for 30 days is pruned at startup.
+```json
+{"type": "upload_begin", "data": {"uploadId": "up-1", "name": "trace.log", "size": 1048576, "sha256": "<64 lowercase hex chars>"}}
+{"type": "upload_chunk", "data": {"uploadId": "up-1", "data": "<base64 bytes>"}}
+```
+- `uploadId` is client-chosen, scoped to this connection. `size` is capped at 256 MB. If the server already holds `sha256` it answers `upload_done` straight away — send no chunks.
+- Otherwise it answers `upload_progress` (`received: 0`); send sequential `upload_chunk`s, each after the previous one's `upload_progress` ack. That ack is the flow control: it keeps a large upload from queueing ahead of chat traffic on the same connection. Keep a chunk well under the 10 MB frame limit after base64 (512 KB raw is a good size).
+- When `received` reaches `size` the content is checked against `sha256` and `upload_done` carries the stored `path`, or `error` (wrong hash, overflow, unknown id). An unfinished upload is discarded when its connection closes.
+
+#### `list_notifications` / `dismiss_notification` *(v2.14)*
+`list_notifications` (no data) returns `notification_list`: the server's shared notification buffer (the last 100 entries, in memory only). Send it after connecting to catch up on what happened while this client wasn't there.
+`dismiss_notification` removes one entry by `id`, or every entry when `id` is omitted, and broadcasts `notification_dismissed` with the same payload to every peer, so clearing a notification on one device clears it everywhere.
+```json
+{"type": "dismiss_notification", "data": {"id": "a1b2c3d4e5f60718"}}
+```
 
 #### `ping`
 Either side may send this at any time, on any connection state, to check liveness / measure round-trip time. See "Keeping a connection alive" in §2a.
 ```json
 {"type": "ping", "data": {"nonce": "anything-you-want-echoed-back"}}
 ```
+- A **server-sent** ping (v2.14) also carries `data.status`, a snapshot for a client's status bar. One is sent right after connecting as well, so the bar fills in without waiting a full interval:
+```json
+{"type": "ping", "data": {"status": {"uptimeSec": 5230, "activeTurns": 1, "peers": 2, "openProjects": 3, "load1": 0.42, "cpus": 16, "memTotalBytes": 16710000000, "memAvailBytes": 9100000000, "heapBytes": 18400000}}}
+```
+  `load1`/`memTotalBytes`/`memAvailBytes` are read from `/proc` and left out on other platforms. Reply with `pong` as usual; `status` is never echoed.
+- `status` also carries these (v2.15):
+```json
+{
+  "queuedTurns": 1,
+  "rateLimits": {
+    "Claude Max": {
+      "fiveHour": {"usedPct": 55, "resetsAt": "2026-09-24T00:20:00Z"},
+      "sevenDay": {"usedPct": 21, "resetsAt": "2026-09-30T12:00:00Z"}
+    },
+    "Codex": {"other": [{"windowMins": 43200, "usedPct": 100, "resetsAt": "2026-09-30T19:43:23Z"}]}
+  },
+  "spend": {"todayUsd": 1.84, "monthUsd": 23.10},
+  "budgets": [{"scope": "session", "period": "total", "limitUsd": 5}]
+}
+```
+  - `queuedTurns`: turns accepted but not started yet. A session runs one turn at a time, so a `user_prompt`/`edit_message`/`retry_message` sent while that session is mid-turn waits; this counts those waiters across every session. There is no server-wide concurrency limit — different sessions never queue behind each other.
+  - `rateLimits`: subscription usage for each `cli_claude`/`cli_codex` provider, keyed by its registered provider name; omitted until one has been read. `usedPct` is 0–100, `resetsAt` is RFC 3339. `fiveHour`/`sevenDay` are the plan-wide windows, omitted when the CLI didn't report them; anything else goes in `other` with its `windowMins` — a window of another length (a Codex free plan's 30-day one), or a narrower bucket named by `label` (Claude's per-model weeklies, e.g. `"Opus"`; a Codex per-model limit's `limitName`). Also carried per provider: `kind` (`"cli_claude"`/`"cli_codex"`), `plan` (the subscription tier the CLI reports, e.g. `"pro"`, `"max"`, `"plus"`, `"free"`) and `updatedAt` (RFC 3339, when the server last read them).
+    Sources, none of which cost any quota or send a prompt: the server **reads** each CLI's usage at startup, every 5 minutes while at least one client is connected, right after a client connects, and right after a `cli_claude`/`cli_codex` provider is registered — Claude via Claude Code's `get_usage` control request (the Agent SDK's experimental usage call, the numbers `/usage` shows), Codex via its app-server's `account/rateLimits/read`. One probe per CLI, however many providers point at it (they share the machine's one login); a CLI read within the last minute isn't read again. **During a turn**, what the CLI streams is merged on top — Claude's `rate_limit_event` (one window at a time) and Codex's `account/rateLimits/updated`. A failed read keeps the last good numbers. ACP agents report none. In memory only; the startup read refills it after a restart. `remove_provider` drops that provider's entry.
+  - `spend`: total recorded turn cost across every session and project, for the server's **local** day and calendar month. Kept in `<-state-dir>/spend.json`, which only starts counting from the version that introduced it.
+  - `budgets`: the spend limits the server enforces; omitted when none are set. Today that's only `-max-session-cost-usd` (§1), reported as `{"scope": "session", "period": "total", "limitUsd": N}` with no `usedUsd`, because it applies to each session separately — a session's own usage is `turn_completed.spend.sessionTotalUsd`. `scope` may also be `"server"`/`"project"` (with `projectPath`) and `period` `"day"`/`"month"` if such limits are ever added, with `usedUsd` set.
+- Besides the 30s heartbeat, the server pushes an extra status ping to every peer right after anything in it changes that a status bar shows: a turn completing (spend), subscription usage being read or reported (rate limits), or a turn starting to wait / leaving the queue (`queuedTurns`). Clients just `pong` it like any other.
 - Response: `pong`, echoing the same `nonce`.
 
 #### `set_peer_name`
@@ -625,6 +674,56 @@ Sets the server-wide default applied to a first `user_prompt` (§3.1) that omits
 ```
 - Response: no direct ack — every peer (including the setter) sees the change via `auto_generate_title`. `error` on failure to persist.
 
+#### `terminal_open`
+Starts a brand-new interactive terminal (tab) **bound to one chat session** — a real shell a human drives directly, distinct from the `bash` tool's single-command-no-shell design (SPEC.md's tool section): no argv parsing, no permission-request round trip, pipes/redirects/job control all work exactly as in a normal terminal. Terminals are **session-scoped, not merely project-scoped**: a chat can hold several at once (its open tabs — the multi-tab, split-view case), `terminalId` only needs to be unique *within* that session (a different chat can reuse the same id for its own first tab), and deleting the chat (`delete_session`) kills every terminal it owns — the shell process itself, not just the bookkeeping entry. Every connected peer/tab/device with that chat open sees the same set of tabs. `terminalId` is always **client-chosen**, never server-allocated, so a client can address "the tab it just opened" without waiting on a response. Runs through the same sandbox tier (`sandboxTier`, see `project_opened`) as the `bash` tool — a remote TCP peer's terminal is bound by the same isolation ladder as an agent-issued command, not a bigger hole next to it.
+```json
+{"type": "terminal_open", "data": {"sessionId": "session-main", "projectPath": "/home/user/projects/my-repo", "terminalId": "term-1", "cwd": "packages/api", "cols": 80, "rows": 24}}
+```
+- `sessionId`: the chat this terminal belongs to. Resolved exactly like `user_prompt`'s own `sessionId` (§3.1) — `projectPath` only matters the first time this `sessionId` is used (opening/binding the project the same way a first prompt would); omit it once the chat is already bound.
+- `cwd` *(optional)*: relative to the project root, validated the same way a file tool's path is (escaping the root is rejected). Defaults to the project root.
+- `cols`/`rows` *(optional)*: initial terminal size, clamped to `[1, 1000]` / `[1, 500]`; default `80x24`.
+- `env` *(optional)*: extra `{"KEY": "value"}` pairs layered on top of the sandbox's own fixed environment — same restricted shape the sandbox already enforces elsewhere (key must match `^[A-Za-z_][A-Za-z0-9_]*$`, at most 128 entries, each value at most 8192 bytes).
+- Opening an id that's already open for this session is an error (`terminal_error`) — re-attaching to a live or exited-but-not-closed tab is `terminal_attach`, not a second `terminal_open`.
+- Response: `terminal_snapshot` on success, `terminal_error` if the id is invalid/taken or the shell fails to spawn.
+
+#### `terminal_attach`
+Subscribes this connection to a terminal that may already be running within `sessionId`'s chat — opened earlier by this same client, or by another tab/device/peer with that chat open. This is what makes tabs and split views work: two panes attached to the same `sessionId`+`terminalId` both receive every `terminal_output` live, and both see the identical scrollback on attach.
+```json
+{"type": "terminal_attach", "data": {"sessionId": "session-main", "terminalId": "term-1", "cols": 120, "rows": 32, "restartIfExited": true}}
+```
+- `cols`/`rows` *(optional)*: resize immediately on attach — the attaching pane's own size may differ from whoever had the tab open last.
+- `restartIfExited` *(optional, default `false`)*: if the shell already exited, respawn it (same `cwd`/`env` it was opened with) instead of returning it in `"exited"` status — for "reopen this closed tab" rather than a fresh `terminal_open`.
+- Response: `terminal_snapshot`, or `terminal_error` if `terminalId` isn't open in this chat.
+
+#### `terminal_input`
+Writes raw bytes to the terminal's pty, exactly as typed or pasted client-side — this is not a command string (no parsing, no argv); the shell on the other end interprets it, including control characters (Ctrl-C, Ctrl-D, arrow-key escape sequences, etc.).
+```json
+{"type": "terminal_input", "data": {"sessionId": "session-main", "terminalId": "term-1", "data": "bHMgLWxhCg=="}}
+```
+- `data` is **base64-encoded raw bytes**, not a plain JSON string of the input text — terminal I/O isn't guaranteed to be valid UTF-8 (a pasted binary blob, a multi-byte character split across two writes), and a plain JSON string would let `encoding/json` silently mangle invalid sequences (substituting `U+FFFD`) instead of erroring, corrupting exactly the input a user is relying on being sent byte-for-byte.
+- No response on success. `terminal_error` if the terminal isn't running (exited, or never successfully spawned).
+
+#### `terminal_resize`
+Applies a new terminal window size to an already-running terminal (a pane being resized, a split view changing proportions) — separate from the one-time size `terminal_open`/`terminal_attach` set.
+```json
+{"type": "terminal_resize", "data": {"sessionId": "session-main", "terminalId": "term-1", "cols": 120, "rows": 40}}
+```
+- No response on success (the shell itself is sent `SIGWINCH` and reflows its own output — nothing for the backend to echo back). `terminal_error` if `terminalId` isn't open.
+
+#### `terminal_close`
+Ends a terminal permanently — kills the shell if still running and drops the tab itself, scrollback included. Unlike the shell simply exiting on its own (`terminal_exited`), this is not reopenable via `terminal_attach`; a client should remove the tab from its UI. For closing *every* terminal in a chat at once (deleting the chat itself), see `delete_session` — that's `terminal_close`'s bulk counterpart, not a separate flag here.
+```json
+{"type": "terminal_close", "data": {"sessionId": "session-main", "terminalId": "term-1"}}
+```
+- Response: `terminal_closed` (broadcast to every attached connection, not just the sender) on success, `terminal_error` if `terminalId` isn't open.
+
+#### `list_terminals`
+Enumerates every open terminal (tab) in one chat session — what a client repaints that chat's tab strip from on open, resolved the same way `get_session_history` is.
+```json
+{"type": "list_terminals", "data": {"sessionId": "session-main"}}
+```
+- Response: `terminal_list`.
+
 ---
 
 ### 3.2 Outbound Events (Backend → Frontend)
@@ -652,7 +751,7 @@ A real-time token or text chunk streamed by the model. Exactly one of `data.cont
   }
 }
 ```
-*UI Action*: Append `data.content` directly to the active assistant message widget. Append `data.reasoning` to a separate collapsible section instead — it's not part of the answer. A client that doesn't care about reasoning can just ignore events where `data.content` is absent. Not emitted at all by `cli_claude`/`cli_codex` providers. A completed reasoning section is also included in a reloaded transcript, as `reasoning` on the relevant entry of `get_session_history`'s `messages` (§3.2 below).
+*UI Action*: Append `data.content` directly to the active assistant message widget. Append `data.reasoning` to a separate collapsible section instead — it's not part of the answer. A client that doesn't care about reasoning can just ignore events where `data.content` is absent. `cli_*` agents stream both, like any other provider. A completed reasoning section is also included in a reloaded transcript, as `reasoning` on the relevant entry of `get_session_history`'s `messages` (§3.2 below).
 
 #### `tool_call_requested`
 Notifies the frontend that the model has formally requested a tool call.
@@ -671,6 +770,12 @@ Notifies the frontend that the model has formally requested a tool call.
   }
 }
 ```
+- **Native tool calls** *(v2.15)*: a `cli_*` agent (§6b) reports the tool calls it runs itself with its **own** tool names and argument shapes (`Bash`, `Edit`, `commandExecution`, an ACP agent's `kind`, …), so `data` also carries fields a client can render generically without knowing each agent's tools:
+```json
+{"name": "Edit", "args": {"file_path": "/repo/notes.txt", "old_string": "hello", "new_string": "goodbye"},
+ "native": true, "title": "Edit /repo/notes.txt", "kind": "edit", "locations": ["/repo/notes.txt"]}
+```
+  `native: true` means the agent already ran (or is running) it — yoakeland won't; `kind` is one of ACP's tool kinds (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `other`). If it needs permission, a `permission_request` with the same `toolCallId` follows; its `tool_result` arrives when the agent reports it finished. The same fields appear on `get_session_history`'s `toolCalls`.
 *UI Action*: Render an in-progress tool execution card/indicator.
 
 **`file_read`'s optional `startLine`/`endLine`:** both are 1-indexed and inclusive; giving neither reads the whole file (unchanged from before this existed). A frontend rendering a `file_read` tool call should show the requested range when either is present, e.g. `"lib/main.dart:12-40"`, rather than only the path.
@@ -755,6 +860,8 @@ The result of executing a tool (after approval or if pre-approved by policy).
   }
 }
 ```
+- `diffs` *(v2.15, native tool calls only)*: the file changes a `cli_*` agent's tool made, as §5 `FileDiff`s (`filePath`, `unified`, `hunks`) — from the agent's own patch when it reports one, else computed from the change it described. Also kept on the `tool` entry in `get_session_history`.
+
 *Note*: If the user denied permission, `data.error` contains `"permission denied by user or policy"` — or, if the `permission_response` carried non-empty `feedback` (§3.1), `"permission denied by user: <feedback>"` instead, so the model sees the reason in the same turn.
 
 #### `turn_completed`
@@ -790,7 +897,7 @@ Signifies that the iterative turn loop has ended.
 - `userMessageId`/`messageId`: the real, server-assigned ids (§3.2's `session_history` `id` field) of the messages this turn touched — `userMessageId` is the prompt this turn is anchored to (the message just created by `user_prompt`/`edit_message`, or, for `retry_message`, the existing user message the retried reply followed), `messageId` is the last message this turn appended (normally the final assistant reply). **This is the primary way a client learns a message's id** — including for the message it just sent or watched stream in — so it always has what it needs to `edit_message`/`retry_message`/`switch_branch` (§4d) that exact message without a follow-up `get_session_history` round trip. Both omitted when the turn ended before any message existed to anchor to or was appended (`no_provider`/`budget_exceeded`, or a `cancelled` turn with zero content — see the `"length"` caveat below for the analogous zero-content case). `session_history` remains the fallback for anything not covered here: a cold-open, a reconnect mid-turn, or `switch_branch`'s own response, which already carries ids for the whole reachable tree.
 - `finishReason`: `"stop"` (normal completion), `"length"` (the model's own final round-trip was cut off at its output-token limit before it finished on its own — Anthropic's `stop_reason: "max_tokens"` and OpenAI/OpenRouter's `finish_reason: "length"` are both normalized to this one value here, so a client only ever has to branch on one string regardless of provider), `"cancelled"` (user aborted), `"budget_exceeded"` (the session was already at/over its `-max-session-cost-usd` cap), or `"no_provider"` (this session has neither a default provider from server startup nor its own `set_provider` call — register one and retry, see §6b). In the latter two cases the model was never called for this turn; `usage`/`context` reflect the session's existing state, not this rejected turn.
 - **`"length"` caveat**: this is only ever reported for a turn's *final* round-trip (the one with no tool calls) — a round-trip that got cut off mid-tool-call instead (rare: it needs a tool call's arguments themselves to straddle the token limit) still executes whatever (possibly malformed) JSON the model had emitted so far, same as before this value existed; the tool's own error on unparseable arguments is the fallback signal in that case. A client that wants to recover a `"length"`-truncated answer that still has *some* content should resend the conversation with a higher `thinkingBudget`/larger model output allowance rather than assume the harness retries automatically — for that case, it doesn't. The one exception: a round-trip that hit the token limit with *zero* content and *zero* tool calls (a reasoning model spending its whole budget on hidden reasoning before writing anything visible) is retried internally, up to twice, before `"length"` is ever reported — a fresh independently-sampled generation each time, not a resend of the same request. Only once all three attempts come back empty does the client see `"length"` with nothing to show for it.
-- `usage`: Token consumption for this turn. For API-key providers, `costUsd` is priced against a live-fetched per-model rate table (LiteLLM's `model_prices_and_context_window.json`, refreshed daily) first, falling back to a small built-in table when a model is in neither. A CLI-subprocess provider (§6b) reports its own authoritative cost instead when it has one — `claude` always does; `codex` doesn't, so its turns fall through to the same rate-table pricing as an API-key provider (not a flat `0` as such) and only actually come out `0` if the model it used isn't in either table.
+- `usage`: Token consumption for this turn. For API-key providers, `costUsd` is priced against a live-fetched per-model rate table (LiteLLM's `model_prices_and_context_window.json`, refreshed daily) first, falling back to a small built-in table when a model is in neither. A CLI-subprocess provider (§6b) reports its own authoritative cost instead when it has one — `claude` always does, and ACP agents that send `usage_update` with a cost do; `codex` doesn't, so its turns fall through to the same rate-table pricing as an API-key provider (not a flat `0` as such) and only actually come out `0` if the model it used isn't in either table.
 - `context`: How full the session's context window estimate is right now (`estimatedTokens` / `maxTokens`). `estimatedTokens` prefers the provider's own reported token count for this turn (exact, and the number that reflects what's actually resent next turn) over yoakeland's own char-count heuristic, used only when the provider hasn't reported usage at all. *UI Action*: render as a context meter/progress bar.
 - `spend`: Running totals persisted in `.yoake/usage.json`, surviving process restarts — *UI Action*: render as a running cost display, per-session and/or project-wide.
 - `durationMs`: Wall-clock execution time for the entire turn.
@@ -1011,6 +1118,7 @@ Response to `get_session_history`.
 - `id`: this message's stable address for `edit_message`/`retry_message`/`switch_branch` (§3.1). Empty only for a message persisted before this field existed and never since migrated (the migration runs the next time its session loads) — treat absence as "not addressable" rather than an error.
 - `alternateIds` *(optional)*: the *other* versions that exist at this point in the conversation — other edits of this same user message, or other retried responses to the same prompt (§4d) — each individually addressable via `switch_branch`. Omitted when this message has no alternates, which is the common case and always true for a message that was never edited or retried. *UI Action*: this is what tells a client to render "◀ 2 / 3 ▶"-style regenerate/edit-history arrows under a message at all — their absence means there's nothing to cycle through.
 - `author`: who actually sent this message. Set on a `user` message from a sender that identified itself — a token-authenticated TCP peer (`register_token`'s named ones, or the legacy shared `"default"` — §3.1), whose name is a real credential, or a client that declared `authorName` on its `user_prompt` (§3.1), which is what the local unix socket relies on since it has no credential to attribute to. Omitted for assistant/tool messages (no human author) and for a `user` message whose sender identified itself as nothing. *UI Action*: render as e.g. "aveline: ..." in a shared session; fall back to a generic label (or nothing) when absent, don't treat its absence as an error.
+- `attachments` *(v2.14)*: the server-side paths a `user` message attached (§3.1 `user_prompt`). Omitted when there are none. *UI Action*: render them as file chips under the message.
 - `authorAvatar`: that sender's picture, stored alongside the name — either a short emoji glyph or a data URL, whichever the sending client uses (§2a's avatar conventions). Omitted for assistant/tool messages and for a sender that never set one. *UI Action*: render it next to the message; fall back to a placeholder avatar client-side when absent, don't treat its absence as an error. Store it with the message rather than looking it up from the live peer roster: `peer_list` is per-connection and gone after a reload, whereas this is what a repainted transcript has to draw from.
 
 #### `project_opened`
@@ -1043,7 +1151,7 @@ Response to `list_directory`.
   }
 }
 ```
-- `path` is the resolved absolute directory that was listed. `entries` is sorted directories-first, then alphabetically within each group — unlike `list_files` (§3.1), nothing is filtered out (dotfiles and VCS directories included), since this is for navigating *toward* a project root, not listing one.
+- `path` is the resolved absolute directory that was listed. If it can't be listed (missing, not a directory, permission denied), the reply is still `directory_list`, with `path` echoing the request, empty `entries`, and `error` saying why (v2.14; previously a generic `error` event). `entries` is sorted directories-first, then alphabetically within each group — unlike `list_files` (§3.1), nothing is filtered out (dotfiles and VCS directories included), since this is for navigating *toward* a project root, not listing one.
 *UI Action*: Render as a folder browser; let the user drill into a directory by re-issuing `list_directory` with its path, and confirm a selection via `open_project`.
 
 #### `project_list`
@@ -1064,9 +1172,62 @@ Response to `list_files`.
 #### `cli_availability`
 Response to `detect_cli`.
 ```json
-{"type": "cli_availability", "data": {"claude": true, "codex": false}}
+{"type": "cli_availability", "data": {"claude": true, "codex": false, "agents": {"cli_claude": true, "cli_codex": false, "cli_cursor": false, "cli_kimi": true, "cli_opencode": false, "cli_gemini": false, "cli_grok": false, "cli_deepseek": false}}}
 ```
-*UI Action*: Show/hide or enable/disable the `cli_claude`/`cli_codex` provider options accordingly before the user tries to register one.
+`agents` covers every `cli_*` kind, keyed by kind; `claude`/`codex` are kept for older clients. *UI Action*: Show/hide or enable/disable each `cli_*` provider option accordingly before the user tries to register one.
+
+#### `notification` *(v2.14)*
+Broadcast to **every** peer when something happens that a person not looking at that chat would want to know about. The same entries are replayed by `list_notifications`.
+```json
+{
+  "type": "notification",
+  "data": {
+    "id": "a1b2c3d4e5f60718",
+    "level": "success",
+    "kind": "turn_completed",
+    "title": "Response ready",
+    "body": "Refactor the file reader",
+    "sessionId": "session-main",
+    "projectPath": "/home/user/projects/my-repo",
+    "createdAt": "2026-09-23T10:00:00Z"
+  }
+}
+```
+- `level`: `info` | `success` | `warning` | `error`. `kind` says what raised it: `turn_completed` (`finishReason` `stop`/`length`/`budget_exceeded`/`no_provider`; a `cancelled` turn raises nothing), `turn_failed` (the turn returned an error), `error`, `permission_request`, `ask_user_question_requested`, `peer_joined`/`peer_left` (TCP peers only, and not sent to the peer itself; `peer_left` waits 30 seconds, and a device that reconnects with the same `deviceId` within that window raises neither). Clients should treat unknown kinds as generic.
+- `sessionId`/`projectPath` are set (inside `data` only — the envelope's own `sessionId` is left empty, this isn't part of a session's stream) when it concerns a chat. *UI Action*: add it to a notification center and, if that chat isn't the one in focus, show a toast; clicking it opens the chat.
+
+#### `git_status` *(v2.15)*
+One project's git state, for a status bar. Broadcast to **every** peer (envelope `sessionId` empty).
+```json
+{"type": "git_status", "data": {"projectPath": "/home/user/projects/my-repo", "branch": "main", "detached": false, "dirtyFiles": 3, "ahead": 1, "behind": 0, "hasUpstream": true, "files": [{"path": "src/main.go", "status": "M"}, {"path": "notes.txt", "status": "?"}]}}
+```
+- Covers every known project (`project_list`), opened or not: each connection gets the current status of every repo right after it connects, the connection that opens a project gets it again after its `project_opened`, and every peer gets it whenever any field changes. A newly added project is watched from its first `open_project`. Change detection: the server rechecks after every turn in that project, and when `.git/HEAD`, the index, `logs/HEAD`, `FETCH_HEAD`, `packed-refs` or the remote-tracking refs change (checked once a second, which is also the rate limit). Only a real change is sent. Edits made outside a turn (the user's own editor) show up at the next of those triggers, not instantly.
+- `branch` is `null` when `detached` is true. `dirtyFiles` counts every changed, staged, unmerged or untracked path (`git status --porcelain=v2 --branch`, one line per path). `ahead`/`behind` are `0` when `hasUpstream` is false.
+- `files` lists the first 50 of those paths (omitted when clean; `dirtyFiles` stays the full count). `status` is one letter — `M` modified, `A` added, `D` deleted, `R` renamed, `C` copied, `T` type change, `U` unmerged, `?` untracked — taken from the worktree side, or the staged side when the worktree is unchanged. A rename lists its new path only.
+- Projects that aren't git repos (or a server without `git` installed) never get one — treat absence as "no git".
+
+#### `pending_asks` *(v2.15)*
+Every unanswered `permission_request` and `ask_user_question_requested` on the server, across all sessions and projects, oldest first.
+```json
+{
+  "type": "pending_asks",
+  "data": {
+    "asks": [
+      {"kind": "permission", "sessionId": "session-main", "projectPath": "/home/user/projects/my-repo", "turnId": "turn-1", "toolCallId": "call_1", "createdAt": "2026-09-23T10:00:00Z", "toolName": "bash", "description": "bash on {\"command\":\"make\"}", "requiresAsk": true, "cacheKey": "bash:make"},
+      {"kind": "question", "sessionId": "session-2", "projectPath": "/home/user/projects/other", "turnId": "turn-9", "toolCallId": "call_4", "createdAt": "2026-09-23T10:01:00Z", "question": "Which database?", "options": ["postgres", "sqlite"]}
+    ]
+  }
+}
+```
+- Each entry is the original event's payload (`permission_request`'s or `ask_user_question_requested`'s `data`, flattened in) plus `kind`, the ids needed to answer it (`permission_response`/`ask_user_answer`), `projectPath`, and `createdAt`.
+- Sent to a connection right after it connects (after `server_identity`), and to **every** peer whenever the list changes: an ask raised, answered, or cancelled (its turn cancelled or its session deleted). Asks don't time out on their own. This is the recovery path for a client that connects or reconnects while a turn is blocked on an ask it never saw — replace your whole list with each snapshot rather than merging.
+- Not sent in `-stdio` mode (no peer roster to broadcast to), same as the heartbeat.
+
+#### `notification_list` / `notification_dismissed` *(v2.14)*
+`notification_list` answers `list_notifications` with `{"notifications": [...]}`, oldest first. `notification_dismissed` echoes a `dismiss_notification` (`{"id": "..."}`, or `{}` for all) to every peer.
+
+#### `upload_progress` / `upload_done` *(v2.14)*
+Replies to `upload_begin`/`upload_chunk` on the uploading connection only: `{"uploadId": "up-1", "received": 524288}` acks a chunk, and `{"uploadId": "up-1", "path": "/home/me/.yoake/uploads/<sha256>/trace.log"}` (or `{"uploadId": ..., "error": "..."}`) ends the upload.
 
 #### `pong`
 Response to a `ping`, from either side.
@@ -1087,13 +1248,17 @@ Pushed to **every** connected peer whenever the connection roster changes (conne
         "ip": "192.168.1.42",
         "deviceType": "web",
         "avatar": "data:image/png;base64,...",
-        "connectedAt": "2026-09-11T20:52:39.448503642Z"
+        "connectedAt": "2026-09-11T20:52:39.448503642Z",
+        "deviceId": "3f2a…",
+        "sessionId": "session-main",
+        "projectPath": "/home/user/projects/my-repo"
       }
-    ]
+    ],
+    "you": "a1b2c3d4"
   }
 }
 ```
-*UI Action*: Render the full peer/connection list from `data.peers` on every push — it's always the complete current roster, not a diff. `ip` is empty for a unix-socket peer (no meaningful remote address). `avatar` is omitted entirely for a peer that never set one (render a fallback/initials avatar client-side, don't treat absence as an error). `peerId` is per-**connection**, not per-user: two tabs/devices from the same person are two separate rows, each independently renameable/disconnectable.
+*UI Action*: Render the full peer/connection list from `data.peers` on every push — it's always the complete current roster, not a diff. `deviceId` is the stable id the client sent in `auth` (omitted if it sent none): the same device keeps it across reconnects and across servers, so a client groups rows by it. `sessionId`/`projectPath` are the chat that connection last opened (its latest `get_session_history`), omitted until it opens one. `you` is the receiving connection's own `peerId` (so each peer gets a slightly different push), for telling your own row apart; older servers omit it. `ip` is empty for a unix-socket peer (no meaningful remote address). `avatar` is omitted entirely for a peer that never set one (render a fallback/initials avatar client-side, don't treat absence as an error). `peerId` is per-**connection**, not per-user: two tabs/devices from the same person are two separate rows, each independently renameable/disconnectable.
 
 #### `server_identity`
 Pushed to a peer right after it connects, and to every peer whenever `set_server_identity` changes it.
@@ -1150,6 +1315,95 @@ Response to a successful `remove_token`, echoing `name` back.
 ```json
 {"type": "token_removed", "data": {"name": "aveline"}}
 ```
+
+#### `terminal_snapshot`
+Response to `terminal_open`/`terminal_attach`: the terminal's current state plus its buffered scrollback, so a client (a freshly opened tab, or a second device/tab attaching to a terminal already running) repaints correctly before any live `terminal_output` arrives — the same "state, not just a future stream" shape `session_history` gives a reconnecting chat client.
+```json
+{
+  "type": "terminal_snapshot",
+  "data": {
+    "terminalId": "term-1",
+    "cwd": "/home/user/projects/my-repo/packages/api",
+    "cols": 80,
+    "rows": 24,
+    "status": "running",
+    "pid": 48213,
+    "history": "bHMgLWxhCnRvdGFsIDgK...",
+    "sequence": 42,
+    "label": "bash",
+    "sandboxTier": "bubblewrap"
+  }
+}
+```
+- `status`: `"starting"` | `"running"` | `"exited"` | `"error"`.
+- `history`: base64-encoded raw bytes (same reasoning as `terminal_input`'s `data`) — decode and feed directly into a terminal emulator widget (e.g. xterm.js) to repaint. Bounded to a fixed recent-bytes window per terminal, not full unbounded scrollback.
+- `sequence`: the output sequence number `history` already includes up to. Resume live rendering from `terminal_output` events with `sequence > this value` — a client that sees a gap (a missed event from a dropped connection) should re-`terminal_attach` for a fresh snapshot rather than render out of order.
+- `exitCode` *(omitted unless `status` is `"exited"`)*: the shell's exit code, or absent-but-`status:"exited"` semantics don't apply here — always present together with `"exited"`.
+- `label`: a short display name for the tab (currently just the shell's binary name, e.g. `"bash"`).
+- `sandboxTier`: which isolation tier this terminal is actually running under — same values as `project_opened`'s `sandboxTier` (§6).
+*UI Action*: Create or update the tab, decode+render `history` into the terminal widget, then keep appending live `terminal_output`.
+
+#### `terminal_output`
+One chunk of raw PTY output, pushed to every connection currently attached to this `terminalId` (every tab/device/peer watching it — the split-view fan-out).
+```json
+{"type": "terminal_output", "data": {"terminalId": "term-1", "data": "bHMgLWxhCg==", "sequence": 43}}
+```
+- `data`: base64-encoded raw bytes, decode and feed straight into the terminal widget.
+- `sequence`: monotonic per terminal — see `terminal_snapshot`'s `sequence` for how a client uses it to detect gaps.
+- A connection that falls too far behind live output (each attached peer is delivered independently, so one stalled/slow peer never blocks delivery to the others) is silently dropped from further `terminal_output` — indistinguishable from the ordinary "missed event" gap above, recovered the same way: re-`terminal_attach` for a fresh snapshot.
+*UI Action*: Decode and append to the attached terminal widget's buffer.
+
+#### `terminal_exited`
+The shell process itself exited (the user typed `exit`, `Ctrl-D`, or it crashed) — pushed to every attached connection. The terminal (tab) still exists and keeps its scrollback; it isn't gone until an explicit `terminal_close`.
+```json
+{"type": "terminal_exited", "data": {"terminalId": "term-1", "exitCode": 0}}
+```
+*UI Action*: Show the tab as exited (dimmed, an "exited (0)" badge) with a way to either close it or reopen it (`terminal_attach` with `restartIfExited: true`).
+
+#### `terminal_closed`
+Confirms `terminal_close` — pushed to every connection that had this terminal attached, not just whoever sent the close.
+```json
+{"type": "terminal_closed", "data": {"terminalId": "term-1"}}
+```
+*UI Action*: Remove the tab from every pane showing it.
+
+#### `terminal_error`
+Reports a terminal operation that failed — an invalid/duplicate `terminalId`, a spawn failure, writing to a terminal that isn't running, etc. Distinct from the generic `error` event so a client can scope the failure to one tab instead of surfacing it as a session/connection-level error.
+```json
+{"type": "terminal_error", "data": {"terminalId": "term-1", "message": "terminal \"term-1\" is already open"}}
+```
+*UI Action*: Surface inline on the affected tab (a toast, an inline banner) rather than a global error dialog.
+
+#### `terminal_list`
+Response to `list_terminals`: every open terminal (tab) in one chat session.
+```json
+{
+  "type": "terminal_list",
+  "data": {
+    "sessionId": "session-main",
+    "terminals": [
+      {"terminalId": "term-1", "cwd": "/home/user/projects/my-repo", "status": "running", "label": "bash"},
+      {"terminalId": "term-2", "cwd": "/home/user/projects/my-repo/packages/api", "status": "exited", "label": "bash"}
+    ]
+  }
+}
+```
+*UI Action*: Populate that chat's tab strip. This is a summary only (no scrollback) — `terminal_attach` each tab the user actually opens/views to get its `history`.
+
+#### `terminal_index`
+Every terminal on the server, across every chat and project. Sent to each connection right after it connects, and to every peer whenever a terminal starts, exits or closes anywhere — so a client knows about terminals started on other devices, in chats it never opened. Envelope `sessionId` is empty.
+```json
+{
+  "type": "terminal_index",
+  "data": {
+    "terminals": [
+      {"terminalId": "term-1", "sessionId": "session-main", "projectPath": "/home/user/projects/my-repo", "cwd": "/home/user/projects/my-repo", "status": "running", "label": "bash"},
+      {"terminalId": "term-2", "sessionId": "session-other", "projectPath": "/home/user/projects/api", "cwd": "/home/user/projects/api", "status": "exited", "label": "bash", "exitCode": 0}
+    ]
+  }
+}
+```
+*UI Action*: Treat it as a `terminal_list` for every chat at once: a chat missing from it has no terminals. Rows carry the same fields as `terminal_list`'s, plus `sessionId`/`projectPath`; `exitCode` (also on `terminal_list` rows now) is set once the shell has exited.
 
 ---
 
@@ -1241,6 +1495,8 @@ Every session is in exactly one of four modes, switched with `set_mode` (§3.1),
 **`write_plan` and the sidebar.** In `plan` mode, the model is expected to call `write_plan` (args: `content`, the plan in markdown) once its plan is ready, rather than only narrating it in prose — `model_delta` still streams normally alongside this, so a plan can also be talked through, but `write_plan` is the designated record of it. This writes to `.yoake/plans/<sessionId>.md` (project-root-relative, per-session so two concurrent `plan`-mode sessions in one project never clobber each other) and emits `plan_written` (§3.2) naming the path. *UI Action*: open that file in a sidebar/side-pane on `plan_written`, rather than relying only on `model_delta` prose to convey the plan.
 
 **`ask_user_question`** is available in every mode, including `autonomous` — it's not a mutation, so it's never gated by `permission.Engine` at all; see `ask_user_question_requested`/`ask_user_answer` (§3.1/§3.2).
+
+**CLI agents** (`cli_*`, §6b) have their own tools, so the tool-exposure rules above don't apply to them: each mode is instead mapped onto the agent's own permission mode, and the agent's permission asks are denied (`read_only`/`plan`), prompted (`read_write`), or allowed silently (`autonomous`). See §6b's table.
 
 **What none of this changes:** `read_write`'s bash exception aside, permission behavior for exposed tools is unaffected — `file_read` (and `ask_user_question`) have never required permission. Switching mode never touches history, snapshots, or other session state.
 
@@ -1345,19 +1601,57 @@ A **provider** is a named, persisted *credential*, not a model choice — a sess
 
 Each provider also persists its own **favorite models** (`FavoriteModels` on `ProviderConfig`, set via `set_favorite_models`/§3.1) — server-side, in the same `providers.json` entry as the credential, so a starred model follows the user to any client rather than living in that one client's local storage. `list_models` echoes each model's `isFavorite` status back so a picker can sort/highlight without a second round trip.
 
-Three provider kinds exist:
+Two families of provider kind exist:
 
-| `kind` | Needs | Billing | Notes |
+| `kind` | Needs | Billing | Runs |
 |---|---|---|---|
-| `api_key` | `httpProvider` (`anthropic`\|`openai`\|`openrouter`) + `apiKey`, optional `baseUrl` | Metered API usage | Calls the provider's HTTP API directly. `list_models` queries that HTTP backend's own models endpoint live, using this same credential. |
-| `cli_claude` | — | The user's own Claude subscription | Shells out to the user's own, separately-installed-and-authenticated `claude` CLI (`claude auth login` done outside yoakeland entirely). Yoakeland never sees a credential. `model` on `set_provider` is optional; `list_models` returns the current model slugs from T3 Code's manifest (see below) since there's no key to query. |
-| `cli_codex` | — | The user's own ChatGPT subscription | Same idea via the `codex` CLI. |
+| `api_key` | `httpProvider` (`anthropic`\|`openai`\|`openrouter`) + `apiKey`, optional `baseUrl` | Metered API usage | A plain model API. yoakeland's own agent loop and **built-in tools** (`file_read`/`file_write`/`file_edit`/`bash`/`web_search`/…, §3.2) do the work. `list_models` queries that backend's models endpoint live. |
+| `cli_<agent>` | — (the CLI's own login) | The user's own subscription to that agent | A whole coding-agent CLI, **with its own native tools** — see "CLI agents" below. |
 
-**Registering `cli_claude`/`cli_codex` is a singleton per kind**: there's only ever one `claude` CLI and one `codex` CLI on the machine the backend runs on, so `register_provider` for either kind always replaces the previously-registered provider of that same kind — even if you give it a different `name` — rather than accumulating stale duplicate entries. The `name` you most recently registered it under is still what you address it by in `set_provider`/`remove_provider`; only the *old* name stops resolving once a new registration of the same kind supersedes it.
+The `cli_*` kinds (v2.15):
 
-**Streaming caveat for `cli_claude`/`cli_codex`**: `model_delta` (§3.2) is normally incremental, token-by-token. For these two provider kinds it is not — each turn is one subprocess run to completion (`claude -p --output-format json` / `codex exec --json`), parsed only after the process exits, so the frontend receives the entire response as a single `model_delta` event rather than a stream of small ones. Expect silence followed by the whole message at once for these providers; don't assume every provider streams at the same granularity.
+| `kind` | Binary | Protocol | Reports usage/cost | `list_models` from |
+|---|---|---|---|---|
+| `cli_claude` | `claude` | Claude Code stream-json | tokens + cost + 5h/7d quota | T3 Code's manifest (§6b below) |
+| `cli_codex` | `codex` | `codex app-server` (JSON-RPC) | tokens + quota; no cost | T3 Code's manifest |
+| `cli_cursor` | `cursor-agent acp` | ACP | undocumented | the agent (ACP session) |
+| `cli_kimi` | `kimi acp` | ACP | cost via `usage_update` | the agent |
+| `cli_opencode` | `opencode acp` | ACP | cost via `usage_update` | the agent |
+| `cli_gemini` | `gemini --acp` | ACP | none found | the agent |
+| `cli_grok` | `grok agent stdio` | ACP | undocumented | the agent |
+| `cli_deepseek` | `dsh --profile acp` (DeepSeek's harness) | ACP | context usage only | the agent |
 
-**Why CLI-subprocess instead of OAuth token reuse**: Anthropic and OpenAI both prohibit third-party tools from using a Claude/ChatGPT *subscription* OAuth token directly against their APIs — that's billing-plan misuse, and Anthropic actively enforces it. Shelling out to the *official, already-authenticated CLI binary* is the sanctioned pattern instead (this is what tools like T3 Code do): the CLI owns its own auth end-to-end, yoakeland just drives it as a subprocess per turn. Both CLIs are themselves full autonomous coding agents with their own tool/sandbox systems, so yoakeland invokes them in a restricted, mutation-disabled mode — `claude -p --disallowedTools Bash,Read,Write,Edit,Glob,Grep,Task,NotebookEdit,TodoWrite,BashOutput,KillShell,SlashCommand`, `codex exec --sandbox read-only -c tools.web_search=true` — they act as pure text-completion backends plus (as of this manifest generation) their own server-side web search, and yoakeland's own permission-gated tool engine (§5, `.yoake/permissions.json`) remains the *only* thing that can actually read/write files or run shell commands. `WebFetch`/`WebSearch` are deliberately left off the claude CLI's disallow-list — read-only, run server-side on Anthropic's own account, no reason to reimplement them client-side. A frontend offering `cli_claude`/`cli_codex` should check the CLI is actually installed first — send `detect_cli` (§3.1) and gate on the `cli_availability` response (§3.2); this checks whichever machine the *backend* runs on, not the frontend's machine, if they differ.
+Every one of them is installed and logged in outside yoakeland (`claude auth login`, `codex login`, running `kimi`/`cursor-agent`/… once in a terminal); yoakeland never sees a credential. `model` on `set_provider` is optional — omitted, the agent uses its own default.
+
+**Registering a `cli_*` kind is a singleton per kind**: there's only ever one of each CLI on the machine the backend runs on, so `register_provider` for one always replaces the previously-registered provider of that same kind — even if you give it a different `name` — rather than accumulating stale duplicate entries. The `name` you most recently registered it under is still what you address it by in `set_provider`/`remove_provider`; only the *old* name stops resolving once a new registration of the same kind supersedes it.
+
+### CLI agents run with their own tools
+
+A `cli_*` provider is not a text model — it's the whole agent. yoakeland hands it the user's message and relays everything it reports back onto the normal turn stream (§3.2), so a client renders a CLI agent's turn with the same events as any other:
+
+- **Text and reasoning** stream as `model_delta` (`content` / `reasoning`), token by token for claude, codex and ACP agents alike.
+- **Tool calls it runs** arrive as `tool_call_requested` then `tool_result`, both with `native: true` plus `title`/`kind`/`locations` (and `tool_result.diffs` for edits) — see those events in §3.2. yoakeland never executes them; the agent already did. They're stored in the chat's history in the order they happened (text → call → result → more text), so `get_session_history` repaints them the same way.
+- **Permission asks** become ordinary `permission_request`s, answered with the usual `permission_response` (§3.1), and show up in `pending_asks`. `remember: true` maps to the agent's own "always allow" (Claude's permission suggestions, Codex's `acceptForSession`, ACP's `allow_always`), not to `.yoake/permissions.json`, which only covers yoakeland's built-in tools. **Questions** the agent asks (Claude's `AskUserQuestion`, Codex's `requestUserInput`) become `ask_user_question_requested`, one per question.
+- **Mode** (§4c) is enforced twice: mapped onto the agent's own mode where it has one (below), and at the permission bridge — in `read_only`/`plan` every ask the agent still raises is denied, in `autonomous` every ask is allowed without a prompt, in `read_write` each one is a `permission_request`.
+
+| yoakeland mode | Claude Code `--permission-mode` | Codex sandbox / approval | ACP agent mode |
+|---|---|---|---|
+| `read_only` | `plan` | `read-only` / `never` | one named like ask/read/plan, if offered |
+| `plan` | `plan` | `read-only` / `never` | one named like plan |
+| `read_write` | `default` | `workspace-write` / `untrusted` | the agent's default |
+| `autonomous` | `bypassPermissions` | `workspace-write` / `never` | one named like yolo/bypass/full/auto |
+
+**Continuity.** Each turn is one short-lived CLI process, continuing the agent's **own** session: yoakeland stores that session's id with the chat (`.yoake/sessions/<id>.json`, `native`), together with the id of the last message it saw. The next turn resumes it (`claude --resume`, Codex `thread/resume`, ACP `session/load` or `session/resume`) and sends only the new message — as long as the chat's history still ends where the agent left off. After an edit, retry, branch switch, a turn on a different provider, or when resuming fails, the agent starts a fresh session instead and gets a plain-text transcript of the conversation so far. The same happens in reverse: a plain API model (or a different CLI agent) is sent a CLI agent's tool steps as text, never as tool calls, since it can't replay another agent's tools.
+
+**What yoakeland doesn't cover for CLI agents:** snapshots (§6) — `restore_snapshot` only undoes yoakeland's built-in tools' edits, not a CLI agent's; use the agent's own undo or git. And the agent's own sandbox applies, not yoakeland's `sandboxTier`: a remote peer driving a CLI agent in `autonomous` mode gets that agent's bypass mode (Claude's `bypassPermissions` has no sandbox at all).
+
+**Per agent, what's documented and what isn't** (as of v2.15):
+
+- **Claude Code** — `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode> [--model] [--effort] [--resume <id>]`. The stream-json message types (partial `stream_event`s, `assistant`/`user` tool blocks, `result` with `usage` and `total_cost_usd`, `rate_limit_event`) are documented. The permission round trip is the Agent SDK's `control_request` / `control_response` (`can_use_tool`) on stdin/stdout; passing `stdio` as the prompt tool is **undocumented** (it's what the Agent SDK itself does). `rate_limit_event`'s `unifiedWindows` (5-hour and 7-day utilization) and a result line's `tool_use_result.structuredPatch` (used for edit diffs) are observed, not documented; without the patch, the diff is computed from the tool input against the file on disk. `--effort` comes from `set_model_options.reasoningEffort`.
+- **Codex** — `codex app-server -c web_search="live"`, its documented JSON-RPC interface (types: `codex app-server generate-ts`): `initialize`, `thread/start|resume`, `turn/start` (with `effort`), `item/*` notifications, approval requests (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, legacy `execCommandApproval`/`applyPatchApproval`), `thread/tokenUsage/updated`, `account/rateLimits/read|updated`. Extra sandbox-permission requests (`item/permissions/requestApproval`) are declined, and so are MCP elicitations. `codex exec --json` is not used: it has no approvals and no streamed deltas. No USD cost is reported, so it's priced like an API model (§3.2 `usage`).
+- **ACP agents** — the Agent Client Protocol v1 (agentclientprotocol.com): `initialize`, `session/new`/`load`/`resume`, `session/prompt`, `session/update` (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`), `session/request_permission`. yoakeland advertises no `fs`/`terminal` client capabilities, so the agent uses its own. Model and effort are set through config options (category `model` / `thought_level`, `session/set_config_option`), falling back to the unstable `session/set_model`. Cost comes from `usage_update.cost` (a running total, so a turn's cost is the difference); token counts only when the agent returns the unstable `PromptResponse.usage`. `list_models` opens a throwaway session to read the model option (ACP has no models call outside a session), which some agents keep in their own session list. Cursor's `cursor/*` extensions (its own question/plan requests) aren't handled. An agent that isn't logged in fails the turn with an `error` telling the user to sign in once in a terminal on the server.
+
+**Why CLI subprocesses instead of OAuth token reuse**: Anthropic and OpenAI both prohibit third-party tools from using a Claude/ChatGPT *subscription* OAuth token directly against their APIs — that's billing-plan misuse, and Anthropic actively enforces it. Driving the *official, already-authenticated CLI* is the sanctioned pattern instead (T3 Code and waku do the same): the CLI owns its auth end to end. A frontend offering a `cli_*` kind should check the CLI is installed first — send `detect_cli` (§3.1) and gate on `cli_availability` (§3.2); this checks the machine the *backend* runs on, not the frontend's.
 
 **Web search**: available with no extra setup on `anthropic` (Anthropic's native `web_search_20250305` server tool, added to every request unless `ANTHROPIC_DISABLE_WEB_SEARCH` is set — e.g. for an org that has it disabled in the Console, where including it makes the API reject the whole request with a 400) and `openrouter` (`openrouter:web_search`, opt out with `OPENROUTER_DISABLE_WEB_SEARCH`) — both resolved entirely server-side against the same credential already in use, invisible to yoakeland's own tool-call machinery. Plain `openai` gets none (Chat Completions has no general hosted search tool). Separately, a `web_search` *client* tool (in the same family as `file_read`/`bash`, §3.2's `tool_call_requested`) is always registered, for providers/backends with no native option of their own: with `BRAVE_API_KEY` set it queries Brave's JSON API (the reliable path); with no key it falls back to scraping DuckDuckGo's HTML results for free, which works but is best-effort — DuckDuckGo bot-checks non-browser/datacenter traffic, so this path can intermittently return an error instead of results, and a startup log line names which mode a project is running in.
 
@@ -1386,7 +1680,7 @@ Three provider kinds exist:
 
 ## 6c. Provider Registry Is Server-Level, Not Project-Level
 
-Providers/credentials belong to whoever is running the server, not to any one project someone connects to work on — you register an API key once and it's available no matter which project a session is bound to (§4b). Concretely: `providers.json` lives at `<-state-dir>/providers.json` (default `~/.yoake/providers.json`), completely separate from any project's own `.yoake/` directory, and `register_provider`/`list_providers`/`set_provider`/`remove_provider`/the OpenRouter OAuth flow all operate against this one server-wide registry regardless of which session or project you're issuing them from. The only project-relative detail is that `set_provider` builds a `cli_claude`/`cli_codex` provider's subprocess to run with the *session's own bound project* as its working directory — so the same named provider config behaves correctly no matter which project a given session activates it in.
+Providers/credentials belong to whoever is running the server, not to any one project someone connects to work on — you register an API key once and it's available no matter which project a session is bound to (§4b). Concretely: `providers.json` lives at `<-state-dir>/providers.json` (default `~/.yoake/providers.json`), completely separate from any project's own `.yoake/` directory, and `register_provider`/`list_providers`/`set_provider`/`remove_provider`/the OpenRouter OAuth flow all operate against this one server-wide registry regardless of which session or project you're issuing them from. The only project-relative detail is that `set_provider` builds a `cli_*` provider's subprocess to run with the *session's own bound project* as its working directory — so the same named provider config behaves correctly no matter which project a given session activates it in.
 
 `<-state-dir>` holds every other piece of server-level state alongside `providers.json`: `server.json` (identity + remote-access password) and `tls/` (the auto-managed CA + server certificate backing the optional TCP listener when `-tls-cert`/`-tls-key` aren't given — see §2a for what's in there and what "pairing" a client means).
 
@@ -1549,7 +1843,8 @@ class YoakeBackend {
 - [ ] **Context & Spend**: Render `turn_completed.data.context`/`.spend` (§3.2) rather than re-deriving them client-side.
 - [ ] **Budget Rejections**: Handle `finishReason: "budget_exceeded"` as a distinct, user-visible outcome, not a generic error — the model was never even called.
 - [ ] **No-Provider Rejections**: Handle `finishReason: "no_provider"` by prompting the user to register/select a provider, rather than treating it as a generic failure — a server started with no default provider is an expected, supported setup, not a misconfiguration.
-- [ ] **Provider Picker**: Populate provider choices from `provider_list`, never hardcode a fixed set — new ones can be registered at any time; gate `cli_claude`/`cli_codex` on `cli_availability` (§3.1/§3.2) first.
+- [ ] **Provider Picker**: Populate provider choices from `provider_list`, never hardcode a fixed set — new ones can be registered at any time; gate the `cli_*` kinds on `cli_availability` (§3.1/§3.2) first.
+- [ ] **Native tool calls**: Render `tool_call_requested`/`tool_result` with `native: true` from `title`/`kind`/`locations`/`diffs` rather than assuming yoakeland's own tool names and args (§3.2, §6b).
 - [ ] **Model Picker**: Populate model choices from `list_models` (per selected provider), never hardcode a fixed model set — pass the chosen `id` as `model` on `set_provider`. One registered provider now covers many models; don't ask the user to register a separate provider per model.
 - [ ] **Favorite Models**: Let the user star models in the picker (`isFavorite` on each `model_list` entry) and persist the choice via `set_favorite_models`, not local storage — favorites are server-side per provider (§6b) so they follow the user across devices/clients.
 - [ ] **Reasoning/Thinking Controls**: Only show a reasoning-effort or thinking-budget control for a model that advertises it via `capabilities` on its `model_list` entry (§3.2) — sending `set_model_options` to a model that doesn't support the field is a silent no-op, not an error, so the UI is what prevents a confusing dead control.
@@ -1564,12 +1859,14 @@ class YoakeBackend {
 - [ ] **Split/Sidebar Layout**: Persist which two sessions are paired via `set_session_layout` (§3.1), reading it back from `linkedSessionId` on `session_list`/`session_updated` (§3.2) — this is what lets a paired session survive a reconnect or a second device opening the project. Keep purely visual state (sidebar collapsed, split ratio, panel width) in client-local storage instead: those are per-device screen-space preferences, not conversation data, and syncing them would fight different window sizes across devices.
 - [ ] **Snapshot Picker**: Use `list_snapshots` (§3.1) to populate a restore-snapshot picker rather than requiring a user to already know a `snapshotId` — each entry now represents a whole turn's changes, not a single mutation, so restoring one reverts everything that turn touched (§6).
 - [ ] **Snapshot Visibility** (optional): Handle `snapshot_capturing`/`snapshot_created` (§3.2) for a "snapshotting…" indicator or activity log around otherwise-invisible pre-mutation backups; a client that doesn't care can ignore both and rely on `tool_result` alone as before.
+- [ ] **Built-in Terminal**: Terminals belong to a chat, not a project — scope your tab strip per open `sessionId` and call `list_terminals` with it whenever that chat is opened, not once globally. Use `terminal_open`/`terminal_attach` (client-chosen `terminalId`, unique only within its session — a different chat can reuse `"term-1"`) to create/join a tab — the same `sessionId`+`terminalId` attached from two panes is what makes split views work, since both receive every `terminal_output` live. Decode `terminal_snapshot.history` and every `terminal_output.data` from base64 before feeding a terminal emulator widget (e.g. xterm.js); don't treat them as plain JSON strings. Call `terminal_resize` on pane resize (`SIGWINCH`, not a respawn), and offer `restartIfExited` on `terminal_attach` for a "reopen this closed tab" action rather than a fresh `terminal_open`. Deleting a chat (`delete_session`) kills every terminal it owns — drop those tabs from the UI without waiting on individual `terminal_closed` events, since they arrive as a batch alongside `session_deleted`.
 - [ ] **Peer List**: Render `peer_list` (§3.2) as a live roster, not a one-time fetch — it's pushed on every connect/disconnect/rename/avatar-change, and each push is the full roster, not a diff. Gate `disconnect_peer`'s "are you sure" UI on the fact that any peer can disconnect any other (§2a) — there's no per-user identity backing a finer-grained check yet.
 - [ ] **Peer Identity**: Send `name`/`deviceType`/`avatar` on `auth` (§2a) when connecting to any server (downscale the avatar to 96x96 client-side first — the backend does no image processing and drops anything oversized), and use `set_peer_name`/`set_peer_avatar` (§3.1) to update them live afterward, e.g. from a Settings screen — don't require a reconnect to pick up a profile change.
 - [ ] **Remote Access & Password Settings**: Build the "enable remote use / choose a password" UI around `set_remote_access`/`set_remote_password` (§3.1), and disable or hide both controls when the active connection isn't the local unix socket — the backend rejects them over TCP outright.
 - [ ] **Per-Person Tokens**: For a server more than one human connects to, build a "people with access" settings list around `register_token`/`list_tokens`/`remove_token` (§3.1) instead of sharing the one `-token`/`set_remote_password` secret — same local-socket-only restriction as above. Render `session_history`'s `author`/`authorAvatar` fields (§3.2) in a shared transcript, and know that a token-backed peer can't `set_peer_name` itself (its name is fixed at registration).
 - [ ] **Server Identity**: Show `server_identity` (§3.2, pushed on connect and on change) as the server's display name; let `set_server_identity` rename it from Settings.
 - [ ] **Modes**: Reflect `set_mode`/`mode_set` (§3.1/§3.2/§4c) in the composer UI — the restriction is enforced backend-side (the model literally isn't given the withheld tools), but the frontend still owns signaling the mode to the user.
+- [ ] **Status bar**: Render `ping`'s `data.status` (rate limits per CLI provider, spend, budgets, queued turns), `git_status` per project, and keep a pending-asks list from `pending_asks` snapshots (replace, don't merge).
 - [ ] **Liveness**: Reply to unsolicited `ping` with `pong` (echoing `nonce`), and treat a connection that's gone quiet for a while as dead and worth reconnecting — see "Keeping a connection alive" in §2a.
 - [ ] **Local Connections**: For same-machine use, dial the always-on local unix socket (§2a) directly rather than spawning `yoakeland -stdio` as a subprocess or dialing `127.0.0.1` TCP — no token to manage, the OS enforces who can connect, and the daemon keeps running (and keeps other clients' sessions alive) independent of any one client's lifetime. Reserve `-stdio` for when a frontend genuinely wants to own the backend's whole process lifecycle itself; fall back to TCP+token only for remote/multi-device access.
 - [ ] **TLS Awareness**: The TCP listener is always TLS (an operator's own cert, or yoakeland's auto-managed CA — see §2a) — but a client dialing it must still trust the *right* CA rather than skip verification: for the auto-managed case, fetch/copy `<-state-dir>/tls/ca.pem` once during pairing and trust only that certificate (a non-default root-cert-pool), not the public trust store, and never fall back to disabling certificate verification.

@@ -33,7 +33,7 @@ func TestHandshake(t *testing.T) {
 				}
 				return "", TokenRecord{}, false
 			}
-			_, _, _, _, _, _, got := handshake(ipc, "tcp", lookup)
+			_, _, got := handshake(ipc, "tcp", lookup)
 			if got != tc.want {
 				t.Fatalf("handshake() ok = %v, want %v (out: %s)", got, tc.want, out.String())
 			}
@@ -50,18 +50,20 @@ func TestHandshake_UnixAllowsOptionalAuth(t *testing.T) {
 		in := bytes.NewBufferString(`{"type":"ping","data":{}}` + "\n")
 		ipc := protocol.NewIPCStream(in, &bytes.Buffer{})
 
-		name, deviceType, _, _, _, pending, ok := handshake(ipc, "unix", nil)
+		who, pending, ok := handshake(ipc, "unix", nil)
+		name, deviceType := who.Name, who.DeviceType
 		if !ok || pending == nil || pending.Type != protocol.EventPing {
 			t.Fatalf("handshake() = name=%q deviceType=%q pending=%v ok=%v, want the ping envelope handed back pending", name, deviceType, pending, ok)
 		}
 	})
 
 	t.Run("self-reported identity, no token required", func(t *testing.T) {
-		in := bytes.NewBufferString(`{"type":"auth","data":{"name":"aveline-laptop","deviceType":"desktop"}}` + "\n")
+		in := bytes.NewBufferString(`{"type":"auth","data":{"name":"aveline-laptop","deviceType":"desktop","deviceId":"dev-1"}}` + "\n")
 		ipc := protocol.NewIPCStream(in, &bytes.Buffer{})
 
-		name, deviceType, _, _, _, pending, ok := handshake(ipc, "unix", nil)
-		if !ok || pending != nil || name != "aveline-laptop" || deviceType != "desktop" {
+		who, pending, ok := handshake(ipc, "unix", nil)
+		name, deviceType := who.Name, who.DeviceType
+		if !ok || pending != nil || name != "aveline-laptop" || deviceType != "desktop" || who.DeviceID != "dev-1" {
 			t.Fatalf("handshake() = name=%q deviceType=%q pending=%v ok=%v, want identity captured with no pending envelope", name, deviceType, pending, ok)
 		}
 	})

@@ -34,7 +34,7 @@ func TestRunHeartbeat_PingsWhileAlive(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runHeartbeat(ctx, ipc, closer, &lastSeen, 10*time.Millisecond, 200*time.Millisecond)
+		runHeartbeat(ctx, ipc, closer, &lastSeen, 10*time.Millisecond, 200*time.Millisecond, nil)
 	}()
 
 	// Keep the connection "alive" for a few ping intervals.
@@ -67,7 +67,7 @@ func TestRunHeartbeat_ClosesStaleConnection(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runHeartbeat(ctx, ipc, closer, &lastSeen, 5*time.Millisecond, 10*time.Millisecond)
+	go runHeartbeat(ctx, ipc, closer, &lastSeen, 5*time.Millisecond, 10*time.Millisecond, nil)
 
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) && !closer.closed.Load() {
@@ -95,7 +95,7 @@ func TestRunHeartbeat_ClosesOnFailedPing(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runHeartbeat(ctx, ipc, closer, &lastSeen, 5*time.Millisecond, time.Hour)
+	go runHeartbeat(ctx, ipc, closer, &lastSeen, 5*time.Millisecond, time.Hour, nil)
 
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) && !closer.closed.Load() {

@@ -3,8 +3,10 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
@@ -42,13 +44,16 @@ func (t *FileReadTool) RequiresPermission(_ []byte) bool {
 	return false // Always permitted by default
 }
 
-func (t *FileReadTool) Execute(_ context.Context, _ ExecutionContext, argsJSON []byte) (string, error) {
+func (t *FileReadTool) Execute(_ context.Context, execCtx ExecutionContext, argsJSON []byte) (string, error) {
 	var args FileReadArgs
 	if err := json.Unmarshal(argsJSON, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
 
 	safePath, err := t.normalizer.ResolveAndValidatePath(args.Path)
+	if errors.Is(err, normalizer.ErrEscapesRoot) {
+		safePath, err = resolveAttached(args.Path, execCtx.ExtraReadPaths, err)
+	}
 	if err != nil {
 		return "", fmt.Errorf("path error: %w", err)
 	}
@@ -70,6 +75,31 @@ func (t *FileReadTool) Execute(_ context.Context, _ ExecutionContext, argsJSON [
 		return string(content), nil
 	}
 	return sliceLines(string(content), args.StartLine, args.EndLine)
+}
+
+// resolveAttached allows an absolute path outside the project root when it
+// is, or sits under, a path the user attached. Both sides are symlink-
+// resolved, so a link inside an attached folder can't point back out of it.
+// rootErr is returned unchanged when nothing matches.
+func resolveAttached(rawPath string, attached []string, rootErr error) (string, error) {
+	if len(attached) == 0 || !filepath.IsAbs(rawPath) {
+		return "", rootErr
+	}
+	real, err := filepath.EvalSymlinks(rawPath)
+	if err != nil {
+		return "", rootErr
+	}
+	for _, a := range attached {
+		realA, err := filepath.EvalSymlinks(a)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(realA, real)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return real, nil
+		}
+	}
+	return "", rootErr
 }
 
 // sliceLines returns the 1-indexed, inclusive [startLine, endLine] range of

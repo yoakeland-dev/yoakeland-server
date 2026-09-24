@@ -28,11 +28,11 @@ func TestServeConnection_SetModeBroadcastsToOtherPeers(t *testing.T) {
 
 	aOut := &bytes.Buffer{}
 	aIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), aOut)
-	deps.peers.Add(aIPC, &fakeCloser{}, "unix", "peer-a", "desktop", "")
+	deps.peers.Add(aIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-a", DeviceType: "desktop", Avatar: ""})
 
 	bOut := &bytes.Buffer{}
 	bIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), bOut)
-	peerB := deps.peers.Add(bIPC, &fakeCloser{}, "unix", "peer-b", "desktop", "")
+	peerB := deps.peers.Add(bIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-b", DeviceType: "desktop", Avatar: ""})
 
 	line := envelopeJSON(t, protocol.EventSetMode, protocol.SetModeData{
 		SessionID: "sess-mode", Mode: "autonomous",
@@ -83,7 +83,7 @@ func TestServeConnection_ModePersistsAcrossSessionHistoryFetch(t *testing.T) {
 		SessionID: "sess-mode-2", Mode: "plan",
 	})
 	setIPC := protocol.NewIPCStream(bytes.NewBufferString(setLine+"\n"), &bytes.Buffer{})
-	peer := deps.peers.Add(setIPC, &fakeCloser{}, "unix", "peer-setter", "desktop", "")
+	peer := deps.peers.Add(setIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-setter", DeviceType: "desktop", Avatar: ""})
 	serveConnection(context.Background(), setIPC, deps, "unix", peer.ID, nil)
 
 	// A brand-new connection, never involved in the SetMode call above —
@@ -94,7 +94,7 @@ func TestServeConnection_ModePersistsAcrossSessionHistoryFetch(t *testing.T) {
 	})
 	histOut := &bytes.Buffer{}
 	histIPC := protocol.NewIPCStream(bytes.NewBufferString(histLine+"\n"), histOut)
-	peer2 := deps.peers.Add(histIPC, &fakeCloser{}, "unix", "peer-joiner", "desktop", "")
+	peer2 := deps.peers.Add(histIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-joiner", DeviceType: "desktop", Avatar: ""})
 	serveConnection(context.Background(), histIPC, deps, "unix", peer2.ID, nil)
 
 	var env protocol.Envelope
@@ -141,11 +141,11 @@ func TestServeConnection_RestoreSnapshotBroadcastsToOtherPeers(t *testing.T) {
 
 	aOut := &bytes.Buffer{}
 	aIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), aOut)
-	deps.peers.Add(aIPC, &fakeCloser{}, "unix", "peer-a", "desktop", "")
+	deps.peers.Add(aIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-a", DeviceType: "desktop", Avatar: ""})
 
 	bOut := &bytes.Buffer{}
 	bIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), bOut)
-	peerB := deps.peers.Add(bIPC, &fakeCloser{}, "unix", "peer-b", "desktop", "")
+	peerB := deps.peers.Add(bIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-b", DeviceType: "desktop", Avatar: ""})
 
 	line := envelopeJSON(t, protocol.EventRestoreSnapshot, protocol.RestoreSnapshotData{
 		SnapshotID: snap.ID,

@@ -41,6 +41,11 @@ type ExecutionContext struct {
 	// is cancelled. Injected by Agent per dispatch — internal/tool never
 	// imports internal/agent, same reasoning as Stream/AuthorName above.
 	AskUser func(question string, options []string) (string, error)
+
+	// ExtraReadPaths are files (or directories) the session's user attached
+	// (agent.Message.Attachments): file_read may read these, and anything
+	// under them, even though they're outside the project root.
+	ExtraReadPaths []string
 }
 
 type Tool interface {

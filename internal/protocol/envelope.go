@@ -64,6 +64,26 @@ const (
 	EventRegisterToken        EventType = "register_token"
 	EventListTokens           EventType = "list_tokens"
 	EventRemoveToken          EventType = "remove_token"
+	EventListNotifications    EventType = "list_notifications"
+	EventDismissNotification  EventType = "dismiss_notification"
+	EventUploadBegin          EventType = "upload_begin"
+	EventUploadChunk          EventType = "upload_chunk"
+
+	// Terminal events (§ built-in terminal): a real, interactive shell —
+	// distinct from the bash tool's single-command-no-shell design — that a
+	// human peer drives directly. Terminals are scoped per project (like
+	// list_files/list_sessions), not per chat session: a project's terminal
+	// tabs are the same set regardless of which chat is open, so more than
+	// one connected peer/tab/device sees the same tabs. TerminalID is always
+	// client-chosen (never server-allocated, same convention t3.chat's own
+	// terminal panel uses) so a client can address "the tab it just opened"
+	// without a request/response round trip.
+	EventTerminalOpen   EventType = "terminal_open"
+	EventTerminalAttach EventType = "terminal_attach"
+	EventTerminalInput  EventType = "terminal_input"
+	EventTerminalResize EventType = "terminal_resize"
+	EventTerminalClose  EventType = "terminal_close"
+	EventListTerminals  EventType = "list_terminals"
 
 	EventModelDelta               EventType = "model_delta"
 	EventToolCallRequested        EventType = "tool_call_requested"
@@ -106,6 +126,39 @@ const (
 	EventTokenRegistered          EventType = "token_registered"
 	EventTokenList                EventType = "token_list"
 	EventTokenRemoved             EventType = "token_removed"
+	EventNotification             EventType = "notification"
+	EventGitStatus                EventType = "git_status"
+	EventPendingAsks              EventType = "pending_asks"
+	EventNotificationList         EventType = "notification_list"
+	EventNotificationDismissed    EventType = "notification_dismissed"
+	EventUploadProgress           EventType = "upload_progress"
+	EventUploadDone               EventType = "upload_done"
+
+	// EventTerminalSnapshot answers terminal_open/terminal_attach: the
+	// terminal's current state plus its buffered scrollback, so a client
+	// (a newly opened tab, or a second device/tab attaching to one already
+	// running) repaints correctly before any live terminal_output arrives —
+	// the same "state, not just a future stream" shape get_session_history
+	// gives a reconnecting chat client.
+	EventTerminalSnapshot EventType = "terminal_snapshot"
+	// EventTerminalOutput carries one chunk of raw PTY output. Sequence is
+	// monotonic per terminal (from the same counter the snapshot's
+	// ReplayedThrough reports), so a client can detect a gap (a dropped
+	// connection that missed events) and re-attach for a fresh snapshot
+	// instead of silently rendering out-of-order bytes.
+	EventTerminalOutput EventType = "terminal_output"
+	// EventTerminalExited announces the shell process itself exiting (the
+	// user typed `exit`, or it crashed) — the terminal (tab) still exists
+	// and keeps its scrollback until an explicit terminal_close.
+	EventTerminalExited EventType = "terminal_exited"
+	// EventTerminalClosed confirms terminal_close: the terminal is gone,
+	// scrollback and all — a client should drop the tab.
+	EventTerminalClosed EventType = "terminal_closed"
+	EventTerminalError  EventType = "terminal_error"
+	EventTerminalList   EventType = "terminal_list"
+	// EventTerminalIndex is the server-wide terminal roster, pushed to every
+	// peer on connect and whenever a terminal starts, exits or closes.
+	EventTerminalIndex EventType = "terminal_index"
 )
 
 type Envelope struct {
@@ -132,6 +185,9 @@ type AuthData struct {
 	// peer. Oversized values are dropped rather than failing the connection
 	// — see maxAvatarLen.
 	Avatar string `json:"avatar,omitempty"`
+	// DeviceID is a stable id the client generates once and keeps, so the
+	// same device is recognizable across reconnects and across servers.
+	DeviceID string `json:"deviceId,omitempty"`
 }
 
 // RegisterProviderData registers (or updates) a named provider config: a
@@ -417,6 +473,7 @@ type HistoryToolCall struct {
 	ID   string          `json:"id"`
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args"`
+	NativeToolInfo
 }
 
 type HistoryMessage struct {
@@ -430,6 +487,8 @@ type HistoryMessage struct {
 	Reasoning  string            `json:"reasoning,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
+	// Diffs: a native tool result's file changes (see ToolResultData.Diffs).
+	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
 
 	// AlternateIDs lists the OTHER versions that exist at this point in the
 	// conversation — other edits of this same user message, or other
@@ -449,6 +508,10 @@ type HistoryMessage struct {
 	// the sending client uses (SPEC.md §2a's avatar conventions). Omitted for
 	// an assistant/tool message, and for a sender who never set one.
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
+
+	// Attachments are the server-side paths this user message attached
+	// (user_prompt's own attachments), so a repainted transcript can show them.
+	Attachments []string `json:"attachments,omitempty"`
 
 	// Provider/Model are the registered provider name and model id that
 	// generated this message (assistant only). Empty for a message
@@ -518,6 +581,11 @@ type DirEntry struct {
 type DirectoryListData struct {
 	Path    string     `json:"path"`
 	Entries []DirEntry `json:"entries"`
+
+	// Error is set (with Path echoing the request, Entries empty) when the
+	// directory couldn't be listed, so a folder browser can say why rather
+	// than wait on a reply that never comes.
+	Error string `json:"error,omitempty"`
 }
 
 // ListSnapshotsData requests the snapshots captured for one project, so a
@@ -548,6 +616,10 @@ type PeerInfo struct {
 	DeviceType  string    `json:"deviceType"`
 	Avatar      string    `json:"avatar,omitempty"` // data URL, see AuthData.Avatar
 	ConnectedAt time.Time `json:"connectedAt"`
+	DeviceID    string    `json:"deviceId,omitempty"` // AuthData.DeviceID
+	// The chat this connection last opened (get_session_history), if any.
+	SessionID   string `json:"sessionId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
 }
 
 // PeerListData is pushed to every connected peer whenever the connection
@@ -555,6 +627,9 @@ type PeerInfo struct {
 // requested, so a frontend's peer list never goes stale sitting in a poll.
 type PeerListData struct {
 	Peers []PeerInfo `json:"peers"`
+	// You is the receiving connection's own PeerID, so a client can tell
+	// itself apart from everyone else.
+	You string `json:"you,omitempty"`
 }
 
 // SetPeerNameData renames the connection sending it — there's no target
@@ -612,11 +687,19 @@ type RegisterTokenData struct {
 }
 
 // TokenRegisteredData carries the newly generated token — shown only once,
-// at creation, matching TokenListData being scrubbed.
+// at creation, matching TokenListData being scrubbed. CaPem is the server's
+// auto-managed CA certificate (empty if it's running an operator-supplied
+// one instead, see remoteControl.CAPEM) — bundled alongside the token so a
+// client can be paired in one copy/paste instead of two: the token alone is
+// only as trustworthy as the TLS connection it's sent over, and this CA is
+// what lets a client verify that connection actually terminates at this
+// server rather than an operator-supplied cert whose issuer the client's own
+// OS trust store already covers.
 type TokenRegisteredData struct {
 	Name  string `json:"name"`
 	Token string `json:"token"`
 	Email string `json:"email,omitempty"`
+	CaPem string `json:"caPem,omitempty"`
 }
 
 // TokenSummary is one row of a token_list response — no raw token value,
@@ -716,12 +799,237 @@ type FileListData struct {
 type CLIAvailabilityData struct {
 	Claude bool `json:"claude"`
 	Codex  bool `json:"codex"`
+	// Agents covers every supported CLI (claude and codex included), keyed
+	// by the provider kind that registers it ("cli_cursor", ...).
+	Agents map[string]bool `json:"agents"`
 }
 
 // PingData/PongData carry an optional client-chosen nonce so a round trip
 // can be correlated and timed; either side may initiate a ping.
 type PingData struct {
 	Nonce string `json:"nonce,omitempty"`
+
+	// Status rides along on every server-sent ping (SPEC.md §2a) so a
+	// client's status bar stays current without a separate poll. Omitted on
+	// a client-sent ping and on the pong echo.
+	Status *ServerStatus `json:"status,omitempty"`
+}
+
+// ServerStatus is a cheap snapshot of the server's own health. Load and
+// memory fields are zero on platforms without /proc (see readHostStats).
+type ServerStatus struct {
+	UptimeSec     int64   `json:"uptimeSec"`
+	ActiveTurns   int     `json:"activeTurns"`
+	Peers         int     `json:"peers"`
+	OpenProjects  int     `json:"openProjects"`
+	Load1         float64 `json:"load1,omitempty"`
+	CPUs          int     `json:"cpus"`
+	MemTotalBytes uint64  `json:"memTotalBytes,omitempty"`
+	MemAvailBytes uint64  `json:"memAvailBytes,omitempty"`
+	HeapBytes     uint64  `json:"heapBytes"`
+	Version       string  `json:"version,omitempty"`
+
+	// QueuedTurns counts turns accepted but waiting to start: a session runs
+	// one turn at a time, so a prompt sent while its session is busy waits.
+	QueuedTurns int `json:"queuedTurns"`
+	// RateLimits holds the latest subscription usage each cli_claude/
+	// cli_codex provider reported, keyed by provider name.
+	RateLimits map[string]ProviderRateLimits `json:"rateLimits,omitempty"`
+	Spend      *ServerSpend                  `json:"spend,omitempty"`
+	Budgets    []Budget                      `json:"budgets,omitempty"`
+}
+
+// RateLimitWindow is one subscription usage window. ResetsAt is RFC 3339.
+type RateLimitWindow struct {
+	UsedPct  float64 `json:"usedPct"`
+	ResetsAt string  `json:"resetsAt,omitempty"`
+}
+
+// OtherRateLimitWindow is a window that is neither the plan's own 5-hour
+// nor 7-day one: a different length (Codex's 30-day window on a free plan),
+// or a narrower bucket such as a single model's weekly cap, named by Label.
+type OtherRateLimitWindow struct {
+	WindowMins int `json:"windowMins"`
+	// Label names what a scoped window covers ("Opus", a Codex limitName).
+	// Empty for a plan-wide window.
+	Label string `json:"label,omitempty"`
+	RateLimitWindow
+}
+
+type ProviderRateLimits struct {
+	// Kind is the provider's kind ("cli_claude" / "cli_codex"), so a client
+	// can show which agent the numbers belong to without a provider lookup.
+	Kind string `json:"kind,omitempty"`
+	// Plan is the subscription tier the CLI reports ("pro", "max", "plus",
+	// "free", ...), when it does.
+	Plan string `json:"plan,omitempty"`
+	// UpdatedAt is when the server last heard these numbers (RFC 3339).
+	UpdatedAt string                 `json:"updatedAt,omitempty"`
+	FiveHour  *RateLimitWindow       `json:"fiveHour,omitempty"`
+	SevenDay  *RateLimitWindow       `json:"sevenDay,omitempty"`
+	Other     []OtherRateLimitWindow `json:"other,omitempty"`
+}
+
+// Windows lists every window, the 5h/7d ones included, in one shape.
+func (rl ProviderRateLimits) Windows() []OtherRateLimitWindow {
+	var out []OtherRateLimitWindow
+	if rl.FiveHour != nil {
+		out = append(out, OtherRateLimitWindow{WindowMins: 5 * 60, RateLimitWindow: *rl.FiveHour})
+	}
+	if rl.SevenDay != nil {
+		out = append(out, OtherRateLimitWindow{WindowMins: 7 * 24 * 60, RateLimitWindow: *rl.SevenDay})
+	}
+	return append(out, rl.Other...)
+}
+
+// Merge overlays a partial update (one window from a streamed
+// rate_limit_event) onto rl: windows it carries replace the matching ones,
+// everything else is kept.
+func (rl ProviderRateLimits) Merge(u ProviderRateLimits) ProviderRateLimits {
+	if u.Kind != "" {
+		rl.Kind = u.Kind
+	}
+	if u.Plan != "" {
+		rl.Plan = u.Plan
+	}
+	if u.UpdatedAt != "" {
+		rl.UpdatedAt = u.UpdatedAt
+	}
+	if u.FiveHour != nil {
+		rl.FiveHour = u.FiveHour
+	}
+	if u.SevenDay != nil {
+		rl.SevenDay = u.SevenDay
+	}
+	other := append([]OtherRateLimitWindow(nil), rl.Other...)
+	for _, w := range u.Other {
+		replaced := false
+		for i := range other {
+			if other[i].Label == w.Label && other[i].WindowMins == w.WindowMins {
+				other[i], replaced = w, true
+			}
+		}
+		if !replaced {
+			other = append(other, w)
+		}
+	}
+	rl.Other = other
+	return rl
+}
+
+// ServerSpend totals recorded turn cost across every project, bucketed by
+// the server's local day/calendar month.
+type ServerSpend struct {
+	TodayUSD float64 `json:"todayUsd"`
+	MonthUSD float64 `json:"monthUsd"`
+}
+
+// Budget is one spend limit the server enforces. UsedUSD is omitted for a
+// "session" scope limit, which applies to each session separately (its
+// per-session usage is in every turn_completed's spend).
+type Budget struct {
+	Scope       string   `json:"scope"` // "server" | "project" | "session"
+	ProjectPath string   `json:"projectPath,omitempty"`
+	Period      string   `json:"period"` // "day" | "month" | "total"
+	LimitUSD    float64  `json:"limitUsd"`
+	UsedUSD     *float64 `json:"usedUsd,omitempty"`
+}
+
+// GitStatusData is one project's git state (SPEC.md §3.2 git_status).
+type GitStatusData struct {
+	ProjectPath string  `json:"projectPath"`
+	Branch      *string `json:"branch"`
+	Detached    bool    `json:"detached"`
+	DirtyFiles  int     `json:"dirtyFiles"`
+	Ahead       int     `json:"ahead"`
+	Behind      int     `json:"behind"`
+	HasUpstream bool    `json:"hasUpstream"`
+	// Files lists the first MaxGitFiles changed paths; DirtyFiles is still
+	// the full count.
+	Files []GitFile `json:"files,omitempty"`
+}
+
+// MaxGitFiles caps GitStatusData.Files — it rides every git_status push.
+const MaxGitFiles = 50
+
+// GitFile is one changed path. Status is one letter: M modified, A added,
+// D deleted, R renamed, C copied, T type change, U unmerged, ? untracked.
+type GitFile struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+// PendingAsk is one unanswered permission_request or ask_user_question.
+// Exactly one of the embedded payloads is set, matching Kind, and its fields
+// are flattened into the object — the same shape the original event carried.
+type PendingAsk struct {
+	Kind        string    `json:"kind"` // "permission" | "question"
+	SessionID   string    `json:"sessionId"`
+	ProjectPath string    `json:"projectPath,omitempty"`
+	TurnID      string    `json:"turnId"`
+	ToolCallID  string    `json:"toolCallId"`
+	CreatedAt   time.Time `json:"createdAt"`
+	*PermissionRequestData
+	*AskUserQuestionRequestedData
+}
+
+type PendingAsksData struct {
+	Asks []PendingAsk `json:"asks"`
+}
+
+// Notification is one entry in the server's shared notification feed
+// (SPEC.md §3.2 notification) — broadcast to every peer when raised, and
+// replayed by list_notifications for a client that connected afterward.
+type Notification struct {
+	ID          string    `json:"id"`
+	Level       string    `json:"level"` // "info" | "success" | "warning" | "error"
+	Kind        string    `json:"kind"`  // e.g. "turn_completed", "permission_request", "peer_joined"
+	Title       string    `json:"title"`
+	Body        string    `json:"body,omitempty"`
+	SessionID   string    `json:"sessionId,omitempty"`
+	ProjectPath string    `json:"projectPath,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+type NotificationListData struct {
+	Notifications []Notification `json:"notifications"`
+}
+
+// DismissNotificationData dismisses one notification by ID, or every
+// notification when ID is empty. Echoed back verbatim as
+// notification_dismissed to every peer.
+type DismissNotificationData struct {
+	ID string `json:"id,omitempty"`
+}
+
+// UploadBeginData starts a chunked client→server file upload (SPEC.md §3.1
+// upload_begin). SHA256 (lowercase hex) is the content address: if the
+// server already holds that content, it answers upload_done immediately and
+// no bytes are sent at all.
+type UploadBeginData struct {
+	UploadID string `json:"uploadId"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256"`
+}
+
+// UploadChunkData carries the next sequential slice of an upload's bytes.
+type UploadChunkData struct {
+	UploadID string `json:"uploadId"`
+	Data     []byte `json:"data"` // base64 on the wire (encoding/json's []byte default)
+}
+
+type UploadProgressData struct {
+	UploadID string `json:"uploadId"`
+	Received int64  `json:"received"`
+}
+
+// UploadDoneData ends an upload: Path (an absolute path on the server,
+// usable as a user_prompt attachment) on success, Error otherwise.
+type UploadDoneData struct {
+	UploadID string `json:"uploadId"`
+	Path     string `json:"path,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type PongData struct {
@@ -752,6 +1060,12 @@ type UserPromptData struct {
 	// senders could be named.
 	AuthorName   string `json:"authorName,omitempty"`
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
+
+	// Attachments are absolute paths on the server's machine the model may
+	// read for the rest of this session, even outside the project root
+	// (SPEC.md §3.1). Over TCP each must resolve inside the server's upload
+	// store or the project; the unix socket's own user may attach anything.
+	Attachments []string `json:"attachments,omitempty"`
 }
 
 // EditMessageData replaces a past user message's content and regenerates
@@ -811,6 +1125,20 @@ type ModelDeltaData struct {
 type ToolCallData struct {
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args"`
+	NativeToolInfo
+}
+
+// NativeToolInfo describes a tool call a CLI agent ran with its own tools
+// (SPEC.md §6b) rather than one of yoakeland's: Name/Args are the agent's
+// own tool name and input, which a client can't be expected to know every
+// variant of, so Title/Kind/Locations give it something generic to render.
+type NativeToolInfo struct {
+	Native bool   `json:"native,omitempty"`
+	Title  string `json:"title,omitempty"`
+	// Kind is one of ACP's tool kinds: read | edit | delete | move | search |
+	// execute | think | fetch | other.
+	Kind      string   `json:"kind,omitempty"`
+	Locations []string `json:"locations,omitempty"`
 }
 
 type PermissionRequestData struct {
@@ -831,6 +1159,9 @@ type ToolResultData struct {
 	ToolName string `json:"toolName"`
 	Output   string `json:"output,omitempty"`
 	Error    string `json:"error,omitempty"`
+	// Diffs are the file changes a native tool call made, when the agent
+	// reported them (SPEC.md §6b).
+	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
 }
 
 type UsageData struct {
@@ -919,6 +1250,165 @@ type ErrorData struct {
 	// request id) can match a failure to its request instead of only ever
 	// seeing errors on success. Empty for every other error.
 	ProjectPath string `json:"projectPath,omitempty"`
+}
+
+// TerminalOpenData starts a new terminal (tab) bound to a chat session —
+// terminals live and die with the chat that opened them (see CloseSession,
+// invoked by delete_session): closing the chat kills every terminal it
+// owns, and a session can hold several at once (its open tabs). SessionID
+// resolves exactly like UserPromptData's does — ProjectPath only matters the
+// first time this SessionID is used, binding it the same way a prompt
+// would; omit it on a session that's already bound (e.g. one that already
+// has messages). Cwd, if given, is relative to the project root (validated
+// the same way a tool's file path is — escaping the root is rejected) and
+// defaults to the root itself. Cols/Rows default to a conventional 80x24
+// when omitted. Env adds to, never replaces, the sandbox's own fixed
+// environment (see sandbox.LinuxSandbox.baseEnv) — same restricted shape
+// (key pattern, count, size) as the sandboxed bash tool's environment
+// already gets, so a terminal can't be used to smuggle in something the
+// tool boundary wouldn't allow.
+type TerminalOpenData struct {
+	SessionID   string            `json:"sessionId"`
+	ProjectPath string            `json:"projectPath,omitempty"`
+	TerminalID  string            `json:"terminalId"`
+	Cwd         string            `json:"cwd,omitempty"`
+	Cols        int               `json:"cols,omitempty"`
+	Rows        int               `json:"rows,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+}
+
+// TerminalAttachData subscribes this connection to a terminal that may
+// already be running within SessionID's chat (opened by this client
+// earlier, or by another tab/device watching the same chat) — the
+// multi-tab/split-view case. Cols/Rows, if given, resize it immediately (the
+// attaching pane's own size may differ from whoever had it open last).
+// RestartIfExited respawns the shell (same Cwd/Env it was opened with) if
+// the previous process already exited, instead of erroring — for "reopen
+// this closed tab".
+type TerminalAttachData struct {
+	SessionID       string `json:"sessionId"`
+	ProjectPath     string `json:"projectPath,omitempty"`
+	TerminalID      string `json:"terminalId"`
+	Cols            int    `json:"cols,omitempty"`
+	Rows            int    `json:"rows,omitempty"`
+	RestartIfExited bool   `json:"restartIfExited,omitempty"`
+}
+
+// TerminalInputData writes raw bytes to the terminal's pty, exactly as
+// typed/pasted client-side — this is not a command string (no parsing,
+// no argv, unlike the bash tool); the shell on the other end interprets it.
+// Data is base64-encoded raw bytes, not a JSON string of the input text:
+// terminal I/O is not guaranteed to be valid UTF-8 (paste of binary data,
+// a multi-byte character split across two writes) and encoding/json quietly
+// mangles invalid UTF-8 in a plain string (substituting U+FFFD) rather than
+// erroring, which would corrupt exactly the input a user is relying on
+// being sent byte-for-byte.
+type TerminalInputData struct {
+	SessionID   string `json:"sessionId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	TerminalID  string `json:"terminalId"`
+	Data        string `json:"data"`
+}
+
+type TerminalResizeData struct {
+	SessionID   string `json:"sessionId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	TerminalID  string `json:"terminalId"`
+	Cols        int    `json:"cols"`
+	Rows        int    `json:"rows"`
+}
+
+type TerminalCloseData struct {
+	SessionID   string `json:"sessionId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	TerminalID  string `json:"terminalId"`
+}
+
+// ListTerminalsData requests every terminal (tab) open in one chat session —
+// the set a client repaints that chat's tab strip from on open, resolved the
+// same way GetSessionHistoryData is.
+type ListTerminalsData struct {
+	SessionID   string `json:"sessionId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+}
+
+// TerminalStatus mirrors terminal.Status on the wire as a plain string
+// rather than importing internal/terminal here (protocol is the lower-level
+// package; see HistoryMessage's doc comment for the same reasoning).
+type TerminalStatus string
+
+const (
+	TerminalStatusStarting TerminalStatus = "starting"
+	TerminalStatusRunning  TerminalStatus = "running"
+	TerminalStatusExited   TerminalStatus = "exited"
+	TerminalStatusError    TerminalStatus = "error"
+)
+
+// TerminalSnapshotData answers terminal_open/terminal_attach: current state
+// plus buffered scrollback (see EventTerminalSnapshot). History is
+// base64-encoded raw bytes, same reasoning as TerminalInputData.Data — it's
+// the same PTY output stream, just replayed instead of live. ExitCode is nil
+// unless Status is "exited". Sequence is the output sequence number History
+// already includes up to — a client resumes live terminal_output from
+// Sequence+1 without gapping or duplicating.
+type TerminalSnapshotData struct {
+	TerminalID  string         `json:"terminalId"`
+	Cwd         string         `json:"cwd"`
+	Cols        int            `json:"cols"`
+	Rows        int            `json:"rows"`
+	Status      TerminalStatus `json:"status"`
+	Pid         int            `json:"pid,omitempty"`
+	History     string         `json:"history"`
+	Sequence    uint64         `json:"sequence"`
+	ExitCode    *int           `json:"exitCode,omitempty"`
+	Label       string         `json:"label"`
+	SandboxTier string         `json:"sandboxTier"`
+}
+
+// TerminalOutputData.Data is base64-encoded raw bytes — see
+// TerminalInputData's doc comment.
+type TerminalOutputData struct {
+	TerminalID string `json:"terminalId"`
+	Data       string `json:"data"`
+	Sequence   uint64 `json:"sequence"`
+}
+
+type TerminalExitedData struct {
+	TerminalID string `json:"terminalId"`
+	ExitCode   int    `json:"exitCode"`
+}
+
+type TerminalClosedData struct {
+	TerminalID string `json:"terminalId"`
+}
+
+type TerminalErrorData struct {
+	TerminalID string `json:"terminalId"`
+	Message    string `json:"message"`
+}
+
+// TerminalSummary is one row of a terminal_list response — enough for a
+// client to render its tab strip without attaching to every tab up front.
+type TerminalSummary struct {
+	TerminalID string         `json:"terminalId"`
+	Cwd        string         `json:"cwd"`
+	Status     TerminalStatus `json:"status"`
+	Label      string         `json:"label"`
+	ExitCode   *int           `json:"exitCode,omitempty"`
+	// Set only in terminal_index, where rows span sessions and projects.
+	SessionID   string `json:"sessionId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+}
+
+// TerminalIndexData is every terminal on the server, across every chat and
+// project (SPEC.md §3.2 terminal_index).
+type TerminalIndexData struct {
+	Terminals []TerminalSummary `json:"terminals"`
+}
+
+type TerminalListData struct {
+	SessionID string            `json:"sessionId"`
+	Terminals []TerminalSummary `json:"terminals"`
 }
 
 type IPCStream struct {

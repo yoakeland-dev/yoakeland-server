@@ -92,3 +92,36 @@ func TestFileReadTool_LineRangeErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestFileReadTool_AttachedPathsOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	norm, _ := normalizer.New(root)
+	rt := tool.NewFileReadTool(norm)
+
+	attachedDir := filepath.Join(outside, "shared")
+	_ = os.Mkdir(attachedDir, 0o755)
+	_ = os.WriteFile(filepath.Join(outside, "a.txt"), []byte("A"), 0o644)
+	_ = os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("S"), 0o644)
+	_ = os.WriteFile(filepath.Join(attachedDir, "b.txt"), []byte("B"), 0o644)
+	_ = os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(attachedDir, "escape"))
+
+	ctx := tool.ExecutionContext{ExtraReadPaths: []string{filepath.Join(outside, "a.txt"), attachedDir}}
+	read := func(p string) (string, error) {
+		args, _ := json.Marshal(tool.FileReadArgs{Path: p})
+		return rt.Execute(context.Background(), ctx, args)
+	}
+
+	if out, err := read(filepath.Join(outside, "a.txt")); err != nil || out != "A" {
+		t.Fatalf("attached file: %q, %v", out, err)
+	}
+	if out, err := read(filepath.Join(attachedDir, "b.txt")); err != nil || out != "B" {
+		t.Fatalf("file under attached dir: %q, %v", out, err)
+	}
+	if _, err := read(filepath.Join(outside, "secret.txt")); err == nil {
+		t.Fatal("unattached sibling must stay unreadable")
+	}
+	if _, err := read(filepath.Join(attachedDir, "escape")); err == nil {
+		t.Fatal("symlink out of an attached dir must stay unreadable")
+	}
+}

@@ -57,7 +57,7 @@ func TestServeConnection_SetPeerNameRenamesRegisteredPeer(t *testing.T) {
 	deps := newTestDeps(t)
 	out := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
-	peer := deps.peers.Add(ipc, &fakeCloser{}, "unix", "old-name", "desktop", "")
+	peer := deps.peers.Add(ipc, &fakeCloser{}, "unix", peerIdentity{Name: "old-name", DeviceType: "desktop", Avatar: ""})
 
 	in := bytes.NewBufferString(envelopeJSON(t, protocol.EventSetPeerName, protocol.SetPeerNameData{Name: "renamed"}) + "\n")
 	ipc2 := protocol.NewIPCStream(in, out)
@@ -75,7 +75,7 @@ func TestServeConnection_SetPeerAvatar(t *testing.T) {
 	deps := newTestDeps(t)
 	out := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
-	peer := deps.peers.Add(ipc, &fakeCloser{}, "unix", "someone", "desktop", "")
+	peer := deps.peers.Add(ipc, &fakeCloser{}, "unix", peerIdentity{Name: "someone", DeviceType: "desktop", Avatar: ""})
 
 	line := envelopeJSON(t, protocol.EventSetPeerAvatar, protocol.SetPeerAvatarData{Avatar: "data:image/png;base64,abc123"})
 	in := bytes.NewBufferString(line + "\n")
@@ -115,7 +115,7 @@ func TestServeConnection_DisconnectPeerClosesTarget(t *testing.T) {
 	targetOut := &bytes.Buffer{}
 	targetIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), targetOut)
 	targetCloser := &fakeCloser{}
-	target := deps.peers.Add(targetIPC, targetCloser, "unix", "target", "desktop", "")
+	target := deps.peers.Add(targetIPC, targetCloser, "unix", peerIdentity{Name: "target", DeviceType: "desktop", Avatar: ""})
 
 	line := envelopeJSON(t, protocol.EventDisconnectPeer, protocol.DisconnectPeerData{PeerID: target.ID})
 	envs := runDispatch(t, deps, line)
@@ -134,7 +134,7 @@ func TestServeConnection_SetServerIdentity(t *testing.T) {
 	deps := newTestDeps(t)
 	out := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
-	peer := deps.peers.Add(ipc, &fakeCloser{}, "unix", "requester", "desktop", "")
+	peer := deps.peers.Add(ipc, &fakeCloser{}, "unix", peerIdentity{Name: "requester", DeviceType: "desktop", Avatar: ""})
 
 	in := bytes.NewBufferString(envelopeJSON(t, protocol.EventSetServerIdentity, protocol.SetServerIdentityData{Name: "living-room-server"}) + "\n")
 	ipc2 := protocol.NewIPCStream(in, out)

@@ -2,3 +2,6 @@
 /yoakeland
 /.yoake/
 /graphify-out/
+/.bash_history
+/.cache/
+/cmd/yoakeland/tls/

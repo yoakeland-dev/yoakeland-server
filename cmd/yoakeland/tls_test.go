@@ -103,7 +103,7 @@ func TestServerMode_TLSEndToEnd(t *testing.T) {
 			}
 			return "", TokenRecord{}, false
 		}
-		_, _, _, _, _, _, ok := handshake(ipc, "tcp", lookup)
+		_, _, ok := handshake(ipc, "tcp", lookup)
 		if !ok {
 			return
 		}

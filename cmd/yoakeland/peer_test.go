@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 	"yoakeland/internal/protocol"
 )
 
@@ -14,7 +15,7 @@ func fakeIPCPeer(t *testing.T, r *PeerRegistry, name, deviceType string) (*Peer,
 	t.Helper()
 	out := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
-	p := r.Add(ipc, &fakeCloser{}, "unix", name, deviceType, "")
+	p := r.Add(ipc, &fakeCloser{}, "unix", peerIdentity{Name: name, DeviceType: deviceType, Avatar: ""})
 	return p, out
 }
 
@@ -82,7 +83,7 @@ func TestPeerRegistry_AddDropsOversizedAvatar(t *testing.T) {
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
 	huge := strings.Repeat("a", maxAvatarLen+1)
 
-	p := r.Add(ipc, &fakeCloser{}, "unix", "someone", "web", huge)
+	p := r.Add(ipc, &fakeCloser{}, "unix", peerIdentity{Name: "someone", DeviceType: "web", Avatar: huge})
 	if p.Avatar != "" {
 		t.Fatalf("expected an oversized avatar to be dropped, got %d bytes stored", len(p.Avatar))
 	}
@@ -137,7 +138,7 @@ func TestPeerRegistry_DisconnectClosesConnAndTriggersRemoval(t *testing.T) {
 	out := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
 	closer := &fakeCloser{}
-	p := r.Add(ipc, closer, "unix", "target", "desktop", "")
+	p := r.Add(ipc, closer, "unix", peerIdentity{Name: "target", DeviceType: "desktop", Avatar: ""})
 
 	if !r.Disconnect(p.ID) {
 		t.Fatal("expected Disconnect of a live peer to succeed")
@@ -154,4 +155,63 @@ func TestPeerRegistry_DisconnectClosesConnAndTriggersRemoval(t *testing.T) {
 	if len(r.All()) != 0 {
 		t.Fatalf("expected the roster empty after Remove, got %+v", r.All())
 	}
+}
+
+// A device's id and the chat it last opened reach everyone's peer_list;
+// re-reporting the same chat doesn't rebroadcast.
+func TestPeerRegistry_DeviceAndActivity(t *testing.T) {
+	r := NewPeerRegistry()
+	out := &bytes.Buffer{}
+	p := r.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), out), &fakeCloser{}, "unix", peerIdentity{Name: "laptop", DeviceType: "desktop", DeviceID: "dev-1"})
+	if got := lastPeerList(t, out).Peers[0]; got.DeviceID != "dev-1" || got.SessionID != "" {
+		t.Fatalf("after add: %+v", got)
+	}
+	r.SetActivity(p.ID, "s1", "/proj")
+	if got := lastPeerList(t, out).Peers[0]; got.SessionID != "s1" || got.ProjectPath != "/proj" {
+		t.Fatalf("after activity: %+v", got)
+	}
+	n := bytes.Count(out.Bytes(), []byte("\n"))
+	r.SetActivity(p.ID, "s1", "/proj")
+	if bytes.Count(out.Bytes(), []byte("\n")) != n {
+		t.Fatal("unchanged activity rebroadcast")
+	}
+}
+
+// A device that drops and comes back inside the grace period posts no
+// notifications at all; one that stays gone posts "disconnected" once; a
+// client without a device id gets both straight away, as before.
+func TestPresenceNotes_ReconnectGrace(t *testing.T) {
+	feed := NewNotificationFeed(NewPeerRegistry())
+	n := newPresenceNotes(feed)
+	n.grace = 50 * time.Millisecond
+	phone := &Peer{ID: "a", Name: "phone", DeviceID: "dev-phone"}
+
+	n.Joined(phone)
+	n.Left(phone)
+	n.Joined(&Peer{ID: "b", Name: "phone", DeviceID: "dev-phone"}) // reconnect
+	time.Sleep(120 * time.Millisecond)
+	if got := kinds(feed); got != "peer_joined" {
+		t.Fatalf("after a blip: %s", got)
+	}
+
+	n.Left(phone)
+	time.Sleep(120 * time.Millisecond)
+	if got := kinds(feed); got != "peer_joined,peer_left" {
+		t.Fatalf("after staying gone: %s", got)
+	}
+
+	legacy := &Peer{ID: "c", Name: "old client"}
+	n.Joined(legacy)
+	n.Left(legacy)
+	if got := kinds(feed); got != "peer_joined,peer_left,peer_joined,peer_left" {
+		t.Fatalf("no device id: %s", got)
+	}
+}
+
+func kinds(f *NotificationFeed) string {
+	var ks []string
+	for _, n := range f.List() {
+		ks = append(ks, n.Kind)
+	}
+	return strings.Join(ks, ",")
 }

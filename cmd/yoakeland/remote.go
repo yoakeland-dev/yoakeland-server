@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"net"
+	"os"
 	"sync"
+
+	"yoakeland/internal/tlsca"
 )
 
 // defaultRemoteAddr is where set_remote_access binds the TCP listener when
@@ -61,6 +64,31 @@ func (r *remoteControl) Start(ctx context.Context) error {
 	r.tracker = tracker
 	go acceptLoop(lctx, ln, "tcp", r.deps, r.settings.LookupToken, tracker)
 	return nil
+}
+
+// CAPEM returns the auto-managed CA's PEM contents, for bundling into a
+// pairing code alongside a freshly registered token (register_token, in
+// main.go) — the two travel together since a token is only as trustworthy
+// as the connection it's sent over. Returns "" if this server is using an
+// operator-supplied certificate instead (resolveServerCert's real-cert
+// branch, same -tls-cert/-tls-key test): there's no private CA to hand out
+// there, a client just needs the public trust store like normal TLS.
+// Idempotent and cheap — same EnsureServerCert call Start makes, which
+// loads the persisted CA rather than regenerating it, so this works even
+// before remote access has ever been turned on.
+func (r *remoteControl) CAPEM() (string, error) {
+	if r.tlsCert != "" || r.tlsKey != "" {
+		return "", nil
+	}
+	_, caPEMPath, _, err := tlsca.EnsureServerCert(r.stateDir, tlsca.DefaultSANs())
+	if err != nil {
+		return "", err
+	}
+	pem, err := os.ReadFile(caPEMPath)
+	if err != nil {
+		return "", err
+	}
+	return string(pem), nil
 }
 
 // Stop closes the TCP listener, if running, and force-closes every

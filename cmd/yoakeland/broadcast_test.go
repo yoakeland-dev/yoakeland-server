@@ -32,12 +32,12 @@ func TestServeConnection_SessionUpdateBroadcastsToOtherPeers(t *testing.T) {
 	// in.
 	aOut := &bytes.Buffer{}
 	aIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), aOut)
-	deps.peers.Add(aIPC, &fakeCloser{}, "unix", "peer-a", "desktop", "")
+	deps.peers.Add(aIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-a", DeviceType: "desktop", Avatar: ""})
 
 	// Peer B: the requester, on a separate connection/peer.
 	bOut := &bytes.Buffer{}
 	bIPC := protocol.NewIPCStream(bytes.NewBuffer(nil), bOut)
-	peerB := deps.peers.Add(bIPC, &fakeCloser{}, "unix", "peer-b", "desktop", "")
+	peerB := deps.peers.Add(bIPC, &fakeCloser{}, "unix", peerIdentity{Name: "peer-b", DeviceType: "desktop", Avatar: ""})
 
 	line := envelopeJSON(t, protocol.EventSetSessionTitle, protocol.SetSessionTitleData{
 		SessionID: "sess-broadcast", Title: "renamed from B",

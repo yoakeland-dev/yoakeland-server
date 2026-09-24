@@ -95,14 +95,15 @@ func TestHandshake_ResolvesNamedTokenIdentity(t *testing.T) {
 
 	line := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "tok-123", Name: "spoofed-name"})
 	ipc := protocol.NewIPCStream(bytes.NewBufferString(line+"\n"), &bytes.Buffer{})
-	name, _, avatar, tokenName, email, _, ok := handshake(ipc, "tcp", deps.settings.LookupToken)
+	who, _, ok := handshake(ipc, "tcp", deps.settings.LookupToken)
+	name, avatar, tokenName, email := who.Name, who.Avatar, who.TokenName, who.Email
 	if !ok || name != "aveline" || tokenName != "aveline" || email != "aveline@example.com" || avatar == "" {
 		t.Fatalf("handshake() = name=%q tokenName=%q email=%q avatar=%q ok=%v, want the persisted identity to win over the self-reported name", name, tokenName, email, avatar, ok)
 	}
 
 	badLine := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "wrong"})
 	badIPC := protocol.NewIPCStream(bytes.NewBufferString(badLine+"\n"), &bytes.Buffer{})
-	_, _, _, _, _, _, ok = handshake(badIPC, "tcp", deps.settings.LookupToken)
+	_, _, ok = handshake(badIPC, "tcp", deps.settings.LookupToken)
 	if ok {
 		t.Fatal("expected an unrecognized token to fail the handshake")
 	}

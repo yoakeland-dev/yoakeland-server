@@ -30,6 +30,9 @@ type Peer struct {
 	Avatar      string
 	TokenName   string
 	Email       string
+	DeviceID    string
+	SessionID   string // last chat opened, see SetActivity
+	ProjectPath string
 
 	conn io.Closer
 	ipc  *protocol.IPCStream
@@ -49,27 +52,37 @@ func NewPeerRegistry() *PeerRegistry {
 	return &PeerRegistry{peers: make(map[string]*Peer)}
 }
 
+// peerIdentity is who a connection says it is (its auth frame), resolved
+// against its token on TCP. See handshake.
+type peerIdentity struct {
+	Name, DeviceType, Avatar, DeviceID string
+	TokenName, Email                   string // set only for a named TCP token
+}
+
 // Add registers a freshly handshaken connection and broadcasts the updated
-// roster. name/deviceType/avatar come from the connection's auth frame
-// (empty name gets a generated placeholder so the peer list never shows a
-// blank row; an oversized avatar — see maxAvatarLen — is dropped rather than
-// failing the connection over what's cosmetic).
-func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network, name, deviceType, avatar string) *Peer {
+// roster. An empty name gets a generated placeholder so the peer list never
+// shows a blank row; an oversized avatar — see maxAvatarLen — is dropped
+// rather than failing the connection over what's cosmetic.
+func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network string, who peerIdentity) *Peer {
 	id := randomID()
-	if name == "" {
-		name = deviceType + "-" + id[:6]
+	if who.Name == "" {
+		who.Name = who.DeviceType + "-" + id[:6]
 	}
-	if len(avatar) > maxAvatarLen {
-		avatar = ""
+	if len(who.Avatar) > maxAvatarLen {
+		who.Avatar = ""
 	}
+	name, deviceType := who.Name, who.DeviceType
 
 	p := &Peer{
 		ID:          id,
 		IP:          remoteIP(conn, network),
 		ConnectedAt: time.Now().UTC(),
-		Name:        name,
-		DeviceType:  deviceType,
-		Avatar:      avatar,
+		Name:        who.Name,
+		DeviceType:  who.DeviceType,
+		Avatar:      who.Avatar,
+		DeviceID:    who.DeviceID,
+		TokenName:   who.TokenName,
+		Email:       who.Email,
 		conn:        conn,
 		ipc:         ipc,
 	}
@@ -144,6 +157,27 @@ func (r *PeerRegistry) Disconnect(id string) bool {
 	return true
 }
 
+// DisconnectByToken force-closes every live connection currently
+// authenticated under tokenName — remove_token's other half: deleting the
+// credential only stops *future* handshakes, so a revoked person would
+// otherwise stay connected on the session they already have (same reasoning
+// as remoteControl.Stop force-closing everyone when remote access itself
+// turns off). Reports how many connections that was.
+func (r *PeerRegistry) DisconnectByToken(tokenName string) int {
+	r.mu.Lock()
+	var toClose []io.Closer
+	for _, p := range r.peers {
+		if p.TokenName == tokenName {
+			toClose = append(toClose, p.conn)
+		}
+	}
+	r.mu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+	return len(toClose)
+}
+
 // Get looks up a live peer by ID, for callers (like the user_prompt author
 // lookup, or set_peer_name's tokened-peer guard) that need one specific
 // peer's current identity rather than the whole roster.
@@ -154,17 +188,18 @@ func (r *PeerRegistry) Get(id string) (*Peer, bool) {
 	return p, ok
 }
 
-// SetTokenIdentity records which named token (see register_token)
-// authenticated id, plus its cached email — purely internal bookkeeping for
-// message/git-author attribution, not part of the peer_list wire shape, so
-// this deliberately doesn't broadcast. Reports whether id was a live peer.
-func (r *PeerRegistry) SetTokenIdentity(id, tokenName, email string) bool {
+// SetActivity records the chat id last opened, broadcasting only on a
+// change. Reports whether id was a live peer.
+func (r *PeerRegistry) SetActivity(id, sessionID, projectPath string) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	p, ok := r.peers[id]
-	if ok {
-		p.TokenName = tokenName
-		p.Email = email
+	changed := ok && (p.SessionID != sessionID || p.ProjectPath != projectPath)
+	if changed {
+		p.SessionID, p.ProjectPath = sessionID, projectPath
+	}
+	r.mu.Unlock()
+	if changed {
+		r.Broadcast()
 	}
 	return ok
 }
@@ -179,6 +214,13 @@ func (r *PeerRegistry) All() []*Peer {
 		out = append(out, p)
 	}
 	return out
+}
+
+// Count is how many peers are connected right now.
+func (r *PeerRegistry) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.peers)
 }
 
 // BroadcastEvent pushes one event to every live peer except exceptPeerID —
@@ -216,13 +258,16 @@ func (r *PeerRegistry) Broadcast() {
 			DeviceType:  p.DeviceType,
 			Avatar:      p.Avatar,
 			ConnectedAt: p.ConnectedAt,
+			DeviceID:    p.DeviceID,
+			SessionID:   p.SessionID,
+			ProjectPath: p.ProjectPath,
 		})
 		peers = append(peers, p)
 	}
 	r.mu.Unlock()
 
 	for _, p := range peers {
-		_ = p.ipc.SendEvent(protocol.EventPeerList, "", "", "", protocol.PeerListData{Peers: list})
+		_ = p.ipc.SendEvent(protocol.EventPeerList, "", "", "", protocol.PeerListData{Peers: list, You: p.ID})
 	}
 }
 
