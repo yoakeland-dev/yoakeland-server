@@ -60,6 +60,7 @@ func testAgent(t *testing.T, provider agent.ModelProvider) (*agent.Agent, agent.
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	tools := []tool.Tool{tool.NewBashTool(norm, sb)}
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, agent.NewContextManager(1000, 100), nil)
+	t.Cleanup(ag.WaitBackground)
 	return ag, sessStore, outBuf
 }
 
@@ -234,5 +235,22 @@ func TestSessionStore_UpdateExistingRequiresAnExistingSession(t *testing.T) {
 	state, err := sessStore.Load("session-absent")
 	if err != nil || state.Title != "now it exists" {
 		t.Fatalf("state = %+v (err %v), want the title set", state, err)
+	}
+}
+
+// Picking a mode on a chat that hasn't been prompted yet must not create its
+// session file (that left empty ghost chats in list_sessions), but the mode
+// still has to land on disk with the first turn.
+func TestAgent_SetModeBeforeFirstPromptCreatesNoFile(t *testing.T) {
+	ag, store, _ := testAgent(t, &ErrorProvider{err: errors.New("boom")})
+	_ = ag.LoadSession("fresh")
+	ag.SetMode(agent.ModeAutonomous)
+	if _, err := store.Load("fresh"); !errors.Is(err, agent.ErrSessionNotFound) {
+		t.Fatalf("set_mode created a session file (err %v)", err)
+	}
+	_ = ag.RunTurn(context.Background(), "fresh", "t1", "hi")
+	state, err := store.Load("fresh")
+	if err != nil || state.Mode != string(agent.ModeAutonomous) || len(state.History) == 0 {
+		t.Fatalf("first turn didn't persist mode/history: %+v, %v", state, err)
 	}
 }

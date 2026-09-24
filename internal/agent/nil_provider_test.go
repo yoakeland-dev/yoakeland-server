@@ -28,6 +28,7 @@ func TestAgent_RunTurnWithNilProvider(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, nil, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	err := ag.RunTurn(context.Background(), "session-no-provider", "turn-1", "hello")
 	if err == nil {
@@ -52,6 +53,7 @@ func TestAgent_SetProviderThenRunTurn(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, nil, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	scripted := &ScriptedProvider{
 		turns: [][]agent.ModelStreamChunk{{{Kind: agent.StreamChunkDelta, Delta: "now it works"}}},
@@ -84,6 +86,7 @@ func TestAgent_EditRetryWithNilProvider(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, scripted, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-edit-no-provider", "turn-1", "hello"); err != nil {
 		t.Fatalf("initial turn: %v", err)

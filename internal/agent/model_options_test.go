@@ -38,6 +38,7 @@ func TestAgent_SetModelOptions_AppliesToProviderAndContextWindow(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, tunable, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	applied := ag.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high", ThinkingBudget: 4096}, 8000)
 	if !applied {
@@ -67,6 +68,7 @@ func TestAgent_SetModelOptions_IgnoredByPlainProvider(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, plain, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	applied := ag.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high"}, 0)
 	if applied {

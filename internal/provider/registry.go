@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -21,9 +22,21 @@ const (
 	// their Claude subscription rather than metered API tokens.
 	ProviderKindCLIClaude ProviderKind = "cli_claude"
 	// ProviderKindCLICodex is the same idea for OpenAI's `codex` CLI /
-	// ChatGPT subscription.
+	// ChatGPT subscription. Every other "cli_<kind>" (cli_cursor, cli_kimi,
+	// cli_opencode, cli_gemini, cli_grok, cli_deepseek) is an ACP agent —
+	// see CLIKindOf and cliSpecs.
 	ProviderKindCLICodex ProviderKind = "cli_codex"
 )
+
+// CLIKindOf reports which CLI agent a "cli_<kind>" provider kind drives.
+func CLIKindOf(k ProviderKind) (CLIKind, bool) {
+	name, ok := strings.CutPrefix(string(k), "cli_")
+	if !ok {
+		return "", false
+	}
+	_, known := cliSpecs[CLIKind(name)]
+	return CLIKind(name), known
+}
 
 // ProviderConfig is a named, persisted *credential*, not a model choice: one
 // anthropic/openai/openrouter API key normally unlocks many models, so the
@@ -158,7 +171,7 @@ func (s *ProviderStore) Register(cfg ProviderConfig) error {
 	// that same kind rather than leaving a stale duplicate slot behind. The
 	// caller's chosen Name is still honored for lookup (set_provider,
 	// providers.json), unlike a fixed internal slot name would be.
-	if cfg.Kind == ProviderKindCLIClaude || cfg.Kind == ProviderKindCLICodex {
+	if _, isCLI := CLIKindOf(cfg.Kind); isCLI {
 		for name, existing := range s.model.Providers {
 			if existing.Kind == cfg.Kind && name != cfg.Name {
 				delete(s.model.Providers, name)
@@ -257,11 +270,10 @@ func BuildProvider(cfg ProviderConfig, model string, projectRoot string) (Provid
 			APIKey:       cfg.APIKey,
 			BaseURL:      cfg.BaseURL,
 		})
-	case ProviderKindCLIClaude:
-		return &CLISubprocessProvider{Kind: CLIKindClaude, Model: model, Dir: projectRoot}, nil
-	case ProviderKindCLICodex:
-		return &CLISubprocessProvider{Kind: CLIKindCodex, Model: model, Dir: projectRoot}, nil
 	default:
+		if kind, ok := CLIKindOf(cfg.Kind); ok {
+			return &CLISubprocessProvider{Kind: kind, Model: model, Dir: projectRoot}, nil
+		}
 		return nil, fmt.Errorf("unknown provider kind %q", cfg.Kind)
 	}
 }

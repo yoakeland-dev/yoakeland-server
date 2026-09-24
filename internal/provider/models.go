@@ -1,10 +1,13 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 )
 
 // ModelInfo is one model available through a provider credential.
@@ -64,6 +67,13 @@ func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 	case ProviderKindAPIKey:
 		// fall through
 	default:
+		// The ACP agents only say which models they offer inside a session.
+		if kind, ok := CLIKindOf(cfg.Kind); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			home, _ := os.UserHomeDir()
+			return ListACPModels(ctx, kind, home)
+		}
 		return nil, fmt.Errorf("unknown provider kind %q", cfg.Kind)
 	}
 

@@ -377,6 +377,7 @@ func TestAgent_RetryMessage_NonTerminalRoundTripInMultiToolCallTurn(t *testing.T
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{tool.NewFileReadTool(norm)}, engine, snapStore, sessStore, agent.NewContextManager(1000, 100), nil)
+	t.Cleanup(ag.WaitBackground)
 
 	ctx := context.Background()
 	if err := ag.RunTurn(ctx, "s6", "t1", "read the file"); err != nil {

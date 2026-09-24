@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/permission"
@@ -28,6 +29,8 @@ type Message struct {
 	Reasoning  string     `json:"reasoning,omitempty"` // assistant only: the model's own reasoning/chain-of-thought text, if the provider exposed one
 	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string     `json:"toolCallId,omitempty"`
+	// Diffs: file changes a native tool call reported (tool messages only).
+	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
 
 	// AuthorName is who actually sent this message, for a shared session
 	// with more than one connected peer — set only on the user message
@@ -41,6 +44,12 @@ type Message struct {
 	// nothing else to draw from. Either a short emoji glyph or a data URL
 	// (SPEC.md §2a's conventions, devolved to whichever the client uses).
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
+
+	// Attachments are server-side paths this user message attached (see
+	// WithAttachments). They stay readable by file_read for the rest of the
+	// session, even outside the project root, and the model is told about
+	// them via attachmentNote rather than by rewriting Content.
+	Attachments []string `json:"attachments,omitempty"`
 
 	// Provider/Model are the registered provider name and model id that
 	// generated this message (assistant only — empty for user/tool
@@ -85,6 +94,49 @@ func WithAuthor(ctx context.Context, a Author) context.Context {
 	return context.WithValue(ctx, authorContextKey{}, a)
 }
 
+type attachmentsContextKey struct{}
+
+// WithAttachments attaches a user_prompt's attachment paths to ctx, consumed
+// by RunTurn the same way WithAuthor is — so no RunTurn signature change.
+func WithAttachments(ctx context.Context, paths []string) context.Context {
+	return context.WithValue(ctx, attachmentsContextKey{}, paths)
+}
+
+func attachmentsFromContext(ctx context.Context) []string {
+	p, _ := ctx.Value(attachmentsContextKey{}).([]string)
+	return p
+}
+
+// withAttachmentNotes returns history with each attaching user message's
+// content suffixed by a note naming its files, for the provider only — the
+// stored Content (and so the transcript) stays exactly what the user typed.
+func withAttachmentNotes(history []Message) []Message {
+	var out []Message
+	for i, m := range history {
+		if len(m.Attachments) == 0 {
+			continue
+		}
+		if out == nil {
+			out = append([]Message(nil), history...)
+		}
+		out[i].Content = m.Content + "\n\n[Attached files — read them with file_read using these exact absolute paths: " + strings.Join(m.Attachments, ", ") + "]"
+	}
+	if out == nil {
+		return history
+	}
+	return out
+}
+
+// sessionAttachmentsLocked is every path attached anywhere in the active
+// history — file_read's extra allowlist (tool.ExecutionContext.ExtraReadPaths).
+func (a *Agent) sessionAttachmentsLocked() []string {
+	var paths []string
+	for _, m := range a.history {
+		paths = append(paths, m.Attachments...)
+	}
+	return paths
+}
+
 // AuthorFromContext returns the zero Author if none was attached.
 func AuthorFromContext(ctx context.Context) Author {
 	a, _ := ctx.Value(authorContextKey{}).(Author)
@@ -108,6 +160,9 @@ type ToolCall struct {
 	ID   string          `json:"id"`
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args"`
+	// Set only for a call a NativeAgent ran itself (see native.go) — never
+	// executed by this loop, and flattened to text for any other provider.
+	protocol.NativeToolInfo
 }
 
 type StreamEventKind string
@@ -131,12 +186,17 @@ const (
 	// limit) — its absence means "ended normally", so existing providers
 	// that never emit it keep behaving exactly as before.
 	StreamChunkFinish StreamEventKind = "finish"
+
+	// StreamChunkToolResult is a NativeAgent reporting the outcome of a tool
+	// call it already ran itself (see native.go).
+	StreamChunkToolResult StreamEventKind = "tool_result"
 )
 
 type ModelStreamChunk struct {
 	Kind         StreamEventKind
 	Delta        string
 	ToolCall     *ToolCall
+	ToolResult   *NativeToolResult // StreamChunkToolResult only
 	Usage        *protocol.UsageData
 	FinishReason string
 }
@@ -239,6 +299,88 @@ type Agent struct {
 	// it back (a TOCTOU on -max-session-cost-usd), and could interleave
 	// a.history appends / sessionStore.Save calls non-deterministically.
 	turnMu sync.Mutex
+
+	// titleWG tracks runTitleGeneration goroutines, which outlive the turn
+	// that started them by design; tests wait on it before their temp
+	// project dir is removed (export_test.go).
+	titleWG sync.WaitGroup
+
+	// queued counts turns blocked on turnMu (see lockTurn); pendingAsks is
+	// every unanswered permission/question ask, keyed by toolCallId (under
+	// mu). hooks tells the server when either changes.
+	queued      atomic.Int32
+	pendingAsks map[string]protocol.PendingAsk
+	hooks       Hooks
+
+	// native is the CLI agent session this chat continues (native.go);
+	// nativeRemember carries permission_response's remember flag back to a
+	// native ask (under mu).
+	native         *NativeSessionRef
+	nativeRemember map[string]bool
+}
+
+// Hooks lets the server react to agent state that isn't a session event:
+// a status bar's queued-turn count, and the cross-session pending-asks list.
+// Nil funcs are no-ops.
+type Hooks struct {
+	QueueChanged func()
+	AsksChanged  func()
+}
+
+func (h Hooks) queueChanged() {
+	if h.QueueChanged != nil {
+		h.QueueChanged()
+	}
+}
+
+func (h Hooks) asksChanged() {
+	if h.AsksChanged != nil {
+		h.AsksChanged()
+	}
+}
+
+// lockTurn takes turnMu, counting this turn as queued while it waits.
+func (a *Agent) lockTurn() {
+	if a.turnMu.TryLock() {
+		return
+	}
+	a.queued.Add(1)
+	a.hooks.queueChanged()
+	a.turnMu.Lock()
+	a.queued.Add(-1)
+	a.hooks.queueChanged()
+}
+
+// QueuedTurns is how many turns are waiting for this session's current one.
+func (a *Agent) QueuedTurns() int { return int(a.queued.Load()) }
+
+func (a *Agent) addPendingAsk(ask protocol.PendingAsk) {
+	ask.CreatedAt = time.Now().UTC()
+	a.mu.Lock()
+	a.pendingAsks[ask.ToolCallID] = ask
+	a.mu.Unlock()
+	a.hooks.asksChanged()
+}
+
+func (a *Agent) removePendingAsk(toolCallID string) {
+	a.mu.Lock()
+	_, ok := a.pendingAsks[toolCallID]
+	delete(a.pendingAsks, toolCallID)
+	a.mu.Unlock()
+	if ok {
+		a.hooks.asksChanged()
+	}
+}
+
+// PendingAsks returns this session's unanswered asks.
+func (a *Agent) PendingAsks() []protocol.PendingAsk {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]protocol.PendingAsk, 0, len(a.pendingAsks))
+	for _, ask := range a.pendingAsks {
+		out = append(out, ask)
+	}
+	return out
 }
 
 func NewAgent(
@@ -295,6 +437,8 @@ func NewAgent(
 		permRequestKeys:   make(map[string]string),
 		askUserRequests:   make(map[string]chan string),
 		activeTurnCancels: make(map[string]context.CancelFunc),
+		pendingAsks:       make(map[string]protocol.PendingAsk),
+		nativeRemember:    make(map[string]bool),
 	}
 }
 
@@ -321,6 +465,7 @@ func (a *Agent) LoadSession(sessionID string) error {
 		a.branches = make(map[string][][]Message)
 	}
 	a.nextMsgSeq = state.NextMsgSeq
+	a.native = state.Native
 	switch Mode(state.Mode) {
 	case ModeReadOnly, ModeReadWrite, ModeAutonomous, ModePlan:
 		a.mode = Mode(state.Mode)
@@ -446,7 +591,12 @@ func (a *Agent) SetMode(m Mode) {
 	if a.sessionStore == nil || sessID == "" {
 		return
 	}
-	_, _ = a.sessionStore.Update(sessID, func(state *SessionState) error {
+	// UpdateExisting, not Update: toggling mode on a chat that hasn't been
+	// prompted yet must not create its session file — that left an empty,
+	// untitled ghost chat in list_sessions for every new chat whose mode was
+	// picked before (or instead of) its first message. The first turn's
+	// persistCurrentState writes the live mode along with everything else.
+	_, _ = a.sessionStore.UpdateExisting(sessID, func(state *SessionState) error {
 		if a.isDiscarded() {
 			return errSessionDiscarded
 		}
@@ -568,6 +718,13 @@ func (a *Agent) CancelTurn(turnID string) {
 	}
 }
 
+// ActiveTurnCount is how many turns are running on this agent right now.
+func (a *Agent) ActiveTurnCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.activeTurnCancels)
+}
+
 // CancelAll cancels every turn currently running on this agent, e.g. before
 // its session is deleted out from under it.
 func (a *Agent) CancelAll() {
@@ -616,11 +773,15 @@ func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, rememb
 	cacheKey := a.permRequestKeys[toolCallID]
 	delete(a.permRequests, toolCallID)
 	delete(a.permRequestKeys, toolCallID)
+	if _, ok := a.nativeRemember[toolCallID]; ok {
+		a.nativeRemember[toolCallID] = remember
+	}
 	a.mu.Unlock()
 
 	if remember && cacheKey != "" {
 		a.permEngine.RecordDecision(cacheKey, allowed, true)
 	}
+	a.removePendingAsk(toolCallID)
 
 	if exists {
 		ch <- permDecision{allowed: allowed, feedback: feedback}
@@ -636,6 +797,7 @@ func (a *Agent) HandleAskUserAnswer(toolCallID string, answer string) {
 	ch, exists := a.askUserRequests[toolCallID]
 	delete(a.askUserRequests, toolCallID)
 	a.mu.Unlock()
+	a.removePendingAsk(toolCallID)
 
 	if exists {
 		ch <- answer
@@ -654,7 +816,7 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	// (both happen below) so the check-then-record isn't itself racy. Also
 	// serializes against EditMessage/RetryMessage/SwitchBranch on the same
 	// Agent — all four mutate a.history/a.branches and must never interleave.
-	a.turnMu.Lock()
+	a.lockTurn()
 	defer a.turnMu.Unlock()
 
 	startTime := time.Now()
@@ -674,11 +836,13 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		Content:      prompt,
 		AuthorName:   author.Name,
 		AuthorAvatar: author.Avatar,
+		Attachments:  attachmentsFromContext(parentCtx),
 		CreatedAt:    startTime,
 	})
 	a.mu.Unlock()
 
 	if isNewChat {
+		a.titleWG.Add(1)
 		go a.runTitleGeneration(parentCtx, sessionID, turnID, prompt, autoGenerateTitle, turnProvider)
 	}
 
@@ -728,6 +892,7 @@ func (a *Agent) runTitleGeneration(parentCtx context.Context, sessID, turnID, pr
 	// Runs unsupervised in its own goroutine (see the two call sites) — a
 	// panic here (e.g. from a misbehaving TitleGenerator) must not take the
 	// whole process down along with every other session's connection.
+	defer a.titleWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("title generation for session %s panicked: %v\n%s", sessID, r, debug.Stack())
@@ -798,6 +963,8 @@ func (a *Agent) persistCurrentState() error {
 	history := append([]Message(nil), a.history...)
 	branches := cloneBranches(a.branches)
 	nextMsgSeq := a.nextMsgSeq
+	mode := a.mode
+	native := a.native
 	a.mu.Unlock()
 	if a.sessionStore == nil || sessID == "" {
 		return nil
@@ -814,6 +981,8 @@ func (a *Agent) persistCurrentState() error {
 		state.History = history
 		state.Branches = branches
 		state.NextMsgSeq = nextMsgSeq
+		state.Mode = string(mode)
+		state.Native = native
 		return nil
 	})
 	if errors.Is(err, errSessionDiscarded) {
@@ -894,7 +1063,14 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 		assistantText  string
 		toolCalls      []ToolCall
 		roundTripStart time.Time
+
+		// Native agents only (native.go): calls the agent already ran,
+		// which are recorded but never executed here, and the turn's
+		// NativeTurn, whose SessionID is read back after the stream.
+		segCalls []ToolCall
+		nt       *NativeTurn
 	)
+	_, isNative := turnProvider.(NativeAgent)
 
 	// emptyLengthRetries caps how many times a round-trip that produced no
 	// visible text and no tool call — just finish_reason "length" — gets
@@ -912,7 +1088,7 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 	// cancelled or the provider fails mid-stream.
 turn:
 	for {
-		assistantText, toolCalls = "", nil
+		assistantText, toolCalls, segCalls = "", nil, nil
 		roundTripStart = time.Now()
 		roundTripUsage = protocol.UsageData{}
 		var reasoningText string
@@ -931,10 +1107,49 @@ turn:
 		}
 
 		a.mu.Lock()
-		activeContext := a.contextManager.PrepareHistory(a.history)
+		activeContext := withAttachmentNotes(a.contextManager.PrepareHistory(a.history))
 		a.mu.Unlock()
 
-		chunks, errs := turnProvider.StreamTurn(turnCtx, activeContext, a.activeToolDefs(), a.activeSystemPrompt())
+		streamCtx, toolDefs, systemPrompt := turnCtx, a.activeToolDefs(), a.activeSystemPrompt()
+		if isNative {
+			a.mu.Lock()
+			hist := append([]Message(nil), a.history...)
+			a.mu.Unlock()
+			nt = a.newNativeTurn(sessionID, turnID, a.getProviderName(), hist)
+			streamCtx = WithNativeTurn(turnCtx, nt)
+			toolDefs, systemPrompt = nil, ""
+		} else {
+			activeContext = flattenNativeTools(activeContext)
+		}
+
+		// flushSegment stores a native round's output so far as its own
+		// assistant message, so a tool result lands after the call that
+		// produced it rather than after the whole turn's text.
+		segStart := roundTripStart
+		flushSegment := func() {
+			if assistantText == "" && reasoningText == "" && len(segCalls) == 0 {
+				return
+			}
+			providerName, modelName := a.getProviderName(), a.getModelName()
+			a.mu.Lock()
+			lastMessageID = a.nextMessageIDLocked()
+			a.history = append(a.history, Message{
+				ID:           lastMessageID,
+				Role:         "assistant",
+				Content:      assistantText,
+				Reasoning:    reasoningText,
+				ToolCalls:    segCalls,
+				Provider:     providerName,
+				Model:        modelName,
+				CreatedAt:    time.Now(),
+				GenerationMs: time.Since(segStart).Milliseconds(),
+			})
+			a.mu.Unlock()
+			assistantText, reasoningText, segCalls = "", "", nil
+			segStart = time.Now()
+		}
+
+		chunks, errs := turnProvider.StreamTurn(streamCtx, activeContext, toolDefs, systemPrompt)
 
 		done := false
 		for !done {
@@ -993,10 +1208,34 @@ turn:
 					})
 				case StreamChunkToolCall:
 					if chunk.ToolCall != nil {
-						toolCalls = append(toolCalls, *chunk.ToolCall)
+						if chunk.ToolCall.Native {
+							segCalls = append(segCalls, *chunk.ToolCall)
+						} else {
+							toolCalls = append(toolCalls, *chunk.ToolCall)
+						}
 						_ = a.getStream().SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
-							Name: chunk.ToolCall.Name,
-							Args: chunk.ToolCall.Args,
+							Name:           chunk.ToolCall.Name,
+							Args:           chunk.ToolCall.Args,
+							NativeToolInfo: chunk.ToolCall.NativeToolInfo,
+						})
+					}
+				case StreamChunkToolResult:
+					if r := chunk.ToolResult; r != nil {
+						flushSegment()
+						a.mu.Lock()
+						a.history = append(a.history, Message{
+							ID:         a.nextMessageIDLocked(),
+							Role:       "tool",
+							Content:    r.Output + r.Error,
+							ToolCallID: r.ToolCallID,
+							Diffs:      r.Diffs,
+						})
+						a.mu.Unlock()
+						_ = a.getStream().SendEvent(protocol.EventToolResult, a.sessionID, turnID, r.ToolCallID, protocol.ToolResultData{
+							ToolName: r.Name,
+							Output:   r.Output,
+							Error:    r.Error,
+							Diffs:    r.Diffs,
 						})
 					}
 				case StreamChunkUsage:
@@ -1050,7 +1289,7 @@ turn:
 		// every provider's wire format requires one or the other, so that
 		// message would make every future request in this session invalid
 		// — the next turn fails outright instead of just this one.
-		if assistantText != "" || len(toolCalls) > 0 {
+		if assistantText != "" || len(toolCalls) > 0 || len(segCalls) > 0 || (isNative && reasoningText != "") {
 			providerName, modelName := a.getProviderName(), a.getModelName()
 			usage := roundTripUsage
 			if !usage.CostKnown && modelName != "" {
@@ -1063,14 +1302,18 @@ turn:
 				Role:         "assistant",
 				Content:      assistantText,
 				Reasoning:    reasoningText,
-				ToolCalls:    toolCalls,
+				ToolCalls:    append(toolCalls, segCalls...),
 				Provider:     providerName,
 				Model:        modelName,
 				CreatedAt:    time.Now(),
-				GenerationMs: time.Since(roundTripStart).Milliseconds(),
+				GenerationMs: time.Since(segStart).Milliseconds(),
 				Usage:        &usage,
 			})
 			a.mu.Unlock()
+		} else if isNative {
+			// Ended right after a tool result: the usage (reported once, at
+			// the end of a native turn) goes on the turn's last text message.
+			a.attachUsage(lastMessageID, roundTripUsage)
 		}
 
 		if len(toolCalls) == 0 {
@@ -1147,16 +1390,23 @@ turn:
 						}
 					}
 
-					_ = a.getStream().SendEvent(protocol.EventPermissionRequest, a.sessionID, turnID, tc.ID, protocol.PermissionRequestData{
+					req := protocol.PermissionRequestData{
 						ToolName:    tc.Name,
 						Description: fmt.Sprintf("%s on %s", tc.Name, string(tc.Args)),
 						RequiresAsk: true,
 						CacheKey:    cacheKey,
 						Diff:        computedDiff,
-					})
+					}
+					a.addPendingAsk(protocol.PendingAsk{Kind: "permission", SessionID: sessionID, TurnID: turnID, ToolCallID: tc.ID, PermissionRequestData: &req})
+					_ = a.getStream().SendEvent(protocol.EventPermissionRequest, a.sessionID, turnID, tc.ID, req)
 
 					select {
 					case <-turnCtx.Done():
+						a.mu.Lock()
+						delete(a.permRequests, tc.ID)
+						delete(a.permRequestKeys, tc.ID)
+						a.mu.Unlock()
+						a.removePendingAsk(tc.ID)
 						finishReason, cutShort = "cancelled", true
 						break turn
 					case decision := <-respCh:
@@ -1186,26 +1436,13 @@ turn:
 				Stream:        a.getStream(),
 				AuthorName:    author.Name,
 				AuthorEmail:   author.Email,
-				AskUser: func(question string, options []string) (string, error) {
-					respCh := make(chan string, 1)
+				ExtraReadPaths: func() []string {
 					a.mu.Lock()
-					a.askUserRequests[toolCallID] = respCh
-					a.mu.Unlock()
-
-					_ = a.getStream().SendEvent(protocol.EventAskUserQuestionRequested, a.sessionID, turnID, toolCallID, protocol.AskUserQuestionRequestedData{
-						Question: question,
-						Options:  options,
-					})
-
-					select {
-					case <-turnCtx.Done():
-						a.mu.Lock()
-						delete(a.askUserRequests, toolCallID)
-						a.mu.Unlock()
-						return "", turnCtx.Err()
-					case answer := <-respCh:
-						return answer, nil
-					}
+					defer a.mu.Unlock()
+					return a.sessionAttachmentsLocked()
+				}(),
+				AskUser: func(question string, options []string) (string, error) {
+					return a.askUserQuestion(turnCtx, sessionID, turnID, toolCallID, question, options)
 				},
 			}
 
@@ -1225,7 +1462,7 @@ turn:
 	// prompt as the turn's only record. (Only for the cut-short exits: a
 	// completed round-trip already appended its assistant message above.) A
 	// cut-short turn that produced nothing adds no empty assistant message.
-	if (cutShort || streamErr != nil) && (assistantText != "" || len(toolCalls) > 0) {
+	if (cutShort || streamErr != nil) && (assistantText != "" || len(toolCalls) > 0 || len(segCalls) > 0) {
 		providerName, modelName := a.getProviderName(), a.getModelName()
 		usage := roundTripUsage
 		if !usage.CostKnown && modelName != "" {
@@ -1237,13 +1474,23 @@ turn:
 			ID:           lastMessageID,
 			Role:         "assistant",
 			Content:      assistantText,
-			ToolCalls:    toolCalls,
+			ToolCalls:    append(toolCalls, segCalls...),
 			Provider:     providerName,
 			Model:        modelName,
 			CreatedAt:    time.Now(),
 			GenerationMs: time.Since(roundTripStart).Milliseconds(),
 			Usage:        &usage,
 		})
+		a.mu.Unlock()
+	}
+
+	if nt != nil && nt.SessionID != "" {
+		a.mu.Lock()
+		cursor := ""
+		if n := len(a.history); n > 0 {
+			cursor = a.history[n-1].ID
+		}
+		a.native = &NativeSessionRef{Provider: a.providerName, SessionID: nt.SessionID, Cursor: cursor, CostUSD: nt.SessionCostUSD}
 		a.mu.Unlock()
 	}
 
@@ -1284,7 +1531,7 @@ turn:
 // the tree one hop at a time composes correctly without a full recursive
 // lookup — see the plan's scope note).
 func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messageID, content string, autoGenerateTitle bool) error {
-	a.turnMu.Lock()
+	a.lockTurn()
 	defer a.turnMu.Unlock()
 
 	startTime := time.Now()
@@ -1315,12 +1562,14 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 	a.branches[branchPoint] = append(a.branches[branchPoint], append([]Message(nil), a.history[idx:]...))
 	isNewChat := idx == 0
 	userMessageID := a.nextMessageIDLocked()
+	attachments := a.history[idx].Attachments // an edit rewrites the text, not what was attached
 	a.history = append(a.history[:idx:idx], Message{
 		ID:           userMessageID,
 		Role:         "user",
 		Content:      content,
 		AuthorName:   author.Name,
 		AuthorAvatar: author.Avatar,
+		Attachments:  attachments,
 		CreatedAt:    startTime,
 	})
 	a.mu.Unlock()
@@ -1333,6 +1582,7 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 		// applyGeneratedTitle's own "only fills in an empty title" rule (SPEC.md
 		// §3.1) still applies unchanged: a session that already got a real
 		// title (its own set_session_title, or a previous generation) keeps it.
+		a.titleWG.Add(1)
 		go a.runTitleGeneration(parentCtx, sessionID, turnID, content, autoGenerateTitle, turnProvider)
 	}
 
@@ -1351,7 +1601,7 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 // restore_snapshot (SPEC.md §3.1) is the tool for reverting the filesystem
 // itself, and is orthogonal to this.
 func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messageID string) error {
-	a.turnMu.Lock()
+	a.lockTurn()
 	defer a.turnMu.Unlock()
 
 	startTime := time.Now()

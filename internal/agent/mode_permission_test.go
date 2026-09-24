@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"yoakeland/internal/agent"
@@ -82,17 +83,30 @@ func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
 	out := &syncBuf{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 	ag.SetMode(agent.ModeReadWrite)
 
 	// First turn: "pwd" would auto-allow under the engine's normal static
 	// policy (see permission.Engine.Evaluate) — tier 2 must still force an
 	// Ask. Answer it with remember: true.
+	var asksChanged atomic.Int32
+	ag.SetHooks(agent.Hooks{AsksChanged: func() { asksChanged.Add(1) }})
+	pendingWhileAsking := make(chan []protocol.PendingAsk, 1)
 	go func() {
 		waitForSubstring(t, out, `"toolCallId":"tc-bash-1"`, 2*time.Second)
+		pendingWhileAsking <- ag.PendingAsks()
 		ag.HandlePermissionResponse("tc-bash-1", true, true, "")
 	}()
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "run pwd"); err != nil {
 		t.Fatalf("turn 1: %v", err)
+	}
+	// The ask is listed while open (for pending_asks on reconnect), and gone
+	// once answered, with a change signalled each way.
+	if p := <-pendingWhileAsking; len(p) != 1 || p[0].Kind != "permission" || p[0].ToolCallID != "tc-bash-1" || p[0].PermissionRequestData == nil {
+		t.Fatalf("pending asks while asking = %+v", p)
+	}
+	if p := ag.PendingAsks(); len(p) != 0 || asksChanged.Load() != 2 {
+		t.Fatalf("after answer: pending %+v, %d change signals", p, asksChanged.Load())
 	}
 	if !strings.Contains(out.String(), `"toolCallId":"tc-bash-1"`) || !strings.Contains(out.String(), "permission_request") {
 		t.Fatalf("expected a permission_request for the forced-ask bash call, got: %s", out.String())
@@ -136,6 +150,7 @@ func TestAgent_AutonomousModeNeverAsks(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 	ag.SetMode(agent.ModeAutonomous)
 
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "write it"); err != nil {
@@ -173,6 +188,7 @@ func TestAgent_WebToolsToggleFiltersToolDefs(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "hi"); err != nil {
 		t.Fatalf("turn 1: %v", err)
@@ -219,6 +235,7 @@ func TestAgent_AskUserQuestionBlocksAndResumes(t *testing.T) {
 	out := &syncBuf{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 	// Even in ModeReadOnly, ask_user_question must stay available.
 	ag.SetMode(agent.ModeReadOnly)
 

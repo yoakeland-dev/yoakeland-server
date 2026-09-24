@@ -25,6 +25,72 @@ type Registry struct {
 
 	maxSessionSpendUSD float64
 	webToolsEnabled    bool
+	eventTap           func(protocol.EventType, string, string, any)
+	hooks              Hooks
+}
+
+// SetHooks installs hooks on every session's Agent, current and future.
+func (r *Registry) SetHooks(h Hooks) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hooks = h
+	for _, ag := range r.sessions {
+		ag.hooks = h
+	}
+}
+
+func (r *Registry) agents() []*Agent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		out = append(out, ag)
+	}
+	return out
+}
+
+// QueuedTurns sums every session's waiting turns.
+func (r *Registry) QueuedTurns() int {
+	n := 0
+	for _, ag := range r.agents() {
+		n += ag.QueuedTurns()
+	}
+	return n
+}
+
+// PendingAsks collects every session's unanswered asks.
+func (r *Registry) PendingAsks() []protocol.PendingAsk {
+	var out []protocol.PendingAsk
+	for _, ag := range r.agents() {
+		out = append(out, ag.PendingAsks()...)
+	}
+	return out
+}
+
+// SetEventTap installs tap on every session's event stream, current and
+// future (see protocol.StreamSet.SetTap).
+func (r *Registry) SetEventTap(tap func(evtType protocol.EventType, sessionID, turnID string, payload any)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.eventTap = tap
+	for _, ag := range r.sessions {
+		ag.stream.SetTap(tap)
+	}
+}
+
+// ActiveTurns sums running turns across every live session.
+func (r *Registry) ActiveTurns() int {
+	r.mu.Lock()
+	agents := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		agents = append(agents, ag)
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, ag := range agents {
+		n += ag.ActiveTurnCount()
+	}
+	return n
 }
 
 func NewRegistry(
@@ -102,9 +168,20 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	}, r.usageStore)
 	ag.SetMaxSessionSpendUSD(r.maxSessionSpendUSD)
 	ag.SetWebToolsEnabled(r.webToolsEnabled)
+	if r.eventTap != nil {
+		ag.stream.SetTap(r.eventTap)
+	}
+	ag.hooks = r.hooks
 	_ = ag.LoadSession(sessionID)
 	r.sessions[sessionID] = ag
 	return ag
+}
+
+// Lookup returns sessionID's live Agent without creating one, or nil.
+func (r *Registry) Lookup(sessionID string) *Agent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessions[sessionID]
 }
 
 // Remove evicts sessionID's in-memory Agent, if one was ever created,

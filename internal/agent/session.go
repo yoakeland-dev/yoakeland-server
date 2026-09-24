@@ -44,6 +44,10 @@ type SessionState struct {
 	// from len(History) because Branches also consumes IDs that may no
 	// longer appear in History at all.
 	NextMsgSeq int `json:"nextMsgSeq,omitempty"`
+
+	// Native is the CLI agent session this chat continues, if its last turn
+	// ran on one (agent/native.go) — persisted so a restart still resumes it.
+	Native *NativeSessionRef `json:"native,omitempty"`
 }
 
 type SessionStore interface {

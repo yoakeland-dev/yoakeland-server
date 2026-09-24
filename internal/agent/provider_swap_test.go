@@ -32,6 +32,7 @@ func TestAgent_SetProviderTakesEffectOnNextTurn(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, providerA, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-swap", "turn-1", "hi"); err != nil {
 		t.Fatalf("turn 1: %v", err)

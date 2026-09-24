@@ -70,6 +70,7 @@ func TestAgent_TurnCompletedReportsContextAndSpend(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, usageStore)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-cost", "turn-1", "Hello"); err != nil {
 		t.Fatalf("RunTurn: %v", err)

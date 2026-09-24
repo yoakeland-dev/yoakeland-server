@@ -38,6 +38,7 @@ func TestAgent_MaxSessionSpendUSD(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, providerA, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	t.Cleanup(ag.WaitBackground)
 	ag.SetMaxSessionSpendUSD(1.0) // claude-3-5-sonnet-20241022 pricing puts this turn at $18
 
 	if err := ag.RunTurn(context.Background(), "session-budget", "turn-1", "do something expensive"); err != nil {
@@ -75,6 +76,7 @@ func TestAgent_MaxSessionSpendUSD_Unlimited(t *testing.T) {
 
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
 	ag := agent.NewAgent(ipc, provider, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	t.Cleanup(ag.WaitBackground)
 	// No SetMaxSessionSpendUSD call: default must be unlimited.
 
 	if err := ag.RunTurn(context.Background(), "session-unlimited", "turn-1", "hi"); err != nil {
@@ -108,6 +110,7 @@ func TestAgent_MaxSessionSpendUSD_AppliesToEditAndRetry(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	t.Cleanup(ag.WaitBackground)
 	ag.SetMaxSessionSpendUSD(1.0)
 
 	if err := ag.RunTurn(context.Background(), "session-budget-2", "turn-1", "do something expensive"); err != nil {

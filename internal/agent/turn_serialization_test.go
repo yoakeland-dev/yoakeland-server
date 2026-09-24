@@ -63,10 +63,15 @@ func TestAgent_RunTurn_SerializesConcurrentTurnsForSameSession(t *testing.T) {
 
 	var inFlight int32
 	var sawOverlap int32
+	var maxQueued int32
+	var ag *agent.Agent
 	provider := &blockingCostProvider{
 		onStart: func() {
 			if atomic.AddInt32(&inFlight, 1) > 1 {
 				atomic.StoreInt32(&sawOverlap, 1)
+			}
+			if q := int32(ag.QueuedTurns()); q > atomic.LoadInt32(&maxQueued) {
+				atomic.StoreInt32(&maxQueued, q)
 			}
 			time.Sleep(20 * time.Millisecond) // widen the race window
 			atomic.AddInt32(&inFlight, -1)
@@ -76,7 +81,8 @@ func TestAgent_RunTurn_SerializesConcurrentTurnsForSameSession(t *testing.T) {
 
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
-	ag := agent.NewAgent(ipc, provider, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	ag = agent.NewAgent(ipc, provider, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, usageStore)
+	t.Cleanup(ag.WaitBackground)
 
 	const numTurns = 5
 	var wg sync.WaitGroup
@@ -92,6 +98,9 @@ func TestAgent_RunTurn_SerializesConcurrentTurnsForSameSession(t *testing.T) {
 
 	if atomic.LoadInt32(&sawOverlap) != 0 {
 		t.Fatal("two RunTurn calls for the same session executed concurrently — turnMu did not serialize them")
+	}
+	if atomic.LoadInt32(&maxQueued) == 0 || ag.QueuedTurns() != 0 {
+		t.Fatalf("queued turns: max seen %d, after %d — turns waiting on turnMu must be counted, then drain", maxQueued, ag.QueuedTurns())
 	}
 
 	got := usageStore.SessionTotal("session-concurrent").CostUSD

@@ -34,6 +34,7 @@ func TestRegistry_SessionsAreIsolated(t *testing.T) {
 
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
 	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil, true)
+	t.Cleanup(registry.WaitBackground)
 
 	agA := registry.Get(ipc, "session-A")
 	agB := registry.Get(ipc, "session-B")
@@ -90,6 +91,7 @@ func TestRegistry_ContextWindowIsPerSession(t *testing.T) {
 	ipcBOut := &bytes.Buffer{}
 	ipcB := protocol.NewIPCStream(bytes.NewBuffer(nil), ipcBOut)
 	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil, true)
+	t.Cleanup(registry.WaitBackground)
 
 	agA := registry.Get(ipcA, "session-A")
 	agB := registry.Get(ipcB, "session-B")
@@ -123,6 +125,7 @@ func TestRegistry_ReconnectBroadcastsToEveryConnection(t *testing.T) {
 
 	provider := &ScriptedProvider{turns: [][]agent.ModelStreamChunk{{{Kind: agent.StreamChunkDelta, Delta: "hi"}}}}
 	registry := agent.NewRegistry(provider, "test-provider", []tool.Tool{}, engine, snapStore, sessStore, ctxMgr, nil, true)
+	t.Cleanup(registry.WaitBackground)
 
 	firstOut := &bytes.Buffer{}
 	firstConn := protocol.NewIPCStream(bytes.NewBuffer(nil), firstOut)

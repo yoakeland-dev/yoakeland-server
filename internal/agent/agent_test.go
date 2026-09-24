@@ -110,6 +110,7 @@ func TestAgent_MultiTurnSessionPersistenceAndContextManagement(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	ctx := context.Background()
 
@@ -144,6 +145,7 @@ func TestAgent_TurnCancellationAndMetrics(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	go func() {
 		<-provider.started
@@ -186,6 +188,7 @@ func TestAgent_ReportsProviderFinishReason(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-test", "turn-length-1", "Write me something long"); err != nil {
 		t.Fatalf("RunTurn returned error: %v", err)
@@ -234,6 +237,7 @@ func TestAgent_EmptyRoundTripNotAddedToHistory(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-empty", "turn-1", "hello"); err != nil {
 		t.Fatalf("first RunTurn returned error: %v", err)
@@ -274,6 +278,7 @@ func TestAgent_EmptyLengthCutoffAutoContinues(t *testing.T) {
 	outBuf := &bytes.Buffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
 	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{tool.NewBashTool(norm, sb)}, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-retry", "turn-1", "hello"); err != nil {
 		t.Fatalf("RunTurn returned error: %v", err)
