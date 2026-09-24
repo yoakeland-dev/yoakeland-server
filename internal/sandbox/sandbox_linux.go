@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 type LinuxSandbox struct {
@@ -68,6 +70,72 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 	execCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
+	// --new-session (severs any inherited controlling tty) and network
+	// isolation both apply to the agent-issued one-shot command — see
+	// buildCmd's doc comment for why SpawnPTY's interactive terminal gets
+	// neither.
+	cmd := s.buildCmd(execCtx, argv, true, false)
+	cmd.Env = s.baseEnv(extraEnv, false)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	// Prioritize context deadline / cancellation errors
+	if execCtx.Err() != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("execution timed out after %v: %w", s.timeout, execCtx.Err())
+	}
+
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return nil, fmt.Errorf("sandbox launch error: %w", err)
+		}
+	}
+
+	return &ExecutionResult{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: exitCode,
+		ModeUsed: s.mode,
+	}, nil
+}
+
+// buildCmd constructs the not-yet-started *exec.Cmd for argv under this
+// sandbox's tier, shared by Execute (buffered, one-shot) and SpawnPTY
+// (interactive) — same bind mounts, same namespace flags, same project-root
+// chdir either way. newSession and allowNetwork differ by caller:
+//
+// Execute always passes newSession=true: bwrap's --new-session puts the
+// sandboxed command in its own terminal session with no controlling tty
+// inherited from yoakeland's own, closing off the TIOCSTI ioctl trick
+// (pushing synthetic keystrokes onto a terminal you don't own) — a
+// well-documented bwrap/container escape technique, the same class of issue
+// Flatpak's own bwrap invocation guards against.
+//
+// SpawnPTY always passes newSession=false: the whole point of a terminal is
+// an interactive shell with real job control (Ctrl-Z, Ctrl-C process-group
+// signaling), which needs a controlling tty — and the one it gets is the
+// freshly allocated pty slave the caller (the terminal's own user) is
+// already driving, not yoakeland's own terminal. TIOCSTI there has nothing
+// to escalate into: injecting keystrokes into a pty you already have full
+// read/write access to isn't a privilege gain.
+//
+// Execute always passes allowNetwork=false (bwrap's --unshare-net) — a
+// deliberate boundary on what an agent-issued command can reach unprompted.
+// SpawnPTY always passes allowNetwork=true: this is the human's own
+// terminal, opened on purpose, meant to run anything a normal terminal
+// would — git clone, curl, npm install, ssh — network access is the
+// baseline expectation, not something to withhold by default the way it is
+// for an autonomous tool call.
+func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, newSession, allowNetwork bool) *exec.Cmd {
 	// Resolve bare executable names (e.g. "echo" -> "/usr/bin/echo")
 	execArgv := make([]string, len(argv))
 	copy(execArgv, argv)
@@ -114,68 +182,126 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 			"--unshare-pid",
 			"--unshare-ipc",
 			"--unshare-uts",
-			"--unshare-net",
 			"--die-with-parent",
-			// Puts the sandboxed process in its own terminal session so it
-			// has no controlling tty inherited from yoakeland's own. Without
-			// this, a sandboxed command can use the TIOCSTI ioctl to push
-			// synthetic keystrokes onto the parent's terminal — a
-			// well-documented bwrap/container escape technique (the same
-			// class of issue Flatpak's own bwrap invocation guards against)
-			// that has nothing to do with filesystem/network isolation and
-			// isn't covered by any of the --unshare-* flags above.
-			"--new-session",
-			"--",
+			// ponytail: namespace/mount isolation only — no seccomp filter.
+			// SpawnPTY additionally applies memory/pids cgroup v2 limits
+			// when this process has delegation for one (applyCgroupLimits,
+			// cgroup_linux.go) — Execute doesn't bother, since its
+			// wall-clock timeout (s.timeout) already bounds a one-shot
+			// command's blast radius, where an interactive terminal has no
+			// such bound by design. Delegation is often unavailable on a
+			// bare daemon with no session manager above it (logged once,
+			// not silent) — upgrade path there is running under a systemd
+			// user session, or granting cgroup delegation another way.
 		)
+		if newSession {
+			bwrapArgs = append(bwrapArgs, "--new-session")
+		}
+		if !allowNetwork {
+			bwrapArgs = append(bwrapArgs, "--unshare-net")
+		}
+		bwrapArgs = append(bwrapArgs, "--")
 		bwrapArgs = append(bwrapArgs, execArgv...)
-		cmd = exec.CommandContext(execCtx, "bwrap", bwrapArgs...)
+		cmd = exec.CommandContext(ctx, "bwrap", bwrapArgs...)
 	} else if s.mode == ModeNamespace {
-		cmd = exec.CommandContext(execCtx, execArgv[0], execArgv[1:]...)
+		cmd = exec.CommandContext(ctx, execArgv[0], execArgv[1:]...)
 		cmd.Dir = s.projectRoot
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC,
 		}
 	} else {
-		cmd = exec.CommandContext(execCtx, execArgv[0], execArgv[1:]...)
+		cmd = exec.CommandContext(ctx, execArgv[0], execArgv[1:]...)
 		cmd.Dir = s.projectRoot
 	}
 
-	cmd.Env = append([]string{
+	return cmd
+}
+
+// baseEnv is the sandbox's fixed environment, plus extraEnv appended as-is.
+// interactive adds TERM, which a captured one-shot command has no use for
+// but an interactive shell (readline, ncurses tools) needs to behave sanely.
+func (s *LinuxSandbox) baseEnv(extraEnv []string, interactive bool) []string {
+	env := []string{
 		"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
 		"LANG=en_US.UTF-8",
 		"HOME=" + s.projectRoot,
 		"PWD=" + s.projectRoot,
-	}, extraEnv...)
+	}
+	if interactive {
+		env = append(env, "TERM=xterm-256color")
+	}
+	return append(env, extraEnv...)
+}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-
-	// Prioritize context deadline / cancellation errors
-	if execCtx.Err() != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("execution timed out after %v: %w", s.timeout, execCtx.Err())
+// SpawnPTY starts argv attached to a pty under this sandbox's tier — see
+// buildCmd for why --new-session is skipped here specifically. There is no
+// enclosing timeout (unlike Execute): ctx cancellation still tears the
+// process down (exec.CommandContext), but an interactive session is
+// expected to outlive any single request.
+func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, cols, rows int) (PTYSession, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("empty command")
 	}
 
-	exitCode := 0
+	cmd := s.buildCmd(ctx, argv, false, true)
+	cmd.Env = s.baseEnv(extraEnv, true)
+
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+	if err != nil {
+		return nil, fmt.Errorf("pty spawn error: %w", err)
+	}
+
+	// Confines the whole spawned tree (bwrap and everything inside its pid
+	// namespace, or the shell directly in namespace/local mode — cgroup
+	// membership is inherited by descendants regardless of pid-namespace
+	// boundaries, so the immediate child's pid is enough in every tier) to a
+	// memory/pids-capped cgroup when this process has delegation for one —
+	// see applyCgroupLimits's doc comment for why this is best-effort rather
+	// than a hard requirement.
+	cgroupCleanup, _ := applyCgroupLimits(cmd.Process.Pid)
+
+	return &linuxPTYSession{cmd: cmd, ptmx: ptmx, cgroupCleanup: cgroupCleanup}, nil
+}
+
+// linuxPTYSession implements PTYSession over creack/pty's master file —
+// same exit-code extraction convention as Execute.
+type linuxPTYSession struct {
+	cmd           *exec.Cmd
+	ptmx          *os.File
+	cgroupCleanup func() // removes this session's cgroup once it's empty; nil-safe no-op if limits weren't applied
+}
+
+func (p *linuxPTYSession) Read(b []byte) (int, error)  { return p.ptmx.Read(b) }
+func (p *linuxPTYSession) Write(b []byte) (int, error) { return p.ptmx.Write(b) }
+func (p *linuxPTYSession) Pid() int                    { return p.cmd.Process.Pid }
+
+func (p *linuxPTYSession) Resize(cols, rows int) error {
+	return pty.Setsize(p.ptmx, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+}
+
+func (p *linuxPTYSession) Close() error {
+	// Closing the master delivers SIGHUP to the slave's foreground process
+	// group first (standard tty semantics, same as closing a real terminal
+	// window); Kill is a backstop for a process that ignores it.
+	err := p.ptmx.Close()
+	if p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+	}
+	return err
+}
+
+func (p *linuxPTYSession) Wait() (int, error) {
+	err := p.cmd.Wait()
+	if p.cgroupCleanup != nil {
+		p.cgroupCleanup()
+	}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			return nil, fmt.Errorf("sandbox launch error: %w", err)
+			return exitErr.ExitCode(), nil
 		}
+		return -1, err
 	}
-
-	return &ExecutionResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
-		ModeUsed: s.mode,
-	}, nil
+	return 0, nil
 }
 
 func probeBubblewrap(testDir string) bool {
