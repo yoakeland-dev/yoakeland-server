@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -53,6 +54,7 @@ func main() {
 	var maxSessionCostUSD float64
 	var masterKey string
 	var stdioMode bool
+	var webRoot string
 
 	flag.StringVar(&projectDir, "project", "", "Default project root — pre-opened at startup and used as the fallback project for sessions/requests that don't specify their own projectPath. Unset by default: a server launched with no -project has no fallback and every request must give its own projectPath. Additional projects can be opened on demand via open_project/user_prompt.")
 	flag.StringVar(&stateDir, "state-dir", sockpath.DefaultStateDir(), "Directory for server-level state that isn't tied to any one project: providers.json, and the fallback unix socket path. Defaults to ~/.yoake (Linux), ~/Library/Application Support/yoake (macOS), or %AppData%\\yoake (Windows).")
@@ -64,6 +66,7 @@ func main() {
 	flag.StringVar(&listenAddr, "listen", "", "Optionally ALSO listen here, in addition to the always-on local unix socket (a named pipe on Windows; ignored if -stdio is set): a TCP address (e.g. ':7890') for remote/multi-device access, or 'unix:/path/to/socket' to override where the local socket itself lives. A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent.")
 	flag.StringVar(&authToken, "token", "", "Shared auth token required from clients of the optional TCP listener (auto-generated if empty). Not used for any unix socket.")
 	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate file for the optional TCP listener (requires -tls-key). Without both, yoakeland auto-generates and uses its own self-managed CA under -state-dir/tls/ instead — the listener is always TLS, never plaintext.")
+	flag.StringVar(&webRoot, "web-root", "", "Directory holding the built web client (the GUI's build/). Served to browsers on the remote TCP listener, which also accepts the protocol over a WebSocket at /ws; without it, /ws still works but there's no page to load.")
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key file for the optional TCP listener (requires -tls-cert)")
 	flag.Float64Var(&maxSessionCostUSD, "max-session-cost-usd", 0, "Refuse to start a new turn once a session has already spent this much (0 = unlimited)")
 	flag.StringVar(&masterKey, "master-key", "", "Passphrase encrypting providers.json at rest (AES-256-GCM, scrypt-derived key). Falls back to YOAKELAND_MASTER_KEY if unset. Without either, providers.json is plaintext (0600 perms only).")
@@ -195,6 +198,7 @@ func main() {
 		settings:           settings,
 		remote:             rc,
 		status:             hub,
+		webRoot:            webRoot,
 		turnWG:             &sync.WaitGroup{},
 	}
 	rc.deps = deps
@@ -443,59 +447,75 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 			defer tracker.Remove(conn)
 			defer conn.Close()
 
+			var c net.Conn = conn
 			if tlsConn, ok := conn.(*tls.Conn); ok {
 				_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 				if err := tlsConn.Handshake(); err != nil {
 					logWarn("TLS handshake failed from %s: %v", conn.RemoteAddr(), err)
 					return
 				}
+				// Clients open with a JSON auth frame; anything else is a browser.
+				br := bufio.NewReader(conn)
+				first, err := br.Peek(1)
 				_ = tlsConn.SetDeadline(time.Time{})
+				if err != nil {
+					return
+				}
+				c = &bufferedConn{Conn: conn, r: br}
+				if first[0] != '{' {
+					serveWeb(ctx, c, network, deps, lookupToken)
+					return
+				}
 			}
-
-			ipc := protocol.NewIPCStream(conn, conn)
-			who, pending, ok := handshake(ipc, network, lookupToken)
-			if !ok {
-				return
-			}
-			if who.DeviceType == "" {
-				who.DeviceType = "desktop"
-			}
-
-			peer := deps.peers.Add(ipc, conn, network, who)
-			defer deps.peers.Remove(peer.ID)
-			defer deps.uploads.DropPeer(peer.ID)
-			// The poller idles with nobody connected; catch up for this client.
-			deps.status.KickUsage()
-			if network == "tcp" {
-				// Remote devices only: a local GUI reconnecting is routine noise.
-				deps.presence.Joined(peer)
-				defer deps.presence.Left(peer)
-			}
-
-			var lastSeen atomic.Int64
-			lastSeen.Store(time.Now().UnixNano())
-
-			hbCtx, stopHeartbeat := context.WithCancel(ctx)
-			defer stopHeartbeat()
-			status := func() *protocol.ServerStatus { return serverStatus(deps) }
-			go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
-			onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
-
-			_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
-			_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
-			deps.status.SendPendingAsks(ipc)
-			for _, st := range deps.projects.GitStatuses() {
-				_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
-			}
-			deps.status.SendTerminals(ipc)
-
-			if pending != nil {
-				onActivity()
-				handleEnvelope(ctx, ipc, deps, network, peer.ID, pending)
-			}
-			serveConnection(ctx, ipc, deps, network, peer.ID, onActivity)
+			serveAccepted(ctx, c, network, deps, lookupToken)
 		}()
 	}
+}
+
+// Shared by socket clients and browser WebSockets (web.go).
+func serveAccepted(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
+	ipc := protocol.NewIPCStream(conn, conn)
+	who, pending, ok := handshake(ipc, network, lookupToken)
+	if !ok {
+		return
+	}
+	if who.DeviceType == "" {
+		who.DeviceType = "desktop"
+	}
+
+	peer := deps.peers.Add(ipc, conn, network, who)
+	defer deps.peers.Remove(peer.ID)
+	defer deps.uploads.DropPeer(peer.ID)
+	// The poller idles with nobody connected; catch up for this client.
+	deps.status.KickUsage()
+	if network == "tcp" {
+		// Remote devices only: a local GUI reconnecting is routine noise.
+		deps.presence.Joined(peer)
+		defer deps.presence.Left(peer)
+	}
+
+	var lastSeen atomic.Int64
+	lastSeen.Store(time.Now().UnixNano())
+
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	status := func() *protocol.ServerStatus { return serverStatus(deps) }
+	go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
+	onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
+
+	_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
+	_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
+	deps.status.SendPendingAsks(ipc)
+	for _, st := range deps.projects.GitStatuses() {
+		_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
+	}
+	deps.status.SendTerminals(ipc)
+
+	if pending != nil {
+		onActivity()
+		handleEnvelope(ctx, ipc, deps, network, peer.ID, pending)
+	}
+	serveConnection(ctx, ipc, deps, network, peer.ID, onActivity)
 }
 
 // runHeartbeat periodically pings an idle connection and closes it if
@@ -671,6 +691,7 @@ type connDeps struct {
 	settings           *ServerSettings
 	remote             *remoteControl
 	status             *statusHub
+	webRoot            string // "" serves no web UI
 
 	// turnWG, if non-nil, is Add(1)'d before every RunTurn goroutine is
 	// spawned and Done() when it returns. Production leaves this nil (the

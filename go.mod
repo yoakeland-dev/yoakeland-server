@@ -7,6 +7,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/PuerkitoBio/goquery v1.13.0
 	github.com/UserExistsError/conpty v0.1.4
+	github.com/coder/websocket v1.8.15
 	github.com/creack/pty v1.1.24
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
