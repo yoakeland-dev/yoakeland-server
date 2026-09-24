@@ -105,6 +105,10 @@ func (s *DiskSessionStore) saveLocked(session *SessionState) error {
 
 	target := filepath.Join(s.baseDir, session.SessionID+".json")
 	tmp := target + ".tmp"
+	// The folder may have been deleted since startup.
+	if err := os.MkdirAll(s.baseDir, 0755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err

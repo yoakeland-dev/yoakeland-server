@@ -63,6 +63,9 @@ func (s *Store) Save(settings ProjectSettings) error {
 	}
 
 	tmpFile := s.filePath + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(tmpFile), 0755); err != nil {
+		return err
+	}
 	if err := os.WriteFile(tmpFile, bytes, 0644); err != nil {
 		return err
 	}

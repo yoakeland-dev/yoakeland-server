@@ -85,6 +85,9 @@ func (s *UsageStore) save() error {
 		return err
 	}
 	tmp := s.filePath + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(tmp), 0755); err != nil {
+		return err
+	}
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
 	}
