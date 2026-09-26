@@ -7,7 +7,7 @@ export YOAKE_SHELL_INTEGRATION=1
 
 autoload -Uz add-zsh-hook
 
-# Emits VS Code's OSC 633 A/B/C/D/P subset — see yoake-gui's
+# Emits VS Code's OSC 633 A/B/C/D/E/P subset — see yoake-gui's
 # terminalShellIntegration.ts for the parser. Registered *before* the user's
 # own ~/.zshrc runs below, so __yoake_precmd is first in zsh's
 # precmd_functions array and sees $? exactly as the last command left it —
@@ -17,7 +17,8 @@ __yoake_precmd() {
   printf '\033]633;D;%s\007\033]633;P;Cwd=%s\007\033]633;A\007' "$?" "$PWD"
 }
 __yoake_preexec() {
-  printf '\033]633;B\007\033]633;C\007'
+  # E carries the command line; control chars would end the OSC early.
+  printf '\033]633;B\007\033]633;E;%s\007\033]633;C\007' "${1//[[:cntrl:]]/ }"
 }
 add-zsh-hook precmd __yoake_precmd
 add-zsh-hook preexec __yoake_preexec

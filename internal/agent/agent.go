@@ -9,7 +9,6 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/permission"
@@ -291,24 +290,26 @@ type Agent struct {
 	// removed. Read/written under mu.
 	discarded bool
 
-	// turnMu serializes RunTurn calls for this Agent (i.e. this session —
-	// the registry hands out one Agent per sessionID, so this never blocks
-	// a *different* session's turn, only two turns racing on the same one).
-	// Without this, two user_prompts dispatched close together for the same
-	// session could both read the pre-turn spend total before either wrote
-	// it back (a TOCTOU on -max-session-cost-usd), and could interleave
-	// a.history appends / sessionStore.Save calls non-deterministically.
-	turnMu sync.Mutex
+	// turnSlot (capacity 1) serializes RunTurn calls for this Agent (i.e.
+	// this session — the registry hands out one Agent per sessionID, so this
+	// never blocks a *different* session's turn, only two turns racing on the
+	// same one). Without this, two user_prompts dispatched close together for
+	// the same session could both read the pre-turn spend total before either
+	// wrote it back (a TOCTOU on -max-session-cost-usd), and could interleave
+	// a.history appends / sessionStore.Save calls non-deterministically. A
+	// channel rather than a mutex so a queued turn can stop waiting (lockTurn).
+	turnSlot chan struct{}
 
 	// titleWG tracks runTitleGeneration goroutines, which outlive the turn
 	// that started them by design; tests wait on it before their temp
 	// project dir is removed (export_test.go).
 	titleWG sync.WaitGroup
 
-	// queued counts turns blocked on turnMu (see lockTurn); pendingAsks is
-	// every unanswered permission/question ask, keyed by toolCallId (under
-	// mu). hooks tells the server when either changes.
-	queued      atomic.Int32
+	// queuedTurns holds the cancel of every turn waiting for turnSlot (see
+	// lockTurn); pendingAsks is every unanswered permission/question ask,
+	// keyed by toolCallId. Both under mu. hooks tells the server when either
+	// changes.
+	queuedTurns map[string]context.CancelFunc
 	pendingAsks map[string]protocol.PendingAsk
 	hooks       Hooks
 
@@ -339,20 +340,67 @@ func (h Hooks) asksChanged() {
 	}
 }
 
-// lockTurn takes turnMu, counting this turn as queued while it waits.
-func (a *Agent) lockTurn() {
-	if a.turnMu.TryLock() {
-		return
+// lockTurn claims the session's turn slot, counting the turn as queued
+// while it waits behind the current one. A queued turn can be withdrawn
+// (CancelTurn/WithdrawTurn, or ctx ending) before it starts: lockTurn then
+// reports turn_completed "cancelled" itself and returns false, and the
+// caller must return without touching history. A turn that gets the slot is
+// announced with turn_started, the point after which it can't be withdrawn.
+func (a *Agent) lockTurn(ctx context.Context, sessionID, turnID string) bool {
+	select {
+	case a.turnSlot <- struct{}{}:
+	default:
+		qctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		a.mu.Lock()
+		a.queuedTurns[turnID] = cancel
+		a.mu.Unlock()
+		a.hooks.queueChanged()
+		got := false
+		select {
+		case a.turnSlot <- struct{}{}:
+			got = true
+		case <-qctx.Done():
+		}
+		a.mu.Lock()
+		delete(a.queuedTurns, turnID)
+		a.mu.Unlock()
+		a.hooks.queueChanged()
+		// Both cases can be ready at once; a withdrawn turn must never run.
+		if got && qctx.Err() != nil {
+			a.unlockTurn()
+			got = false
+		}
+		if !got {
+			_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("cancelled", protocol.UsageData{}, time.Now(), "", ""))
+			return false
+		}
 	}
-	a.queued.Add(1)
-	a.hooks.queueChanged()
-	a.turnMu.Lock()
-	a.queued.Add(-1)
-	a.hooks.queueChanged()
+	_ = a.getStream().SendEvent(protocol.EventTurnStarted, sessionID, turnID, "", protocol.TurnStartedData{})
+	return true
 }
 
+func (a *Agent) unlockTurn() { <-a.turnSlot }
+
 // QueuedTurns is how many turns are waiting for this session's current one.
-func (a *Agent) QueuedTurns() int { return int(a.queued.Load()) }
+func (a *Agent) QueuedTurns() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.queuedTurns)
+}
+
+// WithdrawTurn cancels turnID only if it's still queued, reporting whether
+// it was. Unlike CancelTurn it never stops a turn that already started, so
+// a client's "undo send" can't race into cancelling the reply it wanted.
+func (a *Agent) WithdrawTurn(turnID string) bool {
+	a.mu.Lock()
+	cancel, ok := a.queuedTurns[turnID]
+	a.mu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
 
 func (a *Agent) addPendingAsk(ask protocol.PendingAsk) {
 	ask.CreatedAt = time.Now().UTC()
@@ -437,6 +485,8 @@ func NewAgent(
 		permRequestKeys:   make(map[string]string),
 		askUserRequests:   make(map[string]chan string),
 		activeTurnCancels: make(map[string]context.CancelFunc),
+		turnSlot:          make(chan struct{}, 1),
+		queuedTurns:       make(map[string]context.CancelFunc),
 		pendingAsks:       make(map[string]protocol.PendingAsk),
 		nativeRemember:    make(map[string]bool),
 	}
@@ -708,9 +758,13 @@ func (a *Agent) SetMaxSessionSpendUSD(limit float64) {
 	a.maxSessionSpendUSD = limit
 }
 
+// CancelTurn stops turnID, whether it's running or still queued.
 func (a *Agent) CancelTurn(turnID string) {
 	a.mu.Lock()
 	cancel, exists := a.activeTurnCancels[turnID]
+	if !exists {
+		cancel, exists = a.queuedTurns[turnID]
+	}
 	a.mu.Unlock()
 
 	if exists && cancel != nil {
@@ -811,13 +865,15 @@ func (a *Agent) RunTurn(parentCtx context.Context, sessionID, turnID, prompt str
 // RunTurnWithTitleGeneration runs a turn and titles a newly-created chat in
 // parallel. Existing callers use RunTurn, whose default is enabled.
 func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID, turnID, prompt string, autoGenerateTitle bool) error {
-	// Serialize turns within this session: see turnMu's doc comment. This
+	// Serialize turns within this session: see turnSlot's doc comment. This
 	// must wrap the budget check through the final usageStore.Record write
 	// (both happen below) so the check-then-record isn't itself racy. Also
 	// serializes against EditMessage/RetryMessage/SwitchBranch on the same
 	// Agent — all four mutate a.history/a.branches and must never interleave.
-	a.lockTurn()
-	defer a.turnMu.Unlock()
+	if !a.lockTurn(parentCtx, sessionID, turnID) {
+		return nil
+	}
+	defer a.unlockTurn()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
@@ -1531,8 +1587,10 @@ turn:
 // the tree one hop at a time composes correctly without a full recursive
 // lookup — see the plan's scope note).
 func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messageID, content string, autoGenerateTitle bool) error {
-	a.lockTurn()
-	defer a.turnMu.Unlock()
+	if !a.lockTurn(parentCtx, sessionID, turnID) {
+		return nil
+	}
+	defer a.unlockTurn()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
@@ -1601,8 +1659,10 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 // restore_snapshot (SPEC.md §3.1) is the tool for reverting the filesystem
 // itself, and is orthogonal to this.
 func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messageID string) error {
-	a.lockTurn()
-	defer a.turnMu.Unlock()
+	if !a.lockTurn(parentCtx, sessionID, turnID) {
+		return nil
+	}
+	defer a.unlockTurn()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
@@ -1641,7 +1701,7 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 // SwitchBranch makes the branch containing messageID the active one,
 // stashing whatever suffix was active at that branch point back into
 // Branches in its place. Pure navigation — no model call, no cost. Blocks
-// on turnMu so it never races a concurrently in-flight turn on the same
+// on turnSlot so it never races a concurrently in-flight turn on the same
 // session; it simply waits for one to finish rather than switching out the
 // history a turn is actively appending to.
 //
@@ -1651,8 +1711,8 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 // reachable only after switching to that outer one first, which is just
 // walking the (implicit) tree one hop at a time.
 func (a *Agent) SwitchBranch(sessionID, messageID string) error {
-	a.turnMu.Lock()
-	defer a.turnMu.Unlock()
+	a.turnSlot <- struct{}{}
+	defer a.unlockTurn()
 
 	a.mu.Lock()
 	if a.sessionID == "" || a.sessionID != sessionID {

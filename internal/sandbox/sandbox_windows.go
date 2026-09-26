@@ -118,7 +118,10 @@ func (s *WindowsSandbox) Execute(ctx context.Context, argv []string, extraEnv []
 // keep the package compiling there, and its StartWithSize is a hard-coded
 // ErrUnsupported stub. This tier uses a dedicated ConPTY library instead of
 // the shared pty.StartWithSize path the other platforms use.
-func (s *WindowsSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, cols, rows int) (PTYSession, error) {
+func (s *WindowsSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error) {
+	if dir == "" {
+		dir = s.projectRoot
+	}
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -132,7 +135,7 @@ func (s *WindowsSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv [
 	cp, err := conpty.Start(
 		commandLine,
 		conpty.ConPtyDimensions(cols, rows),
-		conpty.ConPtyWorkDir(s.projectRoot),
+		conpty.ConPtyWorkDir(dir),
 		conpty.ConPtyEnv(windowsBaseEnv(s.projectRoot, extraEnv)),
 	)
 	if err != nil {

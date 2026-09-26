@@ -248,12 +248,12 @@ func envelopeTypes(t *testing.T, raw string) []string {
 	return types
 }
 
-// TestFileWrite_RefusesSymlinkedTempFile guards the O_NOFOLLOW fix: the
-// atomic-write temp path (safePath + ".tmp") is never itself passed through
-// normalizer.ResolveAndValidatePath (only the real target path is), so a
-// pre-planted symlink at that exact temp-file name — from a malicious repo
-// checkout, or a concurrent tool call — must not be silently followed and
-// written through to wherever it points, possibly outside the project root.
+// TestFileWrite_RefusesSymlinkedTempFile: the atomic-write temp file is never
+// passed through normalizer.ResolveAndValidatePath (only the real target
+// is), so a symlink pre-planted at a guessable temp name — from a malicious
+// repo checkout, or a concurrent tool call — must never be written through
+// to wherever it points. WriteFileAtomic's temp name is random and created
+// exclusively, so the planted link is simply never touched.
 func TestFileWrite_RefusesSymlinkedTempFile(t *testing.T) {
 	tempDir := t.TempDir()
 	norm, err := normalizer.New(tempDir)
@@ -277,8 +277,8 @@ func TestFileWrite_RefusesSymlinkedTempFile(t *testing.T) {
 		"path": "hello.txt",
 		"content": "pwned"
 	}`))
-	if err == nil {
-		t.Fatal("expected file_write to refuse a symlinked temp path, got nil error")
+	if err != nil {
+		t.Fatalf("file_write: %v", err)
 	}
 
 	got, readErr := os.ReadFile(outsideTarget)

@@ -25,8 +25,9 @@ const SocketName = "yoakeland.sock"
 //   - everything else (Linux, BSDs, ...): ~/.yoake, the traditional Unix
 //     dotfile convention (~/.ssh, ~/.aws, ...).
 //
-// Falls back to ".yoake" in the working directory if the home/config
-// directory can't be determined at all.
+// Returns "" if the home/config directory can't be determined: falling back
+// to a relative path would put chats inside whatever project the server was
+// started from.
 func DefaultStateDir() string {
 	switch runtime.GOOS {
 	case "darwin":
@@ -40,7 +41,7 @@ func DefaultStateDir() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ".yoake"
+		return ""
 	}
 	return filepath.Join(home, ".yoake")
 }

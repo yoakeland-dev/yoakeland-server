@@ -110,3 +110,28 @@ func TestComputeDiff_TwoDistantChanges_ProduceSeparateHunks(t *testing.T) {
 		}
 	}
 }
+
+// A full rewrite past maxEditDistance falls back to delete-all/add-all
+// instead of growing the Myers trace quadratically.
+func TestComputeDiff_RewriteFallsBackToReplace(t *testing.T) {
+	var before, after strings.Builder
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(&before, "old %d\n", i)
+		fmt.Fprintf(&after, "new %d\n", i)
+	}
+	d := diff.ComputeDiff("rewrite.txt", before.String(), after.String())
+	adds, dels := 0, 0
+	for _, h := range d.Hunks {
+		for _, l := range h.Lines {
+			switch l.Type {
+			case diff.LineAdd:
+				adds++
+			case diff.LineDelete:
+				dels++
+			}
+		}
+	}
+	if adds != 3000 || dels != 3000 {
+		t.Fatalf("expected 3000 adds and 3000 deletes, got %d/%d", adds, dels)
+	}
+}

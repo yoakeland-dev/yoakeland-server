@@ -254,3 +254,56 @@ func TestDiskSnapshotStore_RestoreSnapshot_RejectsTraversalRelPath(t *testing.T)
 		t.Fatalf("restore must not have written outside projectRoot, but %s exists", outsideTarget)
 	}
 }
+
+// Restoring an older snapshot rewinds later turns too, and saves an undo
+// snapshot that brings the pre-restore state back.
+func TestDiskSnapshotStore_RestoreIsPointInTimeAndUndoable(t *testing.T) {
+	root := t.TempDir()
+	store, err := snapshot.NewDiskSnapshotStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(p string) string {
+		data, err := os.ReadFile(p)
+		if os.IsNotExist(err) {
+			return "<missing>"
+		}
+		return string(data)
+	}
+
+	write(a, "a0")
+	first, _, err := store.CapturePreMutation("t1", "turn 1", root, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.CloseTurn("t1")
+	write(a, "a1")
+	if _, _, err := store.CapturePreMutation("t2", "turn 2", root, a, b); err != nil {
+		t.Fatal(err)
+	}
+	store.CloseTurn("t2")
+	write(a, "a2")
+	write(b, "b2")
+
+	if err := store.RestoreSnapshot(first.ID, root); err != nil {
+		t.Fatal(err)
+	}
+	if read(a) != "a0" || read(b) != "<missing>" {
+		t.Fatalf("after restore: a=%q b=%q, want a0 and missing", read(a), read(b))
+	}
+
+	all, _ := store.ListSnapshots()
+	undo := all[len(all)-1]
+	if err := store.RestoreSnapshot(undo.ID, root); err != nil {
+		t.Fatal(err)
+	}
+	if read(a) != "a2" || read(b) != "b2" {
+		t.Fatalf("after undo: a=%q b=%q, want a2 and b2", read(a), read(b))
+	}
+}

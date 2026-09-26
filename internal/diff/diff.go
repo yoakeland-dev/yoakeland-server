@@ -78,9 +78,12 @@ func myersDiff(a, b []string) []editOp {
 	v := make(map[int]int)
 	v[1] = 0
 
-	trace := make([]map[int]int, 0, max+1)
+	trace := make([]map[int]int, 0, min(max, maxEditDistance)+1)
 
 	for d := 0; d <= max; d++ {
+		if d > maxEditDistance {
+			return replaceAll(a, b)
+		}
 		vCopy := make(map[int]int, len(v))
 		for k, val := range v {
 			vCopy[k] = val
@@ -109,6 +112,22 @@ func myersDiff(a, b []string) []editOp {
 	}
 
 	return nil
+}
+
+// maxEditDistance bounds myersDiff: its trace keeps O(d²) entries, so a
+// wholesale rewrite of a big file would otherwise eat memory. Past it the
+// diff is reported as every old line removed and every new line added.
+const maxEditDistance = 2000
+
+func replaceAll(a, b []string) []editOp {
+	edits := make([]editOp, 0, len(a)+len(b))
+	for _, l := range a {
+		edits = append(edits, editOp{op: LineDelete, text: l})
+	}
+	for _, l := range b {
+		edits = append(edits, editOp{op: LineAdd, text: l})
+	}
+	return edits
 }
 
 func backtrack(trace []map[int]int, a, b []string, n, m int) []editOp {

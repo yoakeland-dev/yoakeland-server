@@ -85,13 +85,16 @@ func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv [
 
 // SpawnPTY has no isolation to apply on this platform (see Execute) — same
 // unconfined-fallback tier, just attached to a pty instead of buffered pipes.
-func (s *NonLinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, cols, rows int) (PTYSession, error) {
+func (s *NonLinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = s.projectRoot
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	cmd.Env = append([]string{
 		"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
 		"LANG=en_US.UTF-8",

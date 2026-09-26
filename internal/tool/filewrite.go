@@ -51,32 +51,44 @@ func (t *FileWriteTool) Execute(_ context.Context, execCtx ExecutionContext, arg
 		return "", fmt.Errorf("failed to create snapshot before write: %w", err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(safePath), 0755); err != nil {
+	if err := WriteFileAtomic(safePath, []byte(args.Content)); err != nil {
 		return "", err
 	}
 
-	// Atomic write via temp file. Opened with O_NOFOLLOW so a symlink
-	// planted at tmpPath between path validation and this write (e.g. by a
-	// concurrent tool call or a malicious repo checkout) is refused instead
-	// of silently followed and written through to wherever it points.
-	tmpPath := safePath + ".tmp"
-	f, err := openNoFollow(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return "", fmt.Errorf("failed to write buffer: %w", err)
-	}
-	_, writeErr := f.Write([]byte(args.Content))
-	closeErr := f.Close()
-	if writeErr != nil {
-		return "", fmt.Errorf("failed to write buffer: %w", writeErr)
-	}
-	if closeErr != nil {
-		return "", fmt.Errorf("failed to write buffer: %w", closeErr)
-	}
-	if err := os.Rename(tmpPath, safePath); err != nil {
-		return "", fmt.Errorf("failed to commit file write: %w", err)
-	}
-
 	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(args.Content), args.Path), nil
+}
+
+// WriteFileAtomic replaces path's content via a temp file in the same
+// directory and a rename, so a reader never sees a half-written file. The
+// temp file is created exclusively under a random name, so a symlink planted
+// in the meantime can't redirect the write. An existing file keeps its mode.
+func WriteFileAtomic(path string, data []byte) error {
+	mode := os.FileMode(0644)
+	if fi, err := os.Stat(path); err == nil {
+		mode = fi.Mode().Perm()
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to write buffer: %w", err)
+	}
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(f.Name(), mode)
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return fmt.Errorf("failed to write %s: %w", filepath.Base(path), err)
+	}
+	return nil
 }
 
 func (t *FileWriteTool) Definition() ToolDefinition {

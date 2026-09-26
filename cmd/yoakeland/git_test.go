@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,4 +83,15 @@ func TestProjectRegistry_WatchesKnownReposWithoutOpening(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("known repo never got a git status")
+}
+
+func TestGitChanges_NotARepoSaysSo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", os.TempDir())
+	_, _, err := gitChanges(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "not a git repository") {
+		t.Fatalf("err = %v, want git's own \"not a git repository\"", err)
+	}
 }

@@ -101,12 +101,15 @@ func (s *DarwinSandbox) Execute(ctx context.Context, argv []string, extraEnv []s
 // does. allowNetwork=true: this is the human's own terminal — see
 // sandbox_linux.go's buildCmd doc comment for the full reasoning, identical
 // here.
-func (s *DarwinSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, cols, rows int) (PTYSession, error) {
+func (s *DarwinSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
 
 	cmd := s.buildCmd(ctx, argv, true)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	cmd.Env = s.baseEnv(extraEnv, true)
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})

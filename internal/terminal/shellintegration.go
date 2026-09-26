@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"yoakeland/internal/sandbox"
 )
 
 // Shell integration injects a small init script into the shell we spawn so
@@ -40,7 +42,7 @@ var integrationScriptErr error
 // small, static, non-secret files the OS already reclaims.
 func integrationDir() (string, error) {
 	writeIntegrationScriptsOnce.Do(func() {
-		dir := filepath.Join(os.TempDir(), "yoakeland-shell-integration")
+		dir := sandbox.ShellIntegrationDir()
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			integrationScriptErr = err
 			return

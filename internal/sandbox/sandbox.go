@@ -3,7 +3,9 @@ package sandbox
 import (
 	"context"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 type SandboxMode string
@@ -58,11 +60,20 @@ type Sandbox interface {
 	// under the same isolation tier Execute uses, sized to cols x rows.
 	// Unlike Execute, ctx is not given a deadline internally — the session
 	// runs until the process exits or the caller cancels ctx/Close()s it.
-	SpawnPTY(ctx context.Context, argv []string, extraEnv []string, cols, rows int) (PTYSession, error)
+	// dir is where it starts, already validated to be inside the project
+	// root; "" means the root itself.
+	SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error)
 }
 
 // Helper to determine if an executable is in $PATH
 func commandExists(cmd string) bool {
 	_, err := exec.LookPath(cmd)
 	return err == nil
+}
+
+// ShellIntegrationDir is where the terminal package writes its shell rc scripts. It lives under
+// the host's temp dir, which bubblewrap hides behind a fresh tmpfs, so SpawnPTY binds this one
+// directory back in read-only.
+func ShellIntegrationDir() string {
+	return filepath.Join(os.TempDir(), "yoakeland-shell-integration")
 }

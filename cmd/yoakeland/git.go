@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,7 +128,7 @@ func (w *gitWatcher) refresh() {
 	// --no-optional-locks: plain `git status` may rewrite the index to
 	// refresh stat info, which would bump index's mtime and retrigger this
 	// watcher every second forever.
-	out, err := exec.Command("git", "--no-optional-locks", "-C", w.root, "status", "--porcelain=v2", "--branch").Output()
+	out, err := exec.Command("git", "--no-optional-locks", "-c", "core.quotePath=false", "-C", w.root, "status", "--porcelain=v2", "--branch").Output()
 	if err != nil {
 		return
 	}
@@ -180,30 +181,39 @@ func parseGitStatus(out []byte) protocol.GitStatusData {
 	return st
 }
 
-// parseGitFile reads one porcelain-v2 entry line. Paths may contain spaces,
-// so the path is everything after the fixed field count; renames/copies
-// append "\t<origPath>", which is dropped.
-func parseGitFile(line string) (protocol.GitFile, bool) {
-	var xy, path string
+// parseGitEntry reads one porcelain-v2 entry line into its path, a
+// rename/copy's source, and the two-letter XY code ("." = that side is
+// unchanged). Paths may contain spaces, so the path is everything after the
+// fixed field count.
+func parseGitEntry(line string) (path, orig, xy string, ok bool) {
 	switch line[0] {
 	case '?':
-		return protocol.GitFile{Path: line[2:], Status: "?"}, true
+		return line[2:], "", "??", true
 	case '1':
 		if f := strings.SplitN(line, " ", 9); len(f) == 9 {
-			xy, path = f[1], f[8]
+			return f[8], "", f[1], len(f[1]) == 2
 		}
 	case '2':
 		if f := strings.SplitN(line, " ", 10); len(f) == 10 {
-			xy = f[1]
-			path, _, _ = strings.Cut(f[9], "\t")
+			path, orig, _ = strings.Cut(f[9], "\t")
+			return path, orig, f[1], len(f[1]) == 2
 		}
 	case 'u':
 		if f := strings.SplitN(line, " ", 11); len(f) == 11 {
-			return protocol.GitFile{Path: f[10], Status: "U"}, true
+			return f[10], "", f[1], len(f[1]) == 2
 		}
 	}
-	if len(xy) != 2 || path == "" {
+	return "", "", "", false
+}
+
+// parseGitFile collapses an entry to one status letter for git_status.
+func parseGitFile(line string) (protocol.GitFile, bool) {
+	path, _, xy, ok := parseGitEntry(line)
+	if !ok || path == "" {
 		return protocol.GitFile{}, false
+	}
+	if line[0] == 'u' {
+		return protocol.GitFile{Path: path, Status: "U"}, true
 	}
 	// The worktree side is what's most recent; fall back to the staged side.
 	s := xy[1]
@@ -211,6 +221,53 @@ func parseGitFile(line string) (protocol.GitFile, bool) {
 		s = xy[0]
 	}
 	return protocol.GitFile{Path: path, Status: string(s)}, true
+}
+
+// maxGitChanges caps list_git_changes, which (unlike git_status) lists
+// every file inside untracked folders.
+const maxGitChanges = 5000
+
+// gitChanges is list_git_changes: every changed path with both its staged
+// and worktree state.
+func gitChanges(root string) (files []protocol.GitChange, truncated bool, err error) {
+	out, err := exec.Command("git", "--no-optional-locks", "-c", "core.quotePath=false", "-C", root, "status", "--porcelain=v2", "--untracked-files=all").Output()
+	if err != nil {
+		// git's own message ("not a git repository", …) beats a bare exit status.
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return nil, false, fmt.Errorf("git status: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, false, fmt.Errorf("git status: %w", err)
+	}
+	files = []protocol.GitChange{}
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		path, orig, xy, ok := parseGitEntry(line)
+		if !ok {
+			continue
+		}
+		if len(files) == maxGitChanges {
+			return files, true, nil
+		}
+		files = append(files, protocol.GitChange{Path: path, OrigPath: orig, Index: xy[:1], Worktree: xy[1:], Conflict: line[0] == 'u'})
+	}
+	return files, false, nil
+}
+
+// gitShowHead returns rel's content at HEAD; missing is true when HEAD has
+// no such file (new, untracked, or no commits yet).
+func gitShowHead(root, rel string) (content []byte, missing bool, err error) {
+	out, err := exec.Command("git", "-C", root, "show", "HEAD:"+rel).Output()
+	if err != nil {
+		if _, isExit := err.(*exec.ExitError); isExit {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("git show: %w", err)
+	}
+	return out, false, nil
 }
 
 func gitStatusEqual(a, b protocol.GitStatusData) bool {

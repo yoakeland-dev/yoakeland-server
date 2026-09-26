@@ -7,13 +7,11 @@
 # code> (previous command finished), P;Cwd=<path> (cwd report), A (prompt
 # start) — see yoake-gui's terminalShellIntegration.ts for the parser.
 #
-# ponytail: no command-start (C) marker here — bash's only hook for that is
-# `trap ... DEBUG`, which also fires inside subshells and command
-# substitution ($(...)), misattributing those as top-level commands.
-# Prompt-boundary markers only (good enough for exit-code gutter marks + a
-# live cwd); upgrade to a guarded DEBUG trap if per-command decorations are
-# ever needed. zsh gets the full set below since its preexec/precmd hooks
-# don't have this problem.
+# Command start (C) comes from PS0 (bash 4.4+), which bash prints after
+# reading a command line and before running it, and never for an empty
+# line. Not a DEBUG trap: that also fires inside subshells and $(...).
+# ponytail: no command-line (E) marker, PS0 can't see the line reliably
+# (history is skipped under HISTCONTROL=ignorespace). zsh sends it.
 
 [ -n "$YOAKE_SHELL_INTEGRATION" ] && return
 export YOAKE_SHELL_INTEGRATION=1
@@ -27,3 +25,4 @@ __yoake_precmd() {
   printf '\033]633;D;%s\007\033]633;P;Cwd=%s\007\033]633;A\007' "$ec" "$PWD"
 }
 PROMPT_COMMAND="__yoake_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+PS0="${PS0}"$'\e]633;C\a'

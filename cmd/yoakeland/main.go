@@ -17,7 +17,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +73,15 @@ func main() {
 	flag.Float64Var(&maxSessionCostUSD, "max-session-cost-usd", 0, "Refuse to start a new turn once a session has already spent this much (0 = unlimited)")
 	flag.StringVar(&masterKey, "master-key", "", "Passphrase encrypting providers.json at rest (AES-256-GCM, scrypt-derived key). Falls back to YOAKELAND_MASTER_KEY if unset. Without either, providers.json is plaintext (0600 perms only).")
 	flag.Parse()
+
+	// State must never land in the working directory, which may be a project.
+	if stateDir == "" {
+		fmt.Fprintln(os.Stderr, "yoakeland: can't find your home directory for state; pass -state-dir")
+		os.Exit(2)
+	}
+	if abs, err := filepath.Abs(stateDir); err == nil {
+		stateDir = abs
+	}
 
 	initLogging(stateDir)
 
@@ -833,6 +844,9 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 }
 
 func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
+	if handleFileEnvelope(ipc, deps, env) {
+		return
+	}
 	switch env.Type {
 	case protocol.EventUserPrompt:
 		var data protocol.UserPromptData
@@ -949,7 +963,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
-		pc.Registry.Get(ipc, sessID).CancelTurn(tID)
+		ag := pc.Registry.Get(ipc, sessID)
+		if data.QueuedOnly {
+			ag.WithdrawTurn(tID)
+		} else {
+			ag.CancelTurn(tID)
+		}
 
 	case protocol.EventRegisterProvider:
 		var data protocol.RegisterProviderData
@@ -1373,6 +1392,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			history = state.History
 			branches = state.Branches
 			mode = state.Mode
+			if mode == "" {
+				// Empty means the default — say so, or a client keeps its
+				// locally seeded mode and shows one the server isn't using.
+				mode = string(agent.ModeReadWrite)
+			}
 		} else if ag := pc.Registry.Lookup(data.SessionID); ag != nil {
 			// Not prompted yet, so no file (set_mode doesn't create one) —
 			// the live mode is still the truth a client should adopt.
@@ -1685,10 +1709,16 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		summaries := make([]protocol.SnapshotSummary, 0, len(snaps))
 		for _, snap := range snaps {
+			files := make([]string, 0, len(snap.Files))
+			for rel := range snap.Files {
+				files = append(files, filepath.ToSlash(rel))
+			}
+			sort.Strings(files)
 			summaries = append(summaries, protocol.SnapshotSummary{
 				SnapshotID:  snap.ID,
 				Description: snap.Description,
 				CreatedAt:   snap.CreatedAt,
+				Files:       files,
 			})
 		}
 		_ = ipc.SendEvent(protocol.EventSnapshotList, env.SessionID, env.TurnID, "", protocol.SnapshotListData{

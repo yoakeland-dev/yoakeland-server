@@ -74,7 +74,7 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 	// isolation both apply to the agent-issued one-shot command — see
 	// buildCmd's doc comment for why SpawnPTY's interactive terminal gets
 	// neither.
-	cmd := s.buildCmd(execCtx, argv, true, false)
+	cmd := s.buildCmd(execCtx, argv, "", true, false)
 	cmd.Env = s.baseEnv(extraEnv, false)
 
 	var stdout, stderr bytes.Buffer
@@ -135,7 +135,10 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 // would — git clone, curl, npm install, ssh — network access is the
 // baseline expectation, not something to withhold by default the way it is
 // for an autonomous tool call.
-func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, newSession, allowNetwork bool) *exec.Cmd {
+func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, newSession, allowNetwork bool) *exec.Cmd {
+	if dir == "" {
+		dir = s.projectRoot
+	}
 	// Resolve bare executable names (e.g. "echo" -> "/usr/bin/echo")
 	execArgv := make([]string, len(argv))
 	copy(execArgv, argv)
@@ -178,7 +181,7 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, newSession, 
 			"--dev", "/dev",
 			"--tmpfs", "/tmp",
 			"--bind", s.projectRoot, s.projectRoot,
-			"--chdir", s.projectRoot,
+			"--chdir", dir,
 			"--unshare-pid",
 			"--unshare-ipc",
 			"--unshare-uts",
@@ -196,6 +199,10 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, newSession, 
 		)
 		if newSession {
 			bwrapArgs = append(bwrapArgs, "--new-session")
+		} else {
+			// The PTY path: the shell's --rcfile lives here, after the /tmp tmpfs above.
+			dir := ShellIntegrationDir()
+			bwrapArgs = append(bwrapArgs, "--ro-bind-try", dir, dir)
 		}
 		if !allowNetwork {
 			bwrapArgs = append(bwrapArgs, "--unshare-net")
@@ -205,13 +212,13 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, newSession, 
 		cmd = exec.CommandContext(ctx, "bwrap", bwrapArgs...)
 	} else if s.mode == ModeNamespace {
 		cmd = exec.CommandContext(ctx, execArgv[0], execArgv[1:]...)
-		cmd.Dir = s.projectRoot
+		cmd.Dir = dir
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC,
 		}
 	} else {
 		cmd = exec.CommandContext(ctx, execArgv[0], execArgv[1:]...)
-		cmd.Dir = s.projectRoot
+		cmd.Dir = dir
 	}
 
 	return cmd
@@ -238,12 +245,12 @@ func (s *LinuxSandbox) baseEnv(extraEnv []string, interactive bool) []string {
 // enclosing timeout (unlike Execute): ctx cancellation still tears the
 // process down (exec.CommandContext), but an interactive session is
 // expected to outlive any single request.
-func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, cols, rows int) (PTYSession, error) {
+func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmd := s.buildCmd(ctx, argv, false, true)
+	cmd := s.buildCmd(ctx, argv, dir, false, true)
 	cmd.Env = s.baseEnv(extraEnv, true)
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})

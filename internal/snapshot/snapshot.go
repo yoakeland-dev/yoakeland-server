@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/normalizer"
 )
 
 // ErrInvalidSnapshotID is returned when a snapshot id is not a plain basename
@@ -87,9 +89,16 @@ type SnapshotStore interface {
 	// once a turn has finished, cancelled or not, so the tracking map
 	// doesn't grow for the life of the process.
 	CloseTurn(turnID string)
+	// RestoreSnapshot returns every file captured by id or any later
+	// snapshot to its state right before id's turn, first capturing their
+	// current state as a new snapshot so the restore can itself be undone.
 	RestoreSnapshot(id string, projectRoot string) error
+	// ListSnapshots returns every snapshot, oldest first.
 	ListSnapshots() ([]*Snapshot, error)
 	GetSnapshot(id string) (*Snapshot, error)
+	// ReadBackup returns relPath's content as id captured it; existed is
+	// false when the file didn't exist before that turn.
+	ReadBackup(id, relPath string) (content []byte, existed bool, err error)
 }
 
 type DiskSnapshotStore struct {
@@ -118,7 +127,10 @@ func NewDiskSnapshotStore(dataDir string) (*DiskSnapshotStore, error) {
 func (s *DiskSnapshotStore) CapturePreMutation(turnID, description string, projectRoot string, absFilePaths ...string) (*Snapshot, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.captureLocked(turnID, description, projectRoot, absFilePaths...)
+}
 
+func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoot string, absFilePaths ...string) (*Snapshot, bool, error) {
 	snap, snapDir, isNewSnapshot, err := s.openOrCreateTurnSnapshot(turnID, description)
 	if err != nil {
 		return nil, false, err
@@ -251,29 +263,86 @@ func (s *DiskSnapshotStore) RestoreSnapshot(id string, projectRoot string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := validateSnapshotID(id); err != nil {
+	target, err := s.readManifest(id)
+	if err != nil {
 		return err
 	}
-	snapDir := filepath.Join(s.baseDir, id)
-	manifestPath := filepath.Join(snapDir, "manifest.json")
-	data, err := os.ReadFile(manifestPath)
+	all, err := s.listLocked()
 	if err != nil {
-		return fmt.Errorf("snapshot %s not found: %w", id, err)
+		return err
+	}
+	// Newest first, down to target: each file ends at the copy taken by the
+	// oldest snapshot (at or after target) that touched it, which is its
+	// state right before target's turn.
+	var apply []*Snapshot
+	affected := map[string]bool{}
+	for i := len(all) - 1; i >= 0; i-- {
+		if all[i].CreatedAt.Before(target.CreatedAt) {
+			break
+		}
+		apply = append(apply, all[i])
+		for rel := range all[i].Files {
+			affected[rel] = true
+		}
 	}
 
-	var snap Snapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return fmt.Errorf("corrupted snapshot manifest: %w", err)
+	norm, err := normalizer.New(projectRoot)
+	if err != nil {
+		return err
 	}
-
-	for relPath, state := range snap.Files {
-		targetPath, err := safeJoin(projectRoot, relPath)
+	paths := make([]string, 0, len(affected))
+	for rel := range affected {
+		p, err := restoreTarget(norm, rel)
 		if err != nil {
 			return err
 		}
+		paths = append(paths, p)
+	}
+	undoTurn := fmt.Sprintf("restore:%s:%d", id, time.Now().UnixNano())
+	_, _, err = s.captureLocked(undoTurn, "Before restoring to "+target.CreatedAt.Local().Format("Jan 2 15:04:05"), norm.ProjectRoot, paths...)
+	delete(s.openByTurn, undoTurn)
+	if err != nil {
+		return fmt.Errorf("saving an undo snapshot: %w", err)
+	}
+
+	for _, snap := range apply {
+		if err := s.applyLocked(snap, norm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// restoreTarget resolves rel's parent through symlinks and checks it's still
+// inside the project, so a link planted after capture can't redirect a
+// restore elsewhere. The last component isn't followed: a restore replaces
+// whatever sits there.
+func restoreTarget(norm *normalizer.Normalizer, rel string) (string, error) {
+	if _, err := safeJoin(norm.ProjectRoot, rel); err != nil {
+		return "", err
+	}
+	dir, err := norm.ResolveAndValidatePath(filepath.Dir(rel))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(rel)), nil
+}
+
+func (s *DiskSnapshotStore) applyLocked(snap *Snapshot, norm *normalizer.Normalizer) error {
+	snapDir := filepath.Join(s.baseDir, snap.ID)
+	for relPath, state := range snap.Files {
+		targetPath, err := restoreTarget(norm, relPath)
+		if err != nil {
+			return err
+		}
+		// Replace a symlink rather than write through it.
+		if fi, err := os.Lstat(targetPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(targetPath); err != nil {
+				return err
+			}
+		}
 
 		if !state.Existed {
-			// File was newly created after snapshot; remove it
 			if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("failed to remove newly created file %s: %w", relPath, err)
 			}
@@ -288,7 +357,6 @@ func (s *DiskSnapshotStore) RestoreSnapshot(id string, projectRoot string) error
 		if err != nil {
 			return fmt.Errorf("failed to read backup file %s: %w", backupFile, err)
 		}
-
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 			return err
 		}
@@ -296,14 +364,16 @@ func (s *DiskSnapshotStore) RestoreSnapshot(id string, projectRoot string) error
 			return fmt.Errorf("restoring file %s: %w", targetPath, err)
 		}
 	}
-
 	return nil
 }
 
 func (s *DiskSnapshotStore) ListSnapshots() ([]*Snapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.listLocked()
+}
 
+func (s *DiskSnapshotStore) listLocked() ([]*Snapshot, error) {
 	entries, err := os.ReadDir(s.baseDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -327,24 +397,49 @@ func (s *DiskSnapshotStore) ListSnapshots() ([]*Snapshot, error) {
 			snaps = append(snaps, &snap)
 		}
 	}
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].CreatedAt.Before(snaps[j].CreatedAt) })
 	return snaps, nil
 }
 
-func (s *DiskSnapshotStore) GetSnapshot(id string) (*Snapshot, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *DiskSnapshotStore) readManifest(id string) (*Snapshot, error) {
 	if err := validateSnapshotID(id); err != nil {
 		return nil, err
 	}
-	manifest := filepath.Join(s.baseDir, id, "manifest.json")
-	data, err := os.ReadFile(manifest)
+	data, err := os.ReadFile(filepath.Join(s.baseDir, id, "manifest.json"))
 	if err != nil {
 		return nil, fmt.Errorf("snapshot %s not found", id)
 	}
 	var snap Snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("corrupted snapshot manifest: %w", err)
 	}
 	return &snap, nil
+}
+
+func (s *DiskSnapshotStore) ReadBackup(id, relPath string) ([]byte, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap, err := s.readManifest(id)
+	if err != nil {
+		return nil, false, err
+	}
+	state, ok := snap.Files[filepath.FromSlash(relPath)]
+	if !ok {
+		return nil, false, fmt.Errorf("snapshot %s has no copy of %s", id, relPath)
+	}
+	if !state.Existed {
+		return nil, false, nil
+	}
+	backup, err := safeJoin(filepath.Join(s.baseDir, id), state.BackupRelLoc)
+	if err != nil {
+		return nil, false, err
+	}
+	content, err := os.ReadFile(backup)
+	return content, true, err
+}
+
+func (s *DiskSnapshotStore) GetSnapshot(id string) (*Snapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readManifest(id)
 }

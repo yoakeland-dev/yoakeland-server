@@ -89,6 +89,7 @@ const (
 	EventToolCallRequested        EventType = "tool_call_requested"
 	EventPermissionRequest        EventType = "permission_request"
 	EventToolResult               EventType = "tool_result"
+	EventTurnStarted              EventType = "turn_started"
 	EventTurnCompleted            EventType = "turn_completed"
 	EventSnapshotCapturing        EventType = "snapshot_capturing"
 	EventSnapshotCreated          EventType = "snapshot_created"
@@ -159,6 +160,22 @@ const (
 	// EventTerminalIndex is the server-wide terminal roster, pushed to every
 	// peer on connect and whenever a terminal starts, exits or closes.
 	EventTerminalIndex EventType = "terminal_index"
+
+	// Project files and diffs (§3.1 "Project files"). Each request's
+	// requestId is echoed on its reply.
+	EventListTree     EventType = "list_tree"
+	EventTreeList     EventType = "tree_list"
+	EventReadFile     EventType = "read_file"
+	EventFileContent  EventType = "file_content"
+	EventWriteFile    EventType = "write_file"
+	EventFileWritten  EventType = "file_written"
+	EventFsOp         EventType = "fs_op"
+	EventFsOpDone     EventType = "fs_op_done"
+	EventFilesChanged EventType = "files_changed"
+	EventListChanges  EventType = "list_git_changes"
+	EventGitChanges   EventType = "git_changes"
+	EventGetFileDiff  EventType = "get_file_diff"
+	EventFileDiff     EventType = "file_diff"
 )
 
 type Envelope struct {
@@ -598,6 +615,9 @@ type SnapshotSummary struct {
 	SnapshotID  string    `json:"snapshotId"`
 	Description string    `json:"description"`
 	CreatedAt   time.Time `json:"createdAt"`
+	// Files are the project-relative paths this snapshot holds a pre-turn
+	// copy (or recorded absence) of, forward-slash separated.
+	Files []string `json:"files"`
 }
 
 type SnapshotListData struct {
@@ -791,6 +811,116 @@ type ListFilesData struct {
 type FileListData struct {
 	ProjectPath string   `json:"projectPath"`
 	Files       []string `json:"files"`
+}
+
+// FileRequestData is list_tree/read_file/get_file_diff: Path is relative to
+// the project root, forward-slash separated ("" is the root itself).
+type FileRequestData struct {
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	Path        string `json:"path"`
+	// get_file_diff only: diff against this snapshot's copy instead of
+	// HEAD, or against HEAD's copy of BasePath (a rename's old path).
+	SnapshotID string `json:"snapshotId,omitempty"`
+	BasePath   string `json:"basePath,omitempty"`
+}
+
+type TreeEntry struct {
+	Name      string `json:"name"`
+	IsDir     bool   `json:"isDir"`
+	IsSymlink bool   `json:"isSymlink,omitempty"`
+	Size      int64  `json:"size,omitempty"`
+}
+
+type TreeListData struct {
+	RequestID   string      `json:"requestId,omitempty"`
+	ProjectPath string      `json:"projectPath"`
+	Path        string      `json:"path"`
+	Entries     []TreeEntry `json:"entries"`
+	Error       string      `json:"error,omitempty"`
+}
+
+// FileContentData answers read_file. Version identifies this content for
+// write_file's conflict check. Content is empty when Binary or TooLarge.
+type FileContentData struct {
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath"`
+	Path        string `json:"path"`
+	Content     string `json:"content"`
+	Version     string `json:"version,omitempty"`
+	Size        int64  `json:"size"`
+	Binary      bool   `json:"binary,omitempty"`
+	TooLarge    bool   `json:"tooLarge,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// WriteFileData saves a file. BaseVersion is the read_file Version the edit
+// started from ("" for a new file); a mismatch is a conflict, not a write.
+type WriteFileData struct {
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	Path        string `json:"path"`
+	Content     string `json:"content"`
+	BaseVersion string `json:"baseVersion"`
+	Force       bool   `json:"force,omitempty"`
+}
+
+type FileWrittenData struct {
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath"`
+	Path        string `json:"path"`
+	Version     string `json:"version,omitempty"`
+	Conflict    bool   `json:"conflict,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// FsOpData is one explorer action. Op is "create" (empty file), "mkdir",
+// "rename" (to NewPath) or "delete" (recursive for a folder).
+type FsOpData struct {
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	Op          string `json:"op"`
+	Path        string `json:"path"`
+	NewPath     string `json:"newPath,omitempty"`
+}
+
+type FsOpDoneData struct {
+	RequestID string `json:"requestId,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// FilesChangedData is pushed to every peer after write_file/fs_op, naming
+// the paths touched, so open explorers and editors can refresh.
+type FilesChangedData struct {
+	ProjectPath string   `json:"projectPath"`
+	Paths       []string `json:"paths"`
+}
+
+// GitChange is one path from `git status`. Index/Worktree are porcelain's
+// X/Y letters ("." unchanged, "?" untracked); Conflict marks an unmerged path.
+type GitChange struct {
+	Path     string `json:"path"`
+	OrigPath string `json:"origPath,omitempty"`
+	Index    string `json:"index"`
+	Worktree string `json:"worktree"`
+	Conflict bool   `json:"conflict,omitempty"`
+}
+
+type GitChangesData struct {
+	RequestID   string      `json:"requestId,omitempty"`
+	ProjectPath string      `json:"projectPath"`
+	Files       []GitChange `json:"files"`
+	Truncated   bool        `json:"truncated,omitempty"`
+	Error       string      `json:"error,omitempty"`
+}
+
+type FileDiffData struct {
+	RequestID   string         `json:"requestId,omitempty"`
+	ProjectPath string         `json:"projectPath"`
+	Path        string         `json:"path"`
+	Diff        *diff.FileDiff `json:"diff,omitempty"`
+	Binary      bool           `json:"binary,omitempty"`
+	Error       string         `json:"error,omitempty"`
 }
 
 // CLIAvailabilityData reports whether the `claude`/`codex` binaries are on
@@ -1107,7 +1237,12 @@ type SwitchBranchData struct {
 type CancelTurnData struct {
 	SessionID string `json:"sessionId,omitempty"`
 	TurnID    string `json:"turnId,omitempty"`
+	// QueuedOnly withdraws the turn only if it hasn't started yet (§3.1).
+	QueuedOnly bool `json:"queuedOnly,omitempty"`
 }
+
+// TurnStartedData is empty: the envelope's turnId is the whole message.
+type TurnStartedData struct{}
 
 type ModelDeltaData struct {
 	Content string `json:"content,omitempty"`

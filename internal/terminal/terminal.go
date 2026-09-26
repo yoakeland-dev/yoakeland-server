@@ -429,12 +429,14 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	argv := shellArgv()
 
 	t.mu.Lock()
-	cols, rows, env := t.cols, t.rows, t.env
+	cols, rows, env, cwd := t.cols, t.rows, t.env, t.cwd
 	t.mu.Unlock()
 
 	argv, env = applyShellIntegration(argv, env)
+	// Later entries win, so this overrides the sandbox's PWD (the project root).
+	env = append(env, "PWD="+cwd)
 
-	session, err := m.sb.SpawnPTY(ctx, argv, env, cols, rows)
+	session, err := m.sb.SpawnPTY(ctx, argv, env, cwd, cols, rows)
 	if err != nil {
 		t.mu.Lock()
 		t.status = protocol.TerminalStatusError

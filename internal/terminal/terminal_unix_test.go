@@ -5,6 +5,10 @@ package terminal_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -42,4 +46,41 @@ func TestManager_CloseSessionKillsTheShellProcess(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("shell process (pid %d) still alive after CloseSession", pid)
+}
+
+// TestManager_OpenStartsInRequestedCwd: terminal_open's cwd (the explorer's "Open terminal
+// here") is where the shell starts, not just what the snapshot reports.
+func TestManager_OpenStartsInRequestedCwd(t *testing.T) {
+	tempDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tempDir, "pkg", "api"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	norm, err := normalizer.New(tempDir)
+	if err != nil {
+		t.Fatalf("normalizer.New: %v", err)
+	}
+	mgr := terminal.NewManager(sandbox.NewSandbox(tempDir, 60*time.Second), norm)
+	out := &syncBuffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
+	if _, err := mgr.Open(context.Background(), ipc, "sess-1", "term-1", "pkg/api", 80, 24, nil); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer mgr.Close("sess-1", "term-1")
+
+	if err := mgr.Input("sess-1", "term-1", base64.StdEncoding.EncodeToString([]byte("echo CWD=$(pwd -P)=\n"))); err != nil {
+		t.Fatalf("Input: %v", err)
+	}
+	want := "CWD=" + filepath.Join(tempDir, "pkg", "api") + "="
+	if resolved, err := filepath.EvalSymlinks(filepath.Join(tempDir, "pkg", "api")); err == nil {
+		want = "CWD=" + resolved + "="
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var seen string
+	for time.Now().Before(deadline) {
+		if seen = decodedTerminalOutput(t, out.String()); strings.Contains(seen, want) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("shell didn't start in pkg/api: want %q in %q", want, seen)
 }

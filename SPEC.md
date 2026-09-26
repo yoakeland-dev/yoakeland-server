@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.16)
+# Yoakeland Backend IPC Specification (v2.17)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -206,6 +206,8 @@ Initiates a new conversational turn or prompt submission.
 }
 ```
 - **`attachments`** *(optional, v2.14)*: absolute paths **on the server's machine** that `file_read` may read for the rest of this session — even outside the project root, and anything beneath an attached directory. The model is told about them in a note appended to this message for the provider only; the stored message `content` stays exactly what the user typed, and `session_history` echoes them back as `attachments`. An `edit_message` keeps the edited message's attachments. Where they may point depends on the transport: over the unix socket (same OS user) any path is accepted — a local client should attach a file in place rather than copy it; over TCP each path must resolve (symlinks followed) inside the project root or the server's upload store, so a remote client attaches the `path` an upload returned (`upload_begin`, below). Anything else is rejected with `error` before the turn starts.
+- **File mentions** *(v2.17)*: `prompt` is plain text; a client writes `@path` (project-relative) to point at a file, and `@path#L10` or `@path#L10-20` for lines of it. The server doesn't rewrite these; native agents' system prompts explain the syntax (read the range with `file_read`'s `startLine`/`endLine`), and CLI agents like Claude Code already understand it.
+- **Sent mid-turn** *(v2.17)*: a session runs one turn at a time, so a `user_prompt` (or `edit_message`/`retry_message`) that arrives while one is running waits for it to end, then runs as its own turn. `turn_started` (§3.2) marks the moment it leaves the queue; until then it can be withdrawn with `cancel_turn` + `queuedOnly` (below), and it isn't in the session's history yet. A queued turn doesn't depend on the connection that sent it: it still runs if that connection drops, like any other turn, and shows up in `session_history` afterwards. This is how a client offers "steering": show the message as sent but queued, with an undo, and let it run when the current turn ends.
 - **`autoGenerateTitle`** *(optional, default the server's own setting — itself `true` unless changed via `set_auto_generate_title`)*: only meaningful on a session's first prompt (the one that leaves it with an empty title) — see "Auto-generated titles" under `set_session_title` below. Ignored on every later prompt in the same session, the same way `projectPath` is.
 
 #### `edit_message`
@@ -295,9 +297,11 @@ Immediately halts an ongoing turn.
 }
 ```
 *Effect*: Aborts the model's streaming HTTP connection, terminates any child processes executing inside the sandbox via `SIGKILL`, cancels outstanding permission waits, and emits `turn_completed` with `finishReason: "cancelled"`.
+- A turn still waiting in the queue (see "Sent mid-turn" under `user_prompt`) is cancelled too: it ends with `turn_completed` `"cancelled"`, no `userMessageId`, and never reaches history.
+- `queuedOnly` *(optional, v2.17)*: cancel only if the turn hasn't started yet; a running turn is left alone. Use it for an "undo send": if the undo loses the race, the client gets `turn_started` instead of a cancelled reply it didn't ask for.
 
 #### `restore_snapshot`
-Reverts the project filesystem to a previous snapshot state. Resolves its project the same way `user_prompt` does (§4b): `data.projectPath` if given, else whatever project the envelope's `sessionId` is already bound to.
+Reverts the project filesystem to how it was right before that snapshot's turn, undoably (see §6 "Restoring Snapshots"). Resolves its project the same way `user_prompt` does (§4b): `data.projectPath` if given, else whatever project the envelope's `sessionId` is already bound to.
 ```json
 {
   "type": "restore_snapshot",
@@ -423,11 +427,12 @@ Answers an outstanding `ask_user_question_requested` from the backend — the mo
 ```json
 {
   "type": "ask_user_answer",
+  "sessionId": "sess_1",
   "toolCallId": "call_abc123",
   "data": {"answer": "option b"}
 }
 ```
-- **Correlation**: `toolCallId` **must** match the `toolCallId` received in `ask_user_question_requested` — same rule as `permission_response`/`permission_request`.
+- **Correlation**: `toolCallId` **must** match the `toolCallId` received in `ask_user_question_requested` — same rule as `permission_response`/`permission_request`. `sessionId` is required too: it picks the session whose turn is waiting (omitted, the server falls back to `"default"` and the answer is lost).
 
 #### `openrouter_oauth_start`
 Begins an OpenRouter PKCE login (§6b). `name` is the provider name to register once it completes.
@@ -553,6 +558,21 @@ Enumerates every regular file under **one project**'s root, for client-side `@fi
 - Paths are relative to the project root, forward-slash separated, sorted. VCS/dependency/build directories (`.git`, `node_modules`, `target`, `dist`, `build`, `vendor`, `__pycache__`) and anything dot-prefixed are skipped, walking the live filesystem — not `.gitignore`-aware beyond that fixed list.
 - Capped at 20,000 files (silently truncated past that) to stay well under the 10MB line limit from §2 on a huge monorepo.
 - Response: `file_list`.
+
+#### Project files: `list_tree`, `read_file`, `write_file`, `fs_op`, `list_git_changes`, `get_file_diff` *(v2.17)*
+The explorer, editor and diff views. Every request takes `projectPath` (resolved like `list_files`) and an optional `requestId` echoed on its reply, so a client can await one specific answer. `path` is relative to the project root, forward-slash separated (`""` is the root). A path that resolves outside the project, symlinks included, is refused. Failures come back in the reply's `error` field rather than as an `error` envelope.
+
+```json
+{"type": "list_tree", "data": {"requestId": "r1", "projectPath": "/home/user/my-repo", "path": "src"}}
+```
+- `list_tree` → `tree_list`: one folder's entries, folders first, then case-insensitive by name. `.git` is hidden; everything else, dotfiles and ignored folders included, is listed. Capped at 5,000 entries.
+- `read_file` → `file_content`: the text plus a `version` to hand back to `write_file`. Files over 2MB come back with `tooLarge`, files with a NUL byte or invalid UTF-8 with `binary`; neither carries `content`.
+- `write_file` `{path, content, baseVersion, force?}` → `file_written`: saves atomically (temp file + rename, keeping an existing file's mode) and creates parent folders. `baseVersion` is the `version` the edit started from, `""` for a new file. If the file on disk has changed since (an agent or another peer wrote it), nothing is written and the reply has `conflict: true` with the current `version`; resend with `force: true` to overwrite anyway. Not snapshotted: snapshots are agent turns only.
+- `fs_op` `{op, path, newPath?}` → `fs_op_done`: `op` is `create` (empty file, fails if it exists), `mkdir`, `rename` (to `newPath`, fails if that exists) or `delete` (recursive for a folder). The entry itself isn't followed, so deleting or renaming a symlink acts on the link. The project root can't be renamed or deleted.
+- `list_git_changes` → `git_changes`: every changed path with both halves of its status, unlike `git_status`'s 50-file summary. Files inside untracked folders are listed individually. Capped at 5,000 (`truncated`). Outside a repository, `error` carries git's own message (`"… not a git repository …"`).
+- `get_file_diff` `{path, snapshotId?, basePath?}` → `file_diff`: the working copy against its HEAD copy (a missing side counts as empty), against HEAD's copy of `basePath` for a rename, or, with `snapshotId`, against that snapshot's pre-turn copy. Either side over 2MB is an error; a binary side returns `binary: true` and no diff.
+
+After a successful `write_file` or `fs_op` every peer, the sender included, receives `files_changed` (§3.2).
 
 #### `detect_cli`
 Checks whether each coding-agent CLI's binary is on `PATH` **on the machine running the backend** — relevant before offering a `cli_*` provider kind (§6b). Takes no data (`{}` is fine).
@@ -874,6 +894,13 @@ The result of executing a tool (after approval or if pre-approved by policy).
 
 *Note*: If the user denied permission, `data.error` contains `"permission denied by user or policy"` — or, if the `permission_response` carried non-empty `feedback` (§3.1), `"permission denied by user: <feedback>"` instead, so the model sees the reason in the same turn.
 
+#### `turn_started` *(v2.17)*
+A turn got the session's turn slot and is starting: sent for every turn (`user_prompt`, `edit_message`, `retry_message`), right before anything else about it. `data` is `{}`; `turnId` is the whole message.
+```json
+{"type": "turn_started", "sessionId": "session-main", "turnId": "turn-2", "data": {}}
+```
+*UI Action*: For a prompt sent mid-turn this is when it stops being queued: move it into the transcript and start its reply. From here it can only be stopped with a plain `cancel_turn`. A client can ignore it for turns it didn't queue.
+
 #### `turn_completed`
 Signifies that the iterative turn loop has ended.
 ```json
@@ -969,12 +996,12 @@ Response to `list_snapshots`.
   "type": "snapshot_list",
   "data": {
     "snapshots": [
-      {"snapshotId": "snap_1710950400000000", "description": "file_write on lib/main.dart", "createdAt": "2026-09-11T10:03:22Z"}
+      {"snapshotId": "snap_1710950400000000", "description": "file_write on lib/main.dart", "createdAt": "2026-09-11T10:03:22Z", "files": ["lib/main.dart"]}
     ]
   }
 }
 ```
-*UI Action*: Populate a restore-snapshot picker for the project you asked about — most-recent-first is a reasonable default sort (the backend doesn't guarantee an order). Pass the chosen `snapshotId` to `restore_snapshot` (§3.1).
+*UI Action*: Populate a restore-snapshot picker for the project you asked about. Snapshots come oldest first *(v2.17)*. `files` *(v2.17)* are the project-relative paths the snapshot holds a pre-turn copy of; `get_file_diff` with `snapshotId` shows what restoring would revert in each. Pass the chosen `snapshotId` to `restore_snapshot` (§3.1).
 
 #### `error`
 Reports operational or fatal backend errors.
@@ -1178,6 +1205,20 @@ Response to `list_files`.
 {"type": "file_list", "data": {"files": ["README.md", "src/main.go", "src/lib/util.go"]}}
 ```
 *UI Action*: Feed this into `@file` mention autocomplete — filter client-side as the user types, this event isn't re-sent per keystroke. Re-issue `list_files` yourself if you need a refresh (e.g. after the user creates a new file); the backend doesn't push updates on filesystem changes.
+
+#### `tree_list`, `file_content`, `file_written`, `fs_op_done`, `git_changes`, `file_diff` *(v2.17)*
+Replies to the project-file requests above; each echoes `requestId` and `projectPath`.
+```json
+{"type": "tree_list", "data": {"requestId": "r1", "projectPath": "/home/user/my-repo", "path": "src", "entries": [{"name": "lib", "isDir": true}, {"name": "main.ts", "isDir": false, "size": 812}]}}
+{"type": "file_content", "data": {"requestId": "r2", "projectPath": "…", "path": "src/main.ts", "content": "…", "version": "9f86d081884c7d65", "size": 812}}
+{"type": "file_written", "data": {"requestId": "r3", "projectPath": "…", "path": "src/main.ts", "version": "60303ae22b998861", "conflict": false}}
+{"type": "git_changes", "data": {"requestId": "r4", "projectPath": "…", "files": [{"path": "src/new.ts", "origPath": "src/old.ts", "index": "R", "worktree": "M"}, {"path": "notes.md", "index": "?", "worktree": "?"}]}}
+{"type": "file_diff", "data": {"requestId": "r5", "projectPath": "…", "path": "src/main.ts", "diff": {"filePath": "src/main.ts", "unified": "…", "hunks": []}}}
+```
+`tree_list` entries may carry `isSymlink`. `git_changes` uses porcelain's letters: `.` unchanged, `M`, `A`, `D`, `R`, `C`, `T`, `?` untracked; `conflict: true` marks an unmerged path.
+
+#### `files_changed` *(v2.17)*
+Pushed to every peer after a `write_file` or `fs_op`: `{"projectPath": "…", "paths": ["src/a.ts", "src/b.ts"]}`. A rename lists both paths. Agent edits don't send this; refresh open views on `tool_result`/`turn_completed`/`git_status`/`snapshot_restored` as well.
 
 #### `cli_availability`
 Response to `detect_cli`.
@@ -1586,7 +1627,7 @@ The backend keeps each project's persistent state in the server's own `-state-di
             └── data/           # Original pre-mutation byte copies
 ```
 
-The id is derived from the canonical path (the same canonical form `project_list` reports, §3.2), so it needs no registry: removing a project and adding it back finds its history again. A project that **moves** gets a new id; carry its history over by renaming its data dir to the new path's id. Each store recreates its folder on write, so deleting a data dir while the server runs loses that history but breaks nothing. Servers before v2.16 kept this in `<project>/.yoake/`; `scripts/migrate-project-state.py` moves it over once.
+The id is derived from the canonical path (the same canonical form `project_list` reports, §3.2), so it needs no registry: removing a project and adding it back finds its history again. A project that **moves** gets a new id; carry its history over by renaming its data dir to the new path's id. Each store recreates its folder on write, so deleting a data dir while the server runs loses that history but breaks nothing.
 
 Provider configs are **not** here — see §6c: they're server-level state, not project-level, and live in `-state-dir` instead.
 
@@ -1602,6 +1643,8 @@ The frontend can prompt the user to revert a turn by sending:
 }
 ```
 Because a snapshot covers the *entire* turn rather than a single mutation, one `restore_snapshot` call reverts everything that turn touched: every modified file goes back to its exact pre-turn state, and every file the turn created is removed — not just whichever single file happened to trigger that snapshot's creation.
+
+*(v2.17)* Restoring is **point in time**: it applies the chosen snapshot *and every later one*, newest first, so each file any of those turns touched ends up as it was right before the chosen turn — not only the files that one turn touched. Before changing anything it captures the current state of all those files as a new snapshot ("Before restoring to …"), so restoring that snapshot undoes the restore. Each target's parent directory is resolved through symlinks and must still be inside the project; a symlink sitting at the target itself is replaced, not written through.
 
 `snapshot_restored` (§3.2) is sent both to the requester and, via `peers.BroadcastEvent`, to every other live peer — this reverted real files on disk, so any other peer with this session open (its editor, diff view, or file tree) needs to know its view just went stale, the same reasoning as the settings-sync note above.
 
@@ -1878,6 +1921,7 @@ class YoakeBackend {
 - [ ] **Per-Person Tokens**: For a server more than one human connects to, build a "people with access" settings list around `register_token`/`list_tokens`/`remove_token` (§3.1) instead of sharing the one `-token`/`set_remote_password` secret — same local-socket-only restriction as above. Render `session_history`'s `author`/`authorAvatar` fields (§3.2) in a shared transcript, and know that a token-backed peer can't `set_peer_name` itself (its name is fixed at registration).
 - [ ] **Server Identity**: Show `server_identity` (§3.2, pushed on connect and on change) as the server's display name; let `set_server_identity` rename it from Settings.
 - [ ] **Modes**: Reflect `set_mode`/`mode_set` (§3.1/§3.2/§4c) in the composer UI — the restriction is enforced backend-side (the model literally isn't given the withheld tools), but the frontend still owns signaling the mode to the user.
+- [ ] **Steering**: Keep the composer usable while a turn runs. A prompt sent then waits server-side (§3.1 "Sent mid-turn"): show it as queued with an undo (`cancel_turn` + `queuedOnly`), move it into the transcript on `turn_started`, and put its text back in the composer if it comes back `cancelled` instead.
 - [ ] **Status bar**: Render `ping`'s `data.status` (rate limits per CLI provider, spend, budgets, queued turns), `git_status` per project, and keep a pending-asks list from `pending_asks` snapshots (replace, don't merge).
 - [ ] **Liveness**: Reply to unsolicited `ping` with `pong` (echoing `nonce`), and treat a connection that's gone quiet for a while as dead and worth reconnecting — see "Keeping a connection alive" in §2a.
 - [ ] **Local Connections**: For same-machine use, dial the always-on local unix socket (§2a) directly rather than spawning `yoakeland -stdio` as a subprocess or dialing `127.0.0.1` TCP — no token to manage, the OS enforces who can connect, and the daemon keeps running (and keeps other clients' sessions alive) independent of any one client's lifetime. Reserve `-stdio` for when a frontend genuinely wants to own the backend's whole process lifecycle itself; fall back to TCP+token only for remote/multi-device access.
