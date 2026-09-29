@@ -16,6 +16,7 @@ import (
 	"yoakeland/internal/permission"
 	"yoakeland/internal/projectstore"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/provider"
 	"yoakeland/internal/sandbox"
 	"yoakeland/internal/settings"
 	"yoakeland/internal/snapshot"
@@ -598,6 +599,7 @@ func (r *ProjectRegistry) Remove(root string) error {
 		for _, sessID := range boundSessions {
 			pc.Registry.Remove(sessID)
 			pc.Terminals.CloseSession(sessID)
+			provider.CloseNativeSessions(agent.NativeSessionKey(sessID, pc.Root))
 		}
 	}
 	r.mu.Lock()

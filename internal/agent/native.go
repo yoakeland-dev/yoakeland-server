@@ -93,8 +93,17 @@ type NativeTurn struct {
 	// and blocks until every one is answered; answers come back in order.
 	Questions func(ctx context.Context, qs []NativeQuestion) ([]string, error)
 
+	// SessionKey names the chat for a provider that keeps its CLI process alive
+	// between turns; "" means one process per turn.
+	SessionKey string
+
 	// SessionID is set by the provider once its native session id is known.
 	SessionID string
+}
+
+// NativeSessionKey names a chat to the providers that keep its CLI process alive.
+func NativeSessionKey(sessionID, projectRoot string) string {
+	return sessionID + "\x1f" + projectRoot
 }
 
 type nativeTurnKey struct{}
@@ -113,7 +122,7 @@ func NativeTurnFromContext(ctx context.Context) *NativeTurn {
 // newNativeTurn decides resume-vs-fresh from a.native and builds the prompt.
 // history already ends with the user message this turn answers.
 func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []Message) *NativeTurn {
-	nt := &NativeTurn{Mode: a.Mode()}
+	nt := &NativeTurn{Mode: a.Mode(), SessionKey: NativeSessionKey(sessionID, a.projectRoot)}
 	last := len(history) - 1
 	for last >= 0 && history[last].Role != "user" {
 		last--

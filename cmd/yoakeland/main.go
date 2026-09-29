@@ -297,6 +297,8 @@ const turnDrainTimeout = 5 * time.Second
 // whole conversation — the prompt included — since the save is the last thing
 // a turn does.
 func drainTurns(wg *sync.WaitGroup) {
+	// The CLI agents' processes are kept alive between turns; none outlives the server.
+	defer provider.CloseAllNativeSessions()
 	if wg == nil {
 		return
 	}
@@ -1742,6 +1744,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		pc.Registry.Remove(data.SessionID)
 		pc.Terminals.CloseSession(data.SessionID)
+		provider.CloseNativeSessions(agent.NativeSessionKey(data.SessionID, pc.Root))
 		if err := pc.SessStore.Delete(data.SessionID); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("failed to delete session: %v", err),

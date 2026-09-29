@@ -3,11 +3,14 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/protocol"
@@ -22,8 +25,9 @@ import (
 // The prompt goes in as one `user` line on stdin, which stays open so the
 // CLI's permission asks (`control_request` can_use_tool — the protocol the
 // Agent SDK's canUseTool callback rides on; `stdio` as the prompt tool is the
-// undocumented piece) can be answered on it. stdin is closed once `result`
-// arrives, which ends the process.
+// undocumented piece) can be answered on it. The process outlives the turn
+// (claudeSession) when the turn has a SessionKey; without one stdin is closed
+// once `result` arrives, which ends it.
 
 // claudePermissionMode maps yoakeland's mode onto Claude Code's own. read-only
 // has no exact equivalent; plan is Claude's read-only mode. Asks that still
@@ -80,6 +84,8 @@ type claudeLine struct {
 	ToolUseResult json.RawMessage `json:"tool_use_result"`
 	RequestID     string          `json:"request_id"`
 	Request       json.RawMessage `json:"request"`
+	Response      json.RawMessage `json:"response"`
+	UUID          string          `json:"uuid"`
 	RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 
 	// result
@@ -94,154 +100,388 @@ type claudeLine struct {
 	} `json:"usage"`
 }
 
-func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
-	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-		"--include-partial-messages", "--permission-prompt-tool", "stdio", "--permission-mode", claudePermissionMode(nt.Mode)}
-	if p.Model != "" {
-		args = append(args, "--model", p.Model)
+// claudeSession is one live `claude` process. Its reader hands each line to
+// the turn in progress and drops what arrives between turns.
+type claudeSession struct {
+	proc   *nativeProc
+	wmu    sync.Mutex
+	exited chan struct{}
+
+	mu       sync.Mutex
+	turn     *claudeTurn
+	id       string  // Claude's session id
+	model    string  // the model the process is on
+	permMode string  // and its permission mode
+	cost     float64 // total_cost_usd it has reported, which is cumulative over the process
+	nextReq  int
+	waiting  map[string]chan claudeLine // control requests we sent, by request_id
+}
+
+func (s *claudeSession) write(v any) { _ = writeJSONLine(s.proc.stdin, &s.wmu, v) }
+
+func (s *claudeSession) dead() bool {
+	select {
+	case <-s.exited:
+		return true
+	default:
+		return false
 	}
+}
+
+// close asks the process to leave by closing its stdin, and kills it if it stays.
+func (s *claudeSession) close() {
+	_ = s.proc.stdin.Close()
+	select {
+	case <-s.exited:
+	case <-time.After(3 * time.Second):
+		if s.proc.kill != nil {
+			s.proc.kill()
+		}
+	}
+}
+
+func (s *claudeSession) setTurn(t *claudeTurn) {
+	s.mu.Lock()
+	s.turn = t
+	s.mu.Unlock()
+}
+
+func (s *claudeSession) sessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.id
+}
+
+// request sends a control_request and waits for its control_response.
+func (s *claudeSession) request(ctx context.Context, subtype string, extra map[string]any) (claudeLine, error) {
+	ch := make(chan claudeLine, 1)
+	s.mu.Lock()
+	s.nextReq++
+	id := fmt.Sprintf("yk-%d", s.nextReq)
+	s.waiting[id] = ch
+	s.mu.Unlock()
+	req := map[string]any{"subtype": subtype}
+	for k, v := range extra {
+		req[k] = v
+	}
+	s.write(map[string]any{"type": "control_request", "request_id": id, "request": req})
+	select {
+	case r := <-ch:
+		return r, nil
+	case <-s.exited:
+		return claudeLine{}, fmt.Errorf("claude exited before answering %s", subtype)
+	case <-ctx.Done():
+		return claudeLine{}, ctx.Err()
+	}
+}
+
+func (s *claudeSession) read() {
+	for s.proc.lines.Scan() {
+		var ln claudeLine
+		if json.Unmarshal(s.proc.lines.Bytes(), &ln) != nil {
+			continue
+		}
+		s.mu.Lock()
+		if ln.SessionID != "" && s.id == "" {
+			s.id = ln.SessionID
+		}
+		t := s.turn
+		var waiter chan claudeLine
+		if ln.Type == "control_response" {
+			var r struct {
+				RequestID string `json:"request_id"`
+			}
+			_ = json.Unmarshal(ln.Response, &r)
+			waiter = s.waiting[r.RequestID]
+			delete(s.waiting, r.RequestID)
+		}
+		s.mu.Unlock()
+		switch {
+		case waiter != nil:
+			waiter <- ln
+		case t != nil:
+			t.handle(ln)
+		case ln.Type == "control_request":
+			// Nobody is here to ask (a background task outliving its turn): deny rather than leave it waiting.
+			s.write(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": ln.RequestID, "error": "no turn is running"}})
+		}
+	}
+	// No more output: as far as anyone is concerned it is gone. Reap it after.
+	close(s.exited)
+	_ = s.proc.wait()
+}
+
+// claudeTurn is what one turn has seen so far of the session's output.
+type claudeTurn struct {
+	p    *CLISubprocessProvider
+	s    *claudeSession
+	ctx  context.Context
+	nt   *agent.NativeTurn
+	emit func(agent.ModelStreamChunk)
+	done chan claudeLine // the result line
+	seen atomic.Bool     // the session has said something since the prompt went in
+
+	mu       sync.Mutex
+	names    map[string]string           // tool_use_id -> tool name
+	proposed map[string][]*diff.FileDiff // tool_use_id -> diff computed before it ran
+}
+
+func (t *claudeTurn) handle(ln claudeLine) {
+	t.seen.Store(true)
+	nt, emit := t.nt, t.emit
+	if ln.SessionID != "" && nt.SessionID == "" {
+		nt.SessionID = ln.SessionID
+	}
+	topLevel := ln.ParentToolUseID == nil || *ln.ParentToolUseID == ""
+	switch ln.Type {
+	case "stream_event":
+		if topLevel && ln.Event.Type == "content_block_delta" {
+			switch ln.Event.Delta.Type {
+			case "text_delta":
+				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: ln.Event.Delta.Text})
+			case "thinking_delta":
+				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkReasoning, Delta: ln.Event.Delta.Thinking})
+			}
+		}
+	case "assistant":
+		// Text already streamed as deltas; only the tool calls are new.
+		// A subagent's (Task) own calls carry the Task's id as parent.
+		for _, b := range ln.Message.Content {
+			if b.Type != "tool_use" {
+				continue
+			}
+			t.mu.Lock()
+			t.names[b.ID] = b.Name
+			t.proposed[b.ID] = claudeProposedDiffs(b.Name, b.Input)
+			t.mu.Unlock()
+			tc := claudeToolCall(b.ID, b.Name, b.Input)
+			if !topLevel {
+				tc.ParentToolCallID = *ln.ParentToolUseID
+			}
+			emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+		}
+	case "user":
+		for _, b := range ln.Message.Content {
+			if b.Type != "tool_result" {
+				continue
+			}
+			t.mu.Lock()
+			name, diffs := t.names[b.ToolUseID], t.proposed[b.ToolUseID]
+			t.mu.Unlock()
+			if d := claudeResultDiffs(ln.ToolUseResult); d != nil {
+				diffs = d
+			}
+			r := &agent.NativeToolResult{ToolCallID: b.ToolUseID, Name: name, Diffs: diffs}
+			if !topLevel {
+				r.ParentToolCallID = *ln.ParentToolUseID
+			}
+			if text := claudeResultText(b.Content); b.IsError {
+				r.Error = text
+			} else {
+				r.Output = text
+			}
+			emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: r})
+		}
+	case "control_request":
+		id, req := ln.RequestID, ln.Request
+		go func() { t.s.write(t.p.claudeControl(t.ctx, nt, id, req)) }()
+	case "rate_limit_event":
+		t.p.reportRateLimits(parseClaudeRateLimits(ln.RateLimitInfo))
+	case "result":
+		select {
+		case t.done <- ln:
+		default:
+		}
+	}
+}
+
+// claudeLaunch is what the process is started with. Everything here but the
+// model and the permission mode is a launch argument, so a change to it
+// restarts the process (resuming the chat); those two are switched in session.
+type claudeLaunch struct {
+	effort   string
+	settings string // --settings JSON, "" for none
+	permMode string
+}
+
+func (p *CLISubprocessProvider) claudeLaunch(nt *agent.NativeTurn) claudeLaunch {
 	// Ultracode is a Claude Code setting on top of xhigh, not an effort level of its own.
 	effort, settings := p.effort, map[string]any{}
 	if effort == "ultracode" {
 		effort, settings["ultracode"] = "xhigh", true
 	}
-	if effort != "" {
-		args = append(args, "--effort", effort)
-	}
 	if p.fast {
 		settings["fastMode"] = true
-	}
-	if nt.ResumeID != "" {
-		args = append(args, "--resume", nt.ResumeID)
 	}
 	if nt.Mode == agent.ModeAutonomous {
 		_ = json.Unmarshal([]byte(claudeAutonomousSandbox), &settings)
 	}
+	l := claudeLaunch{effort: effort, permMode: claudePermissionMode(nt.Mode)}
 	if len(settings) > 0 {
 		raw, _ := json.Marshal(settings)
-		args = append(args, "--settings", string(raw))
+		l.settings = string(raw)
 	}
-	proc, err := p.start()(ctx, "claude", args, p.Dir)
+	return l
+}
+
+func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch) (*claudeSession, error) {
+	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+		"--include-partial-messages", "--permission-prompt-tool", "stdio", "--permission-mode", l.permMode}
+	if p.Model != "" {
+		args = append(args, "--model", p.Model)
+	}
+	if l.effort != "" {
+		args = append(args, "--effort", l.effort)
+	}
+	if nt.ResumeID != "" {
+		args = append(args, "--resume", nt.ResumeID)
+	}
+	if l.settings != "" {
+		args = append(args, "--settings", l.settings)
+	}
+	// The process outlives the turn that started it, so it isn't bound to the turn's context.
+	proc, err := p.start()(context.Background(), "claude", args, p.Dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var wmu sync.Mutex
-	write := func(v any) { _ = writeJSONLine(proc.stdin, &wmu, v) }
+	s := &claudeSession{proc: proc, exited: make(chan struct{}), id: nt.ResumeID, model: p.Model, permMode: l.permMode, waiting: map[string]chan claudeLine{}}
+	go s.read()
 	// Headless Claude Code omits thinking text on Sonnet/Opus 4.7+ unless asked;
 	// a CLI that predates the request just answers with an error we ignore.
-	write(map[string]any{
+	s.write(map[string]any{
 		"type": "control_request", "request_id": "thinking-display",
 		"request": map[string]any{"subtype": "set_max_thinking_tokens", "thinking_display": "summarized"},
 	})
-	write(map[string]any{
+	return s, nil
+}
+
+// errStaleSession: a process kept from an earlier turn had died before it
+// answered anything, so the turn can be sent again to a new one.
+var errStaleSession = errors.New("the agent process had already exited")
+
+func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
+	err := p.runClaudeOnce(ctx, nt, emit)
+	if errors.Is(err, errStaleSession) {
+		err = p.runClaudeOnce(ctx, nt, emit)
+	}
+	return err
+}
+
+func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
+	l := p.claudeLaunch(nt)
+	sig := strings.Join([]string{p.Dir, l.effort, l.settings}, "\x00")
+	usable := func(ns nativeSession) bool {
+		cs := ns.(*claudeSession)
+		cs.mu.Lock()
+		defer cs.mu.Unlock()
+		// A live process can't start a different conversation, or fall back to the default model.
+		return cs.id == nt.ResumeID && (p.Model != "" || cs.model == "")
+	}
+	ns, reused, release, err := acquireSession(nt, CLIKindClaude, sig, usable, func() (nativeSession, error) { return p.startClaude(nt, l) })
+	if err != nil {
+		return err
+	}
+	defer release()
+	s := ns.(*claudeSession)
+
+	t := &claudeTurn{p: p, s: s, ctx: ctx, nt: nt, emit: emit, done: make(chan claudeLine, 1),
+		names: map[string]string{}, proposed: map[string][]*diff.FileDiff{}}
+	s.setTurn(t)
+	defer s.setTurn(nil)
+
+	s.mu.Lock()
+	changeModel, changeMode := p.Model != s.model, l.permMode != s.permMode
+	s.mu.Unlock()
+	if changeModel {
+		if r, err := s.request(ctx, "set_model", map[string]any{"model": p.Model}); err != nil {
+			return err
+		} else if e := controlError(r); e != "" {
+			return fmt.Errorf("claude: %s", e)
+		}
+		s.mu.Lock()
+		s.model = p.Model
+		s.mu.Unlock()
+	}
+	if changeMode {
+		if r, err := s.request(ctx, "set_permission_mode", map[string]any{"mode": l.permMode}); err != nil {
+			return err
+		} else if e := controlError(r); e != "" {
+			return fmt.Errorf("claude: %s", e)
+		}
+		s.mu.Lock()
+		s.permMode = l.permMode
+		s.mu.Unlock()
+	}
+
+	s.write(map[string]any{
 		"type":               "user",
 		"message":            map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": nt.Prompt}}},
 		"parent_tool_use_id": nil,
 	})
 
-	var (
-		names    = map[string]string{}           // tool_use_id -> tool name
-		proposed = map[string][]*diff.FileDiff{} // tool_use_id -> diff computed before it ran
-		res      *claudeLine
-		mu       sync.Mutex
-	)
-	for proc.lines.Scan() {
-		var ln claudeLine
-		if json.Unmarshal(proc.lines.Bytes(), &ln) != nil {
-			continue
-		}
-		if ln.SessionID != "" && nt.SessionID == "" {
-			nt.SessionID = ln.SessionID
-		}
-		topLevel := ln.ParentToolUseID == nil || *ln.ParentToolUseID == ""
-		switch ln.Type {
-		case "stream_event":
-			if topLevel && ln.Event.Type == "content_block_delta" {
-				switch ln.Event.Delta.Type {
-				case "text_delta":
-					emit(agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: ln.Event.Delta.Text})
-				case "thinking_delta":
-					emit(agent.ModelStreamChunk{Kind: agent.StreamChunkReasoning, Delta: ln.Event.Delta.Thinking})
-				}
+	var res claudeLine
+	select {
+	case res = <-t.done:
+	case <-s.exited:
+		// It may have said its piece and then left, which leaves both ready.
+		select {
+		case res = <-t.done:
+		default:
+			if reused && !t.seen.Load() {
+				return errStaleSession
 			}
-		case "assistant":
-			// Text already streamed as deltas; only the tool calls are new.
-			// A subagent's (Task) own calls carry the Task's id as parent.
-			for _, b := range ln.Message.Content {
-				if b.Type != "tool_use" {
-					continue
-				}
-				mu.Lock()
-				names[b.ID] = b.Name
-				d := claudeProposedDiffs(b.Name, b.Input)
-				proposed[b.ID] = d
-				mu.Unlock()
-				tc := claudeToolCall(b.ID, b.Name, b.Input)
-				if !topLevel {
-					tc.ParentToolCallID = *ln.ParentToolUseID
-				}
-				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+			msg := "claude exited without a result"
+			if tail := s.proc.stderr(); tail != "" {
+				msg += ": " + lastLines(tail, 5)
 			}
-		case "user":
-			for _, b := range ln.Message.Content {
-				if b.Type != "tool_result" {
-					continue
-				}
-				mu.Lock()
-				name, diffs := names[b.ToolUseID], proposed[b.ToolUseID]
-				mu.Unlock()
-				if d := claudeResultDiffs(ln.ToolUseResult); d != nil {
-					diffs = d
-				}
-				r := &agent.NativeToolResult{ToolCallID: b.ToolUseID, Name: name, Diffs: diffs}
-				if !topLevel {
-					r.ParentToolCallID = *ln.ParentToolUseID
-				}
-				if text := claudeResultText(b.Content); b.IsError {
-					r.Error = text
-				} else {
-					r.Output = text
-				}
-				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: r})
-			}
-		case "control_request":
-			id, req := ln.RequestID, ln.Request
-			go func() { write(p.claudeControl(ctx, nt, id, req)) }()
-		case "rate_limit_event":
-			p.reportRateLimits(parseClaudeRateLimits(ln.RateLimitInfo))
-		case "result":
-			l := ln
-			res = &l
-			_ = proc.stdin.Close()
+			return fmt.Errorf("%s", msg)
 		}
-	}
-	_ = proc.stdin.Close()
-	waitErr := proc.wait()
-	if ctx.Err() != nil {
+	case <-ctx.Done():
+		// Stop the turn, not the process: an interrupt ends it with a result and
+		// the session stays usable. A process that ignores it is killed.
+		s.write(map[string]any{"type": "control_request", "request_id": "yk-interrupt", "request": map[string]any{"subtype": "interrupt"}})
+		select {
+		case <-t.done:
+		case <-s.exited:
+		case <-time.After(5 * time.Second):
+			s.close()
+		}
 		return ctx.Err()
 	}
-	if res == nil {
-		msg := "claude exited without a result"
-		if tail := proc.stderr(); tail != "" {
-			msg += ": " + lastLines(tail, 5)
-		} else if waitErr != nil {
-			msg += ": " + waitErr.Error()
-		}
-		return fmt.Errorf("%s", msg)
+
+	// total_cost_usd is the process's running total; usage is this turn's.
+	s.mu.Lock()
+	cost := res.TotalCostUSD - s.cost
+	if cost < 0 {
+		cost = res.TotalCostUSD
 	}
+	s.cost = res.TotalCostUSD
+	s.mu.Unlock()
 	input := res.Usage.InputTokens + res.Usage.CacheCreationInputTokens + res.Usage.CacheReadInputTokens
 	emit(agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{
 		InputTokens:       input,
 		OutputTokens:      res.Usage.OutputTokens,
 		TotalTokens:       input + res.Usage.OutputTokens,
 		CachedInputTokens: res.Usage.CacheReadInputTokens,
-		CostUSD:           res.TotalCostUSD,
+		CostUSD:           cost,
 		CostKnown:         true,
 	}})
 	if res.IsError {
 		return fmt.Errorf("claude: %s", strings.TrimSpace(res.Result))
 	}
 	return nil
+}
+
+// controlError is the message of a control_response that failed, else "".
+func controlError(ln claudeLine) string {
+	var r struct {
+		Subtype string `json:"subtype"`
+		Error   string `json:"error"`
+	}
+	if json.Unmarshal(ln.Response, &r) == nil && r.Subtype == "error" {
+		return r.Error
+	}
+	return ""
 }
 
 // claudeControl answers one control_request: can_use_tool becomes a

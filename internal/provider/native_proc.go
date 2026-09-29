@@ -20,6 +20,7 @@ type nativeProc struct {
 	lines  *bufio.Scanner
 	stderr func() string
 	wait   func() error
+	kill   func() // nil when the process can't be killed (a test fake)
 }
 
 // procStarter starts a CLI agent. Tests substitute one that wires the
@@ -44,7 +45,7 @@ func startProc(ctx context.Context, name string, args []string, dir string) (*na
 	}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 64*1024), protocol.MaxFrameSize)
-	return &nativeProc{stdin: stdin, lines: sc, stderr: errBuf.String, wait: cmd.Wait}, nil
+	return &nativeProc{stdin: stdin, lines: sc, stderr: errBuf.String, wait: cmd.Wait, kill: func() { _ = cmd.Process.Kill() }}, nil
 }
 
 // tailBuffer keeps the last 4 KiB written to it.
