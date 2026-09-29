@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+
+	"yoakeland/internal/normalizer"
 )
 
 type LinuxSandbox struct {
@@ -130,11 +132,14 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 //
 // Execute always passes allowNetwork=false (bwrap's --unshare-net) — a
 // deliberate boundary on what an agent-issued command can reach unprompted.
-// SpawnPTY always passes allowNetwork=true: this is the human's own
-// terminal, opened on purpose, meant to run anything a normal terminal
-// would — git clone, curl, npm install, ssh — network access is the
-// baseline expectation, not something to withhold by default the way it is
-// for an autonomous tool call.
+// SpawnPTY passes its caller's choice: true for a human's own terminal,
+// opened on purpose, meant to run anything a normal terminal would — git
+// clone, curl, npm install, ssh. An agent's terminal gets the network only
+// while the project's web tools are on (terminal.Manager.SetAgentNetwork):
+// otherwise terminal_start would quietly undo Execute's --unshare-net. The
+// same trade-off Codex makes with workspace-write's network_access switch —
+// off also means a dev server the agent starts can't be reached from the
+// host, since it listens inside its own network namespace.
 func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, newSession, allowNetwork bool) *exec.Cmd {
 	if dir == "" {
 		dir = s.projectRoot
@@ -181,6 +186,31 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, 
 			"--dev", "/dev",
 			"--tmpfs", "/tmp",
 			"--bind", s.projectRoot, s.projectRoot,
+		)
+		// Git runs these as code whenever it runs outside the sandbox
+		// (yoakeland's own git status, the user's commits), so the sandbox
+		// may write the project but not them. Must follow the bind above.
+		// Submodules keep theirs under .git/modules/<name>/ (git status
+		// recurses into them). ponytail: a .git created mid-command, and
+		// submodules named with a slash or nested (.git/modules/a/b/,
+		// .git/modules/a/modules/b/), stay writable; hostGit disables
+		// fsmonitor/hooks for those.
+		gitPaths := []string{".git/config", ".git/hooks"}
+		if mods, err := os.ReadDir(filepath.Join(s.projectRoot, ".git", "modules")); err == nil {
+			for _, m := range mods {
+				gitPaths = append(gitPaths, filepath.Join(".git", "modules", m.Name(), "config"), filepath.Join(".git", "modules", m.Name(), "hooks"))
+			}
+		}
+		for _, p := range gitPaths {
+			p = filepath.Join(s.projectRoot, p)
+			bwrapArgs = append(bwrapArgs, "--ro-bind-try", p, p)
+		}
+		// yoakeland's own state (tokens, CA key, provider keys) when the
+		// project contains it, e.g. a project opened at $HOME.
+		for _, h := range normalizer.HiddenIn(s.projectRoot) {
+			bwrapArgs = append(bwrapArgs, "--tmpfs", h)
+		}
+		bwrapArgs = append(bwrapArgs,
 			"--chdir", dir,
 			"--unshare-pid",
 			"--unshare-ipc",
@@ -201,8 +231,9 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, 
 			bwrapArgs = append(bwrapArgs, "--new-session")
 		} else {
 			// The PTY path: the shell's --rcfile lives here, after the /tmp tmpfs above.
-			dir := ShellIntegrationDir()
-			bwrapArgs = append(bwrapArgs, "--ro-bind-try", dir, dir)
+			if dir := ShellIntegrationDir(); dir != "" {
+				bwrapArgs = append(bwrapArgs, "--ro-bind-try", dir, dir)
+			}
 		}
 		if !allowNetwork {
 			bwrapArgs = append(bwrapArgs, "--unshare-net")
@@ -245,12 +276,12 @@ func (s *LinuxSandbox) baseEnv(extraEnv []string, interactive bool) []string {
 // enclosing timeout (unlike Execute): ctx cancellation still tears the
 // process down (exec.CommandContext), but an interactive session is
 // expected to outlive any single request.
-func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error) {
+func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int, allowNetwork bool) (PTYSession, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmd := s.buildCmd(ctx, argv, dir, false, true)
+	cmd := s.buildCmd(ctx, argv, dir, false, allowNetwork)
 	cmd.Env = s.baseEnv(extraEnv, true)
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})

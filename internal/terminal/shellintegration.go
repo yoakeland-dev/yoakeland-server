@@ -2,6 +2,7 @@ package terminal
 
 import (
 	_ "embed"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -43,8 +44,8 @@ var integrationScriptErr error
 func integrationDir() (string, error) {
 	writeIntegrationScriptsOnce.Do(func() {
 		dir := sandbox.ShellIntegrationDir()
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			integrationScriptErr = err
+		if dir == "" {
+			integrationScriptErr = errors.New("no private temp dir for shell integration")
 			return
 		}
 		files := map[string][]byte{

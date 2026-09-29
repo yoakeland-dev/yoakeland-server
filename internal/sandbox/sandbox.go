@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"sync"
 )
 
 type SandboxMode string
@@ -61,8 +61,11 @@ type Sandbox interface {
 	// Unlike Execute, ctx is not given a deadline internally — the session
 	// runs until the process exits or the caller cancels ctx/Close()s it.
 	// dir is where it starts, already validated to be inside the project
-	// root; "" means the root itself.
-	SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error)
+	// root; "" means the root itself. allowNetwork is true for a human's
+	// terminal and follows the project's web-tools switch for an agent's
+	// (see terminal.Manager.SetAgentNetwork); tiers that can't cut the
+	// network (Windows, the unconfined fallback) ignore it.
+	SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int, allowNetwork bool) (PTYSession, error)
 }
 
 // Helper to determine if an executable is in $PATH
@@ -73,7 +76,13 @@ func commandExists(cmd string) bool {
 
 // ShellIntegrationDir is where the terminal package writes its shell rc scripts. It lives under
 // the host's temp dir, which bubblewrap hides behind a fresh tmpfs, so SpawnPTY binds this one
-// directory back in read-only.
-func ShellIntegrationDir() string {
-	return filepath.Join(os.TempDir(), "yoakeland-shell-integration")
-}
+// directory back in read-only. A fixed name in a shared /tmp would let another local user create
+// it first and swap in their own rc file, so it's a private (0700), randomly named directory made
+// once per process; "" if that fails, which just means no shell integration.
+var ShellIntegrationDir = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "yoakeland-shell-integration-*")
+	if err != nil {
+		return ""
+	}
+	return dir
+})

@@ -98,15 +98,14 @@ func (s *DarwinSandbox) Execute(ctx context.Context, argv []string, extraEnv []s
 // SpawnPTY starts argv attached to a pty under this sandbox's tier.
 // creack/pty has real Darwin support (unlike its Windows stub — see
 // sandbox_windows.go), so this reuses the same pty.StartWithSize path Linux
-// does. allowNetwork=true: this is the human's own terminal — see
-// sandbox_linux.go's buildCmd doc comment for the full reasoning, identical
-// here.
-func (s *DarwinSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int) (PTYSession, error) {
+// does. allowNetwork: see sandbox_linux.go's buildCmd doc comment for the
+// full reasoning, identical here.
+func (s *DarwinSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []string, dir string, cols, rows int, allowNetwork bool) (PTYSession, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmd := s.buildCmd(ctx, argv, true)
+	cmd := s.buildCmd(ctx, argv, allowNetwork)
 	if dir != "" {
 		cmd.Dir = dir
 	}

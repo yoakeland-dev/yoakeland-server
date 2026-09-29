@@ -73,6 +73,23 @@ type Terminal struct {
 	exitCode *int
 	label    string
 
+	// name/agent: set when the agent opened this tab (Start); see
+	// protocol.TerminalSummary.
+	name  string
+	agent bool
+	// written counts every byte ever output, so history[0] sits at offset
+	// written-len(history); readAt is the agent's read cursor on that scale
+	// (see Read).
+	written uint64
+	readAt  uint64
+	// From the shell integration's OSC 633 marks (see scanMarks): ready once
+	// a prompt was drawn, busy between a command's C and D, finished counts
+	// commands that ended (D after C), lastExit is the latest one's code.
+	ready    bool
+	busy     bool
+	finished int
+	lastExit *int
+
 	session sandbox.PTYSession
 
 	history  []byte
@@ -139,6 +156,9 @@ func (t *Terminal) attachLocked(stream *protocol.IPCStream, sandboxTier string) 
 // dropOutputSubscriber — restarts) the goroutine that delivers this
 // connection's terminal_output events. Callers hold t.mu.
 func (t *Terminal) addOutputSubscriberLocked(stream *protocol.IPCStream) {
+	if stream == nil { // opened by the agent, nobody watching yet
+		return
+	}
 	if _, exists := t.subs[stream]; exists {
 		return
 	}
@@ -217,6 +237,8 @@ func (t *Terminal) snapshotLocked(sandboxTier string) *protocol.TerminalSnapshot
 		ExitCode:    exitCode,
 		Label:       t.label,
 		SandboxTier: sandboxTier,
+		Name:        t.name,
+		Agent:       t.agent,
 	}
 }
 
@@ -263,6 +285,8 @@ func (t *Terminal) appendOutput(chunk []byte) {
 	data := append([]byte(nil), chunk...)
 
 	t.mu.Lock()
+	t.written += uint64(len(data))
+	t.scanMarks(data)
 	t.history = append(t.history, data...)
 	if len(t.history) > historyLimit {
 		t.history = t.history[len(t.history)-historyLimit:]
@@ -307,7 +331,17 @@ type Manager struct {
 	sandboxTier string
 
 	onChange atomic.Pointer[func()]
+
+	// agentNetwork gates network access for agent-opened terminals only.
+	agentNetwork atomic.Bool
 }
+
+// SetAgentNetwork sets whether terminals the agent opens (terminal_start)
+// get network access — the project's web-tools switch, so turning web tools
+// off really takes the agent offline instead of leaving terminal_start as a
+// way around bash's network isolation. Human terminals always have it.
+// Applies to terminals spawned from now on.
+func (m *Manager) SetAgentNetwork(enabled bool) { m.agentNetwork.Store(enabled) }
 
 // SetOnChange registers fn to run (with no Manager or Terminal lock held)
 // whenever a terminal starts, exits or closes.
@@ -339,6 +373,12 @@ func NewManager(sb sandbox.Sandbox, norm *normalizer.Normalizer) *Manager {
 // exits, an explicit terminal_close, or the owning chat is deleted (see
 // CloseSession).
 func (m *Manager) Open(ctx context.Context, stream *protocol.IPCStream, sessionID, id, cwdRel string, cols, rows int, env map[string]string) (*protocol.TerminalSnapshotData, error) {
+	return m.open(ctx, stream, sessionID, id, cwdRel, cols, rows, env, "")
+}
+
+// open is Open plus the agent's tab name; a non-empty name marks the tab as
+// the agent's, and a nil stream opens it with nobody attached.
+func (m *Manager) open(ctx context.Context, stream *protocol.IPCStream, sessionID, id, cwdRel string, cols, rows int, env map[string]string, name string) (*protocol.TerminalSnapshotData, error) {
 	if sessionID == "" {
 		return nil, fmt.Errorf("terminal requires a sessionId")
 	}
@@ -374,6 +414,8 @@ func (m *Manager) Open(ctx context.Context, stream *protocol.IPCStream, sessionI
 		env:       extraEnv,
 		status:    protocol.TerminalStatusStarting,
 		streams:   protocol.NewStreamSet(),
+		name:      name,
+		agent:     name != "",
 	}
 	if m.terminals[sessionID] == nil {
 		m.terminals[sessionID] = make(map[string]*Terminal)
@@ -429,14 +471,15 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	argv := shellArgv()
 
 	t.mu.Lock()
-	cols, rows, env, cwd := t.cols, t.rows, t.env, t.cwd
+	cols, rows, env, cwd, agent := t.cols, t.rows, t.env, t.cwd, t.agent
 	t.mu.Unlock()
+	network := !agent || m.agentNetwork.Load()
 
 	argv, env = applyShellIntegration(argv, env)
 	// Later entries win, so this overrides the sandbox's PWD (the project root).
 	env = append(env, "PWD="+cwd)
 
-	session, err := m.sb.SpawnPTY(ctx, argv, env, cwd, cols, rows)
+	session, err := m.sb.SpawnPTY(ctx, argv, env, cwd, cols, rows, network)
 	if err != nil {
 		t.mu.Lock()
 		t.status = protocol.TerminalStatusError
@@ -451,6 +494,7 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	t.status = protocol.TerminalStatusRunning
 	t.exitCode = nil
 	t.label = filepath.Base(argv[0])
+	t.ready, t.busy = false, false
 	t.mu.Unlock()
 
 	go func() {
@@ -471,7 +515,11 @@ func (m *Manager) Input(sessionID, id, dataB64 string) error {
 	if err != nil {
 		return fmt.Errorf("invalid base64 input: %w", err)
 	}
+	return m.Write(sessionID, id, raw)
+}
 
+// Write types raw bytes into id's shell.
+func (m *Manager) Write(sessionID, id string, raw []byte) error {
 	t, ok := m.get(sessionID, id)
 	if !ok {
 		return fmt.Errorf("terminal %q not found", id)
@@ -485,7 +533,7 @@ func (m *Manager) Input(sessionID, id, dataB64 string) error {
 		return fmt.Errorf("terminal %q is not running", id)
 	}
 
-	_, err = session.Write(raw)
+	_, err := session.Write(raw)
 	return err
 }
 
@@ -602,6 +650,8 @@ func summarize(terminals []*Terminal) []protocol.TerminalSummary {
 			Label:      t.label,
 			ExitCode:   t.exitCode,
 			SessionID:  t.sessionID,
+			Name:       t.name,
+			Agent:      t.agent,
 		})
 		t.mu.Unlock()
 	}
