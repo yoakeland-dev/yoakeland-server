@@ -24,6 +24,9 @@ const (
 	CLIKindGemini   CLIKind = "gemini"
 	CLIKindGrok     CLIKind = "grok"
 	CLIKindDeepSeek CLIKind = "deepseek"
+	CLIKindAmp      CLIKind = "amp"
+	CLIKindPi       CLIKind = "pi"
+	CLIKindOhMyPi   CLIKind = "ohmypi"
 )
 
 // cliSpec is how to launch one CLI and which wire protocol it speaks:
@@ -32,7 +35,7 @@ const (
 type cliSpec struct {
 	Binary   string
 	Args     []string // ACP agents only; claude/codex build their own
-	Protocol string   // "claude" | "codex" | "acp"
+	Protocol string   // "claude" | "codex" | "acp" | "amp" | "pi"
 	// NoSteer: the agent allows one prompt at a time, so a message typed while
 	// it works can't go into the turn.
 	NoSteer bool
@@ -49,11 +52,14 @@ var cliSpecs = map[CLIKind]cliSpec{
 	CLIKindGemini:   {Binary: "gemini", Args: []string{"--acp"}, Protocol: "acp"},
 	CLIKindGrok:     {Binary: "grok", Args: []string{"agent", "stdio"}, Protocol: "acp"},
 	CLIKindDeepSeek: {Binary: "dsh", Args: []string{"--profile", "acp"}, Protocol: "acp"},
+	CLIKindAmp:      {Binary: "amp", Protocol: "amp"},
+	CLIKindPi:       {Binary: "pi", Protocol: "pi"},
+	CLIKindOhMyPi:   {Binary: "omp", Protocol: "pi"},
 }
 
 // CLIKinds lists every supported CLI, for detect_cli.
 func CLIKinds() []CLIKind {
-	return []CLIKind{CLIKindClaude, CLIKindCodex, CLIKindCursor, CLIKindKimi, CLIKindOpenCode, CLIKindGemini, CLIKindGrok, CLIKindDeepSeek}
+	return []CLIKind{CLIKindClaude, CLIKindCodex, CLIKindCursor, CLIKindKimi, CLIKindOpenCode, CLIKindGemini, CLIKindGrok, CLIKindDeepSeek, CLIKindAmp, CLIKindPi, CLIKindOhMyPi}
 }
 
 // DetectCLI reports whether kind's binary is on PATH, so a frontend can show
@@ -152,6 +158,10 @@ func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, _ []agent.Messag
 			err = p.runClaude(ctx, nt, emit)
 		case "codex":
 			err = p.runCodex(ctx, nt, emit)
+		case "amp":
+			err = p.runAmp(ctx, nt, emit)
+		case "pi":
+			err = p.runPi(ctx, nt, emit)
 		default:
 			err = p.runACP(ctx, spec, nt, emit)
 		}

@@ -70,6 +70,12 @@ func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 	case ProviderKindAPIKey:
 		return withPermissionModes(models, apiModes()), nil
 	}
+	switch kind, _ := CLIKindOf(cfg.Kind); kind {
+	case CLIKindAmp:
+		return withPermissionModes(models, ampModes()), nil
+	case CLIKindPi, CLIKindOhMyPi:
+		return withPermissionModes(models, piModes(piFlavorOf(kind))), nil
+	}
 	return models, nil // the ACP agents attach their own, from what they advertise
 }
 
@@ -89,6 +95,13 @@ func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 	default:
 		// The ACP agents only say which models they offer inside a session.
 		if kind, ok := CLIKindOf(cfg.Kind); ok {
+			if kind == CLIKindAmp {
+				return ampModels(), nil // its modes; it has no model inventory to ask
+			}
+			if kind == CLIKindPi || kind == CLIKindOhMyPi {
+				home, _ := os.UserHomeDir()
+				return PiModelsDiscovered(kind, home), nil
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			home, _ := os.UserHomeDir()

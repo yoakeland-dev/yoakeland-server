@@ -358,7 +358,7 @@ Registers (or overwrites) a named provider **credential** — not a model choice
   }
 }
 ```
-- `kind`: `"api_key"` (needs `httpProvider` + `apiKey`), or one of the `cli_*` coding-agent kinds — `"cli_claude"`, `"cli_codex"`, `"cli_cursor"`, `"cli_kimi"`, `"cli_opencode"`, `"cli_gemini"`, `"cli_grok"`, `"cli_deepseek"` (subscription-billed, no credential, run with their own tools — see §6b).
+- `kind`: `"api_key"` (needs `httpProvider` + `apiKey`), or one of the `cli_*` coding-agent kinds — `"cli_claude"`, `"cli_codex"`, `"cli_cursor"`, `"cli_kimi"`, `"cli_opencode"`, `"cli_gemini"`, `"cli_grok"`, `"cli_deepseek"`, `"cli_amp"`, `"cli_pi"`, `"cli_ohmypi"` (subscription-billed, no credential, run with their own tools — see §6b).
 - Response: `provider_registered` on success, `error` on failure (e.g. missing `name`).
 
 #### `list_providers`
@@ -1325,7 +1325,7 @@ Pushed to every peer after a `write_file` or `fs_op`: `{"projectPath": "…", "p
 #### `cli_availability`
 Response to `detect_cli`.
 ```json
-{"type": "cli_availability", "data": {"claude": true, "codex": false, "agents": {"cli_claude": true, "cli_codex": false, "cli_cursor": false, "cli_kimi": true, "cli_opencode": false, "cli_gemini": false, "cli_grok": false, "cli_deepseek": false}}}
+{"type": "cli_availability", "data": {"claude": true, "codex": false, "agents": {"cli_claude": true, "cli_codex": false, "cli_cursor": false, "cli_kimi": true, "cli_opencode": false, "cli_gemini": false, "cli_grok": false, "cli_deepseek": false, "cli_amp": false, "cli_pi": false, "cli_ohmypi": false}}}
 ```
 `agents` covers every `cli_*` kind, keyed by kind; `claude`/`codex` are kept for older clients. *UI Action*: Show/hide or enable/disable each `cli_*` provider option accordingly before the user tries to register one.
 
@@ -1853,14 +1853,19 @@ The `cli_*` kinds (v2.15):
 
 | `kind` | Binary | Protocol | Reports usage/cost | `list_models` from |
 |---|---|---|---|---|
-| `cli_claude` | `claude` | Claude Code stream-json | tokens + cost + 5h/7d quota | T3 Code's manifest (§6b below) |
-| `cli_codex` | `codex` | `codex app-server` (JSON-RPC) | tokens + quota; no cost | T3 Code's manifest |
+| `cli_claude` | `claude` | Claude Code stream-json | tokens + cost + 5h/7d quota | the agent's own list for the account (`initialize`), with the manifest's ultracode and context windows; T3 Code's manifest when it can't be asked (§6b below) |
+| `cli_codex` | `codex` | `codex app-server` (JSON-RPC) | tokens + quota; no cost | the agent's own list for the account (`model/list`); T3 Code's manifest when it can't be asked |
 | `cli_cursor` | `cursor-agent acp` | ACP | undocumented | the agent (ACP session) |
 | `cli_kimi` | `kimi acp` | ACP | cost via `usage_update` | the agent |
 | `cli_opencode` | `opencode acp` | ACP | cost via `usage_update` | the agent |
 | `cli_gemini` | `gemini --acp` | ACP | none found | the agent |
 | `cli_grok` | `grok agent stdio` | ACP | undocumented | the agent |
 | `cli_deepseek` | `dsh --profile acp` (DeepSeek's harness) | ACP | context usage only | the agent |
+| `cli_amp` | `amp --execute --stream-json-input` | Amp streaming JSON | tokens; no cost | its modes: `low`, `medium`, `high`, `ultra`, plus a fast option |
+| `cli_pi` | `pi --mode rpc --approve` | Pi RPC (JSONL request/response) | none | the agent (`get_available_models`); ids are `provider/model` |
+| `cli_ohmypi` | `omp --mode rpc --yolo` | Pi RPC, Oh My Pi's dialect | none | the agent (`get_available_models`); ids are `provider/model` |
+
+`cli_amp`, `cli_pi` and `cli_ohmypi` run with full access only: they are started with their permission checks off (Amp has no permission request to answer, Pi has no permission system, Oh My Pi's is bypassed), so their models offer only Run in `permissionModes`, and a turn in any other mode is refused rather than run unconfined. Amp can't be interrupted, so stopping a turn ends its process and the next turn continues the thread. None of the three can fork their session at a turn, so an edit or retry starts from a transcript. These three follow the behaviour Waku observed in the real CLIs and have not been run against them here.
 
 Every one of them is installed and logged in outside yoakeland (`claude auth login`, `codex login`, running `kimi`/`cursor-agent`/… once in a terminal); yoakeland never sees a credential. `model` on `set_provider` is optional — omitted, the agent uses its own default.
 

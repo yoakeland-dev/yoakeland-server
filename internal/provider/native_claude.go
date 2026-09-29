@@ -58,6 +58,8 @@ func claudePermissionMode(m agent.Mode) string {
 const claudeAutonomousSandbox = `{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}`
 
 type claudeBlock struct {
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
 	Type      string          `json:"type"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
@@ -81,8 +83,16 @@ type claudeLine struct {
 		} `json:"delta"`
 	} `json:"event"`
 	Message struct {
-		Content []claudeBlock `json:"content"`
+		Content    []claudeBlock `json:"content"`
+		StopReason string        `json:"stop_reason"`
+		Usage      struct {
+			InputTokens              int `json:"input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+		} `json:"usage"`
 	} `json:"message"`
+	Error         string          `json:"error"`
 	ToolUseResult json.RawMessage `json:"tool_use_result"`
 	RequestID     string          `json:"request_id"`
 	Request       json.RawMessage `json:"request"`

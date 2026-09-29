@@ -856,3 +856,451 @@ func TestCodexForkFailureFallsBackToTheTranscript(t *testing.T) {
 		t.Fatalf("turn input = %v", in)
 	}
 }
+
+// ampScript is an Amp that ends every turn with an end_turn assistant message,
+// after a tool call whose stop reason is tool_use (mid-turn), like the real one.
+func ampScript(hang *bool) func(int, map[string]any, io.Writer) {
+	return func(_ int, m map[string]any, out io.Writer) {
+		if m["type"] != "user" {
+			return
+		}
+		line(out, map[string]any{"type": "system", "subtype": "init", "session_id": "T-1"})
+		if *hang {
+			return
+		}
+		u := map[string]any{"input_tokens": 5, "output_tokens": 2}
+		line(out, map[string]any{"type": "assistant", "message": map[string]any{"stop_reason": "tool_use", "usage": u, "content": []any{
+			map[string]any{"type": "thinking", "thinking": "hmm"},
+			map[string]any{"type": "text", "text": "Looking."},
+			map[string]any{"type": "tool_use", "id": "tu1", "name": "Bash", "input": map[string]any{"command": "ls"}},
+		}}})
+		line(out, map[string]any{"type": "user", "message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "tool_use_id": "tu1", "content": "a.txt"}}}})
+		line(out, map[string]any{"type": "assistant", "message": map[string]any{"stop_reason": "end_turn", "usage": u, "content": []any{map[string]any{"type": "text", "text": "Found a.txt."}}}})
+	}
+}
+
+func TestAmpTurn(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := false
+	p := &CLISubprocessProvider{Kind: CLIKindAmp, Model: "medium", Dir: t.TempDir(), Start: f.starter(ampScript(&hang))}
+
+	nt := liveTurn(key, agent.ModeAutonomous, "", "list files")
+	chunks, err := runNative(t, p, nt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A tool_use stop reason is mid-turn; only end_turn ends it (there is no result message).
+	if k := kinds(chunks); k != "reasoning,delta,tool_call,tool_result,delta,usage" {
+		t.Fatalf("chunks = %s", k)
+	}
+	if tc := chunks[2].ToolCall; tc.Kind != "execute" || tc.Title != "ls" || !tc.Native {
+		t.Fatalf("tool call = %+v", tc)
+	}
+	if r := chunks[3].ToolResult; r.Output != "a.txt" || r.Name != "Bash" {
+		t.Fatalf("tool result = %+v", r)
+	}
+	if u := chunks[5].Usage; u.InputTokens != 10 || u.OutputTokens != 4 {
+		t.Fatalf("usage = %+v", u)
+	}
+	if nt.SessionID != "T-1" {
+		t.Fatalf("session = %q", nt.SessionID)
+	}
+	args := f.args(0)
+	for _, want := range []string{"--execute", "--stream-json-thinking", "--stream-json-input", "--dangerously-allow-all", "--mode medium"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("args = %s, missing %s", args, want)
+		}
+	}
+
+	// The same process serves the next turn; a launch argument changing restarts it on the same thread.
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAutonomous, "T-1", "again")); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 1 {
+		t.Fatalf("launches = %v", f.launches)
+	}
+	p.effort, p.fast = "high", true
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAutonomous, "T-1", "third")); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 2 || !strings.Contains(f.args(1), "threads continue T-1 --execute") || !strings.Contains(f.args(1), "--effort high --fast") {
+		t.Fatalf("launches = %v", f.launches)
+	}
+}
+
+// Amp can't be sandboxed or asked, so any mode but Run is refused rather than quietly running unconfined.
+func TestAmpRefusesModesItCannotHonour(t *testing.T) {
+	f := &liveFake{}
+	hang := false
+	p := &CLISubprocessProvider{Kind: CLIKindAmp, Dir: t.TempDir(), Start: f.starter(ampScript(&hang))}
+	for _, mode := range []agent.Mode{agent.ModeReadOnly, agent.ModeReadWrite, agent.ModeAcceptEdits, agent.ModeAuto, agent.ModePlan} {
+		if _, err := runNative(t, p, liveTurn("", mode, "", "x")); err == nil || !strings.Contains(err.Error(), "full access only") {
+			t.Fatalf("%s: err = %v", mode, err)
+		}
+	}
+	if f.launchCount() != 0 {
+		t.Fatal("a refused mode started the process")
+	}
+	specs := ampModes()
+	if len(specs) != 1 || specs[0].Mode != "autonomous" {
+		t.Fatalf("amp offers %+v", specs)
+	}
+}
+
+// A message steered into the turn carries "steer": true; without it Amp would run it as a turn of its own.
+func TestAmpSteerIsMarked(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	prompts := 0
+	p := &CLISubprocessProvider{Kind: CLIKindAmp, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["type"] != "user" {
+			return
+		}
+		prompts++
+		line(out, map[string]any{"type": "system", "subtype": "init", "session_id": "T-1"})
+		if prompts == 2 { // the steer is what lets the turn finish
+			line(out, map[string]any{"type": "assistant", "message": map[string]any{"stop_reason": "end_turn", "content": []any{map[string]any{"type": "text", "text": "ok"}}}})
+		}
+	})}
+	nt := liveTurn(key, agent.ModeAutonomous, "", "first")
+	steered := make(chan error, 1)
+	steerAfterPrompt(nt, func() bool { return len(f.prompts()) > 0 }, "also this", steered)
+	if _, err := runNative(t, p, nt); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-steered; err != nil {
+		t.Fatal(err)
+	}
+	users := f.wrote(func(m map[string]any) bool { return m["type"] == "user" })
+	if len(users) != 2 || users[0]["steer"] != nil || users[1]["steer"] != true {
+		t.Fatalf("user lines = %v", users)
+	}
+}
+
+// Stopping ends the process (there is no interrupt); the thread is picked up again by the next turn.
+func TestAmpStopEndsTheProcessAndTheThreadContinues(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := true
+	p := &CLISubprocessProvider{Kind: CLIKindAmp, Dir: t.TempDir(), Start: f.starter(ampScript(&hang))}
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, liveTurn(key, agent.ModeAutonomous, "", "stop me")), nil, nil, "")
+	go func() {
+		for len(f.prompts()) == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	for range chunks {
+	}
+	if err := <-errs; err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("err = %v", err)
+	}
+	f.waitClosed(t, 0)
+	hang = false
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAutonomous, "T-1", "again")); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 2 || !strings.Contains(f.args(1), "threads continue T-1") {
+		t.Fatalf("launches = %v", f.launches)
+	}
+}
+
+func TestAmpModelsAreItsModes(t *testing.T) {
+	models, err := ListModels(ProviderConfig{Name: "amp", Kind: "cli_amp"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, m := range models {
+		ids = append(ids, m.ID)
+		if m.Capabilities["fastMode"] != true {
+			t.Fatalf("%s has no fast mode", m.ID)
+		}
+		if specs := m.Capabilities["permissionModes"].([]ModeSpec); len(specs) != 1 || specs[0].Mode != "autonomous" {
+			t.Fatalf("%s offers %+v", m.ID, specs)
+		}
+	}
+	if strings.Join(ids, ",") != "low,medium,high,ultra" {
+		t.Fatalf("models = %v", ids)
+	}
+}
+
+// piScript is a Pi (or, with omp, an Oh My Pi) RPC agent. While hang is set a prompt
+// starts but doesn't settle until it is steered or aborted.
+func piScript(omp bool, hang *bool, refuse *bool) func(int, map[string]any, io.Writer) {
+	settle := func(out io.Writer) {
+		if omp {
+			line(out, map[string]any{"type": "agent_end", "isTerminal": false}) // an intermediate settle
+			line(out, map[string]any{"type": "agent_end", "isTerminal": true})
+			return
+		}
+		line(out, map[string]any{"type": "agent_settled"})
+	}
+	ok := func(out io.Writer, m map[string]any, data any) {
+		line(out, map[string]any{"type": "response", "id": m["id"], "success": true, "data": data})
+	}
+	return func(_ int, m map[string]any, out io.Writer) {
+		switch m["type"] {
+		case "get_state":
+			ok(out, m, map[string]any{"sessionId": "sid-1", "sessionFile": "/sessions/one.jsonl"})
+		case "switch_session", "set_model", "set_thinking_level":
+			ok(out, m, map[string]any{})
+		case "prompt":
+			if *refuse {
+				line(out, map[string]any{"type": "response", "id": m["id"], "success": false, "error": "no API key for provider"})
+				return
+			}
+			ok(out, m, map[string]any{})
+			line(out, map[string]any{"type": "agent_start"})
+			line(out, map[string]any{"type": "extension_ui_request", "id": "ui-1", "method": "confirm"})
+			line(out, map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}})
+			if *hang {
+				return
+			}
+			line(out, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "hm"}})
+			line(out, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Looking. "}})
+			line(out, map[string]any{"type": "tool_execution_start", "toolCallId": "tc1", "toolName": "bash", "args": map[string]any{"command": "ls"}})
+			line(out, map[string]any{"type": "tool_execution_end", "toolCallId": "tc1", "toolName": "bash", "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "a.txt"}}}})
+			// A message that streamed nothing still has its content at message_end.
+			line(out, map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}})
+			line(out, map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Found a.txt."}}}})
+			settle(out)
+		case "steer", "abort":
+			ok(out, m, map[string]any{})
+			if *hang {
+				*hang = false
+				settle(out)
+			}
+		}
+	}
+}
+
+func rpcTypes(f *liveFake) []string {
+	var out []string
+	for _, m := range f.wrote(func(map[string]any) bool { return true }) {
+		out = append(out, m["type"].(string))
+	}
+	return out
+}
+
+func TestPiTurn(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang, refuse := false, false
+	p := &CLISubprocessProvider{Kind: CLIKindPi, Model: "anthropic/claude-x", effort: "high", Dir: t.TempDir(), Start: f.starter(piScript(false, &hang, &refuse))}
+
+	nt := liveTurn(key, agent.ModeAutonomous, "", "list files")
+	chunks, err := runNative(t, p, nt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := kinds(chunks); k != "reasoning,delta,tool_call,tool_result,delta" {
+		t.Fatalf("chunks = %s", k)
+	}
+	if r := chunks[3].ToolResult; r.Output != "a.txt" || r.Name != "bash" {
+		t.Fatalf("tool result = %+v", r)
+	}
+	if chunks[4].Delta != "Found a.txt." {
+		t.Fatalf("the message that streamed nothing lost its text: %+v", chunks[4])
+	}
+	// Resuming needs the session's file, so that is the session id the chat keeps.
+	if nt.SessionID != "/sessions/one.jsonl" {
+		t.Fatalf("session = %q", nt.SessionID)
+	}
+	// Pi needs its version check skipped, which goes through env(1); the handshake is in this order.
+	if got := f.args(0); got != "env PI_SKIP_VERSION_CHECK=1 pi --mode rpc --approve" {
+		t.Fatalf("launch = %s", got)
+	}
+	if got := strings.Join(rpcTypes(f), ","); !strings.HasPrefix(got, "get_state,set_model,set_thinking_level,get_state,prompt") {
+		t.Fatalf("requests = %s", got)
+	}
+	// The extension's question got no answer from a person: it was cancelled.
+	var ui []map[string]any
+	for deadline := time.Now().Add(2 * time.Second); len(ui) == 0 && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		ui = f.wrote(func(m map[string]any) bool { return m["type"] == "extension_ui_response" })
+	}
+	if len(ui) != 1 || ui[0]["id"] != "ui-1" || ui[0]["cancelled"] != true {
+		t.Fatalf("extension response = %v", ui)
+	}
+
+	// The same process serves the next turn; a new model or level is set on it, not a restart.
+	p.Model, p.effort = "openai/gpt-x", "low"
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAutonomous, "/sessions/one.jsonl", "again")); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 1 {
+		t.Fatalf("launches = %v", f.launches)
+	}
+	sm := f.wrote(func(m map[string]any) bool { return m["type"] == "set_model" })
+	if len(sm) != 2 || sm[1]["provider"] != "openai" || sm[1]["modelId"] != "gpt-x" {
+		t.Fatalf("set_model = %v", sm)
+	}
+}
+
+func TestPiModelsMustBeProviderSlashModel(t *testing.T) {
+	f := &liveFake{}
+	hang, refuse := false, false
+	p := &CLISubprocessProvider{Kind: CLIKindPi, Model: "gpt-x", Dir: t.TempDir(), Start: f.starter(piScript(false, &hang, &refuse))}
+	if _, err := runNative(t, p, liveTurn("", agent.ModeAutonomous, "", "x")); err == nil || !strings.Contains(err.Error(), "provider/model") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPiRefusesModesItCannotHonour(t *testing.T) {
+	f := &liveFake{}
+	hang, refuse := false, false
+	for _, kind := range []CLIKind{CLIKindPi, CLIKindOhMyPi} {
+		p := &CLISubprocessProvider{Kind: kind, Dir: t.TempDir(), Start: f.starter(piScript(false, &hang, &refuse))}
+		for _, mode := range []agent.Mode{agent.ModeReadOnly, agent.ModeReadWrite, agent.ModeAcceptEdits, agent.ModeAuto, agent.ModePlan} {
+			if _, err := runNative(t, p, liveTurn("", mode, "", "x")); err == nil || !strings.Contains(err.Error(), "full access only") {
+				t.Fatalf("%s/%s: err = %v", kind, mode, err)
+			}
+		}
+	}
+	if f.launchCount() != 0 {
+		t.Fatal("a refused mode started the process")
+	}
+}
+
+func TestOhMyPiOnlySettlesOnATerminalAgentEnd(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang, refuse := false, false
+	p := &CLISubprocessProvider{Kind: CLIKindOhMyPi, Dir: t.TempDir(), Start: f.starter(piScript(true, &hang, &refuse))}
+	chunks, err := runNative(t, p, liveTurn(key, agent.ModeAutonomous, "", "go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The intermediate agent_end came before the last message; ending there would have lost it.
+	if last := chunks[len(chunks)-1]; last.Delta != "Found a.txt." {
+		t.Fatalf("the turn ended early: %s", kinds(chunks))
+	}
+	if got := f.args(0); got != "omp --mode rpc --yolo" {
+		t.Fatalf("launch = %s", got)
+	}
+}
+
+func TestPiPromptRefusedFailsTheTurn(t *testing.T) {
+	f := &liveFake{}
+	hang, refuse := false, true
+	p := &CLISubprocessProvider{Kind: CLIKindPi, Dir: t.TempDir(), Start: f.starter(piScript(false, &hang, &refuse))}
+	if _, err := runNative(t, p, liveTurn("", agent.ModeAutonomous, "", "go")); err == nil || !strings.Contains(err.Error(), "no API key for provider") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPiResumeSwitchesToTheSessionFile(t *testing.T) {
+	f := &liveFake{}
+	hang, refuse := false, false
+	p := &CLISubprocessProvider{Kind: CLIKindPi, Dir: t.TempDir(), Start: f.starter(piScript(false, &hang, &refuse))}
+	if _, err := runNative(t, p, liveTurn("", agent.ModeAutonomous, "/sessions/old.jsonl", "go")); err != nil {
+		t.Fatal(err)
+	}
+	sw := f.wrote(func(m map[string]any) bool { return m["type"] == "switch_session" })
+	if len(sw) != 1 || sw[0]["sessionPath"] != "/sessions/old.jsonl" {
+		t.Fatalf("switch_session = %v", sw)
+	}
+}
+
+func TestPiSteerAndAbort(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang, refuse := true, false
+	p := &CLISubprocessProvider{Kind: CLIKindPi, Dir: t.TempDir(), Start: f.starter(piScript(false, &hang, &refuse))}
+
+	// A steer is a request of its own; here it is what lets the turn settle.
+	nt := liveTurn(key, agent.ModeAutonomous, "", "first")
+	steered := make(chan error, 1)
+	steerAfterPrompt(nt, func() bool { return len(f.wrote(func(m map[string]any) bool { return m["type"] == "prompt" })) > 0 }, "also this", steered)
+	if _, err := runNative(t, p, nt); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-steered; err != nil {
+		t.Fatal(err)
+	}
+	st := f.wrote(func(m map[string]any) bool { return m["type"] == "steer" })
+	if len(st) != 1 || st[0]["message"] != "also this" {
+		t.Fatalf("steer = %v", st)
+	}
+
+	// Stopping aborts the turn and keeps the process.
+	hang = true
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, liveTurn(key, agent.ModeAutonomous, "/sessions/one.jsonl", "stop me")), nil, nil, "")
+	go func() {
+		for len(f.wrote(func(m map[string]any) bool { return m["type"] == "prompt" })) < 2 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	for range chunks {
+	}
+	if err := <-errs; err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("err = %v", err)
+	}
+	if n := len(f.wrote(func(m map[string]any) bool { return m["type"] == "abort" })); n != 1 || f.launchCount() != 1 {
+		t.Fatalf("aborts %d, launches %d", n, f.launchCount())
+	}
+}
+
+func TestDiscoverPiModels(t *testing.T) {
+	respond := func(models []any) func(int, map[string]any, io.Writer) {
+		return func(_ int, m map[string]any, out io.Writer) {
+			if m["type"] == "get_available_models" {
+				line(out, map[string]any{"type": "response", "id": m["id"], "success": true, "data": map[string]any{"models": models}})
+			}
+		}
+	}
+	// Pi maps levels per model, and null means unavailable; xhigh and max must be mapped to count.
+	f := &liveFake{}
+	useDiscovery(t, f, respond([]any{
+		map[string]any{"provider": "anthropic", "id": "claude-x", "name": "Claude X", "reasoning": true,
+			"thinkingLevelMap": map[string]any{"minimal": nil, "xhigh": "high"}},
+		map[string]any{"provider": "openai", "id": "plain", "reasoning": false},
+		map[string]any{"provider": "", "id": "orphan"},
+	}))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := discoverPiModels(ctx, piFlavorPi, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "anthropic/claude-x" || got[0].DisplayName != "Claude X" || got[1].ID != "openai/plain" {
+		t.Fatalf("models = %+v", got)
+	}
+	if e := got[0].Capabilities["reasoningEfforts"]; !reflect.DeepEqual(e, []string{"off", "low", "medium", "high", "xhigh"}) {
+		t.Fatalf("pi efforts = %v", e)
+	}
+	if got[1].Capabilities != nil {
+		t.Fatalf("a model without reasoning has efforts: %v", got[1].Capabilities)
+	}
+	if !strings.Contains(f.args(0), "env PI_SKIP_VERSION_CHECK=1 pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files") {
+		t.Fatalf("probe = %s", f.args(0))
+	}
+
+	// Oh My Pi lists the levels a model honours, and always accepts off.
+	f2 := &liveFake{}
+	useDiscovery(t, f2, respond([]any{
+		map[string]any{"provider": "anthropic", "id": "claude-x", "reasoning": true, "thinking": map[string]any{"efforts": []any{"low", "high"}}},
+	}))
+	got, err = discoverPiModels(ctx, piFlavorOhMyPi, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := got[0].Capabilities["reasoningEfforts"]; !reflect.DeepEqual(e, []string{"off", "low", "high"}) {
+		t.Fatalf("omp efforts = %v", e)
+	}
+	if !strings.Contains(f2.args(0), "omp --mode rpc --no-session --no-skills --no-rules --no-extensions") {
+		t.Fatalf("probe = %s", f2.args(0))
+	}
+}
