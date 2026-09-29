@@ -95,3 +95,26 @@ func TestAgent_AcceptEditsNativeAsks(t *testing.T) {
 		t.Fatal("a command must still ask")
 	}
 }
+
+// nativeText is a native agent that just answers with text.
+type nativeText struct{ capturingProvider }
+
+func (nativeText) RunsOwnTools() {}
+
+// A native agent with no plan tool of its own still ends a plan turn with a
+// plan: its final message.
+func TestAgent_NativePlanTurnRecordsFinalMessage(t *testing.T) {
+	dir := t.TempDir()
+	p := &nativeText{capturingProvider{turns: [][]agent.ModelStreamChunk{{{Kind: agent.StreamChunkDelta, Delta: "# Steps\n1. do it"}}}}}
+	ag, out := newTestAgent(t, dir, p, []tool.Tool{tool.NewWritePlanTool(filepath.Join(dir, "plans"))})
+	ag.SetMode(agent.ModePlan)
+	if err := ag.RunTurn(context.Background(), "s1", "t1", "plan it"); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.Contains(got, `"type":"plan_written"`) || !strings.Contains(got, "1. do it") {
+		t.Fatalf("expected the final message as plan_written: %s", got)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "plans", "s1.md")); err != nil || !strings.Contains(string(b), "do it") {
+		t.Fatalf("plan file: %q %v", b, err)
+	}
+}
