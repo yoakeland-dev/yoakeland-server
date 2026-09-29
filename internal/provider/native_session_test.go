@@ -134,7 +134,7 @@ func claudeScript(costPerTurn float64) func(int, map[string]any, io.Writer) {
 func liveTurn(key string, mode agent.Mode, resume, prompt string) *agent.NativeTurn {
 	rec := &turnRecorder{answer: agent.NativeAnswer{Allowed: true}}
 	nt := rec.turn(mode)
-	nt.SessionKey, nt.ResumeID, nt.Prompt = key, resume, prompt
+	nt.SessionKey, nt.ResumeID, nt.Prompt, nt.FreshPrompt = key, resume, prompt, prompt
 	return nt
 }
 
@@ -394,5 +394,133 @@ func TestCodexSessionInterruptKeepsProcess(t *testing.T) {
 	}
 	if f.launchCount() != 1 {
 		t.Fatalf("interrupt restarted the process: %v", f.launches)
+	}
+}
+
+// acpScript is an ACP agent with model and effort options. While hang is set a
+// prompt stays open until the client cancels it.
+func acpScript(hang *bool) func(int, map[string]any, io.Writer) {
+	sessions := 0
+	var pending any
+	update := func(out io.Writer, u map[string]any) {
+		line(out, map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "s", "update": u}})
+	}
+	reply := func(out io.Writer, id, result any) {
+		line(out, map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	}
+	return func(_ int, m map[string]any, out io.Writer) {
+		switch m["method"] {
+		case "initialize":
+			reply(out, m["id"], map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{}})
+		case "session/new":
+			sessions++
+			reply(out, m["id"], map[string]any{"sessionId": "s" + string(rune('0'+sessions)), "configOptions": []any{
+				map[string]any{"id": "model", "category": "model", "currentValue": "a", "options": []any{}},
+				map[string]any{"id": "effort", "category": "thought_level", "currentValue": "low", "options": []any{}},
+			}})
+		case "session/set_config_option":
+			reply(out, m["id"], map[string]any{})
+		case "session/prompt":
+			if *hang {
+				pending = m["id"]
+				return
+			}
+			update(out, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "reply"}})
+			reply(out, m["id"], map[string]any{"stopReason": "end_turn"})
+		case "session/cancel":
+			if pending != nil {
+				reply(out, pending, map[string]any{"stopReason": "cancelled"})
+				pending = nil
+			}
+		}
+	}
+}
+
+func TestACPSessionSurvivesTurns(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := false
+	p := &CLISubprocessProvider{Kind: CLIKindKimi, Model: "m1", effort: "high", Dir: t.TempDir(), Start: f.starter(acpScript(&hang))}
+
+	nt1 := liveTurn(key, agent.ModeReadWrite, "", "first")
+	if _, err := runNative(t, p, nt1); err != nil {
+		t.Fatal(err)
+	}
+	if nt1.SessionID != "s1" {
+		t.Fatalf("session = %q", nt1.SessionID)
+	}
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "s1", "second")); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 1 || len(f.rpc("session/new")) != 1 || len(f.rpc("session/load"))+len(f.rpc("session/resume")) != 0 {
+		t.Fatalf("launches %d, new %d", f.launchCount(), len(f.rpc("session/new")))
+	}
+	if n := len(f.rpc("session/set_config_option")); n != 2 { // model and effort, once
+		t.Fatalf("config options set %d times, want 2", n)
+	}
+	if got := strings.Join(promptTexts(f), "|"); got != "first|second" {
+		t.Fatalf("prompts = %s", got)
+	}
+
+	// Only a change is sent.
+	p.Model = "m2"
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "s1", "third")); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.rpc("session/set_config_option")); n != 3 {
+		t.Fatalf("config options set %d times, want 3", n)
+	}
+
+	// A history that moved on gets a new session in the same process, with its options set again.
+	nt4 := liveTurn(key, agent.ModeReadWrite, "", "fresh")
+	if _, err := runNative(t, p, nt4); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 1 || len(f.rpc("session/new")) != 2 || nt4.SessionID != "s2" || len(f.rpc("session/set_config_option")) != 5 {
+		t.Fatalf("launches %d, new %d, session %q, options %d", f.launchCount(), len(f.rpc("session/new")), nt4.SessionID, len(f.rpc("session/set_config_option")))
+	}
+	CloseNativeSessions(key)
+	f.waitClosed(t, 0)
+}
+
+func promptTexts(f *liveFake) []string {
+	var out []string
+	for _, m := range f.rpc("session/prompt") {
+		prompt := m["params"].(map[string]any)["prompt"].([]any)
+		out = append(out, prompt[0].(map[string]any)["text"].(string))
+	}
+	return out
+}
+
+func TestACPSessionCancelWaitsForThePrompt(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := true
+	p := &CLISubprocessProvider{Kind: CLIKindKimi, Dir: t.TempDir(), Start: f.starter(acpScript(&hang))}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, liveTurn(key, agent.ModeReadWrite, "", "stop me")), nil, nil, "")
+	go func() {
+		for len(f.rpc("session/prompt")) == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+	for range chunks {
+	}
+	if err := <-errs; err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f.rpc("session/cancel")) != 1 {
+		t.Fatal("no session/cancel was sent")
+	}
+	hang = false
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "s1", "again")); err != nil {
+		t.Fatalf("turn after cancel: %v", err)
+	}
+	if f.launchCount() != 1 {
+		t.Fatalf("cancel restarted the process: %v", f.launches)
 	}
 }

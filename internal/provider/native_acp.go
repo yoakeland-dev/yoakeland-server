@@ -3,10 +3,13 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/protocol"
@@ -250,9 +253,10 @@ func (s acpSession) applyMode(ctx context.Context, conn *rpcConn, m agent.Mode) 
 }
 
 // acpInit starts an ACP agent and runs initialize, returning the connection
-// and whether it supports session/load.
-func (p *CLISubprocessProvider) acpInit(ctx context.Context, spec cliSpec, onNotify func(string, json.RawMessage), onRequest func(*rpcConn, json.RawMessage, string, json.RawMessage)) (*rpcConn, bool, error) {
-	proc, err := p.start()(ctx, spec.Binary, spec.Args, p.Dir)
+// and whether it supports session/load. The process is bound to procCtx, the
+// initialize call to ctx.
+func (p *CLISubprocessProvider) acpInit(ctx, procCtx context.Context, spec cliSpec, onNotify func(string, json.RawMessage), onRequest func(*rpcConn, json.RawMessage, string, json.RawMessage)) (*rpcConn, bool, error) {
+	proc, err := p.start()(procCtx, spec.Binary, spec.Args, p.Dir)
 	if err != nil {
 		return nil, false, err
 	}
@@ -283,214 +287,369 @@ func acpErr(binary string, err error) error {
 	return err
 }
 
-func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
-	var (
-		mu       sync.Mutex
-		loading  bool // session/load replays history as updates; drop them
-		calls    = map[string]*acpToolCall{}
-		done     = map[string]bool{}
-		cost     = -1.0 // latest cumulative usage_update cost in USD, -1 = none seen
-		baseline = nt.SessionCostUSD
-	)
-	onNotify := func(method string, params json.RawMessage) {
-		if method != "session/update" {
-			return
+// acpLive is one live ACP agent process: one ACP session at a time, prompted
+// once per turn. Its notifications and requests go to the turn in progress.
+type acpLive struct {
+	conn    *rpcConn
+	spec    cliSpec
+	canLoad bool
+
+	mu      sync.Mutex
+	turn    *acpTurn
+	loading bool // session/load replays history as updates; drop them
+	sess    acpSession
+	model   string // what has been set on sess, so a turn only sends a change
+	effort  string
+	mode    agent.Mode
+	// baseline is the cost usage_update reported while history replayed: what a
+	// resumed session had already spent.
+	baseline float64
+}
+
+func (a *acpLive) dead() bool {
+	select {
+	case <-a.conn.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *acpLive) close() {
+	_ = a.conn.p.stdin.Close()
+	select {
+	case <-a.conn.done:
+	case <-time.After(3 * time.Second):
+		if a.conn.p.kill != nil {
+			a.conn.p.kill()
 		}
-		var n struct {
-			Update struct {
-				SessionUpdate string `json:"sessionUpdate"`
-				// An object for message chunks, an array for tool calls.
-				Content json.RawMessage `json:"content"`
-				Cost    *struct {
-					Amount   float64 `json:"amount"`
-					Currency string  `json:"currency"`
-				} `json:"cost"`
-			} `json:"update"`
-		}
-		if json.Unmarshal(params, &n) != nil {
-			return
-		}
-		u := n.Update
-		mu.Lock()
-		replaying := loading
+	}
+}
+
+func (a *acpLive) setTurn(t *acpTurn) {
+	a.mu.Lock()
+	a.turn = t
+	a.mu.Unlock()
+}
+
+func (a *acpLive) current() (*acpTurn, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.turn, a.loading
+}
+
+// acpTurn is what one turn has seen of the session's output so far.
+type acpTurn struct {
+	a    *acpLive
+	ctx  context.Context
+	nt   *agent.NativeTurn
+	emit func(agent.ModelStreamChunk)
+
+	seen atomic.Bool // the agent has said something this turn
+
+	mu    sync.Mutex
+	calls map[string]*acpToolCall
+	done  map[string]bool
+	cost  float64 // latest cumulative usage_update cost in USD, -1 = none seen
+}
+
+func (t *acpTurn) seenAnything() bool { return t.seen.Load() }
+
+func (a *acpLive) onNotify(method string, params json.RawMessage) {
+	if method != "session/update" {
+		return
+	}
+	var n struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+			// An object for message chunks, an array for tool calls.
+			Content json.RawMessage `json:"content"`
+			Cost    *struct {
+				Amount   float64 `json:"amount"`
+				Currency string  `json:"currency"`
+			} `json:"cost"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &n) != nil {
+		return
+	}
+	u := n.Update
+	t, replaying := a.current()
+	if replaying {
 		if u.SessionUpdate == "usage_update" && u.Cost != nil && strings.EqualFold(u.Cost.Currency, "USD") {
-			if replaying {
-				baseline = u.Cost.Amount
-			} else {
-				cost = u.Cost.Amount
-			}
+			a.mu.Lock()
+			a.baseline = u.Cost.Amount
+			a.mu.Unlock()
 		}
-		mu.Unlock()
-		if replaying {
+		return
+	}
+	if t == nil {
+		return
+	}
+	t.update(u.SessionUpdate, u.Content, u.Cost, params)
+}
+
+func (t *acpTurn) update(kind string, content json.RawMessage, cost *struct {
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
+}, params json.RawMessage) {
+	t.seen.Store(true)
+	if kind == "usage_update" && cost != nil && strings.EqualFold(cost.Currency, "USD") {
+		t.mu.Lock()
+		t.cost = cost.Amount
+		t.mu.Unlock()
+	}
+	var text struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(content, &text)
+	switch kind {
+	case "agent_message_chunk":
+		if text.Type == "text" {
+			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: text.Text})
+		}
+	case "agent_thought_chunk":
+		if text.Type == "text" {
+			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkReasoning, Delta: text.Text})
+		}
+	case "tool_call", "tool_call_update":
+		var c struct {
+			Update acpToolCall `json:"update"`
+		}
+		if json.Unmarshal(params, &c) != nil || c.Update.ToolCallID == "" {
 			return
 		}
-		var text struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+		t.mu.Lock()
+		known, seen := t.calls[c.Update.ToolCallID]
+		if !seen {
+			known = &acpToolCall{ToolCallID: c.Update.ToolCallID}
+			t.calls[c.Update.ToolCallID] = known
 		}
-		_ = json.Unmarshal(u.Content, &text)
-		switch u.SessionUpdate {
-		case "agent_message_chunk":
-			if text.Type == "text" {
-				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: text.Text})
-			}
-		case "agent_thought_chunk":
-			if text.Type == "text" {
-				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkReasoning, Delta: text.Text})
-			}
-		case "tool_call", "tool_call_update":
-			var t struct {
-				Update acpToolCall `json:"update"`
-			}
-			if json.Unmarshal(params, &t) != nil || t.Update.ToolCallID == "" {
+		known.merge(c.Update)
+		snapshot := *known
+		finished := (snapshot.Status == "completed" || snapshot.Status == "failed") && !t.done[snapshot.ToolCallID]
+		if finished {
+			t.done[snapshot.ToolCallID] = true
+		}
+		t.mu.Unlock()
+		if !seen {
+			tc := snapshot.toolCall()
+			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+		}
+		if finished {
+			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: snapshot.result()})
+		}
+	}
+}
+
+func (a *acpLive) onRequest(conn *rpcConn, id json.RawMessage, method string, params json.RawMessage) {
+	t, _ := a.current()
+	if t == nil {
+		conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
+		return
+	}
+	t.request(conn, id, method, params)
+}
+
+func (t *acpTurn) request(conn *rpcConn, id json.RawMessage, method string, params json.RawMessage) {
+	if method != "session/request_permission" {
+		conn.respondError(id, -32601, "yoakeland doesn't provide "+method)
+		return
+	}
+	var r struct {
+		ToolCall acpToolCall `json:"toolCall"`
+		Options  []struct {
+			OptionID string `json:"optionId"`
+			Kind     string `json:"kind"`
+		} `json:"options"`
+	}
+	_ = json.Unmarshal(params, &r)
+	t.mu.Lock()
+	if known := t.calls[r.ToolCall.ToolCallID]; known != nil {
+		known.merge(r.ToolCall)
+		r.ToolCall = *known
+	}
+	t.mu.Unlock()
+	var d *diff.FileDiff
+	if ds := r.ToolCall.diffs(); len(ds) > 0 {
+		d = ds[0]
+	}
+	desc := r.ToolCall.Title
+	if desc == "" {
+		desc = string(r.ToolCall.RawInput)
+	}
+	ask := agent.NativeAsk{ToolCallID: r.ToolCall.ToolCallID, ToolName: r.ToolCall.toolCall().Name, Description: desc, Diff: d}
+	switch r.ToolCall.Kind {
+	case "edit", "delete", "move":
+		ask.Edit = true
+	case "switch_mode":
+		// The agent leaving its plan mode: what it wants approved is the plan.
+		ask.Plan = r.ToolCall.plan()
+	}
+	ans, err := t.nt.Ask(t.ctx, ask)
+	if err != nil {
+		conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
+		return
+	}
+	prefer := []string{"reject_once", "reject_always"}
+	switch {
+	case ans.Allowed && ans.Remember:
+		prefer = []string{"allow_always", "allow_once"}
+	case ans.Allowed:
+		prefer = []string{"allow_once", "allow_always"}
+	case ans.Remember:
+		prefer = []string{"reject_always", "reject_once"}
+	}
+	for _, k := range prefer {
+		for _, o := range r.Options {
+			if o.Kind == k {
+				conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "selected", "optionId": o.OptionID}})
 				return
 			}
-			mu.Lock()
-			known, seen := calls[t.Update.ToolCallID]
-			if !seen {
-				known = &acpToolCall{ToolCallID: t.Update.ToolCallID}
-				calls[t.Update.ToolCallID] = known
-			}
-			known.merge(t.Update)
-			snapshot := *known
-			finished := (snapshot.Status == "completed" || snapshot.Status == "failed") && !done[snapshot.ToolCallID]
-			if finished {
-				done[snapshot.ToolCallID] = true
-			}
-			mu.Unlock()
-			if !seen {
-				tc := snapshot.toolCall()
-				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
-			}
-			if finished {
-				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: snapshot.result()})
-			}
 		}
 	}
-	onRequest := func(conn *rpcConn, id json.RawMessage, method string, params json.RawMessage) {
-		if method != "session/request_permission" {
-			conn.respondError(id, -32601, "yoakeland doesn't provide "+method)
-			return
-		}
-		var r struct {
-			ToolCall acpToolCall `json:"toolCall"`
-			Options  []struct {
-				OptionID string `json:"optionId"`
-				Kind     string `json:"kind"`
-			} `json:"options"`
-		}
-		_ = json.Unmarshal(params, &r)
-		mu.Lock()
-		if known := calls[r.ToolCall.ToolCallID]; known != nil {
-			known.merge(r.ToolCall)
-			r.ToolCall = *known
-		}
-		mu.Unlock()
-		var d *diff.FileDiff
-		if ds := r.ToolCall.diffs(); len(ds) > 0 {
-			d = ds[0]
-		}
-		desc := r.ToolCall.Title
-		if desc == "" {
-			desc = string(r.ToolCall.RawInput)
-		}
-		ask := agent.NativeAsk{ToolCallID: r.ToolCall.ToolCallID, ToolName: r.ToolCall.toolCall().Name, Description: desc, Diff: d}
-		switch r.ToolCall.Kind {
-		case "edit", "delete", "move":
-			ask.Edit = true
-		case "switch_mode":
-			// The agent leaving its plan mode: what it wants approved is the plan.
-			ask.Plan = r.ToolCall.plan()
-		}
-		ans, err := nt.Ask(ctx, ask)
-		if err != nil {
-			conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
-			return
-		}
-		prefer := []string{"reject_once", "reject_always"}
-		switch {
-		case ans.Allowed && ans.Remember:
-			prefer = []string{"allow_always", "allow_once"}
-		case ans.Allowed:
-			prefer = []string{"allow_once", "allow_always"}
-		case ans.Remember:
-			prefer = []string{"reject_always", "reject_once"}
-		}
-		for _, k := range prefer {
-			for _, o := range r.Options {
-				if o.Kind == k {
-					conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "selected", "optionId": o.OptionID}})
-					return
-				}
-			}
-		}
-		conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
-	}
+	conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
+}
 
-	conn, canLoad, err := p.acpInit(ctx, spec, onNotify, onRequest)
+func (p *CLISubprocessProvider) startACP(spec cliSpec) (*acpLive, error) {
+	a := &acpLive{spec: spec}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// The process outlives the turn that started it, so it isn't bound to the turn's context.
+	conn, canLoad, err := p.acpInit(ctx, context.Background(), spec, a.onNotify, a.onRequest)
 	if err != nil {
+		return nil, acpErr(spec.Binary, err)
+	}
+	a.conn, a.canLoad = conn, canLoad
+	return a, nil
+}
+
+func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
+	err := p.runACPOnce(ctx, spec, nt, emit)
+	if errors.Is(err, errStaleSession) {
+		err = p.runACPOnce(ctx, spec, nt, emit)
+	}
+	return err
+}
+
+func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
+	ns, reused, release, err := acquireSession(nt, p.Kind, p.Dir, func(nativeSession) bool { return true },
+		func() (nativeSession, error) { return p.startACP(spec) })
+	if err != nil {
+		return err
+	}
+	defer release()
+	a := ns.(*acpLive)
+	conn := a.conn
+	failed := func(err error) error {
+		if reused && a.dead() && ctx.Err() == nil {
+			return errStaleSession
+		}
 		return acpErr(spec.Binary, err)
 	}
-	defer func() { _ = conn.p.stdin.Close() }()
 
-	base := map[string]any{"cwd": p.Dir, "mcpServers": []any{}}
-	var sess acpSession
+	t := &acpTurn{a: a, ctx: ctx, nt: nt, emit: emit, calls: map[string]*acpToolCall{}, done: map[string]bool{}, cost: -1}
+	a.setTurn(t)
+	defer a.setTurn(nil)
+
+	a.mu.Lock()
+	sess := a.sess
+	a.mu.Unlock()
 	prompt := nt.Prompt
-	resumed := false
-	if nt.ResumeID != "" {
-		params := map[string]any{"sessionId": nt.ResumeID, "cwd": p.Dir, "mcpServers": []any{}}
-		method := "session/resume" // no history replay
-		if canLoad {
-			method = "session/load"
-			mu.Lock()
-			loading = true
-			mu.Unlock()
+	baseline := nt.SessionCostUSD
+	if sess.SessionID == "" || sess.SessionID != nt.ResumeID {
+		// A different conversation from the one this process is on (or none yet).
+		sess = acpSession{}
+		resumed := false
+		if nt.ResumeID != "" {
+			params := map[string]any{"sessionId": nt.ResumeID, "cwd": p.Dir, "mcpServers": []any{}}
+			method := "session/resume" // no history replay
+			if a.canLoad {
+				method = "session/load"
+				a.mu.Lock()
+				a.loading, a.baseline = true, baseline
+				a.mu.Unlock()
+			}
+			raw, err := conn.call(ctx, method, params)
+			a.mu.Lock()
+			a.loading = false
+			baseline = a.baseline
+			a.mu.Unlock()
+			if err == nil {
+				_ = json.Unmarshal(raw, &sess)
+				sess.SessionID, resumed = nt.ResumeID, true
+			} else if a.dead() {
+				return failed(err)
+			}
 		}
-		raw, err := conn.call(ctx, method, params)
-		mu.Lock()
-		loading = false
-		mu.Unlock()
-		if err == nil {
-			_ = json.Unmarshal(raw, &sess)
-			sess.SessionID, resumed = nt.ResumeID, true
+		if !resumed {
+			prompt = nt.FreshPrompt
+			baseline = 0
+			raw, err := conn.call(ctx, "session/new", map[string]any{"cwd": p.Dir, "mcpServers": []any{}})
+			if err != nil {
+				return failed(err)
+			}
+			if err := json.Unmarshal(raw, &sess); err != nil || sess.SessionID == "" {
+				return fmt.Errorf("%s session/new: no session id", spec.Binary)
+			}
 		}
-	}
-	if !resumed {
-		prompt = nt.FreshPrompt
-		mu.Lock()
-		baseline = 0
-		mu.Unlock()
-		raw, err := conn.call(ctx, "session/new", base)
-		if err != nil {
-			return acpErr(spec.Binary, err)
-		}
-		if err := json.Unmarshal(raw, &sess); err != nil || sess.SessionID == "" {
-			return fmt.Errorf("%s session/new: no session id", spec.Binary)
-		}
+		a.mu.Lock()
+		a.sess, a.model, a.effort, a.mode = sess, "", "", ""
+		a.mu.Unlock()
 	}
 	nt.SessionID = sess.SessionID
 
 	// Model/effort/mode are best-effort: an agent that rejects one still runs.
-	if o := sess.option("model"); o != nil && p.Model != "" {
+	// Only what changed since the session last had it set is sent.
+	a.mu.Lock()
+	applyModel, applyEffort := p.Model != "" && p.Model != a.model, p.effort != "" && p.effort != a.effort
+	applyMode := nt.Mode != a.mode
+	a.model, a.effort, a.mode = firstNonEmpty(p.Model, a.model), firstNonEmpty(p.effort, a.effort), nt.Mode
+	a.mu.Unlock()
+	if o := sess.option("model"); o != nil && applyModel {
 		_, _ = conn.call(ctx, "session/set_config_option", map[string]any{"sessionId": sess.SessionID, "configId": o.ID, "value": p.Model})
-	} else if sess.Models != nil && p.Model != "" {
+	} else if sess.Models != nil && applyModel {
 		_, _ = conn.call(ctx, "session/set_model", map[string]any{"sessionId": sess.SessionID, "modelId": p.Model})
 	}
-	if o := sess.option("thought_level"); o != nil && p.effort != "" {
+	if o := sess.option("thought_level"); o != nil && applyEffort {
 		_, _ = conn.call(ctx, "session/set_config_option", map[string]any{"sessionId": sess.SessionID, "configId": o.ID, "value": p.effort})
 	}
-	sess.applyMode(ctx, conn, nt.Mode)
+	if applyMode {
+		sess.applyMode(ctx, conn, nt.Mode)
+	}
 
-	raw, err := conn.call(ctx, "session/prompt", map[string]any{
-		"sessionId": sess.SessionID,
-		"prompt":    []map[string]string{{"type": "text", "text": acpPlanPrefix(sess, nt.Mode) + prompt}},
-	})
-	if err != nil {
-		if ctx.Err() != nil {
-			conn.notify("session/cancel", map[string]string{"sessionId": sess.SessionID})
-			return ctx.Err()
+	// The prompt's answer is waited for even when the turn is stopped, so the
+	// next turn never overlaps it on the same process.
+	type promptResult struct {
+		raw json.RawMessage
+		err error
+	}
+	answer := make(chan promptResult, 1)
+	go func() {
+		raw, err := conn.call(context.Background(), "session/prompt", map[string]any{
+			"sessionId": sess.SessionID,
+			"prompt":    []map[string]string{{"type": "text", "text": acpPlanPrefix(sess, nt.Mode) + prompt}},
+		})
+		answer <- promptResult{raw, err}
+	}()
+	var res promptResult
+	select {
+	case res = <-answer:
+	case <-ctx.Done():
+		conn.notify("session/cancel", map[string]string{"sessionId": sess.SessionID})
+		select {
+		case <-answer:
+		case <-time.After(10 * time.Second):
+			a.close()
 		}
-		return acpErr(spec.Binary, err)
+		return ctx.Err()
+	}
+	if res.err != nil {
+		if !t.seenAnything() {
+			return failed(res.err)
+		}
+		return acpErr(spec.Binary, res.err)
 	}
 	var resp struct {
 		StopReason string `json:"stopReason"`
@@ -501,7 +660,7 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 			CachedWriteTokens int `json:"cachedWriteTokens"`
 		} `json:"usage"` // unstable ACP; reported by some agents only
 	}
-	_ = json.Unmarshal(raw, &resp)
+	_ = json.Unmarshal(res.raw, &resp)
 
 	usage := &protocol.UsageData{}
 	if u := resp.Usage; u != nil {
@@ -510,14 +669,14 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 		usage.CachedInputTokens = u.CachedReadTokens
 	}
-	mu.Lock()
-	if cost >= 0 {
-		nt.SessionCostUSD = cost
-		if cost >= baseline {
-			usage.CostUSD, usage.CostKnown = cost-baseline, true
+	t.mu.Lock()
+	if t.cost >= 0 {
+		nt.SessionCostUSD = t.cost
+		if t.cost >= baseline {
+			usage.CostUSD, usage.CostKnown = t.cost-baseline, true
 		}
 	}
-	mu.Unlock()
+	t.mu.Unlock()
 	emit(agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: usage})
 
 	switch resp.StopReason {
@@ -531,6 +690,13 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 	return nil
 }
 
+func firstNonEmpty[T ~string](a, b T) T {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
 // ListACPModels asks an ACP agent which models it offers, by opening a
 // throwaway session (ACP has no models call outside a session).
 func ListACPModels(ctx context.Context, kind CLIKind, dir string) ([]ModelInfo, error) {
@@ -541,7 +707,7 @@ func ListACPModels(ctx context.Context, kind CLIKind, dir string) ([]ModelInfo, 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	p := &CLISubprocessProvider{Kind: kind, Dir: dir}
-	conn, _, err := p.acpInit(ctx, spec, func(string, json.RawMessage) {}, func(c *rpcConn, id json.RawMessage, m string, _ json.RawMessage) {
+	conn, _, err := p.acpInit(ctx, ctx, spec, func(string, json.RawMessage) {}, func(c *rpcConn, id json.RawMessage, m string, _ json.RawMessage) {
 		c.respondError(id, -32601, "not supported")
 	})
 	if err != nil {
