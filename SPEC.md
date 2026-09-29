@@ -302,6 +302,21 @@ Immediately halts an ongoing turn.
 - A turn still waiting in the queue (see "Sent mid-turn" under `user_prompt`) is cancelled too: it ends with `turn_completed` `"cancelled"`, no `userMessageId`, and never reaches history.
 - `queuedOnly` *(optional, v2.17)*: cancel only if the turn hasn't started yet; a running turn is left alone. Use it for an "undo send": if the undo loses the race, the client gets `turn_started` instead of a cancelled reply it didn't ask for.
 
+#### `steer_turn` *(v2.22)*
+Puts a message into a turn that is still running, instead of queueing it behind the turn (see "Sent mid-turn" under `user_prompt`). Only a CLI agent (§6b) that can take a message while it works accepts it; anything else refuses, and the client sends the text as an ordinary `user_prompt`.
+```json
+{
+  "type": "steer_turn",
+  "sessionId": "session-main",
+  "turnId": "turn-1",
+  "data": { "sessionId": "session-main", "turnId": "turn-1", "prompt": "also update the tests" }
+}
+```
+- `turnId`: the running turn. A different or finished turn is refused.
+- `authorName`/`authorAvatar`/`projectPath` work as they do for `user_prompt`.
+- The answer is `steer_accepted` or `steer_rejected` (§3.2), never both, and no `turn_started`: it is the same turn.
+- How each agent takes it: Claude Code folds a plain user message into the turn at its next model call; Codex uses `turn/steer`, which names the turn and so can't land in one that just ended; ACP agents get a second `session/prompt`, and only the last prompt's answer settles the turn. Agents that allow one prompt at a time refuse.
+
 #### `restore_snapshot`
 Reverts the project filesystem to how it was right before that snapshot's turn, undoably (see §6 "Restoring Snapshots"). Resolves its project the same way `user_prompt` does (§4b): `data.projectPath` if given, else whatever project the envelope's `sessionId` is already bound to.
 ```json
@@ -965,6 +980,14 @@ A turn got the session's turn slot and is starting: sent for every turn (`user_p
 {"type": "turn_started", "sessionId": "session-main", "turnId": "turn-2", "data": {}}
 ```
 *UI Action*: For a prompt sent mid-turn this is when it stops being queued: move it into the transcript and start its reply. From here it can only be stopped with a plain `cancel_turn`. A client can ignore it for turns it didn't queue.
+
+#### `steer_accepted` / `steer_rejected` *(v2.22)*
+The answer to `steer_turn` (§3.1). `data.prompt` is the text that was sent.
+```json
+{"type": "steer_accepted", "sessionId": "session-main", "turnId": "turn-1", "data": {"prompt": "also update the tests", "messageId": "msg-7"}}
+{"type": "steer_rejected", "sessionId": "session-main", "turnId": "turn-1", "data": {"prompt": "also update the tests", "reason": "this agent can't take a message while it is working"}}
+```
+*UI Action*: On `steer_accepted` the message is now in the turn's history at that point, after what the agent had said and before what it says next, under `messageId` — show it there. On `steer_rejected`, send `prompt` as an ordinary `user_prompt` (it waits for the turn to end) and show it as queued.
 
 #### `turn_completed`
 Signifies that the iterative turn loop has ended.
@@ -1845,6 +1868,8 @@ Every one of them is installed and logged in outside yoakeland (`claude auth log
 ### CLI agents run with their own tools
 
 A `cli_*` provider is not a text model — it's the whole agent. yoakeland hands it the user's message and relays everything it reports back onto the normal turn stream (§3.2), so a client renders a CLI agent's turn with the same events as any other:
+
+Its process lives as long as the chat does, not as long as a turn: the first turn starts it, later turns are written to the same process, and it ends when the chat is deleted, the server stops, or nobody has used it for 30 minutes (the next turn then resumes the agent's own session). That is what lets a message reach an agent that is already working (`steer_turn`, §3.1), a model or mode change take effect without a restart, and stopping a turn interrupt the agent instead of killing it. Changing something the agent can only be started with (Claude's effort or fast mode, or entering Run) does restart it, resuming the same conversation.
 
 - **Text and reasoning** stream as `model_delta` (`content` / `reasoning`), token by token for claude, codex and ACP agents alike.
 - **Tool calls it runs** arrive as `tool_call_requested` then `tool_result`, both with `native: true` plus `title`/`kind`/`locations` (and `tool_result.diffs` for edits) — see those events in §3.2. yoakeland never executes them; the agent already did. They're stored in the chat's history in the order they happened (text → call → result → more text), so `get_session_history` repaints them the same way.

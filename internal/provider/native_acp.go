@@ -619,31 +619,81 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 		sess.applyMode(ctx, conn, nt.Mode)
 	}
 
-	// The prompt's answer is waited for even when the turn is stopped, so the
-	// next turn never overlaps it on the same process.
+	// A steer is a second session/prompt while one is open: the agent carries on
+	// with the newer request and the earlier one is answered early (some agents
+	// call that "cancelled"), so only the last prompt's answer settles the turn.
+	// Each prompt's answer is waited for even when the turn is stopped, so the
+	// next turn never overlaps one on the same process.
 	type promptResult struct {
 		raw json.RawMessage
 		err error
 	}
-	answer := make(chan promptResult, 1)
-	go func() {
-		raw, err := conn.call(context.Background(), "session/prompt", map[string]any{
-			"sessionId": sess.SessionID,
-			"prompt":    []map[string]string{{"type": "text", "text": acpPlanPrefix(sess, nt.Mode) + prompt}},
+	var (
+		pmu     sync.Mutex
+		prompts []chan promptResult
+		issued  = make(chan struct{}, 1)
+		over    atomic.Bool
+	)
+	sendPrompt := func(text string) {
+		ch := make(chan promptResult, 1)
+		pmu.Lock()
+		prompts = append(prompts, ch)
+		pmu.Unlock()
+		go func() {
+			raw, err := conn.call(context.Background(), "session/prompt", map[string]any{
+				"sessionId": sess.SessionID,
+				"prompt":    []map[string]string{{"type": "text", "text": text}},
+			})
+			ch <- promptResult{raw, err}
+		}()
+	}
+	last := func() chan promptResult {
+		pmu.Lock()
+		defer pmu.Unlock()
+		return prompts[len(prompts)-1]
+	}
+	sendPrompt(acpPlanPrefix(sess, nt.Mode) + prompt)
+	defer over.Store(true)
+	if !spec.NoSteer {
+		nt.SetSteer(func(text string) error {
+			if over.Load() || a.dead() {
+				return errors.New("the turn has ended")
+			}
+			sendPrompt(text)
+			select {
+			case issued <- struct{}{}:
+			default:
+			}
+			return nil
 		})
-		answer <- promptResult{raw, err}
-	}()
+	}
 	var res promptResult
-	select {
-	case res = <-answer:
-	case <-ctx.Done():
-		conn.notify("session/cancel", map[string]string{"sessionId": sess.SessionID})
+wait:
+	for {
+		cur := last()
 		select {
-		case <-answer:
-		case <-time.After(10 * time.Second):
-			a.close()
+		case r := <-cur:
+			if cur == last() {
+				res = r
+				break wait
+			}
+		case <-issued:
+		case <-ctx.Done():
+			conn.notify("session/cancel", map[string]string{"sessionId": sess.SessionID})
+			deadline := time.After(10 * time.Second)
+			pmu.Lock()
+			open := append([]chan promptResult(nil), prompts...)
+			pmu.Unlock()
+			for _, ch := range open {
+				select {
+				case <-ch:
+				case <-deadline:
+					a.close()
+					return ctx.Err()
+				}
+			}
+			return ctx.Err()
 		}
-		return ctx.Err()
 	}
 	if res.err != nil {
 		if !t.seenAnything() {

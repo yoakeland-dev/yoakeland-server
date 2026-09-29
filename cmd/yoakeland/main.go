@@ -1052,6 +1052,35 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			ag.CancelTurn(tID)
 		}
 
+	case protocol.EventSteerTurn:
+		var data protocol.SteerTurnData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: "malformed steer_turn payload"})
+			return
+		}
+		sessID := data.SessionID
+		if sessID == "" {
+			sessID = env.SessionID
+		}
+		if sessID == "" {
+			sessID = "default"
+		}
+		turnID := data.TurnID
+		if turnID == "" {
+			turnID = env.TurnID
+		}
+		pc, err := deps.projects.Resolve(sessID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, sessID, turnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		// Accepted, the running turn records the message and says steer_accepted; refused,
+		// the client sends it as a prompt of its own, which waits its turn.
+		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
+		if err := pc.Registry.Get(ipc, sessID).Steer(turnID, data.Prompt, author); err != nil {
+			_ = ipc.SendEvent(protocol.EventSteerRejected, sessID, turnID, "", protocol.SteerResultData{Prompt: data.Prompt, Reason: err.Error()})
+		}
+
 	case protocol.EventRegisterProvider:
 		var data protocol.RegisterProviderData
 		if err := json.Unmarshal(env.Data, &data); err != nil {

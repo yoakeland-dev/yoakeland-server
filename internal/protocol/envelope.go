@@ -27,6 +27,9 @@ const (
 	EventSwitchBranch         EventType = "switch_branch"
 	EventPermissionResponse   EventType = "permission_response"
 	EventCancelTurn           EventType = "cancel_turn"
+	EventSteerTurn            EventType = "steer_turn"
+	EventSteerAccepted        EventType = "steer_accepted"
+	EventSteerRejected        EventType = "steer_rejected"
 	EventRestoreSnapshot      EventType = "restore_snapshot"
 	EventAuth                 EventType = "auth"
 	EventRegisterProvider     EventType = "register_provider"
@@ -1453,6 +1456,26 @@ type CancelTurnData struct {
 	TurnID    string `json:"turnId,omitempty"`
 	// QueuedOnly withdraws the turn only if it hasn't started yet (§3.1).
 	QueuedOnly bool `json:"queuedOnly,omitempty"`
+}
+
+// SteerTurnData puts a message into a turn that is still running (§3.1
+// steer_turn). Only a CLI agent that can take one mid-turn accepts it.
+type SteerTurnData struct {
+	SessionID   string `json:"sessionId,omitempty"`
+	TurnID      string `json:"turnId"` // the running turn
+	Prompt      string `json:"prompt"`
+	ProjectPath string `json:"projectPath,omitempty"`
+
+	AuthorName   string `json:"authorName,omitempty"`
+	AuthorAvatar string `json:"authorAvatar,omitempty"`
+}
+
+// SteerResultData is steer_accepted (Prompt is now a message in the turn, MessageID
+// its id) or steer_rejected (Reason says why; send it as an ordinary prompt instead).
+type SteerResultData struct {
+	Prompt    string `json:"prompt"`
+	MessageID string `json:"messageId,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // TurnStartedData is empty: the envelope's turnId is the whole message.

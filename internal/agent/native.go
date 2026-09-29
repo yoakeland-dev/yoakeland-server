@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
@@ -97,6 +100,8 @@ type NativeTurn struct {
 	// between turns; "" means one process per turn.
 	SessionKey string
 
+	steer func(text string) error // see SetSteer
+
 	// SessionID is set by the provider once its native session id is known.
 	SessionID string
 }
@@ -104,6 +109,32 @@ type NativeTurn struct {
 // NativeSessionKey names a chat to the providers that keep its CLI process alive.
 func NativeSessionKey(sessionID, projectRoot string) string {
 	return sessionID + "\x1f" + projectRoot
+}
+
+// steerHookMu guards every NativeTurn's steer hook: a provider's goroutine sets
+// it and the agent's reads it, and a mutex in each turn would make it uncopyable.
+var steerHookMu sync.Mutex
+
+// ErrNoSteer is why a message couldn't be put into a running turn.
+var ErrNoSteer = errors.New("this agent can't take a message while it is working")
+
+// SetSteer is how a provider says it can put a message into the turn as it
+// runs; f returns an error when it can't (the turn is over, or not yet started).
+func (nt *NativeTurn) SetSteer(f func(text string) error) {
+	steerHookMu.Lock()
+	nt.steer = f
+	steerHookMu.Unlock()
+}
+
+// Steer puts text into the turn as it runs.
+func (nt *NativeTurn) Steer(text string) error {
+	steerHookMu.Lock()
+	f := nt.steer
+	steerHookMu.Unlock()
+	if f == nil {
+		return ErrNoSteer
+	}
+	return f(text)
 }
 
 type nativeTurnKey struct{}
@@ -374,6 +405,68 @@ func (a *Agent) planRecorded(turnID string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.planTurn == turnID
+}
+
+// steered is a message the user put into a running native turn.
+type steered struct {
+	text   string
+	author Author
+	at     time.Time
+}
+
+// Steer puts text into the native turn that is running, for an agent that can
+// take a message while it works. It returns before the message is recorded;
+// the turn records it, in order, and says so with steer_accepted.
+func (a *Agent) Steer(turnID, text string, author Author) error {
+	if strings.TrimSpace(text) == "" {
+		return errors.New("an empty message can't steer a turn")
+	}
+	a.steerMu.Lock()
+	defer a.steerMu.Unlock()
+	if a.steerNT == nil || a.steerTurn != turnID {
+		return errors.New("that turn isn't running")
+	}
+	if err := a.steerNT.Steer(text); err != nil {
+		return err
+	}
+	a.steerQ = append(a.steerQ, steered{text: text, author: author, at: time.Now()})
+	select {
+	case a.steerSig <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// beginSteering makes nt the turn Steer talks to; endSteering stops that, then
+// records what was steered in the meantime, so nothing accepted is lost.
+func (a *Agent) beginSteering(turnID string, nt *NativeTurn) {
+	a.steerMu.Lock()
+	a.steerNT, a.steerTurn = nt, turnID
+	a.steerMu.Unlock()
+}
+
+func (a *Agent) endSteering(sessionID, turnID string, flush func()) {
+	a.steerMu.Lock()
+	a.steerNT, a.steerTurn = nil, ""
+	a.steerMu.Unlock()
+	a.recordSteers(sessionID, turnID, flush)
+}
+
+// recordSteers writes each message steered into the turn into history after
+// what the agent said before it (flush stores that), and tells clients.
+func (a *Agent) recordSteers(sessionID, turnID string, flush func()) {
+	a.steerMu.Lock()
+	q := a.steerQ
+	a.steerQ = nil
+	a.steerMu.Unlock()
+	for _, s := range q {
+		flush()
+		a.mu.Lock()
+		id := a.nextMessageIDLocked()
+		a.history = append(a.history, Message{ID: id, Role: "user", Content: s.text, AuthorName: s.author.Name, AuthorAvatar: s.author.Avatar, CreatedAt: s.at})
+		a.mu.Unlock()
+		_ = a.getStream().SendEvent(protocol.EventSteerAccepted, sessionID, turnID, "", protocol.SteerResultData{Prompt: s.text, MessageID: id})
+	}
 }
 
 // ResolvePlanApproval approves a native agent's pending request to leave plan

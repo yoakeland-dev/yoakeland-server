@@ -524,3 +524,123 @@ func TestACPSessionCancelWaitsForThePrompt(t *testing.T) {
 		t.Fatalf("cancel restarted the process: %v", f.launches)
 	}
 }
+
+// steerAfterPrompt steers nt once the fake has seen a prompt, and reports the error.
+func steerAfterPrompt(nt *agent.NativeTurn, seen func() bool, text string, result chan<- error) {
+	go func() {
+		for !seen() {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond) // the turn's own bookkeeping after the prompt goes out
+		result <- nt.Steer(text)
+	}()
+}
+
+func TestClaudeSteerFoldsIntoTheRunningTurn(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	prompts := 0
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["type"] != "user" {
+			return
+		}
+		prompts++
+		line(out, map[string]any{"type": "system", "subtype": "init", "session_id": "sess-1"})
+		if prompts == 1 {
+			return // working; the steer arrives while it does
+		}
+		// One result ends the whole exchange, steer included.
+		line(out, map[string]any{"type": "result", "subtype": "success", "result": "ok", "usage": map[string]any{}})
+	})}
+	nt := liveTurn(key, agent.ModeReadWrite, "", "first")
+	steered := make(chan error, 1)
+	steerAfterPrompt(nt, func() bool { return len(f.prompts()) > 0 }, "also this", steered)
+	if _, err := runNative(t, p, nt); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-steered; err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	if got := strings.Join(f.prompts(), "|"); got != "first|also this" {
+		t.Fatalf("prompts = %s", got)
+	}
+	if err := nt.Steer("too late"); err == nil {
+		t.Fatal("a finished turn took a steer")
+	}
+}
+
+func TestCodexSteerNamesTheTurn(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := true
+	script := codexScript(&hang)
+	p := &CLISubprocessProvider{Kind: CLIKindCodex, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["method"] == "turn/steer" {
+			line(out, map[string]any{"jsonrpc": "2.0", "id": m["id"], "result": map[string]any{"turnId": "turn1"}})
+			line(out, map[string]any{"method": "turn/completed", "params": map[string]any{"turn": map[string]any{"id": "turn1", "status": "completed"}}})
+			return
+		}
+		script(l, m, out)
+	})}
+	nt := liveTurn(key, agent.ModeReadWrite, "", "first")
+	steered := make(chan error, 1)
+	steerAfterPrompt(nt, func() bool { return len(f.rpc("turn/start")) > 0 }, "also this", steered)
+	if _, err := runNative(t, p, nt); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-steered; err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	st := f.rpc("turn/steer")
+	if len(st) != 1 {
+		t.Fatalf("turn/steer calls = %d", len(st))
+	}
+	params := st[0]["params"].(map[string]any)
+	input := params["input"].([]any)[0].(map[string]any)
+	if params["expectedTurnId"] != "turn1" || params["threadId"] != "th1" || input["text"] != "also this" {
+		t.Fatalf("turn/steer params = %v", params)
+	}
+}
+
+// A steered ACP prompt supersedes the one before it, which some agents answer
+// "cancelled": only the last prompt's answer may settle the turn.
+func TestACPSteerLastPromptSettles(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	var firstID any
+	prompts := 0
+	base := acpScript(new(bool))
+	p := &CLISubprocessProvider{Kind: CLIKindCursor, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["method"] != "session/prompt" {
+			base(l, m, out)
+			return
+		}
+		prompts++
+		if prompts == 1 {
+			firstID = m["id"]
+			return
+		}
+		line(out, map[string]any{"jsonrpc": "2.0", "id": firstID, "result": map[string]any{"stopReason": "cancelled"}})
+		line(out, map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "s1", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "both"}}}})
+		line(out, map[string]any{"jsonrpc": "2.0", "id": m["id"], "result": map[string]any{"stopReason": "end_turn"}})
+	})}
+	nt := liveTurn(key, agent.ModeReadWrite, "", "first")
+	steered := make(chan error, 1)
+	steerAfterPrompt(nt, func() bool { return len(f.rpc("session/prompt")) > 0 }, "also this", steered)
+	chunks, err := runNative(t, p, nt)
+	if err != nil {
+		t.Fatalf("the superseded prompt's \"cancelled\" ended the turn: %v", err)
+	}
+	if err := <-steered; err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	if got := strings.Join(promptTexts(f), "|"); got != "first|also this" {
+		t.Fatalf("prompts = %s", got)
+	}
+	if k := kinds(chunks); !strings.Contains(k, "delta") {
+		t.Fatalf("chunks = %s", k)
+	}
+}

@@ -33,6 +33,9 @@ type cliSpec struct {
 	Binary   string
 	Args     []string // ACP agents only; claude/codex build their own
 	Protocol string   // "claude" | "codex" | "acp"
+	// NoSteer: the agent allows one prompt at a time, so a message typed while
+	// it works can't go into the turn.
+	NoSteer bool
 }
 
 var cliSpecs = map[CLIKind]cliSpec{
@@ -69,8 +72,9 @@ func DetectCLI(kind CLIKind) bool {
 // tools, sandbox and session, and relays what the agent reports — streamed
 // text and reasoning, tool calls and their results, permission asks,
 // questions, usage — into yoakeland's turn loop as an agent.NativeAgent.
-// Usage is billed to the user's own subscription. One CLI process per turn;
-// continuity comes from the agent's own session (agent.NativeTurn.ResumeID).
+// Usage is billed to the user's own subscription. The process lives as long as
+// the chat does (session_pool.go); the agent's own session
+// (agent.NativeTurn.ResumeID) is what carries the conversation across restarts.
 type CLISubprocessProvider struct {
 	Kind  CLIKind
 	Model string
@@ -126,7 +130,8 @@ func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, _ []agent.Messag
 			eChan <- fmt.Errorf("CLI agent %q can't run outside a native turn", p.Kind)
 			return
 		}
-		// Every CLI process dies with the turn, however the turn ends.
+		// The turn's own work ends with it, however it ends; the agent's process
+		// belongs to the chat and stays (a stopped turn interrupts it instead).
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		emit := func(c agent.ModelStreamChunk) {

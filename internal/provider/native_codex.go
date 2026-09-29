@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/diff"
@@ -506,6 +507,23 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 		} `json:"turn"`
 	}
 	_ = json.Unmarshal(started, &st)
+
+	// turn/steer names the turn it expects to be running, so a message can't
+	// land in a turn that has just ended.
+	var over atomic.Bool
+	defer over.Store(true)
+	nt.SetSteer(func(text string) error {
+		if over.Load() {
+			return errors.New("the turn has ended")
+		}
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := conn.call(c, "turn/steer", map[string]any{
+			"threadId": threadID, "expectedTurnId": st.Turn.ID,
+			"input": []map[string]any{{"type": "text", "text": text, "text_elements": []any{}}},
+		})
+		return err
+	})
 
 	var turn struct {
 		Status string `json:"status"`

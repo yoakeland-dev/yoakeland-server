@@ -327,6 +327,14 @@ type Agent struct {
 	askUserRequests   map[string]chan string
 	activeTurnCancels map[string]context.CancelFunc
 
+	// Steering a running native turn (native.go): the turn Steer talks to, and
+	// the messages put into it that it has yet to record.
+	steerMu   sync.Mutex
+	steerNT   *NativeTurn
+	steerTurn string
+	steerQ    []steered
+	steerSig  chan struct{}
+
 	// discarded marks the session this Agent serves as deleted (see Discard):
 	// a turn still in flight must not write back a file its caller just
 	// removed. Read/written under mu.
@@ -551,6 +559,7 @@ func NewAgent(
 		permRequestKeys:   make(map[string]string),
 		askUserRequests:   make(map[string]chan string),
 		activeTurnCancels: make(map[string]context.CancelFunc),
+		steerSig:          make(chan struct{}, 1),
 		turnSlot:          make(chan struct{}, 1),
 		queuedTurns:       make(map[string]context.CancelFunc),
 		pendingAsks:       make(map[string]protocol.PendingAsk),
@@ -1329,6 +1338,7 @@ turn:
 			hist := append([]Message(nil), a.history...)
 			a.mu.Unlock()
 			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist)
+			a.beginSteering(turnID, nt)
 			streamCtx = WithNativeTurn(turnCtx, nt)
 			toolDefs, systemPrompt = nil, ""
 		} else {
@@ -1379,6 +1389,8 @@ turn:
 			case <-turnCtx.Done():
 				finishReason, cutShort = "cancelled", true
 				done = true
+			case <-a.steerSig:
+				a.recordSteers(sessionID, turnID, flushSegment)
 			case err, ok := <-errs:
 				if ok && err != nil {
 					if errors.Is(err, context.Canceled) {
@@ -1481,6 +1493,10 @@ turn:
 					providerFinishReason = chunk.FinishReason
 				}
 			}
+		}
+
+		if isNative {
+			a.endSteering(sessionID, turnID, flushSegment)
 		}
 
 		// Priced once, on the model that ran this round, then folded into

@@ -118,3 +118,75 @@ func TestAgent_NativePlanTurnRecordsFinalMessage(t *testing.T) {
 		t.Fatalf("plan file: %q %v", b, err)
 	}
 }
+
+// steerNative works until it is steered, then finishes what it was saying.
+type steerNative struct{ ready, steered chan string }
+
+func (steerNative) RunsOwnTools() {}
+
+func (s steerNative) StreamTurn(ctx context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	c, e := make(chan agent.ModelStreamChunk, 8), make(chan error, 1)
+	nt := agent.NativeTurnFromContext(ctx)
+	got := make(chan string, 1)
+	nt.SetSteer(func(text string) error { got <- text; return nil })
+	go func() {
+		defer close(c)
+		defer close(e)
+		c <- agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: "before"}
+		s.ready <- "working"
+		select {
+		case text := <-got:
+			s.steered <- text
+		case <-ctx.Done():
+			return
+		}
+		time.Sleep(50 * time.Millisecond) // a model round-trip, which the steer is recorded well inside of
+		c <- agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: "after"}
+	}()
+	return c, e
+}
+
+// A message steered into a native turn is recorded where it happened: after
+// what the agent had said, before what it said next.
+func TestAgent_SteerIsRecordedInOrder(t *testing.T) {
+	native := steerNative{ready: make(chan string, 1), steered: make(chan string, 1)}
+	ag, store, out := testAgent(t, native)
+	ag.SetProvider(native, "cc")
+
+	if err := ag.Steer("t1", "too early", agent.Author{}); err == nil {
+		t.Fatal("a steer with no turn running was accepted")
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- ag.RunTurn(context.Background(), "s1", "t1", "go") }()
+	<-native.ready
+
+	if err := ag.Steer("other-turn", "x", agent.Author{}); err == nil {
+		t.Fatal("a steer for another turn was accepted")
+	}
+	if err := ag.Steer("t1", "also do x", agent.Author{Name: "ada"}); err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-native.steered; got != "also do x" {
+		t.Fatalf("the agent was sent %q", got)
+	}
+	st, _ := store.Load("s1")
+	var got []string
+	for _, m := range st.History {
+		got = append(got, m.Role+":"+m.Content)
+	}
+	if want := "user:go|assistant:before|user:also do x|assistant:after"; strings.Join(got, "|") != want {
+		t.Fatalf("history = %s\nwant      %s", strings.Join(got, "|"), want)
+	}
+	if st.History[2].AuthorName != "ada" {
+		t.Fatalf("author = %q", st.History[2].AuthorName)
+	}
+	if !strings.Contains(out.String(), `"type":"steer_accepted"`) || !strings.Contains(out.String(), `"prompt":"also do x"`) {
+		t.Fatalf("no steer_accepted: %s", out.String())
+	}
+	if err := ag.Steer("t1", "too late", agent.Author{}); err == nil {
+		t.Fatal("a steer after the turn ended was accepted")
+	}
+}

@@ -220,6 +220,7 @@ type claudeTurn struct {
 	emit func(agent.ModelStreamChunk)
 	done chan claudeLine // the result line
 	seen atomic.Bool     // the session has said something since the prompt went in
+	over atomic.Bool     // the turn has ended, so there is nothing left to steer
 
 	mu       sync.Mutex
 	names    map[string]string           // tool_use_id -> tool name
@@ -288,6 +289,7 @@ func (t *claudeTurn) handle(ln claudeLine) {
 	case "rate_limit_event":
 		t.p.reportRateLimits(parseClaudeRateLimits(ln.RateLimitInfo))
 	case "result":
+		t.over.Store(true)
 		select {
 		case t.done <- ln:
 		default:
@@ -413,10 +415,24 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 		s.mu.Unlock()
 	}
 
-	s.write(map[string]any{
-		"type":               "user",
-		"message":            map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": nt.Prompt}}},
-		"parent_tool_use_id": nil,
+	userLine := func(text string) map[string]any {
+		return map[string]any{
+			"type":               "user",
+			"message":            map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": text}}},
+			"parent_tool_use_id": nil,
+		}
+	}
+	s.write(userLine(nt.Prompt))
+	// A plain user line while the turn runs is folded into it at the agent's next
+	// model call, and one result still ends the whole exchange. (priority "now"
+	// would interrupt instead.)
+	defer t.over.Store(true)
+	nt.SetSteer(func(text string) error {
+		if t.over.Load() || s.dead() {
+			return errors.New("the turn has ended")
+		}
+		s.write(userLine(text))
+		return nil
 	})
 
 	var res claudeLine
