@@ -33,6 +33,9 @@ var pricingFallback []byte
 type pricingRate struct {
 	InputPerToken  float64
 	OutputPerToken float64
+	// Prompt-cache rates; 0 when LiteLLM doesn't list one.
+	CacheReadPerToken  float64
+	CacheWritePerToken float64
 }
 
 // pricingCacheFile mirrors manifestCacheFile: the raw upstream bytes plus
@@ -112,6 +115,25 @@ func (pc *PricingCache) Lookup(model string) (rate pricingRate, ok bool) {
 		}
 	}
 	return pricingRate{}, false
+}
+
+// CostUSD prices one request with prompt-cache reads and writes split out
+// (both part of input). A missing cache rate falls back to the input rate,
+// so an unknown discount over- rather than under-reports.
+func (pc *PricingCache) CostUSD(model string, input, cacheRead, cacheWrite, output int) (float64, bool) {
+	r, ok := pc.Lookup(model)
+	if !ok {
+		return 0, false
+	}
+	readRate, writeRate := r.CacheReadPerToken, r.CacheWritePerToken
+	if readRate == 0 {
+		readRate = r.InputPerToken
+	}
+	if writeRate == 0 {
+		writeRate = r.InputPerToken
+	}
+	plain := input - cacheRead - cacheWrite
+	return float64(plain)*r.InputPerToken + float64(cacheRead)*readRate + float64(cacheWrite)*writeRate + float64(output)*r.OutputPerToken, true
 }
 
 func bareModelName(key string) string {
@@ -226,8 +248,10 @@ func (pc *PricingCache) recordSuccess() {
 // uses. Extra upstream fields are simply ignored by encoding/json, which is
 // what keeps this defensive against upstream reshaping.
 type rawPricingEntry struct {
-	InputCostPerToken  *float64 `json:"input_cost_per_token"`
-	OutputCostPerToken *float64 `json:"output_cost_per_token"`
+	InputCostPerToken      *float64 `json:"input_cost_per_token"`
+	OutputCostPerToken     *float64 `json:"output_cost_per_token"`
+	CacheReadCostPerToken  float64  `json:"cache_read_input_token_cost"`
+	CacheWriteCostPerToken float64  `json:"cache_creation_input_token_cost"`
 }
 
 // parsePricing projects LiteLLM's document into model -> rate. Entries
@@ -249,8 +273,10 @@ func parsePricing(raw []byte) (map[string]pricingRate, error) {
 			continue
 		}
 		rates[strings.ToLower(name)] = pricingRate{
-			InputPerToken:  *entry.InputCostPerToken,
-			OutputPerToken: *entry.OutputCostPerToken,
+			InputPerToken:      *entry.InputCostPerToken,
+			OutputPerToken:     *entry.OutputCostPerToken,
+			CacheReadPerToken:  entry.CacheReadCostPerToken,
+			CacheWritePerToken: entry.CacheWriteCostPerToken,
 		}
 	}
 	if len(rates) == 0 {

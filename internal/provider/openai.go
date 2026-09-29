@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
@@ -34,9 +35,16 @@ type OpenAICompatibleProvider struct {
 
 // SetModelOptions implements agent.ModelOptionsSetter. ThinkingBudget is
 // ignored — OpenAI/OpenRouter's chat-completions API takes an effort level,
-// not a token budget.
+// not a token budget. An empty effort leaves the current one alone;
+// "default" goes back to the model's own.
 func (p *OpenAICompatibleProvider) SetModelOptions(opts agent.ModelOptions) {
-	p.reasoningEffort.Store(opts.ReasoningEffort)
+	switch opts.ReasoningEffort {
+	case "":
+	case "default":
+		p.reasoningEffort.Store("")
+	default:
+		p.reasoningEffort.Store(opts.ReasoningEffort)
+	}
 }
 
 func (p *OpenAICompatibleProvider) getReasoningEffort() string {
@@ -107,6 +115,12 @@ type openAIRequest struct {
 	// non-pointer struct as empty.
 	StreamOptions   *openAIStreamOptions `json:"stream_options,omitempty"`
 	ReasoningEffort string               `json:"reasoning_effort,omitempty"`
+
+	// PromptCacheKey (OpenAI only) routes a session's requests to the same
+	// cache; CacheControl (OpenRouter, Claude models only) turns on its
+	// automatic prompt caching — OpenAI and most others cache on their own.
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+	CacheControl   any    `json:"cache_control,omitempty"`
 
 	// MaxTokens defaults to defaultMaxTokens below rather than being left
 	// unset: several OpenAI-compatible backends (DeepSeek's API included)
@@ -260,6 +274,16 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			ReasoningEffort: p.getReasoningEffort(),
 			MaxTokens:       maxTokens,
 		}
+		// Only agent turns (they carry tools) are worth caching; a one-off
+		// request would pay the write premium for nothing.
+		if len(tools) > 0 {
+			if p.BaseURL == "https://api.openai.com/v1/chat/completions" {
+				reqBody.PromptCacheKey = agent.RequestHintsFrom(ctx).CacheKey
+			}
+			if p.IsOpenRouter && strings.HasPrefix(p.Model, "anthropic/") {
+				reqBody.CacheControl = map[string]any{"type": "ephemeral"}
+			}
+		}
 
 		jsonBytes, err := json.Marshal(reqBody)
 		if err != nil {
@@ -319,9 +343,13 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 					FinishReason *string `json:"finish_reason"`
 				} `json:"choices"`
 				Usage *struct {
-					PromptTokens     int `json:"prompt_tokens"`
-					CompletionTokens int `json:"completion_tokens"`
-					TotalTokens      int `json:"total_tokens"`
+					PromptTokens        int `json:"prompt_tokens"`
+					CompletionTokens    int `json:"completion_tokens"`
+					TotalTokens         int `json:"total_tokens"`
+					PromptTokensDetails struct {
+						CachedTokens     int `json:"cached_tokens"`
+						CacheWriteTokens int `json:"cache_write_tokens"`
+					} `json:"prompt_tokens_details"`
 				} `json:"usage"`
 			}
 
@@ -335,6 +363,8 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 				usage.InputTokens = chunk.Usage.PromptTokens
 				usage.OutputTokens = chunk.Usage.CompletionTokens
 				usage.TotalTokens = chunk.Usage.TotalTokens
+				usage.CachedInputTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+				usage.CacheWriteInputTokens = chunk.Usage.PromptTokensDetails.CacheWriteTokens
 			}
 
 			if len(chunk.Choices) == 0 {

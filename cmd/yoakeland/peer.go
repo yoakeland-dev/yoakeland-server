@@ -33,6 +33,9 @@ type Peer struct {
 	DeviceID    string
 	SessionID   string // last chat opened, see SetActivity
 	ProjectPath string
+	Network     string // "unix" or "tcp"
+	// BrowserHost: offered its browser panel to the agent (browser_host).
+	BrowserHost bool
 
 	conn io.Closer
 	ipc  *protocol.IPCStream
@@ -83,6 +86,7 @@ func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network stri
 		DeviceID:    who.DeviceID,
 		TokenName:   who.TokenName,
 		Email:       who.Email,
+		Network:     network,
 		conn:        conn,
 		ipc:         ipc,
 	}
@@ -186,6 +190,15 @@ func (r *PeerRegistry) Get(id string) (*Peer, bool) {
 	defer r.mu.Unlock()
 	p, ok := r.peers[id]
 	return p, ok
+}
+
+// SetBrowserHost records whether id offers its browser panel to the agent.
+func (r *PeerRegistry) SetBrowserHost(id string, enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p, ok := r.peers[id]; ok {
+		p.BrowserHost = enabled
+	}
 }
 
 // SetActivity records the chat id last opened, broadcasting only on a

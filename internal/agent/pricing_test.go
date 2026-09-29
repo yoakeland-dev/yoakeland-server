@@ -29,14 +29,14 @@ func TestEstimateCostUSD(t *testing.T) {
 func TestEstimateCostUSD_PrefersLiveSourceOverStaticTable(t *testing.T) {
 	t.Cleanup(func() { agent.SetLivePricingSource(nil) })
 
-	agent.SetLivePricingSource(func(model string) (float64, float64, bool) {
+	agent.SetLivePricingSource(func(model string, u protocol.UsageData) (float64, bool) {
 		if model == "claude-3-5-sonnet-20241022" {
 			// Deliberately different from the static table's $3/$15 per
 			// million, so a test failure here can only mean the static
 			// table was used instead of this one.
-			return 0.000001, 0.000002, true
+			return float64(u.InputTokens)*0.000001 + float64(u.OutputTokens)*0.000002, true
 		}
-		return 0, 0, false
+		return 0, false
 	})
 
 	usage := protocol.UsageData{InputTokens: 1_000_000, OutputTokens: 1_000_000}

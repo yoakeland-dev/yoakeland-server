@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"yoakeland/internal/protocol"
 )
 
 type SessionState struct {
@@ -73,6 +74,14 @@ type SessionStore interface {
 // whose first turn hasn't reached the model — not an error to report.
 var ErrSessionNotFound = errors.New("session not found")
 
+// sessionFile is the one place a session id becomes a path.
+func (s *DiskSessionStore) sessionFile(sessionID string) (string, error) {
+	if !protocol.ValidSessionID(sessionID) {
+		return "", fmt.Errorf("invalid session id %q", sessionID)
+	}
+	return filepath.Join(s.baseDir, sessionID+".json"), nil
+}
+
 type DiskSessionStore struct {
 	mu      sync.RWMutex
 	baseDir string
@@ -103,7 +112,10 @@ func (s *DiskSessionStore) saveLocked(session *SessionState) error {
 		return err
 	}
 
-	target := filepath.Join(s.baseDir, session.SessionID+".json")
+	target, err := s.sessionFile(session.SessionID)
+	if err != nil {
+		return err
+	}
 	tmp := target + ".tmp"
 	// The folder may have been deleted since startup.
 	if err := os.MkdirAll(s.baseDir, 0755); err != nil {
@@ -141,7 +153,10 @@ func (s *DiskSessionStore) Load(sessionID string) (*SessionState, error) {
 }
 
 func (s *DiskSessionStore) loadLocked(sessionID string) (*SessionState, error) {
-	target := filepath.Join(s.baseDir, sessionID+".json")
+	target, err := s.sessionFile(sessionID)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(target)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -233,7 +248,10 @@ func (s *DiskSessionStore) Delete(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	target := filepath.Join(s.baseDir, sessionID+".json")
+	target, err := s.sessionFile(sessionID)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(target); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("session %s not found", sessionID)

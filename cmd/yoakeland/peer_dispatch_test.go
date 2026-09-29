@@ -198,13 +198,18 @@ func TestServeConnection_RemoteAccessAndPasswordAreLocalSocketOnly(t *testing.T)
 // a local connection can rotate the password, and it's persisted.
 func TestServeConnection_SetRemotePasswordOverUnix(t *testing.T) {
 	deps := newTestDeps(t)
-	line := envelopeJSON(t, protocol.EventSetRemotePassword, protocol.SetRemotePasswordData{Password: "new-password"})
+	short := envelopeJSON(t, protocol.EventSetRemotePassword, protocol.SetRemotePasswordData{Password: "hunter2"})
+	if envs := runDispatch(t, deps, short); len(envs) != 1 || envs[0].Type != protocol.EventError {
+		t.Fatalf("expected a short password to be rejected, got %+v", envs)
+	}
 
+	const pw = "new-password-long-enough"
+	line := envelopeJSON(t, protocol.EventSetRemotePassword, protocol.SetRemotePasswordData{Password: pw})
 	envs := runDispatch(t, deps, line)
 	if len(envs) != 1 || envs[0].Type != protocol.EventRemotePasswordSet {
 		t.Fatalf("expected remote_password_set, got %+v", envs)
 	}
-	if got := deps.settings.GetToken(); got != "new-password" {
-		t.Fatalf("GetToken() = %q, want %q", got, "new-password")
+	if got := deps.settings.GetToken(); got != pw {
+		t.Fatalf("GetToken() = %q, want %q", got, pw)
 	}
 }

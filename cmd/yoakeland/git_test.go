@@ -95,3 +95,22 @@ func TestGitChanges_NotARepoSaysSo(t *testing.T) {
 		t.Fatalf("err = %v, want git's own \"not a git repository\"", err)
 	}
 }
+
+// A .git/config written from inside the sandbox must not run on the host
+// when yoakeland itself runs git status.
+func TestHostGitIgnoresFsmonitor(t *testing.T) {
+	repo := t.TempDir()
+	if err := exec.Command("git", "-C", repo, "init", "-q").Run(); err != nil {
+		t.Skipf("git unavailable: %v", err)
+	}
+	marker := filepath.Join(repo, "PWNED")
+	if err := exec.Command("git", "-C", repo, "config", "core.fsmonitor", "touch '"+marker+"'; false #").Run(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := gitChanges(repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("core.fsmonitor ran on the host")
+	}
+}

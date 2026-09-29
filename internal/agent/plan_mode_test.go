@@ -85,8 +85,8 @@ func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "hi"); err != nil {
 		t.Fatalf("turn 1 (read/write): %v", err)
 	}
-	if got := provider.toolNamesByTurn[0]; len(got) != 3 {
-		t.Fatalf("expected all 3 tools in read/write mode, got %v", got)
+	if got := provider.toolNamesByTurn[0]; len(got) != 4 {
+		t.Fatalf("expected all 3 tools + subagent in read/write mode, got %v", got)
 	}
 
 	ag.SetMode(agent.ModeReadOnly)
@@ -96,8 +96,8 @@ func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {
 	if err := ag.RunTurn(context.Background(), "s1", "t2", "read only"); err != nil {
 		t.Fatalf("turn 2 (read-only): %v", err)
 	}
-	if got := provider.toolNamesByTurn[1]; len(got) != 1 || got[0] != "file_read" {
-		t.Fatalf("expected only file_read in read-only mode, got %v", got)
+	if got := provider.toolNamesByTurn[1]; len(got) != 2 || got[0] != "file_read" || got[1] != agent.SubagentToolName {
+		t.Fatalf("expected only file_read + subagent in read-only mode, got %v", got)
 	}
 
 	ag.SetMode(agent.ModePlan)
@@ -105,10 +105,10 @@ func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {
 		t.Fatalf("turn 3 (plan): %v", err)
 	}
 	got := provider.toolNamesByTurn[2]
-	if len(got) != 2 {
-		t.Fatalf("expected file_read + write_plan in plan mode, got %v", got)
+	if len(got) != 3 {
+		t.Fatalf("expected file_read + write_plan + subagent in plan mode, got %v", got)
 	}
-	for _, want := range []string{"file_read", "write_plan"} {
+	for _, want := range []string{"file_read", "write_plan", agent.SubagentToolName} {
 		found := false
 		for _, name := range got {
 			if name == want {
@@ -124,8 +124,8 @@ func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {
 	if err := ag.RunTurn(context.Background(), "s1", "t4", "go"); err != nil {
 		t.Fatalf("turn 4 (autonomous): %v", err)
 	}
-	if got := provider.toolNamesByTurn[3]; len(got) != 3 {
-		t.Fatalf("expected all 3 tools in autonomous mode, got %v", got)
+	if got := provider.toolNamesByTurn[3]; len(got) != 4 {
+		t.Fatalf("expected all 3 tools + subagent in autonomous mode, got %v", got)
 	}
 }
 

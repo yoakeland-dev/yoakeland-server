@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
+	"yoakeland/internal/protocol"
 )
 
 // TokenRecord is one named person's TCP auth credential, plus the identity
@@ -48,6 +50,10 @@ type ServerSettings struct {
 	// so a fresh server behaves identically whether or not this was ever
 	// touched.
 	AutoGenerateTitle *bool `json:"autoGenerateTitle,omitempty"`
+
+	// ModelRoles is the server-wide model role table (set_model_roles,
+	// SPEC.md §4f), keyed by role name.
+	ModelRoles map[string]protocol.ModelRole `json:"modelRoles,omitempty"`
 
 	// Token is the legacy single-secret field from before per-person
 	// tokens existed. Only ever read at load time, to migrate into
@@ -139,6 +145,19 @@ func (s *ServerSettings) SetAutoGenerateTitle(enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AutoGenerateTitle = &enabled
+	return s.save()
+}
+
+func (s *ServerSettings) GetModelRoles() map[string]protocol.ModelRole {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.ModelRoles)
+}
+
+func (s *ServerSettings) SetModelRoles(roles map[string]protocol.ModelRole) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ModelRoles = maps.Clone(roles)
 	return s.save()
 }
 

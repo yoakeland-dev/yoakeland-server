@@ -202,3 +202,27 @@ func TestRemoteControl_AutoCA_ClientTrustsOnlyThatCA(t *testing.T) {
 	}
 	conn.Close()
 }
+
+// A TCP connection that never authenticates is dropped after
+// preAuthTimeout, and gives its pre-auth slot back.
+func TestServeAccepted_DropsSilentUnauthenticatedConn(t *testing.T) {
+	old := preAuthTimeout
+	preAuthTimeout = 50 * time.Millisecond
+	defer func() { preAuthTimeout = old }()
+
+	server, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		serveAccepted(context.Background(), server, "tcp", newTestDeps(t), func(string) (string, TokenRecord, bool) { return "", TokenRecord{}, false })
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("silent unauthenticated connection was never dropped")
+	}
+	if n := len(preAuthSlots); n != 0 {
+		t.Fatalf("%d pre-auth slots still held", n)
+	}
+}

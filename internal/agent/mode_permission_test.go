@@ -193,8 +193,8 @@ func TestAgent_WebToolsToggleFiltersToolDefs(t *testing.T) {
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "hi"); err != nil {
 		t.Fatalf("turn 1: %v", err)
 	}
-	if got := provider.toolNamesByTurn[0]; len(got) != 3 {
-		t.Fatalf("expected all 3 tools with web tools enabled (default), got %v", got)
+	if got := provider.toolNamesByTurn[0]; len(got) != 4 {
+		t.Fatalf("expected all 3 tools + subagent with web tools enabled (default), got %v", got)
 	}
 
 	ag.SetWebToolsEnabled(false)
@@ -205,8 +205,8 @@ func TestAgent_WebToolsToggleFiltersToolDefs(t *testing.T) {
 		t.Fatalf("turn 2: %v", err)
 	}
 	got := provider.toolNamesByTurn[1]
-	if len(got) != 1 || got[0] != "file_read" {
-		t.Fatalf("expected only file_read with web tools disabled, got %v", got)
+	if len(got) != 2 || got[0] != "file_read" || got[1] != agent.SubagentToolName {
+		t.Fatalf("expected only file_read + subagent with web tools disabled, got %v", got)
 	}
 }
 
@@ -249,5 +249,26 @@ func TestAgent_AskUserQuestionBlocksAndResumes(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "which approach?") {
 		t.Fatalf("expected the question in ask_user_question_requested, got: %s", out.String())
+	}
+}
+
+// A remembered decision is keyed on the field the tool acts on, so a stray
+// field can't borrow another target's remembered allow.
+func TestPermissionTarget_UsesToolsOwnField(t *testing.T) {
+	args := json.RawMessage(`{"command":"notes.md","path":"./.git/config","content":"x"}`)
+	if got := agent.PermissionTarget("file_write", args); got != ".git/config" {
+		t.Fatalf("file_write target = %q", got)
+	}
+	if got := agent.PermissionTarget("bash", json.RawMessage(`{"path":"a","command":"ls"}`)); got != "ls" {
+		t.Fatalf("bash target = %q", got)
+	}
+	if got := agent.PermissionTarget("web_fetch", json.RawMessage(`{"url":"https://Docs.Example.com/a?k=secret"}`)); got != "docs.example.com" {
+		t.Fatalf("web_fetch target = %q", got)
+	}
+	if got := agent.PermissionTarget("browser", json.RawMessage(`{"action":"navigate","url":"https://example.com/x"}`)); got != "example.com" {
+		t.Fatalf("browser navigate target = %q", got)
+	}
+	if got := agent.PermissionTarget("new_tool", args); got != string(args) {
+		t.Fatalf("unknown tool target = %q", got)
 	}
 }

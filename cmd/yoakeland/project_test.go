@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"yoakeland/internal/projectstore"
+	"yoakeland/internal/protocol"
 )
 
 // TestProjectRegistry_GetIsIdempotentAndIsolated guards the core promise of
@@ -334,4 +336,40 @@ func newTestRegistry(t *testing.T) *ProjectRegistry {
 		t.Fatalf("NewProjectRegistry: %v", err)
 	}
 	return projects
+}
+
+// A TCP peer can use projects the server already has, never a new path.
+func TestScopeRemoteProject(t *testing.T) {
+	reg, err := NewProjectRegistry(nil, "", 0, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	known, other := t.TempDir(), t.TempDir()
+	if _, err := reg.Get(known); err != nil {
+		t.Fatal(err)
+	}
+	deps := connDeps{projects: reg}
+	env := func(typ protocol.EventType, data string) *protocol.Envelope {
+		return &protocol.Envelope{Type: typ, Data: json.RawMessage(data)}
+	}
+	q := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+	ok := env(protocol.EventReadFile, `{"projectPath":`+q(known+"/./")+`,"path":"a"}`)
+	if err := scopeRemoteProject(deps, ok); err != nil {
+		t.Fatalf("known project refused: %v", err)
+	}
+	var d protocol.FileRequestData
+	_ = json.Unmarshal(ok.Data, &d)
+	if want, _ := projectKey(known); d.ProjectPath != want {
+		t.Fatalf("path not canonicalized: %q", d.ProjectPath)
+	}
+	for _, e := range []*protocol.Envelope{
+		env(protocol.EventReadFile, `{"projectPath":`+q(other)+`}`),
+		env(protocol.EventReadFile, `{"projectPath":`+q(known)+`,"PROJECTPATH":`+q(other)+`}`),
+		env(protocol.EventOpenProject, `{"path":`+q(other)+`}`),
+	} {
+		if err := scopeRemoteProject(deps, e); err == nil {
+			t.Errorf("unknown project allowed: %s", e.Data)
+		}
+	}
 }

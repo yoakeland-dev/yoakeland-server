@@ -39,10 +39,23 @@ type gitWatcher struct {
 	finger string
 }
 
+// hostGit runs git outside the sandbox, so it must not run anything the
+// project's own .git/config names: the agent can write that file from inside
+// the sandbox, and core.fsmonitor alone is a shell command git status runs.
+// Same set Claude Code and Codex landed on for this bug class: blank
+// fsmonitor and hooks on every call, and safe.bareRepository=explicit (git
+// 2.38) so a bare repo committed inside the tree is never picked up as the
+// repository. -c reaches submodule git processes too (GIT_CONFIG_PARAMETERS).
+// ponytail: filter.*.clean drivers still run; the sandbox keeps .git/config
+// and submodule configs read-only so the agent can't add one.
+func hostGit(args ...string) *exec.Cmd {
+	return exec.Command("git", append([]string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "safe.bareRepository=explicit"}, args...)...)
+}
+
 // startGitWatcher returns nil for a project that isn't a git repo (or when
 // git isn't installed) — such projects get no git_status at all.
 func startGitWatcher(root string, publish func(protocol.GitStatusData)) *gitWatcher {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--absolute-git-dir").Output()
+	out, err := hostGit("-C", root, "rev-parse", "--absolute-git-dir").Output()
 	if err != nil {
 		return nil
 	}
@@ -128,7 +141,7 @@ func (w *gitWatcher) refresh() {
 	// --no-optional-locks: plain `git status` may rewrite the index to
 	// refresh stat info, which would bump index's mtime and retrigger this
 	// watcher every second forever.
-	out, err := exec.Command("git", "--no-optional-locks", "-c", "core.quotePath=false", "-C", w.root, "status", "--porcelain=v2", "--branch").Output()
+	out, err := hostGit("--no-optional-locks", "-c", "core.quotePath=false", "-C", w.root, "status", "--porcelain=v2", "--branch").Output()
 	if err != nil {
 		return
 	}
@@ -230,7 +243,7 @@ const maxGitChanges = 5000
 // gitChanges is list_git_changes: every changed path with both its staged
 // and worktree state.
 func gitChanges(root string) (files []protocol.GitChange, truncated bool, err error) {
-	out, err := exec.Command("git", "--no-optional-locks", "-c", "core.quotePath=false", "-C", root, "status", "--porcelain=v2", "--untracked-files=all").Output()
+	out, err := hostGit("--no-optional-locks", "-c", "core.quotePath=false", "-C", root, "status", "--porcelain=v2", "--untracked-files=all").Output()
 	if err != nil {
 		// git's own message ("not a git repository", …) beats a bare exit status.
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
@@ -260,7 +273,7 @@ func gitChanges(root string) (files []protocol.GitChange, truncated bool, err er
 // gitShowHead returns rel's content at HEAD; missing is true when HEAD has
 // no such file (new, untracked, or no commits yet).
 func gitShowHead(root, rel string) (content []byte, missing bool, err error) {
-	out, err := exec.Command("git", "-C", root, "show", "HEAD:"+rel).Output()
+	out, err := hostGit("-C", root, "show", "HEAD:"+rel).Output()
 	if err != nil {
 		if _, isExit := err.(*exec.ExitError); isExit {
 			return nil, true, nil

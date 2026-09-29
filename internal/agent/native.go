@@ -23,10 +23,12 @@ type NativeAgent interface {
 // NativeToolResult is a NativeAgent's report of a tool call it finished.
 type NativeToolResult struct {
 	ToolCallID string
-	Name       string
-	Output     string
-	Error      string
-	Diffs      []*diff.FileDiff
+	// ParentToolCallID: see protocol.NativeToolInfo.
+	ParentToolCallID string
+	Name             string
+	Output           string
+	Error            string
+	Diffs            []*diff.FileDiff
 }
 
 // NativeAsk is a NativeAgent asking permission for one of its tool calls.
@@ -112,7 +114,7 @@ func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []
 	nt.FreshPrompt = msg
 	if last > 0 {
 		nt.FreshPrompt = "Earlier in this conversation (you don't have this in your context, it's a transcript):\n\n" +
-			renderTranscript(history[:last]) + "\n---\n\n" + msg
+			renderTranscript(contextView(history[:last], "")) + "\n---\n\n" + msg
 	}
 	nt.Prompt = nt.FreshPrompt
 	if ref != nil && ref.Provider == providerName && last > 0 && history[last-1].ID == ref.Cursor {

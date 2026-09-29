@@ -139,6 +139,9 @@ func TestClaudeNativeTurn(t *testing.T) {
 	if got := strings.Join(args, " "); !strings.Contains(got, "--permission-prompt-tool stdio") || !strings.Contains(got, "--permission-mode default") || !strings.Contains(got, "--resume sess-0") || !strings.Contains(got, "--model haiku") {
 		t.Fatalf("args = %s", got)
 	}
+	if strings.Contains(strings.Join(args, " "), "--settings") {
+		t.Fatalf("read_write turn got autonomous sandbox settings: %v", args)
+	}
 	if k := kinds(chunks); k != "delta,tool_call,tool_result,usage" {
 		t.Fatalf("chunks = %s", k)
 	}
@@ -330,5 +333,32 @@ func TestDetectCLI(t *testing.T) {
 	t.Setenv("PATH", dir)
 	if !DetectCLI(CLIKindClaude) || !DetectCLI(CLIKindCursor) || DetectCLI(CLIKindCodex) || DetectCLI(CLIKindKimi) {
 		t.Fatal("DetectCLI should find exactly the binaries on PATH")
+	}
+}
+
+// Autonomous bypasses Claude's prompts, so its own sandbox must be on (and
+// refuse to fall back to running unsandboxed).
+func TestClaudeAutonomousTurnIsSandboxed(t *testing.T) {
+	var args []string
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Dir: t.TempDir()}
+	var wait func()
+	p.Start, wait = fakeCLI(t, &args, func(in *bufio.Scanner, out io.Writer) {
+		in.Scan()
+		line(out, map[string]any{"type": "result", "subtype": "success", "result": "done"})
+	})
+	rec := &turnRecorder{}
+	if _, err := runNative(t, p, rec.turn(agent.ModeAutonomous)); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	wait()
+	got := strings.Join(args, " ")
+	if !strings.Contains(got, "--permission-mode bypassPermissions") || !strings.Contains(got, "--settings "+claudeAutonomousSandbox) {
+		t.Fatalf("args = %s", got)
+	}
+	var cfg struct {
+		Sandbox struct{ Enabled, FailIfUnavailable, AllowUnsandboxedCommands bool }
+	}
+	if err := json.Unmarshal([]byte(claudeAutonomousSandbox), &cfg); err != nil || !cfg.Sandbox.Enabled || !cfg.Sandbox.FailIfUnavailable || cfg.Sandbox.AllowUnsandboxedCommands {
+		t.Fatalf("sandbox settings = %+v, %v", cfg, err)
 	}
 }

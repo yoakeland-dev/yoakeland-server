@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
 	"yoakeland/internal/settings"
@@ -66,7 +67,7 @@ func main() {
 	flag.StringVar(&baseURL, "base-url", "", "Custom API base URL (e.g. http://localhost:1234/v1 for LM Studio)")
 	flag.BoolVar(&stdioMode, "stdio", false, "Speak the protocol directly over this process's own stdin/stdout and exit when stdin closes, instead of running as a daemon. This is the spawn-a-subprocess-per-client contract (what yoake-client's default -bin mode uses under the hood). Most local usage wants the default instead: a long-running process that always has a local unix socket open, exiting on SIGINT/SIGTERM rather than stdin EOF. Mutually exclusive with -listen.")
 	flag.StringVar(&listenAddr, "listen", "", "Optionally ALSO listen here, in addition to the always-on local unix socket (a named pipe on Windows; ignored if -stdio is set): a TCP address (e.g. ':7890') for remote/multi-device access, or 'unix:/path/to/socket' to override where the local socket itself lives. A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent.")
-	flag.StringVar(&authToken, "token", "", "Shared auth token required from clients of the optional TCP listener (auto-generated if empty). Not used for any unix socket.")
+	flag.StringVar(&authToken, "token", "", "Shared auth token required from clients of the optional TCP listener (auto-generated if empty). Not used for any unix socket. Prefer YOAKELAND_TOKEN: flags are visible to other local users.")
 	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate file for the optional TCP listener (requires -tls-key). Without both, yoakeland auto-generates and uses its own self-managed CA under -state-dir/tls/ instead — the listener is always TLS, never plaintext.")
 	flag.StringVar(&webRoot, "web-root", "", "Directory holding the built web client (the GUI's build/). Served to browsers on the remote TCP listener, which also accepts the protocol over a WebSocket at /ws; without it, /ws still works but there's no page to load.")
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key file for the optional TCP listener (requires -tls-cert)")
@@ -82,6 +83,9 @@ func main() {
 	if abs, err := filepath.Abs(stateDir); err == nil {
 		stateDir = abs
 	}
+	if canon, err := normalizer.CanonicalRoot(stateDir); err == nil {
+		normalizer.Hidden = []string{canon}
+	}
 
 	initLogging(stateDir)
 
@@ -94,6 +98,13 @@ func main() {
 	if masterKey == "" {
 		masterKey = os.Getenv("YOAKELAND_MASTER_KEY")
 	}
+	if authToken == "" {
+		authToken = os.Getenv("YOAKELAND_TOKEN")
+	}
+	// CLI agents (native_proc.go) inherit this process's environment.
+	_ = os.Unsetenv("YOAKELAND_MASTER_KEY")
+	_ = os.Unsetenv("YOAKELAND_TOKEN")
+	warnSecretFlags()
 	if masterKey == "" {
 		logWarnDetail(
 			"no -master-key set; providers.json will be stored in plaintext",
@@ -137,6 +148,10 @@ func main() {
 	if err != nil {
 		logFatal("failed to open project list store: %v", err)
 	}
+	// Before any project opens: each one's browser tool relays through it.
+	peers := NewPeerRegistry()
+	browser := newBrowserBroker(peers)
+	projects.browser = browser
 	var defaultProjectRoot string
 	if projectDir != "" {
 		defaultProject, err := projects.Get(projectDir)
@@ -166,9 +181,8 @@ func main() {
 	// manifest cache above: a static map silently prices new/renamed models
 	// at $0 with no signal that happened.
 	pricingCache := provider.NewPricingCache(stateDir)
-	agent.SetLivePricingSource(func(model string) (float64, float64, bool) {
-		r, ok := pricingCache.Lookup(model)
-		return r.InputPerToken, r.OutputPerToken, ok
+	agent.SetLivePricingSource(func(model string, u protocol.UsageData) (float64, bool) {
+		return pricingCache.CostUSD(model, u.InputTokens, u.CachedInputTokens, u.CacheWriteInputTokens, u.OutputTokens)
 	})
 
 	// Settings (server identity, remote-access password) are server-level
@@ -178,13 +192,14 @@ func main() {
 	if err != nil {
 		logFatal("failed to initialize server settings: %v", err)
 	}
+	reloadRoles(projects.roles, providerStore, settings)
+
 	if authToken != "" {
 		// An explicit -token always wins over whatever was persisted from a
 		// previous set_remote_password call — a launch-time flag is an
 		// explicit operator override.
 		_ = settings.SetToken(authToken)
 	}
-	peers := NewPeerRegistry()
 	notify := NewNotificationFeed(peers)
 	projects.SetNotifications(notify)
 	hub := newStatusHub(peers, stateDir)
@@ -199,6 +214,7 @@ func main() {
 		projects:           projects,
 		defaultProjectRoot: defaultProjectRoot,
 		providerStore:      providerStore,
+		pricing:            pricingCache,
 		oauthStore:         oauthStore,
 		manifestCache:      manifestCache,
 		peers:              peers,
@@ -208,6 +224,7 @@ func main() {
 		settings:           settings,
 		remote:             rc,
 		status:             hub,
+		browser:            browser,
 		webRoot:            webRoot,
 		turnWG:             &sync.WaitGroup{},
 	}
@@ -297,6 +314,30 @@ func drainTurns(wg *sync.WaitGroup) {
 			fmt.Sprintf("shutdown waited %s for in-flight turns to finish and save; at least one is still running, so its session on disk may be missing the turn in progress. This is expected only if a model request or tool call is ignoring cancellation.", turnDrainTimeout),
 		)
 	}
+}
+
+// minRemotePasswordLen: a chosen password guards the same full access a
+// generated 32-hex-char token does, with no lockout on wrong guesses.
+const minRemotePasswordLen = 16
+
+// secretFlags name the environment variable to use instead of each flag
+// that carries a secret: a process's argv is readable by every local user
+// (/proc/<pid>/cmdline, ps), its environment only by the same user.
+var secretFlags = map[string]string{
+	"token":      "YOAKELAND_TOKEN",
+	"master-key": "YOAKELAND_MASTER_KEY",
+	"api-key":    "ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY",
+}
+
+func warnSecretFlags() {
+	flag.Visit(func(f *flag.Flag) {
+		if env, ok := secretFlags[f.Name]; ok {
+			logWarnDetail(
+				fmt.Sprintf("-%s on the command line is visible to other local users; use %s", f.Name, env),
+				fmt.Sprintf("-%s was passed on the command line, where any local user can read it (ps, /proc/<pid>/cmdline). Set %s in the environment instead.", f.Name, env),
+			)
+		}
+	})
 }
 
 // generateAuthToken produces a fresh random TCP auth token — 16 bytes of
@@ -482,10 +523,39 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 	}
 }
 
+// Until a TCP connection authenticates it's bounded the way OpenSSH bounds
+// one (LoginGraceTime, MaxStartups): preAuthTimeout to send its auth frame,
+// at most maxPreAuth such connections at once (the rest are dropped), and a
+// failed attempt holds its slot for authFailDelay — so a stranger can't pile
+// up idle or 10MB-frame connections, or guess passwords at line rate.
+const (
+	maxPreAuth    = 32
+	authFailDelay = time.Second
+)
+
+var preAuthTimeout = 10 * time.Second // var for tests
+
+var preAuthSlots = make(chan struct{}, maxPreAuth)
+
 // Shared by socket clients and browser WebSockets (web.go).
 func serveAccepted(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
 	ipc := protocol.NewIPCStream(conn, conn)
+	if network == "tcp" {
+		select {
+		case preAuthSlots <- struct{}{}:
+		default:
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(preAuthTimeout))
+	}
 	who, pending, ok := handshake(ipc, network, lookupToken)
+	if network == "tcp" {
+		if !ok {
+			time.Sleep(authFailDelay)
+		}
+		<-preAuthSlots
+		_ = conn.SetReadDeadline(time.Time{})
+	}
 	if !ok {
 		return
 	}
@@ -496,6 +566,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	peer := deps.peers.Add(ipc, conn, network, who)
 	defer deps.peers.Remove(peer.ID)
 	defer deps.uploads.DropPeer(peer.ID)
+	defer deps.browser.DropPeer(peer.ID)
 	// The poller idles with nobody connected; catch up for this client.
 	deps.status.KickUsage()
 	if network == "tcp" {
@@ -515,6 +586,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 
 	_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
 	_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
+	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
 	deps.status.SendPendingAsks(ipc)
 	for _, st := range deps.projects.GitStatuses() {
 		_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
@@ -692,6 +764,7 @@ type connDeps struct {
 	projects           *ProjectRegistry
 	defaultProjectRoot string
 	providerStore      *provider.ProviderStore
+	pricing            *provider.PricingCache
 	oauthStore         *provider.OAuthSessionStore
 	manifestCache      *provider.ManifestCache
 	peers              *PeerRegistry
@@ -701,6 +774,7 @@ type connDeps struct {
 	settings           *ServerSettings
 	remote             *remoteControl
 	status             *statusHub
+	browser            *browserBroker
 	webRoot            string // "" serves no web UI
 
 	// turnWG, if non-nil, is Add(1)'d before every RunTurn goroutine is
@@ -844,6 +918,12 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 }
 
 func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
+	if network == "tcp" {
+		if err := scopeRemoteProject(deps, env); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+	}
 	if handleFileEnvelope(ipc, deps, env) {
 		return
 	}
@@ -1003,6 +1083,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if _, cli := provider.CLIKindOf(cfg.Kind); cli {
 			deps.status.KickUsage()
 		}
+		// A role on this provider still holds the old credentials.
+		reloadRoles(deps.projects.roles, deps.providerStore, deps.settings)
 
 	case protocol.EventListProviders:
 		var summaries []protocol.ProviderSummary
@@ -1161,6 +1243,27 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = ipc.SendEvent(protocol.EventModelOptionsSet, sessID, env.TurnID, "", modelOptsSet)
 		deps.peers.BroadcastEvent(peerID, protocol.EventModelOptionsSet, sessID, modelOptsSet)
 
+	case protocol.EventSetModelRoles:
+		var data protocol.SetModelRolesData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed set_model_roles payload",
+			})
+			return
+		}
+		live, err := buildRoles(deps.providerStore, data.Roles)
+		if err == nil {
+			err = deps.settings.SetModelRoles(data.Roles)
+		}
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		deps.projects.roles.Set(live)
+		rolesSet := protocol.ModelRolesSetData{Roles: data.Roles}
+		_ = ipc.SendEvent(protocol.EventModelRolesSet, "", env.TurnID, "", rolesSet)
+		deps.peers.BroadcastEvent(peerID, protocol.EventModelRolesSet, "", rolesSet)
+
 	case protocol.EventSetMode:
 		var data protocol.SetModeData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
@@ -1222,6 +1325,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		pc.Registry.SetWebToolsEnabled(data.Enabled)
+		pc.Terminals.SetAgentNetwork(data.Enabled)
 		webToolsSet := protocol.WebToolsEnabledSetData{
 			ProjectPath: data.ProjectPath,
 			Enabled:     data.Enabled,
@@ -1304,6 +1408,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		oauthRegistered := protocol.ProviderRegisteredData{Name: cfg.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", oauthRegistered)
 		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRegistered, "", oauthRegistered)
+		reloadRoles(deps.projects.roles, deps.providerStore, deps.settings)
 
 	case protocol.EventRemoveProvider:
 		var data protocol.RemoveProviderData
@@ -1320,6 +1425,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		deps.status.ForgetRateLimits(data.Name)
+		reloadRoles(deps.projects.roles, deps.providerStore, deps.settings)
 		removed := protocol.ProviderRemovedData{Name: data.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRemoved, env.SessionID, env.TurnID, "", removed)
 		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRemoved, "", removed)
@@ -1635,6 +1741,34 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListNotifications:
 		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", protocol.NotificationListData{Notifications: deps.notify.List()})
 
+	case protocol.EventGetUsage:
+		var data protocol.GetUsageData
+		_ = json.Unmarshal(env.Data, &data)
+		var since time.Time
+		if data.Since != "" {
+			since, _ = time.Parse(time.RFC3339, data.Since)
+		}
+		kinds := map[string]string{}
+		if deps.providerStore != nil {
+			for _, p := range deps.providerStore.List() {
+				kinds[p.Name] = string(p.Kind)
+			}
+		}
+		// A cold scan reads every session file, so keep it off the read loop.
+		go func() {
+			var price usagePricer
+			if deps.pricing != nil {
+				price = func(model string, in, cr, cw, o int) float64 {
+					usd, _ := deps.pricing.CostUSD(model, in, cr, cw, o)
+					return usd
+				}
+			}
+			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External, price)
+			out.Accounts = usageAccounts(deps.providerStore)
+			out.RequestID = data.RequestID
+			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)
+		}()
+
 	case protocol.EventDismissNotification:
 		var data protocol.DismissNotificationData
 		_ = json.Unmarshal(env.Data, &data)
@@ -1816,6 +1950,18 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				TerminalID: data.TerminalID,
 				Message:    err.Error(),
 			})
+		}
+
+	case protocol.EventBrowserHost:
+		var data protocol.BrowserHostData
+		if json.Unmarshal(env.Data, &data) == nil && deps.peers != nil {
+			deps.peers.SetBrowserHost(peerID, data.Enabled)
+		}
+
+	case protocol.EventBrowserResponse:
+		var data protocol.BrowserResponseData
+		if json.Unmarshal(env.Data, &data) == nil {
+			deps.browser.Respond(peerID, data)
 		}
 
 	case protocol.EventListTerminals:
@@ -2091,6 +2237,13 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.Password == "" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: "malformed set_remote_password payload (password is required)",
+			})
+			return
+		}
+		// It's the TCP token, and failed logins aren't rate-limited.
+		if len(data.Password) < minRemotePasswordLen {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("remote password must be at least %d characters", minRemotePasswordLen),
 			})
 			return
 		}

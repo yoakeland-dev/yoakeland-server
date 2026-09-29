@@ -464,6 +464,7 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 		usage.InputTokens = u.InputTokens + u.CachedReadTokens + u.CachedWriteTokens
 		usage.OutputTokens = u.OutputTokens
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+		usage.CachedInputTokens = u.CachedReadTokens
 	}
 	mu.Lock()
 	if cost >= 0 {

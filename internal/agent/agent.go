@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -30,6 +32,10 @@ type Message struct {
 	ToolCallID string     `json:"toolCallId,omitempty"`
 	// Diffs: file changes a native tool call reported (tool messages only).
 	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
+	// Subagent is the transcript of the subagent a subagent call ran (tool
+	// messages only; see subagent.go), minus its prompt — shown to the
+	// user, never sent back to the model.
+	Subagent []Message `json:"subagent,omitempty"`
 
 	// AuthorName is who actually sent this message, for a shared session
 	// with more than one connected peer — set only on the user message
@@ -71,6 +77,18 @@ type Message struct {
 	// in up to this point" with no separate running total to track;
 	// OutputTokens is naturally just this round-trip's own reply.
 	Usage *protocol.UsageData `json:"usage,omitempty"`
+
+	// RawContent is the provider's own content blocks for an assistant
+	// message, kept only when they carry something the fields above can't
+	// (Anthropic thinking signatures, server tool results) so a later
+	// request can send them back verbatim. PrefixKey names the model,
+	// system prompt and tools it was generated under; contextView decides
+	// when RawContent may still be replayed. Never sent to clients.
+	RawContent json.RawMessage `json:"rawContent,omitempty"`
+	PrefixKey  string          `json:"prefixKey,omitempty"`
+
+	// Compaction is set on a "compaction" message only (context.go).
+	Compaction *Compaction `json:"compaction,omitempty"`
 }
 
 // Author identifies which peer's user_prompt started the current turn —
@@ -189,6 +207,11 @@ const (
 	// StreamChunkToolResult is a NativeAgent reporting the outcome of a tool
 	// call it already ran itself (see native.go).
 	StreamChunkToolResult StreamEventKind = "tool_result"
+
+	// StreamChunkRawContent carries the round-trip's full content blocks in
+	// the provider's own shape (Message.RawContent), sent once at the end
+	// and only when replaying them matters.
+	StreamChunkRawContent StreamEventKind = "raw_content"
 )
 
 type ModelStreamChunk struct {
@@ -198,6 +221,7 @@ type ModelStreamChunk struct {
 	ToolResult   *NativeToolResult // StreamChunkToolResult only
 	Usage        *protocol.UsageData
 	FinishReason string
+	Raw          json.RawMessage // StreamChunkRawContent only
 }
 
 type ModelProvider interface {
@@ -248,7 +272,11 @@ const (
 // attempt a mutation there's nothing to intercept.
 var readOnlyTools = map[string]bool{
 	"file_read":         true,
+	"search":            true,
 	"ask_user_question": true,
+	// Not a mutation itself: its subagent runs read-only in these modes too
+	// (see newSubagent).
+	SubagentToolName: true,
 }
 
 // planExtraTools is unioned into readOnlyTools for ModePlan only — its own
@@ -262,6 +290,7 @@ type Agent struct {
 	provider         ModelProvider
 	providerName     string // registered name of `provider` (SPEC.md §3.1 set_provider) — stamped onto each assistant Message, not just kept for internal use
 	tools            map[string]tool.Tool
+	toolList         []tool.Tool // as given to NewAgent, for a subagent's own copy
 	toolDefs         []tool.ToolDefinition
 	toolDefsReadOnly []tool.ToolDefinition
 	toolDefsPlan     []tool.ToolDefinition
@@ -318,6 +347,16 @@ type Agent struct {
 	// native ask (under mu).
 	native         *NativeSessionRef
 	nativeRemember map[string]bool
+
+	// systemPrompt overrides the mode's prompt (a subagent's own); subagents
+	// are the running ones by the id of the call that started each (under mu).
+	systemPrompt string
+	subagents    map[string]*Agent
+
+	// roles is the server-wide model role table (roles.go); projectRoot is
+	// where the project's instructions file is read from (instructions.go).
+	roles       *Roles
+	projectRoot string
 }
 
 // Hooks lets the server react to agent state that isn't a session event:
@@ -420,13 +459,21 @@ func (a *Agent) removePendingAsk(toolCallID string) {
 	}
 }
 
-// PendingAsks returns this session's unanswered asks.
+// PendingAsks returns this session's unanswered asks, its running
+// subagents' included.
 func (a *Agent) PendingAsks() []protocol.PendingAsk {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	out := make([]protocol.PendingAsk, 0, len(a.pendingAsks))
 	for _, ask := range a.pendingAsks {
 		out = append(out, ask)
+	}
+	children := make([]*Agent, 0, len(a.subagents))
+	for _, c := range a.subagents {
+		children = append(children, c)
+	}
+	a.mu.Unlock()
+	for _, c := range children {
+		out = append(out, c.PendingAsks()...)
 	}
 	return out
 }
@@ -457,6 +504,9 @@ func NewAgent(
 			toolDefsPlan = append(toolDefsPlan, def)
 		}
 	}
+	toolDefs = append(toolDefs, subagentDefinition)
+	toolDefsReadOnly = append(toolDefsReadOnly, subagentDefinition)
+	toolDefsPlan = append(toolDefsPlan, subagentDefinition)
 	if ctxMgr == nil {
 		ctxMgr = NewContextManager(64000, 4000)
 	}
@@ -469,6 +519,7 @@ func NewAgent(
 		provider:          provider,
 		providerName:      providerName,
 		tools:             toolMap,
+		toolList:          tools,
 		toolDefs:          toolDefs,
 		toolDefsReadOnly:  toolDefsReadOnly,
 		toolDefsPlan:      toolDefsPlan,
@@ -489,6 +540,7 @@ func NewAgent(
 		queuedTurns:       make(map[string]context.CancelFunc),
 		pendingAsks:       make(map[string]protocol.PendingAsk),
 		nativeRemember:    make(map[string]bool),
+		subagents:         make(map[string]*Agent),
 	}
 }
 
@@ -569,6 +621,15 @@ func (a *Agent) getStream() *protocol.StreamSet {
 	return a.stream
 }
 
+// streamFor is the stream for an event from inside subagent call parent
+// (see protocol.StreamSet.WithParent), or the session's own for "".
+func (a *Agent) streamFor(parent string) *protocol.StreamSet {
+	if parent == "" {
+		return a.stream
+	}
+	return a.stream.WithParent(parent)
+}
+
 // SetProvider hot-swaps the model/provider a session uses. Takes effect on
 // the next turn; an in-flight turn keeps using whichever provider it started
 // with. name is the registered provider name (set_provider's providerName)
@@ -595,10 +656,7 @@ func (a *Agent) getProviderName() string {
 // getModelName reports the current provider's active model id, or "" if the
 // provider doesn't expose one (see ModelName() implementations).
 func (a *Agent) getModelName() string {
-	if modelNamer, ok := a.getProvider().(interface{ ModelName() string }); ok {
-		return modelNamer.ModelName()
-	}
-	return ""
+	return modelNameOf(a.getProvider())
 }
 
 // SetModelOptions applies reasoning/thinking options to the current provider
@@ -675,6 +733,60 @@ func (a *Agent) WebToolsEnabled() bool {
 	return a.webToolsEnabled
 }
 
+// shellTools run arbitrary shell input, so Read/Write+Prompts always asks
+// for them (see the permission check in runGenerationLoop).
+var shellTools = map[string]bool{
+	"bash":            true,
+	"terminal_start":  true,
+	"terminal_output": true,
+}
+
+// permissionTarget is what a permission prompt (and a remembered decision's
+// cache key) is about: the command or keystrokes for a shell tool, the
+// script for a browser evaluate, the file path for a file tool. It reads the
+// same field (same json tag) the tool itself acts on — picking whichever
+// field happened to be set let {"command":"a.md","path":".git/config"}
+// reuse a remembered "a.md" for a different file. Anything else keys on the
+// whole raw args, so an unknown tool's "remember" never covers more than
+// exactly that call.
+func permissionTarget(toolName string, args json.RawMessage) string {
+	var a struct {
+		Command    string `json:"command"`
+		Input      string `json:"input"`
+		Expression string `json:"expression"`
+		Path       string `json:"path"`
+		// Untagged like the browser tool's own args struct.
+		Action, URL string
+	}
+	_ = json.Unmarshal(args, &a)
+	switch toolName {
+	case "bash", "terminal_start":
+		return a.Command
+	case "terminal_output":
+		return a.Input
+	case "browser":
+		if a.Action == "navigate" {
+			return urlHost(a.URL, args)
+		}
+		return a.Expression
+	case "web_fetch":
+		return urlHost(a.URL, args)
+	case "file_write", "file_edit":
+		return filepath.Clean(a.Path)
+	}
+	return string(args)
+}
+
+// urlHost keys a web permission on the site, so "remember" covers one host
+// rather than one exact URL; an unparseable URL keys on the exact call.
+func urlHost(raw string, args json.RawMessage) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return string(args)
+	}
+	return strings.ToLower(u.Hostname())
+}
+
 // webToolNames is filtered out of activeToolDefs when web tools are
 // disabled, regardless of mode.
 var webToolNames = map[string]bool{
@@ -741,6 +853,9 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 // activeSystemPrompt returns the system prompt to send this turn — Plan
 // mode's distinct planning-purpose prompt, DefaultSystemPrompt otherwise.
 func (a *Agent) activeSystemPrompt() string {
+	if a.systemPrompt != "" {
+		return a.systemPrompt
+	}
 	if a.Mode() == ModePlan {
 		return PlanSystemPrompt
 	}
@@ -822,6 +937,10 @@ type permDecision struct {
 }
 
 func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool, feedback string) {
+	if child := a.subagentAsking(toolCallID); child != nil {
+		child.HandlePermissionResponse(toolCallID, allowed, remember, feedback)
+		return
+	}
 	a.mu.Lock()
 	ch, exists := a.permRequests[toolCallID]
 	cacheKey := a.permRequestKeys[toolCallID]
@@ -847,6 +966,10 @@ func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, rememb
 // HandlePermissionResponse minus the remember/cache concept, which doesn't
 // apply here).
 func (a *Agent) HandleAskUserAnswer(toolCallID string, answer string) {
+	if child := a.subagentAsking(toolCallID); child != nil {
+		child.HandleAskUserAnswer(toolCallID, answer)
+		return
+	}
 	a.mu.Lock()
 	ch, exists := a.askUserRequests[toolCallID]
 	delete(a.askUserRequests, toolCallID)
@@ -878,7 +1001,7 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
 
-	turnProvider, err := a.beginTurn(sessionID, turnID, startTime)
+	bound, err := a.beginTurn(sessionID, turnID, startTime)
 	if err != nil {
 		return err
 	}
@@ -899,10 +1022,10 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 
 	if isNewChat {
 		a.titleWG.Add(1)
-		go a.runTitleGeneration(parentCtx, sessionID, turnID, prompt, autoGenerateTitle, turnProvider)
+		go a.runTitleGeneration(parentCtx, sessionID, turnID, prompt, autoGenerateTitle, bound)
 	}
 
-	return a.runGenerationLoop(parentCtx, turnID, startTime, author, turnProvider, userMessageID)
+	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)
 }
 
 // beginTurn resolves and binds sessionID, then runs the two checks that can
@@ -911,17 +1034,17 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 // turn_completed a normal exit would, so a client always gets exactly one
 // terminal event per turn — shared by RunTurn, EditMessage, and
 // RetryMessage, which all start a turn the same way.
-func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (ModelProvider, error) {
+func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (RoleBinding, error) {
 	a.mu.Lock()
 	if a.sessionID == "" || a.sessionID != sessionID {
 		a.sessionID = sessionID
 	}
 	a.mu.Unlock()
 
-	turnProvider := a.getProvider()
-	if turnProvider == nil {
+	bound := a.turnBinding()
+	if bound.Provider == nil {
 		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("no_provider", protocol.UsageData{}, startTime, "", ""))
-		return nil, fmt.Errorf("session %s has no provider configured — call register_provider and set_provider first", sessionID)
+		return RoleBinding{}, fmt.Errorf("session %s has no provider configured — call register_provider and set_provider first", sessionID)
 	}
 
 	a.mu.Lock()
@@ -930,10 +1053,10 @@ func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (ModelP
 	if a.usageStore != nil && spendCap > 0 {
 		if spent := a.usageStore.SessionTotal(sessionID).CostUSD; spent >= spendCap {
 			_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("budget_exceeded", protocol.UsageData{}, startTime, "", ""))
-			return nil, fmt.Errorf("session %s has already spent $%.4f, at or above its $%.4f cap", sessionID, spent, spendCap)
+			return RoleBinding{}, fmt.Errorf("session %s has already spent $%.4f, at or above its $%.4f cap", sessionID, spent, spendCap)
 		}
 	}
-	return turnProvider, nil
+	return bound, nil
 }
 
 // runTitleGeneration runs — and saves/broadcasts — independently of the turn
@@ -944,7 +1067,7 @@ func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (ModelP
 // it the way SPEC.md §3.1 describes. Called for a brand-new chat's first
 // prompt, and for an edit of a session's very first message (which is, from
 // the title's point of view, the same situation).
-func (a *Agent) runTitleGeneration(parentCtx context.Context, sessID, turnID, prompt string, autoGenerateTitle bool, turnProvider ModelProvider) {
+func (a *Agent) runTitleGeneration(parentCtx context.Context, sessID, turnID, prompt string, autoGenerateTitle bool, bound RoleBinding) {
 	// Runs unsupervised in its own goroutine (see the two call sites) — a
 	// panic here (e.g. from a misbehaving TitleGenerator) must not take the
 	// whole process down along with every other session's connection.
@@ -956,7 +1079,11 @@ func (a *Agent) runTitleGeneration(parentCtx context.Context, sessID, turnID, pr
 	}()
 	title := fallbackTitle(prompt)
 	if autoGenerateTitle {
-		if generator, ok := turnProvider.(TitleGenerator); ok {
+		generator, ok := a.roleOr(RoleUtility, bound).Provider.(TitleGenerator)
+		if !ok {
+			generator, ok = bound.Provider.(TitleGenerator)
+		}
+		if ok {
 			// parentCtx, not a turn-scoped context: that would be cancelled the
 			// moment the turn's own RunTurn/EditMessage/RetryMessage call
 			// returns, or the user aborts the turn via CancelTurn, either of
@@ -1072,8 +1199,13 @@ func cloneBranches(b map[string][][]Message) map[string][][]Message {
 // a.history currently is, executing tool calls in between, until the turn
 // finishes, is cancelled, or the provider fails, then persist and report
 // turn_completed exactly once.
-func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, startTime time.Time, author Author, turnProvider ModelProvider, userMessageID string) error {
+func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, startTime time.Time, author Author, bound RoleBinding, userMessageID string) error {
 	sessionID := a.CurrentSessionID()
+	turnProvider := bound.Provider
+	// Read once per turn: the system prompt must stay byte-identical across
+	// a turn's round-trips (prompt caching, thinking-block binding) even if
+	// the model edits the instructions file mid-turn.
+	instructions := projectInstructions(a.projectRoot)
 	var lastMessageID string
 
 	turnCtx, cancel := context.WithCancel(parentCtx)
@@ -1120,6 +1252,12 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 		toolCalls      []ToolCall
 		roundTripStart time.Time
 
+		// Subagent calls of the current round still running (subagent.go).
+		subs map[string]chan subagentResult
+		// roundRecorded: this round's assistant message is in history, so a
+		// cut-short exit during its tool calls mustn't append it again.
+		roundRecorded bool
+
 		// Native agents only (native.go): calls the agent already ran,
 		// which are recorded but never executed here, and the turn's
 		// NativeTurn, whose SessionID is read back after the stream.
@@ -1145,9 +1283,11 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 turn:
 	for {
 		assistantText, toolCalls, segCalls = "", nil, nil
+		roundRecorded = false
 		roundTripStart = time.Now()
 		roundTripUsage = protocol.UsageData{}
 		var reasoningText string
+		var rawContent json.RawMessage
 		// ponytail: only surfaced when this round-trip ends with no tool
 		// calls (below) — a round truncated mid tool-call JSON still executes
 		// that (possibly malformed) call instead of being flagged, since
@@ -1162,20 +1302,27 @@ turn:
 		default:
 		}
 
-		a.mu.Lock()
-		activeContext := withAttachmentNotes(a.contextManager.PrepareHistory(a.history))
-		a.mu.Unlock()
-
-		streamCtx, toolDefs, systemPrompt := turnCtx, a.activeToolDefs(), a.activeSystemPrompt()
+		streamCtx, toolDefs, systemPrompt := turnCtx, a.activeToolDefs(), a.activeSystemPrompt()+instructions
+		prefixKey := requestPrefixKey(bound.Model, systemPrompt, toolDefs)
+		var activeContext []Message
 		if isNative {
 			a.mu.Lock()
 			hist := append([]Message(nil), a.history...)
 			a.mu.Unlock()
-			nt = a.newNativeTurn(sessionID, turnID, a.getProviderName(), hist)
+			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist)
 			streamCtx = WithNativeTurn(turnCtx, nt)
 			toolDefs, systemPrompt = nil, ""
 		} else {
-			activeContext = flattenNativeTools(activeContext)
+			overhead := a.contextManager.EstimateTokens(systemPrompt) + a.contextManager.EstimateTokens(fmt.Sprint(toolDefs))
+			if u := a.maybeCompact(turnCtx, turnID, bound, overhead); u.TotalTokens > 0 || u.CostUSD > 0 {
+				addUsage(&totalUsage, u)
+				totalUsage.CostUSD += u.CostUSD
+			}
+			a.mu.Lock()
+			activeContext = contextView(a.history, prefixKey)
+			a.mu.Unlock()
+			activeContext = withAttachmentNotes(flattenNativeTools(activeContext))
+			streamCtx = WithRequestHints(turnCtx, RequestHints{CacheKey: sessionID, AdvisorModel: a.advisorModel(bound)})
 		}
 
 		// flushSegment stores a native round's output so far as its own
@@ -1186,7 +1333,7 @@ turn:
 			if assistantText == "" && reasoningText == "" && len(segCalls) == 0 {
 				return
 			}
-			providerName, modelName := a.getProviderName(), a.getModelName()
+			providerName, modelName := bound.ProviderName, bound.Model
 			a.mu.Lock()
 			lastMessageID = a.nextMessageIDLocked()
 			a.history = append(a.history, Message{
@@ -1269,7 +1416,7 @@ turn:
 						} else {
 							toolCalls = append(toolCalls, *chunk.ToolCall)
 						}
-						_ = a.getStream().SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
+						_ = a.streamFor(chunk.ToolCall.ParentToolCallID).SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
 							Name:           chunk.ToolCall.Name,
 							Args:           chunk.ToolCall.Args,
 							NativeToolInfo: chunk.ToolCall.NativeToolInfo,
@@ -1287,7 +1434,7 @@ turn:
 							Diffs:      r.Diffs,
 						})
 						a.mu.Unlock()
-						_ = a.getStream().SendEvent(protocol.EventToolResult, a.sessionID, turnID, r.ToolCallID, protocol.ToolResultData{
+						_ = a.streamFor(r.ParentToolCallID).SendEvent(protocol.EventToolResult, a.sessionID, turnID, r.ToolCallID, protocol.ToolResultData{
 							ToolName: r.Name,
 							Output:   r.Output,
 							Error:    r.Error,
@@ -1296,29 +1443,37 @@ turn:
 					}
 				case StreamChunkUsage:
 					if chunk.Usage != nil {
-						totalUsage.InputTokens += chunk.Usage.InputTokens
-						totalUsage.OutputTokens += chunk.Usage.OutputTokens
-						totalUsage.TotalTokens += chunk.Usage.TotalTokens
 						// This round-trip's own usage, not the whole turn's — a
 						// provider's InputTokens is already the full conversation
 						// resent as this request's input, so it's naturally "tokens
 						// in up to this point" with no separate accumulation needed;
 						// OutputTokens is naturally just this round-trip's own reply.
-						roundTripUsage.InputTokens += chunk.Usage.InputTokens
-						roundTripUsage.OutputTokens += chunk.Usage.OutputTokens
-						roundTripUsage.TotalTokens += chunk.Usage.TotalTokens
+						// The turn's total picks it up once the round is recorded,
+						// priced by then.
+						addUsage(&roundTripUsage, *chunk.Usage)
 						if chunk.Usage.CostKnown {
-							totalUsage.CostUSD += chunk.Usage.CostUSD
-							totalUsage.CostKnown = true
 							roundTripUsage.CostUSD += chunk.Usage.CostUSD
 							roundTripUsage.CostKnown = true
 						}
 					}
+				case StreamChunkRawContent:
+					rawContent = chunk.Raw
 				case StreamChunkFinish:
 					providerFinishReason = chunk.FinishReason
 				}
 			}
 		}
+
+		// Priced once, on the model that ran this round, then folded into
+		// the turn's total — a turn can span models (plan role, subagents,
+		// the compaction summarizer), so re-pricing the total later on one
+		// model would be wrong.
+		if !roundTripUsage.CostKnown && bound.Model != "" {
+			roundTripUsage.CostUSD = EstimateCostUSD(bound.Model, roundTripUsage)
+		}
+		addUsage(&totalUsage, roundTripUsage)
+		totalUsage.CostUSD += roundTripUsage.CostUSD
+		totalUsage.CostKnown = true
 
 		if cutShort || streamErr != nil {
 			break turn
@@ -1346,11 +1501,7 @@ turn:
 		// message would make every future request in this session invalid
 		// — the next turn fails outright instead of just this one.
 		if assistantText != "" || len(toolCalls) > 0 || len(segCalls) > 0 || (isNative && reasoningText != "") {
-			providerName, modelName := a.getProviderName(), a.getModelName()
 			usage := roundTripUsage
-			if !usage.CostKnown && modelName != "" {
-				usage.CostUSD = EstimateCostUSD(modelName, usage)
-			}
 			a.mu.Lock()
 			lastMessageID = a.nextMessageIDLocked()
 			a.history = append(a.history, Message{
@@ -1359,13 +1510,16 @@ turn:
 				Content:      assistantText,
 				Reasoning:    reasoningText,
 				ToolCalls:    append(toolCalls, segCalls...),
-				Provider:     providerName,
-				Model:        modelName,
+				Provider:     bound.ProviderName,
+				Model:        bound.Model,
 				CreatedAt:    time.Now(),
 				GenerationMs: time.Since(segStart).Milliseconds(),
 				Usage:        &usage,
+				RawContent:   rawContent,
+				PrefixKey:    prefixKey,
 			})
 			a.mu.Unlock()
+			roundRecorded = true
 		} else if isNative {
 			// Ended right after a tool result: the usage (reported once, at
 			// the end of a native turn) goes on the turn's last text message.
@@ -1384,7 +1538,15 @@ turn:
 			break
 		}
 
+		subs = a.startSubagents(turnCtx, turnID, author, bound, toolCalls)
+		// The round's other calls run while its subagents work, so a
+		// question or permission ask next to a subagent call isn't held
+		// back until the subagent finishes; their results are collected
+		// after.
 		for _, tc := range toolCalls {
+			if _, ok := subs[tc.ID]; ok {
+				continue
+			}
 			toolImpl, exists := a.tools[tc.Name]
 			if !exists {
 				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s not recognized", tc.Name))
@@ -1402,20 +1564,11 @@ turn:
 				// Autonomous: every permission check is bypassed outright,
 				// permission.Engine is never consulted (SPEC.md §4c).
 			} else if toolImpl.RequiresPermission(tc.Args) {
-				var target string
-				if tc.Name == "bash" {
-					var bArgs struct{ Command string }
-					_ = json.Unmarshal(tc.Args, &bArgs)
-					target = bArgs.Command
-				} else {
-					var fArgs struct{ Path string }
-					_ = json.Unmarshal(tc.Args, &fArgs)
-					target = fArgs.Path
-				}
+				target := permissionTarget(tc.Name, tc.Args)
 
 				var decision permission.Decision
 				var cacheKey string
-				if mode == ModeReadWrite && tc.Name == "bash" {
+				if mode == ModeReadWrite && shellTools[tc.Name] {
 					// Read/Write+Prompts: bash always asks, bypassing the
 					// engine's safe-command auto-allowlist. cacheKey is left
 					// empty so a "remember" answer here is never persisted
@@ -1511,6 +1664,24 @@ turn:
 				a.recordToolResult(turnID, tc, truncatedOutput, "")
 			}
 		}
+		for _, tc := range toolCalls {
+			if ch, ok := subs[tc.ID]; ok {
+				r := <-ch
+				delete(subs, tc.ID)
+				addUsage(&totalUsage, r.usage)
+				totalUsage.CostUSD += r.usage.CostUSD
+				a.recordToolResultWith(turnID, tc, a.contextManager.TruncateToolOutput(r.output), r.errText, r.transcript)
+			}
+		}
+	}
+
+	// A turn cut short mid-round (a cancelled permission wait) still owes
+	// each started subagent's call a result; cancelled, they end quickly.
+	for _, tc := range toolCalls {
+		if ch, ok := subs[tc.ID]; ok {
+			r := <-ch
+			a.recordToolResultWith(turnID, tc, r.output, r.errText, r.transcript)
+		}
 	}
 
 	// Whatever text had already streamed before the turn was cut short is part
@@ -1518,8 +1689,8 @@ turn:
 	// prompt as the turn's only record. (Only for the cut-short exits: a
 	// completed round-trip already appended its assistant message above.) A
 	// cut-short turn that produced nothing adds no empty assistant message.
-	if (cutShort || streamErr != nil) && (assistantText != "" || len(toolCalls) > 0 || len(segCalls) > 0) {
-		providerName, modelName := a.getProviderName(), a.getModelName()
+	if (cutShort || streamErr != nil) && !roundRecorded && (assistantText != "" || len(toolCalls) > 0 || len(segCalls) > 0) {
+		providerName, modelName := bound.ProviderName, bound.Model
 		usage := roundTripUsage
 		if !usage.CostKnown && modelName != "" {
 			usage.CostUSD = EstimateCostUSD(modelName, usage)
@@ -1595,7 +1766,7 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
 
-	turnProvider, err := a.beginTurn(sessionID, turnID, startTime)
+	bound, err := a.beginTurn(sessionID, turnID, startTime)
 	if err != nil {
 		return err
 	}
@@ -1641,10 +1812,10 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 		// §3.1) still applies unchanged: a session that already got a real
 		// title (its own set_session_title, or a previous generation) keeps it.
 		a.titleWG.Add(1)
-		go a.runTitleGeneration(parentCtx, sessionID, turnID, content, autoGenerateTitle, turnProvider)
+		go a.runTitleGeneration(parentCtx, sessionID, turnID, content, autoGenerateTitle, bound)
 	}
 
-	return a.runGenerationLoop(parentCtx, turnID, startTime, author, turnProvider, userMessageID)
+	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)
 }
 
 // RetryMessage discards a past assistant message and regenerates a fresh
@@ -1667,7 +1838,7 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
 
-	turnProvider, err := a.beginTurn(sessionID, turnID, startTime)
+	bound, err := a.beginTurn(sessionID, turnID, startTime)
 	if err != nil {
 		return err
 	}
@@ -1695,7 +1866,7 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 	a.history = a.history[:idx:idx]
 	a.mu.Unlock()
 
-	return a.runGenerationLoop(parentCtx, turnID, startTime, author, turnProvider, userMessageID)
+	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)
 }
 
 // SwitchBranch makes the branch containing messageID the active one,
@@ -1823,17 +1994,11 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 		spend = &protocol.SpendData{SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD}
 	}
 
-	// The provider's own reported token counts (its actual tokenizer) beat
-	// our char/4 heuristic whenever we have them: the heuristic also never
-	// accounts for the system prompt or tool schemas sent with every
-	// request, so it reads as "less full" than the context window actually
-	// is. InputTokens+OutputTokens is what this turn just added to the
-	// history that gets resent next turn, so it's the right number for
-	// "how full is the window now" — not just this round-trip's input.
-	estimatedTokens := a.contextManager.EstimateHistoryTokens(historySnapshot)
-	if usage.InputTokens > 0 {
-		estimatedTokens = usage.InputTokens + usage.OutputTokens
-	}
+	// The provider's own reported size of the last request (its actual
+	// tokenizer, system prompt and tool schemas included) beats a char/4
+	// estimate; the turn's summed usage would count every round-trip's
+	// resent history over again.
+	estimatedTokens := a.contextManager.contextTokens(historySnapshot, contextView(historySnapshot, ""), 0)
 
 	return protocol.TurnCompletedData{
 		FinishReason:  finishReason,
@@ -1851,12 +2016,19 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 }
 
 func (a *Agent) recordToolResult(turnID string, tc ToolCall, output, errText string) {
+	a.recordToolResultWith(turnID, tc, output, errText, nil)
+}
+
+// recordToolResultWith is recordToolResult keeping a subagent call's
+// transcript (see Message.Subagent).
+func (a *Agent) recordToolResultWith(turnID string, tc ToolCall, output, errText string, transcript []Message) {
 	a.mu.Lock()
 	a.history = append(a.history, Message{
 		ID:         a.nextMessageIDLocked(),
 		Role:       "tool",
 		Content:    output + errText,
 		ToolCallID: tc.ID,
+		Subagent:   transcript,
 	})
 	sessID := a.sessionID
 	a.mu.Unlock()

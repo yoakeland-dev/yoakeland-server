@@ -39,6 +39,15 @@ func claudePermissionMode(m agent.Mode) string {
 	}
 }
 
+// claudeAutonomousSandbox keeps bypassPermissions "no prompts, still
+// confined", like yoakeland's own autonomous bash and Codex's
+// workspace-write: Claude Code's own OS sandbox (bubblewrap/Seatbelt) for
+// every Bash command, no unsandboxed retry, and a refusal to start rather
+// than a silent unsandboxed fallback when bubblewrap is missing.
+// ponytail: covers Claude's Bash only — its Edit/Write tools still follow the
+// permission mode; upgrade path is running the whole CLI under bwrap.
+const claudeAutonomousSandbox = `{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}`
+
 type claudeBlock struct {
 	Type      string          `json:"type"`
 	ID        string          `json:"id"`
@@ -94,6 +103,9 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 	if nt.ResumeID != "" {
 		args = append(args, "--resume", nt.ResumeID)
 	}
+	if nt.Mode == agent.ModeAutonomous {
+		args = append(args, "--settings", claudeAutonomousSandbox)
+	}
 	proc, err := p.start()(ctx, "claude", args, p.Dir)
 	if err != nil {
 		return err
@@ -133,10 +145,7 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 			}
 		case "assistant":
 			// Text already streamed as deltas; only the tool calls are new.
-			// A subagent's (Task) own steps stay inside its one call.
-			if !topLevel {
-				continue
-			}
+			// A subagent's (Task) own calls carry the Task's id as parent.
 			for _, b := range ln.Message.Content {
 				if b.Type != "tool_use" {
 					continue
@@ -147,12 +156,12 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 				proposed[b.ID] = d
 				mu.Unlock()
 				tc := claudeToolCall(b.ID, b.Name, b.Input)
+				if !topLevel {
+					tc.ParentToolCallID = *ln.ParentToolUseID
+				}
 				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
 			}
 		case "user":
-			if !topLevel {
-				continue
-			}
 			for _, b := range ln.Message.Content {
 				if b.Type != "tool_result" {
 					continue
@@ -164,6 +173,9 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 					diffs = d
 				}
 				r := &agent.NativeToolResult{ToolCallID: b.ToolUseID, Name: name, Diffs: diffs}
+				if !topLevel {
+					r.ParentToolCallID = *ln.ParentToolUseID
+				}
 				if text := claudeResultText(b.Content); b.IsError {
 					r.Error = text
 				} else {
@@ -198,11 +210,12 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 	}
 	input := res.Usage.InputTokens + res.Usage.CacheCreationInputTokens + res.Usage.CacheReadInputTokens
 	emit(agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{
-		InputTokens:  input,
-		OutputTokens: res.Usage.OutputTokens,
-		TotalTokens:  input + res.Usage.OutputTokens,
-		CostUSD:      res.TotalCostUSD,
-		CostKnown:    true,
+		InputTokens:       input,
+		OutputTokens:      res.Usage.OutputTokens,
+		TotalTokens:       input + res.Usage.OutputTokens,
+		CachedInputTokens: res.Usage.CacheReadInputTokens,
+		CostUSD:           res.TotalCostUSD,
+		CostKnown:         true,
 	}})
 	if res.IsError {
 		return fmt.Errorf("claude: %s", strings.TrimSpace(res.Result))

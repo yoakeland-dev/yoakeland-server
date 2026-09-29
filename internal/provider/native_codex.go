@@ -179,8 +179,9 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 			var n struct {
 				TokenUsage struct {
 					Last struct {
-						InputTokens  int `json:"inputTokens"`
-						OutputTokens int `json:"outputTokens"`
+						InputTokens       int `json:"inputTokens"`
+						CachedInputTokens int `json:"cachedInputTokens"`
+						OutputTokens      int `json:"outputTokens"`
 					} `json:"last"`
 				} `json:"tokenUsage"`
 			}
@@ -188,6 +189,7 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 				mu.Lock()
 				usage.InputTokens += n.TokenUsage.Last.InputTokens
 				usage.OutputTokens += n.TokenUsage.Last.OutputTokens
+				usage.CachedInputTokens += n.TokenUsage.Last.CachedInputTokens
 				mu.Unlock()
 			}
 		case "error":

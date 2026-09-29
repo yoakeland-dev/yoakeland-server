@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -37,7 +38,7 @@ type ProjectContext struct {
 	Terminals     *terminal.Manager
 }
 
-func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64) (*ProjectContext, error) {
+func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64, browser tool.BrowserRelay) (*ProjectContext, error) {
 	norm, err := normalizer.New(root)
 	if err != nil {
 		return nil, fmt.Errorf("normalizer: %w", err)
@@ -76,13 +77,23 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 			fmt.Sprintf("no sandbox isolation available for project %q (bubblewrap and Linux namespaces both unavailable) — the bash tool runs with NO process/filesystem isolation beyond the project-root path check; a command can see and touch anything this OS user can. Install bubblewrap (bwrap) for real isolation.", norm.ProjectRoot),
 		)
 	}
+	// Reuses the same sb this project's bash tool runs through (see the
+	// sandbox-tier warning above) — a remote peer's interactive terminal
+	// gets exactly the isolation an agent-issued command does, not more.
+	terminals := terminal.NewManager(sb, norm)
+	terminals.SetAgentNetwork(projSettings.WebToolsEnabled)
 	tools := []tool.Tool{
 		tool.NewFileReadTool(norm),
+		tool.NewSearchTool(norm),
 		tool.NewFileWriteTool(norm),
 		tool.NewFileEditTool(norm),
 		tool.NewBashTool(norm, sb),
 		tool.NewAskUserQuestionTool(),
 		tool.NewWritePlanTool(filepath.Join(dataDir, "plans")),
+		tool.NewTerminalStartTool(terminals),
+		tool.NewTerminalOutputTool(terminals),
+		tool.NewTerminalStopTool(terminals),
+		tool.NewBrowserTool(browser),
 	}
 	braveKey := os.Getenv("BRAVE_API_KEY")
 	if braveKey == "" {
@@ -101,6 +112,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 
 	registry := agent.NewRegistry(defaultProvider, defaultProviderName, tools, permEngine, snapStore, sessStore, ctxMgr, usageStore, projSettings.WebToolsEnabled)
 	registry.SetMaxSessionSpendUSD(maxSessionSpendUSD)
+	registry.SetProjectRoot(norm.ProjectRoot)
 
 	return &ProjectContext{
 		Root:          norm.ProjectRoot,
@@ -109,10 +121,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		Registry:      registry,
 		SandboxTier:   string(sb.Mode()),
 		SettingsStore: settingsStore,
-		// Reuses the same sb this project's bash tool runs through (see the
-		// sandbox-tier warning above) — a remote peer's interactive terminal
-		// gets exactly the isolation an agent-issued command does, not more.
-		Terminals: terminal.NewManager(sb, norm),
+		Terminals:     terminals,
 	}, nil
 }
 
@@ -127,6 +136,12 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Message) []protocol.HistoryMessage {
 	out := make([]protocol.HistoryMessage, 0, len(history))
 	for i, m := range history {
+		// A subagent call's transcript goes just before its result, each
+		// message tagged with the call it belongs to.
+		for _, sm := range toHistoryMessages(m.Subagent, nil) {
+			sm.ParentToolCallID = m.ToolCallID
+			out = append(out, sm)
+		}
 		branchPoint := ""
 		if i > 0 {
 			branchPoint = history[i-1].ID
@@ -147,6 +162,9 @@ func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Me
 			CreatedAt:    m.CreatedAt,
 			GenerationMs: m.GenerationMs,
 			Usage:        m.Usage,
+		}
+		if c := m.Compaction; c != nil {
+			hm.Compaction = &protocol.CompactionInfo{Kind: c.Kind, TokensBefore: c.TokensBefore, TokensAfter: c.TokensAfter}
 		}
 		for _, tc := range m.ToolCalls {
 			hm.ToolCalls = append(hm.ToolCalls, protocol.HistoryToolCall{
@@ -300,6 +318,10 @@ type ProjectRegistry struct {
 	// ponytail: one 1s mtime poll per known project; fine for dozens, move
 	// to fsnotify if people keep hundreds of projects around.
 	gits map[string]*gitWatcher
+	// browser relays every project's browser tool (nil: none, in tests).
+	browser *browserBroker
+	// roles is the server-wide model role table every session shares.
+	roles *agent.Roles
 }
 
 // SetNotifications routes every project's session events (current and
@@ -484,6 +506,7 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 		known:               known,
 		stateDir:            stateDir,
 		gits:                make(map[string]*gitWatcher),
+		roles:               agent.NewRoles(),
 	}, nil
 }
 
@@ -511,12 +534,17 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		return pc, nil
 	}
 
-	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.maxSpendUSD)
+	var browser tool.BrowserRelay
+	if r.browser != nil {
+		browser = r.browser
+	}
+	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.maxSpendUSD, browser)
 	if err != nil {
 		return nil, err
 	}
 	r.projects[key] = pc
 	r.installLocked(pc)
+	pc.Registry.SetRoles(r.roles)
 
 	// Only recorded on an actual fresh open (not the map-hit fast path
 	// above), so a hot session doesn't turn every envelope it touches into
@@ -594,6 +622,55 @@ func (r *ProjectRegistry) List() []string {
 		out = append(out, p.Path)
 	}
 	return out
+}
+
+// Known reports whether key (a projectKey) is a project this server has
+// already opened, in this run or an earlier one.
+func (r *ProjectRegistry) Known(key string) bool {
+	r.mu.Lock()
+	_, open := r.projects[key]
+	r.mu.Unlock()
+	return open || slices.Contains(r.List(), key)
+}
+
+// scopeRemoteProject keeps a TCP peer to projects the server already knows
+// (opened from the local socket, via -project, or in an earlier run). Without
+// it a token reached any directory: open_project "/home/you" then read_file
+// ".ssh/id_ed25519". The path is replaced by its canonical form so a symlink
+// flipped after this check can't send the handler somewhere else. Every
+// case-variant of the key is checked, since encoding/json matches field
+// names case-insensitively.
+// ponytail: a known project nested inside another can still be swapped for a
+// symlink from the outer one's sandbox between here and the handler.
+func scopeRemoteProject(deps connDeps, env *protocol.Envelope) error {
+	field := "projectPath"
+	if env.Type == protocol.EventOpenProject {
+		field = "path"
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(env.Data, &m) != nil {
+		return nil // not an object; the handler reports it as malformed
+	}
+	changed := false
+	for k, raw := range m {
+		if !strings.EqualFold(k, field) {
+			continue
+		}
+		var p string
+		if json.Unmarshal(raw, &p) != nil || p == "" {
+			continue
+		}
+		key, err := projectKey(p)
+		if err != nil || !deps.projects.Known(key) {
+			return fmt.Errorf("project %q isn't open on this server; a remote connection can only use projects opened on the server itself", p)
+		}
+		m[k], _ = json.Marshal(key)
+		changed = true
+	}
+	if changed {
+		env.Data, _ = json.Marshal(m)
+	}
+	return nil
 }
 
 // Resolve figures out which project a session-scoped envelope refers to:

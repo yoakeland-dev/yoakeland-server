@@ -1,84 +1,84 @@
 package agent
 
-import "testing"
+import (
+	"strings"
+	"testing"
 
-// TestPrepareHistory_SummarizesDiscardedContent guards that compaction keeps
-// a real trace of what happened in the discarded middle of a long session,
-// not just a bare count — a bug fixed here (CompactSummary existed but was
-// never wired into PrepareHistory, so the model lost that work outright).
-func TestPrepareHistory_SummarizesDiscardedContent(t *testing.T) {
-	cm := NewContextManager(10, 4000) // tiny budget forces compaction
+	"yoakeland/internal/protocol"
+)
 
-	// PrepareHistory keeps history[0] and the last 4 messages verbatim; only
-	// the messages strictly in between (index 1 here) are compacted away.
+// The view only changes when a compaction is appended: that's what keeps
+// consecutive requests on one cached prefix.
+func TestContextView_AppliesRecordedCompactions(t *testing.T) {
+	big := strings.Repeat("x", 4000)
 	history := []Message{
-		{Role: "user", Content: "please refactor the payment module"},
-		{Role: "assistant", Content: "renamed calculateTotal to computeTotal across the codebase"},
-		{Role: "assistant", Content: "kept turn one"},
-		{Role: "assistant", Content: "kept turn two"},
-		{Role: "assistant", Content: "kept turn three"},
-		{Role: "user", Content: "now add tests"},
+		{ID: "m1", Role: "user", Content: "fix the bug"},
+		{ID: "m2", Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "file_read", Args: []byte(`{"path":"a.go"}`)}}},
+		{ID: "m3", Role: "tool", ToolCallID: "c1", Content: big},
+		{ID: "m4", Role: "assistant", ToolCalls: []ToolCall{{ID: "c2", Name: "file_read", Args: []byte(`{"path":"b.go"}`)}}},
+		{ID: "m5", Role: "tool", ToolCallID: "c2", Content: big},
+	}
+	cm := NewContextManager(2000, 4000)
+
+	before := contextView(history, "k")
+	if len(before) != 5 || before[2].Content != big {
+		t.Fatalf("no compaction yet: expected history unchanged, got %+v", before)
 	}
 
-	compacted := cm.PrepareHistory(history)
+	clearBefore, saved, ok := cm.planClear(history, 2600, 2000)
+	if !ok || clearBefore != "m4" || saved < 900 {
+		t.Fatalf("expected to clear up to the latest round (m4), got %q saved=%d ok=%v", clearBefore, saved, ok)
+	}
+	history = append(history, Message{ID: "m6", Role: "compaction", Compaction: &Compaction{Kind: CompactionClear, ClearBefore: clearBefore}})
+	view := contextView(history, "k")
+	if len(view) != 5 || !strings.HasPrefix(view[2].Content, "[cleared") || view[4].Content != big {
+		t.Fatalf("expected the old result stubbed and the latest kept, got %+v", view)
+	}
 
-	if len(compacted) != 6 {
-		t.Fatalf("expected first message + summary + last 4, got %d messages: %+v", len(compacted), compacted)
-	}
-	if compacted[0].Content != history[0].Content {
-		t.Fatalf("expected the first user message preserved verbatim, got %q", compacted[0].Content)
-	}
-	summary := compacted[1]
-	if summary.Role != "system" {
-		t.Fatalf("expected the second message to be the compaction summary, got role %q", summary.Role)
-	}
-	if !contains(summary.Content, "renamed calculateTotal to computeTotal") {
-		t.Fatalf("expected the summary to retain a trace of the discarded turn's content, got: %q", summary.Content)
+	history = append(history, Message{ID: "m7", Role: "compaction", Content: "did things", Compaction: &Compaction{Kind: CompactionSummary}},
+		Message{ID: "m8", Role: "assistant", Content: "continuing"})
+	view = contextView(history, "k")
+	if len(view) != 2 || view[0].Role != "user" || !strings.Contains(view[0].Content, "did things") || view[1].Content != "continuing" {
+		t.Fatalf("expected summary + what followed it, got %+v", view)
 	}
 }
 
-// TestPrepareHistory_KeepsToolCallsPairedWithResults guards against slicing
-// the last-4-messages tail in the middle of an assistant tool_calls message
-// and its tool results: Anthropic and OpenAI both reject a request where a
-// tool result's originating tool_calls message is missing (400 "tool_use
-// ids were found without tool_result blocks" / "'tool' message must be a
-// response to a preceding message with 'tool_calls'"), which is exactly
-// what a naive last-4 cut produces once a tool-heavy turn runs long enough.
-func TestPrepareHistory_KeepsToolCallsPairedWithResults(t *testing.T) {
-	cm := NewContextManager(10, 4000) // tiny budget forces compaction
-
+// Raw content (Anthropic thinking blocks) replays only on the trailing run
+// generated under the current prefix and after the last compaction; blocks
+// may only be dropped from the front.
+func TestContextView_RawContentReplayRules(t *testing.T) {
+	raw := []byte(`[{"type":"thinking"}]`)
 	history := []Message{
-		{Role: "user", Content: "long task"},
-		{Role: "assistant", Content: "step one"},
-		{Role: "assistant", ToolCalls: []ToolCall{{ID: "callA"}, {ID: "callB"}, {ID: "callC"}}},
-		{Role: "tool", ToolCallID: "callA", Content: "result A"},
-		{Role: "tool", ToolCallID: "callB", Content: "result B"},
-		{Role: "tool", ToolCallID: "callC", Content: "result C"},
-		{Role: "assistant", Content: "done"},
+		{ID: "m1", Role: "user", Content: "hi"},
+		{ID: "m2", Role: "assistant", Content: "a", RawContent: raw, PrefixKey: "k"},
+		{ID: "m3", Role: "user", Content: "switched mode"},
+		{ID: "m4", Role: "assistant", Content: "b", RawContent: raw, PrefixKey: "other"},
+		{ID: "m5", Role: "user", Content: "back"},
+		{ID: "m6", Role: "assistant", Content: "c", RawContent: raw, PrefixKey: "k"},
 	}
-	// A naive history[len(history)-4:] slice starts at index 3, a "tool"
-	// message whose owning assistant (index 2) would be discarded.
-
-	compacted := cm.PrepareHistory(history)
-
-	toolCallIDs := map[string]bool{}
-	for _, m := range compacted {
-		for _, tc := range m.ToolCalls {
-			toolCallIDs[tc.ID] = true
-		}
+	view := contextView(history, "k")
+	if view[1].RawContent != nil || view[3].RawContent != nil || view[5].RawContent == nil {
+		t.Fatalf("expected only the trailing same-prefix message to keep raw content")
 	}
-	for _, m := range compacted {
-		if m.Role == "tool" && !toolCallIDs[m.ToolCallID] {
-			t.Fatalf("tool result %q retained without its originating tool_calls message: %+v", m.ToolCallID, compacted)
-		}
+
+	history = append(history, Message{ID: "m7", Role: "compaction", Compaction: &Compaction{Kind: CompactionClear, ClearBefore: "m2"}})
+	if view := contextView(history, "k"); view[5].RawContent != nil {
+		t.Fatal("expected raw content from before a compaction to be dropped")
 	}
 }
 
-func contains(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+func TestContextTokens_PrefersReportedUsageSinceLastCompaction(t *testing.T) {
+	cm := NewContextManager(1000, 100)
+	history := []Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "ok", Usage: &protocol.UsageData{InputTokens: 900, OutputTokens: 100}},
+		{Role: "tool", Content: strings.Repeat("y", 400)},
 	}
-	return false
+	if got := cm.contextTokens(history, history, 0); got != 1100 {
+		t.Fatalf("expected reported 1000 + 100 estimated, got %d", got)
+	}
+	history = append(history, Message{Role: "compaction", Compaction: &Compaction{Kind: CompactionClear}})
+	if got := cm.contextTokens(history, history[:3], 50); got >= 1000 {
+		t.Fatalf("expected a fresh estimate after compaction, got %d", got)
+	}
 }

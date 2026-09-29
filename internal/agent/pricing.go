@@ -13,17 +13,17 @@ type rate struct {
 // (internal/provider's PricingCache, sourced from LiteLLM's
 // model_prices_and_context_window.json) feeds into cost estimation without
 // this package importing internal/provider, which already imports this one
-// (cli_subprocess.go) and would make that a cycle. Returns USD per single
-// token, not per million — the caller's own unit — and ok=false for a model
-// it has no rate for.
-var livePricingSource func(model string) (inputPerToken, outputPerToken float64, ok bool)
+// (cli_subprocess.go) and would make that a cycle. It prices a whole
+// request, prompt-cache reads and writes included, and returns ok=false for
+// a model it has no rate for.
+var livePricingSource func(model string, usage protocol.UsageData) (usd float64, ok bool)
 
 // SetLivePricingSource wires a live rate lookup into EstimateCostUSD. Called
 // once at startup (see cmd/yoakeland/main.go) with internal/provider's
-// PricingCache.Lookup; left unset (nil), EstimateCostUSD falls back to the
+// PricingCache.CostUSD; left unset (nil), EstimateCostUSD falls back to the
 // static table below exactly as before this existed — every existing test
 // and any caller that never calls this keeps working unchanged.
-func SetLivePricingSource(source func(model string) (inputPerToken, outputPerToken float64, ok bool)) {
+func SetLivePricingSource(source func(model string, usage protocol.UsageData) (float64, bool)) {
 	livePricingSource = source
 }
 
@@ -39,6 +39,7 @@ var pricingTable = map[string]rate{
 	"claude-3-5-sonnet-20241022":  {InputPerMTok: 3, OutputPerMTok: 15},
 	"claude-3-5-haiku-20241022":   {InputPerMTok: 0.8, OutputPerMTok: 4},
 	"claude-3-opus-20240229":      {InputPerMTok: 15, OutputPerMTok: 75},
+	"claude-opus-5-5":             {InputPerMTok: 4, OutputPerMTok: 20},
 	"claude-opus-5":               {InputPerMTok: 5, OutputPerMTok: 25},
 	"claude-sonnet-5":             {InputPerMTok: 2, OutputPerMTok: 10},
 	"claude-haiku-4-5":            {InputPerMTok: 1, OutputPerMTok: 5},
@@ -64,8 +65,8 @@ var pricingTable = map[string]rate{
 // an unpriced model never errors — it just reports zero.
 func EstimateCostUSD(model string, usage protocol.UsageData) float64 {
 	if livePricingSource != nil {
-		if inputPerTok, outputPerTok, ok := livePricingSource(model); ok {
-			return float64(usage.InputTokens)*inputPerTok + float64(usage.OutputTokens)*outputPerTok
+		if usd, ok := livePricingSource(model, usage); ok {
+			return usd
 		}
 	}
 
@@ -73,6 +74,18 @@ func EstimateCostUSD(model string, usage protocol.UsageData) float64 {
 	if !ok {
 		return 0
 	}
-	return float64(usage.InputTokens)/1_000_000*r.InputPerMTok +
-		float64(usage.OutputTokens)/1_000_000*r.OutputPerMTok
+	// ponytail: Anthropic's cache multipliers (0.1× reads, 1.25× writes)
+	// for every model here; the live table carries each model's real rates.
+	plain := usage.InputTokens - usage.CachedInputTokens - usage.CacheWriteInputTokens
+	input := float64(plain) + 0.1*float64(usage.CachedInputTokens) + 1.25*float64(usage.CacheWriteInputTokens)
+	return input/1_000_000*r.InputPerMTok + float64(usage.OutputTokens)/1_000_000*r.OutputPerMTok
+}
+
+// addUsage adds u's token counts (not its cost) into dst.
+func addUsage(dst *protocol.UsageData, u protocol.UsageData) {
+	dst.InputTokens += u.InputTokens
+	dst.OutputTokens += u.OutputTokens
+	dst.TotalTokens += u.TotalTokens
+	dst.CachedInputTokens += u.CachedInputTokens
+	dst.CacheWriteInputTokens += u.CacheWriteInputTokens
 }

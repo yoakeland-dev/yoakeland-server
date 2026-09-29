@@ -19,3 +19,6 @@ func (r *Registry) WaitBackground() {
 
 // SetHooks installs hooks directly (the server does it via Registry.SetHooks).
 func (a *Agent) SetHooks(h Hooks) { a.hooks = h }
+
+// PermissionTarget exposes permissionTarget to the external test package.
+var PermissionTarget = permissionTarget

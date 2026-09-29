@@ -27,6 +27,8 @@ type Registry struct {
 	webToolsEnabled    bool
 	eventTap           func(protocol.EventType, string, string, any)
 	hooks              Hooks
+	roles              *Roles
+	projectRoot        string
 }
 
 // SetHooks installs hooks on every session's Agent, current and future.
@@ -147,6 +149,32 @@ func (r *Registry) SetWebToolsEnabled(enabled bool) {
 	}
 }
 
+// SetRoles installs the server-wide model role table (roles.go) on every
+// session, current and future. The table itself is shared and live, so a
+// later Roles.Set reaches them all without calling this again.
+func (r *Registry) SetRoles(roles *Roles) {
+	r.mu.Lock()
+	r.roles = roles
+	agents := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		agents = append(agents, ag)
+	}
+	r.mu.Unlock()
+	for _, ag := range agents {
+		ag.mu.Lock()
+		ag.roles = roles
+		ag.mu.Unlock()
+	}
+}
+
+// SetProjectRoot is where sessions read the project's instructions file
+// from (instructions.go).
+func (r *Registry) SetProjectRoot(root string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.projectRoot = root
+}
+
 // Get returns the Agent for sessionID, creating and loading it on first use.
 func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	r.mu.Lock()
@@ -168,6 +196,7 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	}, r.usageStore)
 	ag.SetMaxSessionSpendUSD(r.maxSessionSpendUSD)
 	ag.SetWebToolsEnabled(r.webToolsEnabled)
+	ag.roles, ag.projectRoot = r.roles, r.projectRoot
 	if r.eventTap != nil {
 		ag.stream.SetTap(r.eventTap)
 	}
