@@ -42,7 +42,9 @@ func TestExternalUsage(t *testing.T) {
 	state := filepath.Join(home, "state")
 	write(filepath.Join(state, "projects", "x", "sessions", "s.json"), `{"sessionId":"s","native":{"provider":"claude","sessionId":"yk"},"history":[]}`)
 
-	price := func(model string, in, cr, cw, out int) float64 { return float64(in-cr-cw)*1 + float64(cr)*0.1 + float64(cw)*1.25 + float64(out)*5 }
+	price := func(model string, in, cr, cw, out int) float64 {
+		return float64(in-cr-cw)*1 + float64(cr)*0.1 + float64(cw)*1.25 + float64(out)*5
+	}
 	r := buildUsageReport(state, nil, time.Time{}, true, price)
 	got := map[string][4]float64{}
 	for _, row := range r.Rows {

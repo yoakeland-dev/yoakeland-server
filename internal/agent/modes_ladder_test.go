@@ -31,7 +31,7 @@ func TestAgent_AcceptEditsAllowsEditsAndAsksForBash(t *testing.T) {
 	ag.SetMode(agent.ModeAcceptEdits)
 
 	go func() {
-		waitForSubstring(t, out, `"toolCallId":"b1"`, 2*time.Second)
+		waitForAsk(t, ag, "b1", 5*time.Second)
 		ag.HandlePermissionResponse("b1", false, false, "")
 	}()
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "go"); err != nil {

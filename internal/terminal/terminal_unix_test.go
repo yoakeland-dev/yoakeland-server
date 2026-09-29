@@ -62,7 +62,9 @@ func TestManager_OpenStartsInRequestedCwd(t *testing.T) {
 	mgr := terminal.NewManager(sandbox.NewSandbox(tempDir, 60*time.Second), norm)
 	out := &syncBuffer{}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
-	if _, err := mgr.Open(context.Background(), ipc, "sess-1", "term-1", "pkg/api", 80, 24, nil); err != nil {
+	// HOME is the project root, so bash writes .bash_history there on SIGHUP and can
+	// land it while TempDir is being removed.
+	if _, err := mgr.Open(context.Background(), ipc, "sess-1", "term-1", "pkg/api", 80, 24, map[string]string{"HISTFILE": "/dev/null"}); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer mgr.Close("sess-1", "term-1")

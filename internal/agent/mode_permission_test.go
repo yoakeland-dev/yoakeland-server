@@ -52,6 +52,23 @@ func waitForSubstring(t *testing.T, buf *syncBuf, want string, timeout time.Dura
 	t.Fatalf("timed out waiting for %q in output: %s", want, buf.String())
 }
 
+// waitForAsk polls until toolCallID is a pending ask, the point from which
+// HandlePermissionResponse lands. Its id shows up in the output sooner, on
+// tool_call_requested, so waiting on that text can answer too early and be dropped.
+func waitForAsk(t *testing.T, ag *agent.Agent, toolCallID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, p := range ag.PendingAsks() {
+			if p.ToolCallID == toolCallID {
+				return
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Errorf("timed out waiting for a pending ask on %q", toolCallID)
+}
+
 // TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember guards tier 2's
 // bash semantics: bash stays exposed, but every call is forced to Ask —
 // bypassing the permission engine's safe-command auto-allowlist (e.g. a
@@ -93,7 +110,7 @@ func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
 	ag.SetHooks(agent.Hooks{AsksChanged: func() { asksChanged.Add(1) }})
 	pendingWhileAsking := make(chan []protocol.PendingAsk, 1)
 	go func() {
-		waitForSubstring(t, out, `"toolCallId":"tc-bash-1"`, 2*time.Second)
+		waitForAsk(t, ag, "tc-bash-1", 5*time.Second)
 		pendingWhileAsking <- ag.PendingAsks()
 		ag.HandlePermissionResponse("tc-bash-1", true, true, "")
 	}()
@@ -116,7 +133,7 @@ func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
 	// been persisted, this would auto-allow with no second ask. It must ask
 	// again.
 	go func() {
-		waitForSubstring(t, out, `"toolCallId":"tc-bash-2"`, 2*time.Second)
+		waitForAsk(t, ag, "tc-bash-2", 5*time.Second)
 		ag.HandlePermissionResponse("tc-bash-2", true, false, "")
 	}()
 	if err := ag.RunTurn(context.Background(), "s1", "t2", "run pwd again"); err != nil {
