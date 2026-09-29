@@ -912,7 +912,7 @@ The backend pauses execution and requires user approval before executing a tool.
 *UI Action*: Display an interactive modal or inline prompt. If `data.diff` is non-null, render a side-by-side or unified diff inspector.
 
 #### `ask_user_question_requested`
-The model called the `ask_user_question` tool: the backend pauses the turn and waits for `ask_user_answer` (§3.1), correlated by `toolCallId` — the same shape as `permission_request`/`permission_response`, but soliciting free-form or multiple-choice input rather than an allow/deny decision. Available regardless of mode, including Autonomous — it's not a mutation, so it never goes through the permission engine at all.
+The model called the `ask_user_question` tool: the backend pauses the turn and waits for `ask_user_answer` (§3.1), correlated by `toolCallId` — the same shape as `permission_request`/`permission_response`, but soliciting free-form or multiple-choice input rather than an allow/deny decision. Available regardless of mode, including `autonomous` — it's not a mutation, so it never goes through the permission engine at all.
 ```json
 {
   "type": "ask_user_question_requested",

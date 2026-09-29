@@ -51,7 +51,7 @@ func (c *capturingProvider) StreamTurn(_ context.Context, _ []agent.Message, too
 }
 
 // TestAgent_ModeRestrictsToolsGivenToModel guards the primary safety
-// mechanism for each of the four tiers: the model isn't handed a
+// mechanism for each mode: the model isn't handed a
 // restricted tool's definition at all, so it has nothing to call — not
 // just something that gets denied after the fact.
 func TestAgent_ModeRestrictsToolsGivenToModel(t *testing.T) {

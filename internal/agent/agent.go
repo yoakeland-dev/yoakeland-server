@@ -693,7 +693,7 @@ func (a *Agent) SetModelOptions(opts ModelOptions, contextWindow int) (didApplyP
 	return didApplyProviderOptions
 }
 
-// SetMode switches a session between the four tiers (SPEC.md §4c). Takes
+// SetMode switches a session between the modes (SPEC.md §4c). Takes
 // effect on the next turn; an in-flight turn keeps whatever tool set and
 // permission behavior it started with.
 //

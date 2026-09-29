@@ -403,8 +403,8 @@ type ContextCompactedData struct {
 	TokensAfter  int    `json:"tokensAfter"`
 }
 
-// SetModeData switches a session between the four tiers on its next turn —
-// "read_only", "read_write", "autonomous", or "plan" (see SPEC.md §4c).
+// SetModeData switches a session between the modes on its next turn —
+// "read_only", "read_write", "accept_edits", "autonomous", or "plan" (see SPEC.md §4c).
 // ApprovePlanData approves the plan a session has shown (SPEC.md §3.1
 // approve_plan): the session moves to Mode and carries the plan out.
 type ApprovePlanData struct {
