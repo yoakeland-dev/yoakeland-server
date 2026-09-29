@@ -274,3 +274,125 @@ func TestClaudeSessionRelaunchesAfterDeath(t *testing.T) {
 		t.Fatalf("launches = %v", f.launches)
 	}
 }
+
+// codexScript is a Codex app-server that finishes every turn with "reply".
+// While hang is set it starts turns without finishing them, and answers an
+// interrupt by ending the turn.
+func codexScript(hang *bool) func(int, map[string]any, io.Writer) {
+	turns, threads := 0, 0
+	var current string
+	reply := func(out io.Writer, m map[string]any, result any) {
+		line(out, map[string]any{"jsonrpc": "2.0", "id": m["id"], "result": result})
+	}
+	finish := func(out io.Writer, status string) {
+		line(out, map[string]any{"method": "thread/tokenUsage/updated", "params": map[string]any{"tokenUsage": map[string]any{"last": map[string]any{"inputTokens": 10, "outputTokens": 3}}}})
+		line(out, map[string]any{"method": "turn/completed", "params": map[string]any{"turn": map[string]any{"id": current, "status": status}}})
+	}
+	return func(_ int, m map[string]any, out io.Writer) {
+		switch m["method"] {
+		case "initialize", "account/rateLimits/read":
+			reply(out, m, map[string]any{})
+		case "thread/start", "thread/resume":
+			threads++
+			id := "th" + string(rune('0'+threads))
+			if p, _ := m["params"].(map[string]any); p["threadId"] != nil {
+				id = p["threadId"].(string)
+			}
+			reply(out, m, map[string]any{"thread": map[string]any{"id": id}})
+		case "turn/start":
+			turns++
+			current = "turn" + string(rune('0'+turns))
+			reply(out, m, map[string]any{"turn": map[string]any{"id": current}})
+			if !*hang {
+				line(out, map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"delta": "reply"}})
+				finish(out, "completed")
+			}
+		case "turn/interrupt":
+			reply(out, m, map[string]any{})
+			finish(out, "interrupted")
+		}
+	}
+}
+
+func (f *liveFake) rpc(method string) []map[string]any {
+	return f.wrote(func(m map[string]any) bool { return m["method"] == method })
+}
+
+func TestCodexSessionSurvivesTurns(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := false
+	p := &CLISubprocessProvider{Kind: CLIKindCodex, Model: "gpt-5.5", Dir: t.TempDir(), Start: f.starter(codexScript(&hang))}
+
+	nt1 := liveTurn(key, agent.ModeReadWrite, "", "first")
+	if _, err := runNative(t, p, nt1); err != nil {
+		t.Fatal(err)
+	}
+	if nt1.SessionID != "th1" {
+		t.Fatalf("session = %q", nt1.SessionID)
+	}
+	// Same chat, a different mode, model and effort: one process, one thread.
+	p.Model, p.effort = "gpt-6-luna", "high"
+	nt2 := liveTurn(key, agent.ModeAutonomous, "th1", "second")
+	if _, err := runNative(t, p, nt2); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 1 || len(f.rpc("thread/start")) != 1 || len(f.rpc("thread/resume")) != 0 {
+		t.Fatalf("launches %d, thread/start %d, thread/resume %d", f.launchCount(), len(f.rpc("thread/start")), len(f.rpc("thread/resume")))
+	}
+	turns := f.rpc("turn/start")
+	if len(turns) != 2 {
+		t.Fatalf("turn/start calls = %d", len(turns))
+	}
+	first, second := turns[0]["params"].(map[string]any), turns[1]["params"].(map[string]any)
+	if first["approvalPolicy"] != "untrusted" || first["sandboxPolicy"].(map[string]any)["type"] != "workspaceWrite" {
+		t.Fatalf("first turn policy = %v", first)
+	}
+	if second["approvalPolicy"] != "never" || second["model"] != "gpt-6-luna" || second["effort"] != "high" {
+		t.Fatalf("second turn = %v", second)
+	}
+	// A history that moved on starts a new thread, in the same process.
+	nt3 := liveTurn(key, agent.ModeReadWrite, "", "fresh")
+	if _, err := runNative(t, p, nt3); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 1 || len(f.rpc("thread/start")) != 2 || nt3.SessionID != "th2" {
+		t.Fatalf("launches %d, thread/start %d, session %q", f.launchCount(), len(f.rpc("thread/start")), nt3.SessionID)
+	}
+	CloseNativeSessions(key)
+	f.waitClosed(t, 0)
+}
+
+func TestCodexSessionInterruptKeepsProcess(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := true
+	p := &CLISubprocessProvider{Kind: CLIKindCodex, Dir: t.TempDir(), Start: f.starter(codexScript(&hang))}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, liveTurn(key, agent.ModeReadWrite, "", "stop me")), nil, nil, "")
+	go func() {
+		for len(f.rpc("turn/start")) == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond) // the reply to turn/start
+		cancel()
+	}()
+	for range chunks {
+	}
+	if err := <-errs; err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f.rpc("turn/interrupt")) != 1 {
+		t.Fatalf("no turn/interrupt was sent")
+	}
+	hang = false
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "th1", "again")); err != nil {
+		t.Fatalf("turn after interrupt: %v", err)
+	}
+	if f.launchCount() != 1 {
+		t.Fatalf("interrupt restarted the process: %v", f.launches)
+	}
+}
