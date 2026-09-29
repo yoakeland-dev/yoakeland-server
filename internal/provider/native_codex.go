@@ -492,6 +492,9 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 	if p.effort != "" {
 		turnParams["effort"] = p.effort
 	}
+	if p.fast {
+		turnParams["serviceTier"] = "fast"
+	}
 	started, err := conn.call(ctx, "turn/start", turnParams)
 	if err != nil {
 		if ctx.Err() != nil {

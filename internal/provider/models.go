@@ -73,13 +73,14 @@ func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error) {
 	switch cfg.Kind {
 	case ProviderKindCLIClaude:
-		// Neither `claude` nor `codex` expose a models-list subcommand to
-		// introspect this from, so it comes from T3 Code's own manifest
-		// instead (see manifest.go) — refreshed in the background, cached to
-		// disk, and never blocking this call on the network.
-		return manifest.ClaudeModels(), nil
+		// Claude Code answers an initialize request with the list /model shows
+		// for this account; the manifest (T3 Code's, see manifest.go) adds what
+		// it doesn't report and stands in when it can't be asked (discover.go).
+		home, _ := os.UserHomeDir()
+		return ClaudeModelsDiscovered(manifest, home), nil
 	case ProviderKindCLICodex:
-		return manifest.CodexModels(), nil
+		home, _ := os.UserHomeDir()
+		return CodexModelsDiscovered(manifest, home), nil
 	case ProviderKindAPIKey:
 		// fall through
 	default:
