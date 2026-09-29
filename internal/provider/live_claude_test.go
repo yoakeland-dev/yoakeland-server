@@ -100,3 +100,44 @@ func TestLiveClaudeSteer(t *testing.T) {
 		t.Fatalf("the steer didn't reach the running turn: steered=%v reply=%q", steered, text.String())
 	}
 }
+
+// Live: Auto runs a harmless command without asking on a model that supports it,
+// and a model that doesn't support it refuses the mode instead of running unreviewed.
+func TestLiveClaudeAuto(t *testing.T) {
+	if os.Getenv("YK_LIVE") == "" {
+		t.Skip("YK_LIVE not set")
+	}
+	run := func(model string, mode agent.Mode) (string, int, error) {
+		key := t.Name() + model
+		defer CloseNativeSessions(key)
+		p := &CLISubprocessProvider{Kind: CLIKindClaude, Model: model, Dir: t.TempDir()}
+		asks := 0
+		rec := &turnRecorder{answer: agent.NativeAnswer{Allowed: true}}
+		nt := rec.turn(mode)
+		nt.SessionKey, nt.Prompt = key, "Run the bash command `echo hello-auto` and tell me what it printed."
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, nt), nil, nil, "")
+		var text strings.Builder
+		for c := range chunks {
+			if c.Kind == agent.StreamChunkDelta {
+				text.WriteString(c.Delta)
+			}
+		}
+		err := <-errs
+		rec.mu.Lock()
+		asks = len(rec.asks)
+		rec.mu.Unlock()
+		return text.String(), asks, err
+	}
+	text, asks, err := run("sonnet", agent.ModeAuto)
+	t.Logf("sonnet/auto: %q asks=%d err=%v", text, asks, err)
+	if err != nil || asks != 0 || !strings.Contains(text, "hello-auto") {
+		t.Fatalf("auto on sonnet: %q asks=%d err=%v", text, asks, err)
+	}
+	_, _, err = run("haiku", agent.ModeAuto)
+	t.Logf("haiku/auto: err=%v", err)
+	if err == nil {
+		t.Fatal("haiku accepted auto mode")
+	}
+}

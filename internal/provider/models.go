@@ -61,7 +61,10 @@ func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 	}
 	switch cfg.Kind {
 	case ProviderKindCLIClaude:
-		return withPermissionModes(models, claudeModes()), nil
+		return withPermissionModesBy(models, func(m ModelInfo) []ModeSpec {
+			auto, _ := m.Capabilities["autoMode"].(bool)
+			return claudeModes(auto)
+		}), nil
 	case ProviderKindCLICodex:
 		return withPermissionModes(models, codexModes()), nil
 	case ProviderKindAPIKey:

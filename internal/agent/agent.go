@@ -256,7 +256,7 @@ type ModelOptionsSetter interface {
 
 // Mode selects which tools the model is even given (SPEC.md §4c) and, for
 // bash specifically, whether the permission engine's normal decision is
-// overridden. Five values, no bool — see SPEC.md §4c for the tier
+// overridden. Six values, no bool — see SPEC.md §4c for the tier
 // descriptions.
 type Mode string
 
@@ -264,14 +264,18 @@ const (
 	ModeReadOnly    Mode = "read_only"
 	ModeReadWrite   Mode = "read_write"
 	ModeAcceptEdits Mode = "accept_edits"
-	ModeAutonomous  Mode = "autonomous"
-	ModePlan        Mode = "plan"
+	// ModeAuto lets the agent's own reviewer (Claude Code's classifier, Codex's
+	// auto review) decide what to ask about. Only a CLI agent that has one
+	// offers it; anything it still asks reaches the user like an Ask.
+	ModeAuto       Mode = "auto"
+	ModeAutonomous Mode = "autonomous"
+	ModePlan       Mode = "plan"
 )
 
 // ValidMode reports whether s names a mode.
 func ValidMode(s string) bool {
 	switch Mode(s) {
-	case ModeReadOnly, ModeReadWrite, ModeAcceptEdits, ModeAutonomous, ModePlan:
+	case ModeReadOnly, ModeReadWrite, ModeAcceptEdits, ModeAuto, ModeAutonomous, ModePlan:
 		return true
 	}
 	return false
@@ -850,7 +854,7 @@ func (a *Agent) toolDefsForModeLocked() []tool.ToolDefinition {
 		return a.toolDefsReadOnly
 	case ModePlan:
 		return a.toolDefsPlan
-	default: // ModeReadWrite, ModeAcceptEdits, ModeAutonomous
+	default: // ModeReadWrite, ModeAcceptEdits, ModeAuto, ModeAutonomous
 		return a.toolDefs
 	}
 }
@@ -873,7 +877,7 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 		return readOnlyTools[name]
 	case ModePlan:
 		return readOnlyTools[name] || planExtraTools[name]
-	default: // ModeReadWrite, ModeAcceptEdits, ModeAutonomous
+	default: // ModeReadWrite, ModeAcceptEdits, ModeAuto, ModeAutonomous
 		return true
 	}
 }
@@ -1611,7 +1615,7 @@ turn:
 
 				var decision permission.Decision
 				var cacheKey string
-				if (mode == ModeReadWrite || mode == ModeAcceptEdits) && shellTools[tc.Name] {
+				if (mode == ModeReadWrite || mode == ModeAcceptEdits || mode == ModeAuto) && shellTools[tc.Name] {
 					// Read/Write+Prompts: bash always asks, bypassing the
 					// engine's safe-command auto-allowlist. cacheKey is left
 					// empty so a "remember" answer here is never persisted

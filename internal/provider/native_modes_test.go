@@ -56,7 +56,7 @@ func TestACPSessionModeChoices(t *testing.T) {
 }
 
 func TestPermissionModesOnEveryModel(t *testing.T) {
-	models := withPermissionModes([]ModelInfo{{ID: "m", Capabilities: map[string]any{"reasoningEfforts": []string{"low"}}}}, claudeModes())
+	models := withPermissionModes([]ModelInfo{{ID: "m", Capabilities: map[string]any{"reasoningEfforts": []string{"low"}}}}, claudeModes(false))
 	if models[0].Capabilities["reasoningEfforts"] == nil {
 		t.Fatal("existing capabilities must survive")
 	}
@@ -147,5 +147,50 @@ func TestClaudeEffortAndFastMode(t *testing.T) {
 		if !strings.Contains(got, c.want) || (c.want == "" && (strings.Contains(got, "--effort") || strings.Contains(got, "--settings"))) {
 			t.Errorf("effort %q fast %v: args = %s", c.effort, c.fast, got)
 		}
+	}
+}
+
+// Auto is offered only where the agent has a reviewer to do the deciding.
+func TestAutoModeOnlyWhereTheAgentHasAReviewer(t *testing.T) {
+	names := func(specs []ModeSpec) string {
+		var out []string
+		for _, s := range specs {
+			out = append(out, s.Mode)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := names(claudeModes(false)); got != "read_only,read_write,accept_edits,autonomous,plan" {
+		t.Fatalf("claude without auto = %s", got)
+	}
+	specs := claudeModes(true)
+	if got := names(specs); got != "read_only,read_write,accept_edits,auto,autonomous,plan" {
+		t.Fatalf("claude with auto = %s", got)
+	}
+	if a := specs[3]; a.Native != "auto" || a.EnforcedBy != "agent" || a.Policy["run"] != "auto" || a.Policy["edit"] != "allow" {
+		t.Fatalf("claude auto spec = %+v", a)
+	}
+	if got := names(codexModes()); !strings.Contains(got, ",auto,") {
+		t.Fatalf("codex = %s", got)
+	}
+	if got := names(apiModes()); strings.Contains(got, "auto,") && strings.Contains(got, ",auto") {
+		t.Fatalf("api models offer auto: %s", got)
+	}
+	if got := names(acpModes(nil)); strings.Contains(got, ",auto,") {
+		t.Fatalf("acp offers auto: %s", got)
+	}
+
+	// Per model: only the ones that report support.
+	models := withPermissionModesBy([]ModelInfo{
+		{ID: "opus", Capabilities: map[string]any{"autoMode": true}},
+		{ID: "haiku"},
+	}, func(m ModelInfo) []ModeSpec {
+		auto, _ := m.Capabilities["autoMode"].(bool)
+		return claudeModes(auto)
+	})
+	if n := len(models[0].Capabilities["permissionModes"].([]ModeSpec)); n != 6 {
+		t.Fatalf("opus modes = %d", n)
+	}
+	if n := len(models[1].Capabilities["permissionModes"].([]ModeSpec)); n != 5 {
+		t.Fatalf("haiku modes = %d", n)
 	}
 }

@@ -407,7 +407,7 @@ type ContextCompactedData struct {
 }
 
 // SetModeData switches a session between the modes on its next turn —
-// "read_only", "read_write", "accept_edits", "autonomous", or "plan" (see SPEC.md §4c).
+// "read_only", "read_write", "accept_edits", "auto", "autonomous", or "plan" (see SPEC.md §4c).
 // ApprovePlanData approves the plan a session has shown (SPEC.md §3.1
 // approve_plan): the session moves to Mode and carries the plan out.
 type ApprovePlanData struct {

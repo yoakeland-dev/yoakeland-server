@@ -190,3 +190,24 @@ func TestAgent_SteerIsRecordedInOrder(t *testing.T) {
 		t.Fatal("a steer after the turn ended was accepted")
 	}
 }
+
+// Auto hands the deciding to the agent's own reviewer; what it still asks
+// about reaches the user, unlike Run, which never asks.
+func TestAgent_AutoModeAsksTheUserWhatTheReviewerEscalates(t *testing.T) {
+	ag, out := newTestAgent(t, t.TempDir(), &capturingProvider{}, nil)
+	ag.SetMode(agent.ModeAuto)
+	if !agent.ValidMode("auto") {
+		t.Fatal("auto isn't a valid mode")
+	}
+	go func() {
+		waitForSubstring(t, out, `"toolCallId":"c1"`, 2*time.Second)
+		ag.HandlePermissionResponse("c1", true, false, "")
+	}()
+	ans, err := ag.AskNative(context.Background(), "s1", "t1", agent.NativeAsk{ToolCallID: "c1", ToolName: "Bash", Description: "rm -rf build"})
+	if err != nil || !ans.Allowed {
+		t.Fatalf("ask = %+v, %v", ans, err)
+	}
+	if n := strings.Count(out.String(), `"type":"permission_request"`); n != 1 {
+		t.Fatalf("want the user asked once, got %d: %s", n, out.String())
+	}
+}

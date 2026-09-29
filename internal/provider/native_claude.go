@@ -41,6 +41,8 @@ func claudePermissionMode(m agent.Mode) string {
 		return "plan"
 	case agent.ModeAcceptEdits:
 		return "acceptEdits"
+	case agent.ModeAuto:
+		return "auto"
 	default:
 		return "default"
 	}
@@ -327,8 +329,16 @@ func (p *CLISubprocessProvider) claudeLaunch(nt *agent.NativeTurn) claudeLaunch 
 }
 
 func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch) (*claudeSession, error) {
+	// A model without auto mode takes --permission-mode auto at launch and runs
+	// with no reviewer; only set_permission_mode refuses it. So auto is never a
+	// launch argument: the session starts in default and is switched, which fails
+	// where auto isn't available.
+	launchMode := l.permMode
+	if launchMode == "auto" {
+		launchMode = "default"
+	}
 	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-		"--include-partial-messages", "--permission-prompt-tool", "stdio", "--permission-mode", l.permMode}
+		"--include-partial-messages", "--permission-prompt-tool", "stdio", "--permission-mode", launchMode}
 	if p.Model != "" {
 		args = append(args, "--model", p.Model)
 	}
@@ -346,7 +356,7 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 	if err != nil {
 		return nil, err
 	}
-	s := &claudeSession{proc: proc, exited: make(chan struct{}), id: nt.ResumeID, model: p.Model, permMode: l.permMode, waiting: map[string]chan claudeLine{}}
+	s := &claudeSession{proc: proc, exited: make(chan struct{}), id: nt.ResumeID, model: p.Model, permMode: launchMode, waiting: map[string]chan claudeLine{}}
 	go s.read()
 	// Headless Claude Code omits thinking text on Sonnet/Opus 4.7+ unless asked;
 	// a CLI that predates the request just answers with an error we ignore.

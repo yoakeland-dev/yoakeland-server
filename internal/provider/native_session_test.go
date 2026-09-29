@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -642,5 +643,75 @@ func TestACPSteerLastPromptSettles(t *testing.T) {
 	}
 	if k := kinds(chunks); !strings.Contains(k, "delta") {
 		t.Fatalf("chunks = %s", k)
+	}
+}
+
+func TestClaudeAutoMode(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	refuse := false
+	script := claudeScript(0.1)
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if refuse && m["type"] == "control_request" && controlSubtype(m) == "set_permission_mode" {
+			line(out, map[string]any{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": m["request_id"], "error": "auto mode unavailable for this model"}})
+			return
+		}
+		script(l, m, out)
+	})}
+	// Never a launch argument (a model without it would take the flag and run unreviewed):
+	// the session starts in default and is switched, which is refused where auto isn't available.
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAuto, "", "one")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.args(0), "--permission-mode default") || strings.Contains(f.args(0), "--permission-mode auto") {
+		t.Fatalf("args = %s", f.args(0))
+	}
+	// Moving into and out of it in a running session is a control request.
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "sess-1", "two")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAuto, "sess-1", "three")); err != nil {
+		t.Fatal(err)
+	}
+	var modes []any
+	for _, m := range f.controls("set_permission_mode") {
+		modes = append(modes, m["request"].(map[string]any)["mode"])
+	}
+	if !reflect.DeepEqual(modes, []any{"auto", "default", "auto"}) || f.launchCount() != 1 {
+		t.Fatalf("mode changes = %v, %d launches", modes, f.launchCount())
+	}
+	// A model that can't do auto says so, and the turn fails rather than running unreviewed.
+	refuse = true
+	_, err := runNative(t, p, liveTurn(key, agent.ModeAcceptEdits, "sess-1", "four"))
+	if err == nil {
+		t.Fatal("expected the refused mode change to fail the turn")
+	}
+}
+
+func TestCodexAutoReviewIsPerTurn(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := false
+	p := &CLISubprocessProvider{Kind: CLIKindCodex, Dir: t.TempDir(), Start: f.starter(codexScript(&hang))}
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeAuto, "", "one")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "th1", "two")); err != nil {
+		t.Fatal(err)
+	}
+	start := f.rpc("thread/start")[0]["params"].(map[string]any)
+	if start["approvalsReviewer"] != "auto_review" || start["approvalPolicy"] != "on-request" || start["sandbox"] != "workspace-write" {
+		t.Fatalf("thread/start = %v", start)
+	}
+	turns := f.rpc("turn/start")
+	one, two := turns[0]["params"].(map[string]any), turns[1]["params"].(map[string]any)
+	if one["approvalsReviewer"] != "auto_review" || one["approvalPolicy"] != "on-request" {
+		t.Fatalf("auto turn = %v", one)
+	}
+	// The reviewer sticks across turns unless told otherwise, so leaving Auto says "user".
+	if two["approvalsReviewer"] != "user" || two["approvalPolicy"] != "untrusted" {
+		t.Fatalf("turn after auto = %v", two)
 	}
 }

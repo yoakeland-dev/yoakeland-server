@@ -36,10 +36,13 @@ var (
 	polReadOnly    = pol("allow", "deny", "deny", "deny")
 	polAsk         = pol("allow", "ask", "ask", "ask")
 	polAcceptEdits = pol("allow", "allow", "ask", "ask")
-	polAutonomous  = pol("allow", "allow", "allow", "allow")
+	// "auto": the agent's own reviewer decides, asking only when it isn't sure.
+	polAuto       = pol("allow", "allow", "auto", "auto")
+	polAutonomous = pol("allow", "allow", "allow", "allow")
 )
 
-func modeSpecs(by func(agent.Mode) (enforcedBy, native string), plan string, sandbox bool) []ModeSpec {
+// modeSpecs lists the modes a provider offers; auto only where its agent has a reviewer.
+func modeSpecs(by func(agent.Mode) (enforcedBy, native string), plan string, sandbox, auto bool) []ModeSpec {
 	mk := func(m agent.Mode, p map[string]string) ModeSpec {
 		by, native := by(m)
 		s := ModeSpec{Mode: string(m), Policy: p, EnforcedBy: by, Native: native}
@@ -51,26 +54,29 @@ func modeSpecs(by func(agent.Mode) (enforcedBy, native string), plan string, san
 		}
 		return s
 	}
-	return []ModeSpec{
+	specs := []ModeSpec{
 		mk(agent.ModeReadOnly, polReadOnly),
 		mk(agent.ModeReadWrite, polAsk),
 		mk(agent.ModeAcceptEdits, polAcceptEdits),
-		mk(agent.ModeAutonomous, polAutonomous),
-		mk(agent.ModePlan, polReadOnly),
 	}
+	if auto {
+		specs = append(specs, mk(agent.ModeAuto, polAuto))
+	}
+	return append(specs, mk(agent.ModeAutonomous, polAutonomous), mk(agent.ModePlan, polReadOnly))
 }
 
 // apiModes: yoakeland runs the loop, so it enforces every mode itself.
 func apiModes() []ModeSpec {
-	return modeSpecs(func(agent.Mode) (string, string) { return "yoakeland", "" }, "yoakeland", true)
+	return modeSpecs(func(agent.Mode) (string, string) { return "yoakeland", "" }, "yoakeland", true, false)
 }
 
-func claudeModes() []ModeSpec {
+// claudeModes: auto only for a model that supports it (a discovered model says so).
+func claudeModes(auto bool) []ModeSpec {
 	native := map[agent.Mode]string{
-		agent.ModeReadOnly: "plan", agent.ModeReadWrite: "default",
+		agent.ModeReadOnly: "plan", agent.ModeReadWrite: "default", agent.ModeAuto: "auto",
 		agent.ModeAcceptEdits: "acceptEdits", agent.ModeAutonomous: "bypassPermissions", agent.ModePlan: "plan",
 	}
-	return modeSpecs(func(m agent.Mode) (string, string) { return "agent", native[m] }, "native", true)
+	return modeSpecs(func(m agent.Mode) (string, string) { return "agent", native[m] }, "native", true, auto)
 }
 
 // codexModes: Codex has a sandbox and an approval policy, not modes. Edits
@@ -80,13 +86,14 @@ func codexModes() []ModeSpec {
 	native := map[agent.Mode]string{
 		agent.ModeReadOnly: "read-only", agent.ModeReadWrite: "workspace-write · untrusted",
 		agent.ModeAcceptEdits: "workspace-write · untrusted", agent.ModeAutonomous: "workspace-write · never", agent.ModePlan: "read-only",
+		agent.ModeAuto: "workspace-write · on-request · auto review",
 	}
 	return modeSpecs(func(m agent.Mode) (string, string) {
 		if m == agent.ModeAcceptEdits {
 			return "yoakeland", native[m]
 		}
 		return "agent", native[m]
-	}, "emulated", true)
+	}, "emulated", true, true)
 }
 
 // acpModes maps what an ACP agent advertised: a mode it has a match for is
@@ -101,7 +108,7 @@ func acpModes(choices []acpModeChoice) []ModeSpec {
 			return "agent", id
 		}
 		return "yoakeland", ""
-	}, "", false)
+	}, "", false, false)
 	for i := range specs {
 		if specs[i].Mode == string(agent.ModePlan) {
 			specs[i].Plan = "emulated"
@@ -111,6 +118,16 @@ func acpModes(choices []acpModeChoice) []ModeSpec {
 		}
 	}
 	return specs
+}
+
+// withPermissionModesBy sets each model's own capability, for a provider whose
+// models differ in what they support.
+func withPermissionModesBy(models []ModelInfo, specs func(ModelInfo) []ModeSpec) []ModelInfo {
+	out := make([]ModelInfo, len(models))
+	for i, m := range models {
+		out[i] = withPermissionModes([]ModelInfo{m}, specs(m))[0]
+	}
+	return out
 }
 
 // withPermissionModes sets the capability on every model, keeping what's there.

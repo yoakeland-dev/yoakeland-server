@@ -28,6 +28,8 @@ func codexPolicy(m agent.Mode) (sandbox, approval string) {
 	switch m {
 	case agent.ModeAutonomous:
 		return "workspace-write", "never"
+	case agent.ModeAuto: // Codex's reviewer (codexReviewer) answers what it would ask
+		return "workspace-write", "on-request"
 	case agent.ModeReadOnly, agent.ModePlan:
 		return "read-only", "never"
 	default: // Ask and Accept Edits: Codex asks either way; the bridge approves the edits
@@ -392,6 +394,15 @@ func (t *codexTurn) request(id json.RawMessage, method string, params json.RawMe
 	}
 }
 
+// codexReviewer is who answers Codex's approval requests: the user, or in Auto
+// its own reviewer. It lasts across turns, so every turn says which.
+func codexReviewer(m agent.Mode) string {
+	if m == agent.ModeAuto {
+		return "auto_review"
+	}
+	return "user"
+}
+
 // codexSandboxPolicy is codexPolicy's sandbox as the tagged object turn/start takes.
 func codexSandboxPolicy(sandbox string) map[string]any {
 	switch sandbox {
@@ -434,7 +445,7 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 	conn := s.conn
 
 	sandbox, approval := codexPolicy(nt.Mode)
-	threadParams := map[string]any{"cwd": p.Dir, "sandbox": sandbox, "approvalPolicy": approval}
+	threadParams := map[string]any{"cwd": p.Dir, "sandbox": sandbox, "approvalPolicy": approval, "approvalsReviewer": codexReviewer(nt.Mode)}
 	if p.Model != "" {
 		threadParams["model"] = p.Model
 	}
@@ -485,6 +496,8 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 		"input":          []map[string]any{{"type": "text", "text": planPrefix(nt.Mode) + prompt, "text_elements": []any{}}},
 		"approvalPolicy": approval,
 		"sandboxPolicy":  codexSandboxPolicy(sandbox),
+
+		"approvalsReviewer": codexReviewer(nt.Mode),
 	}
 	if p.Model != "" {
 		turnParams["model"] = p.Model
