@@ -1273,9 +1273,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		mode := agent.Mode(data.Mode)
-		switch mode {
-		case agent.ModeReadOnly, agent.ModeReadWrite, agent.ModeAutonomous, agent.ModePlan:
-		default:
+		if !agent.ValidMode(data.Mode) {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("unknown mode %q", data.Mode),
 			})
@@ -1304,6 +1302,41 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// as session_updated/session_deleted below: several peers can have
 		// the same session open at once and must sync seamlessly.
 		deps.peers.BroadcastEvent(peerID, protocol.EventModeSet, sessID, modeSet)
+
+	case protocol.EventApprovePlan:
+		var data protocol.ApprovePlanData
+		if err := json.Unmarshal(env.Data, &data); err != nil || !agent.ValidMode(data.Mode) || data.Mode == string(agent.ModePlan) {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed approve_plan payload",
+			})
+			return
+		}
+		sessID := data.SessionID
+		if sessID == "" {
+			sessID = env.SessionID
+		}
+		if sessID == "" {
+			sessID = "default"
+		}
+		pc, err := deps.projects.Resolve(sessID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		// The mode changes first, so what the agent does next runs under it.
+		as := func(t protocol.EventType, d any) {
+			raw, _ := json.Marshal(d)
+			handleEnvelope(ctx, ipc, deps, network, peerID, &protocol.Envelope{Type: t, SessionID: sessID, TurnID: env.TurnID, Data: raw})
+		}
+		as(protocol.EventSetMode, protocol.SetModeData{SessionID: sessID, Mode: data.Mode, ProjectPath: data.ProjectPath})
+		if pc.Registry.Get(ipc, sessID).ResolvePlanApproval() {
+			return // the agent's own turn was waiting on it and carries on
+		}
+		off := false
+		as(protocol.EventUserPrompt, protocol.UserPromptData{
+			Prompt: "The plan is approved. Carry it out.", SessionID: sessID, ProjectPath: data.ProjectPath,
+			AuthorName: data.AuthorName, AuthorAvatar: data.AuthorAvatar, AutoGenerateTitle: &off,
+		})
 
 	case protocol.EventSetWebToolsEnabled:
 		var data protocol.SetWebToolsEnabledData

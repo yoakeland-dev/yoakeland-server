@@ -47,6 +47,7 @@ const (
 	EventRemoveProject        EventType = "remove_project"
 	EventListFiles            EventType = "list_files"
 	EventSetMode              EventType = "set_mode"
+	EventApprovePlan          EventType = "approve_plan"
 	EventSetWebToolsEnabled   EventType = "set_web_tools_enabled"
 	EventAskUserAnswer        EventType = "ask_user_answer"
 	EventGetSessionHistory    EventType = "get_session_history"
@@ -401,6 +402,16 @@ type ContextCompactedData struct {
 
 // SetModeData switches a session between the four tiers on its next turn —
 // "read_only", "read_write", "autonomous", or "plan" (see SPEC.md §4c).
+// ApprovePlanData approves the plan a session has shown (SPEC.md §3.1
+// approve_plan): the session moves to Mode and carries the plan out.
+type ApprovePlanData struct {
+	SessionID    string `json:"sessionId,omitempty"`
+	Mode         string `json:"mode"`
+	ProjectPath  string `json:"projectPath,omitempty"`
+	AuthorName   string `json:"authorName,omitempty"`
+	AuthorAvatar string `json:"authorAvatar,omitempty"`
+}
+
 type SetModeData struct {
 	SessionID string `json:"sessionId,omitempty"`
 	Mode      string `json:"mode"`
@@ -1484,6 +1495,10 @@ type PermissionRequestData struct {
 	RequiresAsk bool           `json:"requiresAsk"`
 	CacheKey    string         `json:"cacheKey"`
 	Diff        *diff.FileDiff `json:"diff,omitempty"` // For rich UI diff previews
+	// Plan: the agent is asking to leave plan mode with the plan a
+	// `plan_written` just showed; approve it with approve_plan, or answer
+	// with feedback to send it back for changes.
+	Plan bool `json:"plan,omitempty"`
 }
 
 type PermissionResponseData struct {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"yoakeland/internal/agent"
@@ -34,6 +35,8 @@ func claudePermissionMode(m agent.Mode) string {
 		return "bypassPermissions"
 	case agent.ModeReadOnly, agent.ModePlan:
 		return "plan"
+	case agent.ModeAcceptEdits:
+		return "acceptEdits"
 	default:
 		return "default"
 	}
@@ -300,7 +303,23 @@ func (p *CLISubprocessProvider) claudeControl(ctx context.Context, nt *agent.Nat
 	if ds := claudeProposedDiffs(req.ToolName, input); len(ds) > 0 {
 		d = ds[0]
 	}
-	ans, err := nt.Ask(ctx, agent.NativeAsk{ToolCallID: callID, ToolName: req.ToolName, Description: desc, Diff: d})
+	ask := agent.NativeAsk{ToolCallID: callID, ToolName: req.ToolName, Description: desc, Diff: d}
+	switch req.ToolName {
+	case "Edit", "MultiEdit", "Write", "NotebookEdit":
+		ask.Edit = true
+		// Plan mode's own scratch file: Claude writes its plan here before
+		// asking to leave plan mode. Not a change to the project.
+		if nt.Mode == agent.ModePlan && isClaudePlanFile(input) {
+			return reply(map[string]any{"behavior": "allow", "updatedInput": input})
+		}
+	case "ExitPlanMode":
+		var in struct {
+			Plan string `json:"plan"`
+		}
+		_ = json.Unmarshal(input, &in)
+		ask.Plan = in.Plan
+	}
+	ans, err := nt.Ask(ctx, ask)
 	if err != nil {
 		return reply(map[string]any{"behavior": "deny", "message": "The turn was cancelled.", "interrupt": true})
 	}
@@ -316,6 +335,21 @@ func (p *CLISubprocessProvider) claudeControl(ctx context.Context, nt *agent.Nat
 		allow["updatedPermissions"] = req.Suggestions // Claude's own "always allow" rules
 	}
 	return reply(allow)
+}
+
+// isClaudePlanFile: the write targets a markdown file directly in
+// ~/.claude/plans, where Claude keeps its plans.
+func isClaudePlanFile(input json.RawMessage) bool {
+	var in struct {
+		FilePath string `json:"file_path"`
+	}
+	home, err := os.UserHomeDir()
+	if json.Unmarshal(input, &in) != nil || err != nil {
+		return false
+	}
+	dir := filepath.Join(home, ".claude", "plans")
+	p := filepath.Clean(in.FilePath)
+	return filepath.Dir(p) == dir && filepath.Ext(p) == ".md"
 }
 
 // claudeToolCall describes one Claude Code tool use for clients.

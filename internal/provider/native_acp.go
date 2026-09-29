@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"yoakeland/internal/agent"
@@ -90,6 +91,19 @@ func (t *acpToolCall) toolCall() agent.ToolCall {
 	return tc
 }
 
+// plan is the plan text an exit-plan request carries (`plan` in its raw
+// input), else its title.
+func (t *acpToolCall) plan() string {
+	var in struct {
+		Plan string `json:"plan"`
+	}
+	_ = json.Unmarshal(t.RawInput, &in)
+	if in.Plan != "" {
+		return in.Plan
+	}
+	return t.Title
+}
+
 func (t *acpToolCall) diffs() []*diff.FileDiff {
 	var out []*diff.FileDiff
 	for _, c := range t.Content {
@@ -143,9 +157,10 @@ type acpSession struct {
 }
 
 type acpConfigOption struct {
-	ID       string          `json:"id"`
-	Category string          `json:"category"`
-	Options  json.RawMessage `json:"options"`
+	ID           string          `json:"id"`
+	Category     string          `json:"category"`
+	CurrentValue string          `json:"currentValue"`
+	Options      json.RawMessage `json:"options"`
 }
 
 // values flattens a select option's choices (plain or grouped).
@@ -180,35 +195,58 @@ func (s acpSession) option(category string) *acpConfigOption {
 	return nil
 }
 
-// acpModeFor picks the agent's own session mode matching yoakeland's, by
-// name — ACP mode ids are agent-defined. Nothing matching leaves the agent's
-// default; asks are still gated by agent.askNativePermission either way.
-func (s acpSession) acpModeFor(m agent.Mode) string {
-	if s.Modes == nil {
-		return ""
-	}
-	var want []string
-	switch m {
-	case agent.ModePlan:
-		want = []string{"plan"}
-	case agent.ModeReadOnly:
-		want = []string{"ask", "read", "plan"}
-	case agent.ModeAutonomous:
-		want = []string{"yolo", "bypass", "full", "auto"}
-	default:
-		return ""
-	}
-	for _, w := range want {
-		for _, md := range s.Modes.AvailableModes {
-			if strings.Contains(strings.ToLower(md.ID+" "+md.Name), w) {
-				if md.ID == s.Modes.CurrentModeID {
-					return ""
-				}
-				return md.ID
-			}
+// modeChoices are the session's modes, from its "mode" config option when it
+// has one (set with session/set_config_option under that option's own id),
+// else from the older `modes` block (session/set_mode). current is the one
+// the agent is in now.
+func (s acpSession) modeChoices() (choices []acpModeChoice, configID, current string) {
+	if o := s.option("mode"); o != nil {
+		for _, v := range o.values() {
+			choices = append(choices, acpModeChoice{v.ID, v.DisplayName})
 		}
+		return choices, o.ID, o.CurrentValue
 	}
-	return ""
+	if s.Modes != nil {
+		for _, m := range s.Modes.AvailableModes {
+			choices = append(choices, acpModeChoice{m.ID, m.Name})
+		}
+		return choices, "", s.Modes.CurrentModeID
+	}
+	return nil, "", ""
+}
+
+// acpPlanPrefix tells an agent with no plan mode of its own to plan.
+func acpPlanPrefix(s acpSession, m agent.Mode) string {
+	choices, _, _ := s.modeChoices()
+	if _, ok := pickACPMode(choices, agent.ModePlan); ok {
+		return ""
+	}
+	return planPrefix(m)
+}
+
+// applyMode puts the agent in its own mode for m. No match leaves it where
+// it is; asks are still gated by agent.askNativePermission either way.
+func (s acpSession) applyMode(ctx context.Context, conn *rpcConn, m agent.Mode) {
+	choices, configID, current := s.modeChoices()
+	id, ok := pickACPMode(choices, m)
+	if !ok {
+		if len(choices) > 0 {
+			log.Printf("acp: no mode for %q among the agent's %v; yoakeland's permission checks still apply", m, choices)
+		}
+		return
+	}
+	if id == current {
+		return
+	}
+	var err error
+	if configID != "" {
+		_, err = conn.call(ctx, "session/set_config_option", map[string]any{"sessionId": s.SessionID, "configId": configID, "value": id})
+	} else {
+		_, err = conn.call(ctx, "session/set_mode", map[string]any{"sessionId": s.SessionID, "modeId": id})
+	}
+	if err != nil {
+		log.Printf("acp: setting mode %q failed: %v", id, err)
+	}
 }
 
 // acpInit starts an ACP agent and runs initialize, returning the connection
@@ -356,7 +394,15 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 		if desc == "" {
 			desc = string(r.ToolCall.RawInput)
 		}
-		ans, err := nt.Ask(ctx, agent.NativeAsk{ToolCallID: r.ToolCall.ToolCallID, ToolName: r.ToolCall.toolCall().Name, Description: desc, Diff: d})
+		ask := agent.NativeAsk{ToolCallID: r.ToolCall.ToolCallID, ToolName: r.ToolCall.toolCall().Name, Description: desc, Diff: d}
+		switch r.ToolCall.Kind {
+		case "edit", "delete", "move":
+			ask.Edit = true
+		case "switch_mode":
+			// The agent leaving its plan mode: what it wants approved is the plan.
+			ask.Plan = r.ToolCall.plan()
+		}
+		ans, err := nt.Ask(ctx, ask)
 		if err != nil {
 			conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
 			return
@@ -433,13 +479,11 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 	if o := sess.option("thought_level"); o != nil && p.effort != "" {
 		_, _ = conn.call(ctx, "session/set_config_option", map[string]any{"sessionId": sess.SessionID, "configId": o.ID, "value": p.effort})
 	}
-	if mode := sess.acpModeFor(nt.Mode); mode != "" {
-		_, _ = conn.call(ctx, "session/set_mode", map[string]any{"sessionId": sess.SessionID, "modeId": mode})
-	}
+	sess.applyMode(ctx, conn, nt.Mode)
 
 	raw, err := conn.call(ctx, "session/prompt", map[string]any{
 		"sessionId": sess.SessionID,
-		"prompt":    []map[string]string{{"type": "text", "text": prompt}},
+		"prompt":    []map[string]string{{"type": "text", "text": acpPlanPrefix(sess, nt.Mode) + prompt}},
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -510,8 +554,10 @@ func ListACPModels(ctx context.Context, kind CLIKind, dir string) ([]ModelInfo, 
 	}
 	var sess acpSession
 	_ = json.Unmarshal(raw, &sess)
+	choices, _, _ := sess.modeChoices()
+	modes := acpModes(choices)
 	if o := sess.option("model"); o != nil {
-		return o.values(), nil
+		return withPermissionModes(o.values(), modes), nil
 	}
 	var out []ModelInfo
 	if sess.Models != nil {
@@ -519,5 +565,5 @@ func ListACPModels(ctx context.Context, kind CLIKind, dir string) ([]ModelInfo, 
 			out = append(out, ModelInfo{ID: m.ModelID, DisplayName: m.Name})
 		}
 	}
-	return out, nil
+	return withPermissionModes(out, modes), nil
 }

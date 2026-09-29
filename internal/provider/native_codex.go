@@ -28,7 +28,7 @@ func codexPolicy(m agent.Mode) (sandbox, approval string) {
 		return "workspace-write", "never"
 	case agent.ModeReadOnly, agent.ModePlan:
 		return "read-only", "never"
-	default:
+	default: // Ask and Accept Edits: Codex asks either way; the bridge approves the edits
 		return "workspace-write", "untrusted"
 	}
 }
@@ -232,10 +232,11 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 					Label string `json:"label"`
 				} `json:"options"`
 			} `json:"questions"`
-			CallID string `json:"callId"` // legacy execCommandApproval/applyPatchApproval
+			CallID    string `json:"callId"` // legacy execCommandApproval/applyPatchApproval
+			GrantRoot string `json:"grantRoot"`
 		}
 		_ = json.Unmarshal(params, &r)
-		ask := func(toolName, desc string, d *diff.FileDiff) (agent.NativeAnswer, error) {
+		ask := func(toolName, desc string, d *diff.FileDiff, edit bool) (agent.NativeAnswer, error) {
 			callID := r.ItemID
 			if callID == "" {
 				callID = r.CallID
@@ -243,7 +244,7 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 			if r.Reason != "" {
 				desc += " — " + r.Reason
 			}
-			return nt.Ask(ctx, agent.NativeAsk{ToolCallID: callID, ToolName: toolName, Description: desc, Diff: d})
+			return nt.Ask(ctx, agent.NativeAsk{ToolCallID: callID, ToolName: toolName, Description: desc, Diff: d, Edit: edit})
 		}
 		decision := func(ans agent.NativeAnswer, err error) string {
 			switch {
@@ -259,7 +260,7 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 		}
 		switch method {
 		case "item/commandExecution/requestApproval":
-			conn.respond(id, map[string]any{"decision": decision(ask("shell", r.Command, nil))})
+			conn.respond(id, map[string]any{"decision": decision(ask("shell", r.Command, nil, false))})
 		case "item/fileChange/requestApproval":
 			mu.Lock()
 			ds := changes[r.ItemID]
@@ -272,10 +273,10 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 			if len(ds) > 0 {
 				first = ds[0]
 			}
-			conn.respond(id, map[string]any{"decision": decision(ask("apply_patch", "Edit "+strings.Join(paths, ", "), first))})
+			conn.respond(id, map[string]any{"decision": decision(ask("apply_patch", "Edit "+strings.Join(paths, ", "), first, r.GrantRoot == ""))})
 		case "execCommandApproval", "applyPatchApproval":
 			legacy := map[string]string{"accept": "approved", "acceptForSession": "approved_for_session", "decline": "denied", "cancel": "abort"}
-			d := decision(ask(method, r.Command, nil))
+			d := decision(ask(method, r.Command, nil, false))
 			if d == "decline" {
 				conn.respond(id, map[string]any{"decision": map[string]any{"denied": map[string]string{"rejection": "The user denied this."}}})
 				return
@@ -351,7 +352,7 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 
 	turnParams := map[string]any{
 		"threadId": ts.Thread.ID,
-		"input":    []map[string]any{{"type": "text", "text": prompt, "text_elements": []any{}}},
+		"input":    []map[string]any{{"type": "text", "text": planPrefix(nt.Mode) + prompt, "text_elements": []any{}}},
 	}
 	if p.effort != "" {
 		turnParams["effort"] = p.effort

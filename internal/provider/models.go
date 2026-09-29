@@ -55,6 +55,22 @@ func openAICapabilities(id string) map[string]any {
 // model one registered key unlocks instead of the user registering a
 // separate named provider per model.
 func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error) {
+	models, err := listModels(cfg, manifest)
+	if err != nil {
+		return nil, err
+	}
+	switch cfg.Kind {
+	case ProviderKindCLIClaude:
+		return withPermissionModes(models, claudeModes()), nil
+	case ProviderKindCLICodex:
+		return withPermissionModes(models, codexModes()), nil
+	case ProviderKindAPIKey:
+		return withPermissionModes(models, apiModes()), nil
+	}
+	return models, nil // the ACP agents attach their own, from what they advertise
+}
+
+func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error) {
 	switch cfg.Kind {
 	case ProviderKindCLIClaude:
 		// Neither `claude` nor `codex` expose a models-list subcommand to

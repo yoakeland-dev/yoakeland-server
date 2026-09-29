@@ -253,16 +253,26 @@ type ModelOptionsSetter interface {
 
 // Mode selects which tools the model is even given (SPEC.md §4c) and, for
 // bash specifically, whether the permission engine's normal decision is
-// overridden. Four values, no bool — see SPEC.md §4c for the tier
+// overridden. Five values, no bool — see SPEC.md §4c for the tier
 // descriptions.
 type Mode string
 
 const (
-	ModeReadOnly   Mode = "read_only"
-	ModeReadWrite  Mode = "read_write"
-	ModeAutonomous Mode = "autonomous"
-	ModePlan       Mode = "plan"
+	ModeReadOnly    Mode = "read_only"
+	ModeReadWrite   Mode = "read_write"
+	ModeAcceptEdits Mode = "accept_edits"
+	ModeAutonomous  Mode = "autonomous"
+	ModePlan        Mode = "plan"
 )
+
+// ValidMode reports whether s names a mode.
+func ValidMode(s string) bool {
+	switch Mode(s) {
+	case ModeReadOnly, ModeReadWrite, ModeAcceptEdits, ModeAutonomous, ModePlan:
+		return true
+	}
+	return false
+}
 
 // readOnlyTools is the allowlist of tools available in ModeReadOnly and
 // ModePlan. Deliberately an allowlist, not a denylist, so a new mutating
@@ -340,7 +350,9 @@ type Agent struct {
 	// changes.
 	queuedTurns map[string]context.CancelFunc
 	pendingAsks map[string]protocol.PendingAsk
-	hooks       Hooks
+	// planTurn is the last turn that showed a plan (recordPlan).
+	planTurn string
+	hooks    Hooks
 
 	// native is the CLI agent session this chat continues (native.go);
 	// nativeRemember carries permission_response's remember flag back to a
@@ -568,13 +580,11 @@ func (a *Agent) LoadSession(sessionID string) error {
 	}
 	a.nextMsgSeq = state.NextMsgSeq
 	a.native = state.Native
-	switch Mode(state.Mode) {
-	case ModeReadOnly, ModeReadWrite, ModeAutonomous, ModePlan:
+	// Empty (never set) or from a session file older than this field — keep
+	// the constructor's default (ModeReadWrite) rather than an unrecognized/
+	// zero value.
+	if ValidMode(state.Mode) {
 		a.mode = Mode(state.Mode)
-	default:
-		// Empty (never set) or from a session file older than this field —
-		// keep the constructor's default (ModeReadWrite) rather than an
-		// unrecognized/zero value.
 	}
 
 	// Migration: a session persisted before Message.ID existed has none —
@@ -733,7 +743,13 @@ func (a *Agent) WebToolsEnabled() bool {
 	return a.webToolsEnabled
 }
 
-// shellTools run arbitrary shell input, so Read/Write+Prompts always asks
+// editTools are what Accept Edits lets through without asking.
+var editTools = map[string]bool{
+	"file_write": true,
+	"file_edit":  true,
+}
+
+// shellTools run arbitrary shell input, so Ask and Accept Edits always ask
 // for them (see the permission check in runGenerationLoop).
 var shellTools = map[string]bool{
 	"bash":            true,
@@ -822,7 +838,7 @@ func (a *Agent) toolDefsForModeLocked() []tool.ToolDefinition {
 		return a.toolDefsReadOnly
 	case ModePlan:
 		return a.toolDefsPlan
-	default: // ModeReadWrite, ModeAutonomous
+	default: // ModeReadWrite, ModeAcceptEdits, ModeAutonomous
 		return a.toolDefs
 	}
 }
@@ -845,7 +861,7 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 		return readOnlyTools[name]
 	case ModePlan:
 		return readOnlyTools[name] || planExtraTools[name]
-	default: // ModeReadWrite, ModeAutonomous
+	default: // ModeReadWrite, ModeAcceptEdits, ModeAutonomous
 		return true
 	}
 }
@@ -1526,6 +1542,14 @@ turn:
 			a.attachUsage(lastMessageID, roundTripUsage)
 		}
 
+		// A native agent planning without a plan tool of its own: its final
+		// message is the plan.
+		// ponytail: a clarifying question ending a plan turn is shown as the
+		// plan too; the user just answers it.
+		if isNative && nt != nil && nt.Mode == ModePlan && assistantText != "" && !a.planRecorded(turnID) {
+			a.recordPlan(sessionID, turnID, "plan-"+turnID, assistantText)
+		}
+
 		if len(toolCalls) == 0 {
 			// A provider-reported reason other than a normal completion (e.g.
 			// output truncated at the token limit) overrides the default —
@@ -1568,7 +1592,7 @@ turn:
 
 				var decision permission.Decision
 				var cacheKey string
-				if mode == ModeReadWrite && shellTools[tc.Name] {
+				if (mode == ModeReadWrite || mode == ModeAcceptEdits) && shellTools[tc.Name] {
 					// Read/Write+Prompts: bash always asks, bypassing the
 					// engine's safe-command auto-allowlist. cacheKey is left
 					// empty so a "remember" answer here is never persisted
@@ -1579,6 +1603,10 @@ turn:
 					decision, cacheKey = permission.DecisionAsk, ""
 				} else {
 					decision, cacheKey = a.permEngine.Evaluate(tc.Name, target)
+				}
+				// Accept Edits: project edits go through; a remembered deny still wins.
+				if mode == ModeAcceptEdits && editTools[tc.Name] && decision == permission.DecisionAsk {
+					decision = permission.DecisionAllow
 				}
 
 				switch decision {

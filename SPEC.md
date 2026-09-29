@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.20)
+# Yoakeland Backend IPC Specification (v2.21)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -416,7 +416,7 @@ Replaces the server-wide model role table (§4f). Server-wide, like `register_pr
 - Persisted in `server.json`. Response: `model_roles_set`, broadcast to every peer. A provider re-registered (new key) or removed later rebuilds the table; a role whose provider is gone falls back to the session model and is logged.
 
 #### `set_mode`
-Switches a session between the four tiers (§4c), effective on that session's *next* turn (a turn already in flight keeps whichever tool set and permission behavior it started with).
+Switches a session between the modes (§4c), effective on that session's *next* turn (a turn already in flight keeps whichever tool set and permission behavior it started with).
 ```json
 {
   "type": "set_mode",
@@ -424,11 +424,20 @@ Switches a session between the four tiers (§4c), effective on that session's *n
   "data": {"mode": "plan"}
 }
 ```
-- `data.mode` is one of `"read_only"`, `"read_write"`, `"autonomous"`, `"plan"` — any other value is rejected with `error`.
+- `data.mode` is one of `"read_only"`, `"read_write"`, `"accept_edits"` *(v2.21)*, `"autonomous"`, `"plan"` — any other value is rejected with `error`.
 - `sessionId` may be given in `data.sessionId` instead of at the envelope level (`data.sessionId` wins if both are set); if neither is given, it falls back to `"default"`.
 - **`projectPath`** *(optional)*: resolves the session the same way `set_provider` above does — mode can be toggled on a brand-new chat before its first prompt has bound the session to a project, and applying it to the wrong project's registry would leave the session's actual turn unrestricted.
 - On a session that has no persisted file yet (never prompted), this does not create one — see "Mode is persisted" (§2a). A chat only appears in `list_sessions` once its first `user_prompt` arrives.
 - Response: `mode_set`.
+
+#### `approve_plan` *(v2.21)*
+Approves the plan a session has shown (`plan_written`, §3.2): the session moves to `data.mode` and carries the plan out.
+```json
+{"type": "approve_plan", "sessionId": "session-main", "turnId": "turn-9", "data": {"mode": "accept_edits"}}
+```
+- `data.mode` is any mode but `plan` (a plan is usually carried out in `read_write`, `accept_edits` or `autonomous`); `sessionId`, `projectPath`, `authorName`/`authorAvatar` work as they do for `set_mode` and `user_prompt`.
+- The mode changes first (`mode_set`, broadcast to every peer). Then either a CLI agent's turn was waiting on the plan approval (a `permission_request` with `plan: true`, §3.2) and carries on under the new mode, or, for an API model whose plan turn already ended, the server starts a turn (`turnId`) with the prompt "The plan is approved. Carry it out."
+- To send the plan back instead, answer the `plan: true` `permission_request` with `permission_response` `allowed: false` and the change you want as `feedback`.
 
 #### `set_web_tools_enabled`
 Turns `web_search`/`web_fetch` on or off for an entire project — every session in it, current and future — independent of mode. Persisted to `<data-dir>/settings.json` (§6), so unlike mode it survives a restart.
@@ -869,7 +878,7 @@ Notifies the frontend that the model has formally requested a tool call.
 **Git attribution, `bash` calls only:** when this turn's `user_prompt` came from a TCP connection authenticated with a token (`register_token` or the legacy `"default"` one — §3.1), any `bash` call in that turn gets `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` set in its environment from that identity, so a `git commit` the agent runs is attributed to the human who asked for it rather than an anonymous or ambient identity. Set unconditionally on every `bash` call in that turn, not just ones that look like `git commit` — harmless for anything else. Nothing is injected for a unix-socket-originated turn (no credential to attribute to); the sandbox's ambient git config, if any, applies unchanged there, exactly as before this existed.
 
 #### `permission_request`
-The backend pauses execution and requires user approval before executing a tool.
+The backend pauses execution and requires user approval before executing a tool. `data.plan: true` *(v2.21)* marks a CLI agent asking to leave its plan mode with the plan a `plan_written` just showed: show it in the plan panel and answer with `approve_plan` (§3.1) rather than an allow/deny card.
 ```json
 {
   "type": "permission_request",
@@ -1116,7 +1125,7 @@ Response to `list_models`.
   }
 }
 ```
-- `capabilities`, when present, mirrors that upstream's *own* shape rather than one unified schema — OpenRouter's own `context_length`/`pricing`/`top_provider`/`reasoning` fields are passed through close to verbatim; OpenAI has no such endpoint field, so reasoning-capable models (`o1`/`o3`/`o4-mini`/`gpt-5*`) instead carry a hand-maintained `reasoningEfforts` list; `cli_claude` models carry `reasoningEfforts`/`fastMode`/`contextWindows` cross-walked from T3 Code's manifest (§6b) where that manifest's profile for the model has them; `cli_codex` and Anthropic models carry no `capabilities` today. Don't assume a common set of keys across providers — branch on which provider you're looking at, not on which keys happen to be present.
+- `capabilities.permissionModes` *(v2.21)* is the one key every model carries whatever its provider: what each mode does there (§4c). Otherwise `capabilities`, when present, mirrors that upstream's *own* shape rather than one unified schema — OpenRouter's own `context_length`/`pricing`/`top_provider`/`reasoning` fields are passed through close to verbatim; OpenAI has no such endpoint field, so reasoning-capable models (`o1`/`o3`/`o4-mini`/`gpt-5*`) instead carry a hand-maintained `reasoningEfforts` list; `cli_claude` models carry `reasoningEfforts`/`fastMode`/`contextWindows` cross-walked from T3 Code's manifest (§6b) where that manifest's profile for the model has them; `cli_codex` and Anthropic models carry no `capabilities` today. Don't assume a common set of keys across providers — branch on which provider you're looking at, not on which keys happen to be present.
 - `isLegacy` (omitted, i.e. `false`, when absent) is only ever set for `cli_claude` models whose T3 manifest entry has `status: "legacy"` — still fully usable, just no longer T3's current pick for that profile. Every other provider's models are never marked legacy.
 *UI Action*: Populate a per-provider model picker from this — never hardcode a fixed model set, since it's meant to reflect whatever the upstream account currently has access to. Use `isFavorite` to sort/star favorites in the picker; let the user toggle it and send the updated set via `set_favorite_models`. Use `capabilities` to decide whether to offer a reasoning-effort/thinking-budget control for a model before calling `set_model_options` (§3.1) — sending it to a model that doesn't support it is silently ignored, not an error, so the UI is the only thing preventing a confusing no-op. Use `isLegacy` to sort/group legacy `cli_claude` models below current ones (or behind a "show legacy" toggle) rather than hiding them outright — a session already pinned to one must still be able to re-select it.
 
@@ -1636,14 +1645,17 @@ A single `yoakeland` process is **not** limited to one project. Every project (i
 
 ---
 
-### 4c. Four session modes
+### 4c. Session modes
 
-Every session is in exactly one of four modes, switched with `set_mode` (§3.1), effective on that session's next turn (a turn already in flight keeps whichever tool set and permission behavior it started with):
+Every session is in exactly one of five modes, switched with `set_mode` (§3.1), effective on that session's next turn (a turn already in flight keeps whichever tool set and permission behavior it started with). Four of them are a ladder of how much the agent may do without asking; `plan` is a phase in front of it:
 
 - **`read_only`**: the tool definitions sent to the model are reduced to a read-only allowlist (`file_read`, `search`, `ask_user_question`, and `subagent`, whose subagents are read-only too) — `file_write`, `file_edit`, `bash`, and the web tools are never handed to the model at all, so there's nothing for it to call.
-- **`read_write`** *(the default)*: the full tool set is exposed, and permission asking works as it always has *except* `bash`, which is forced to `Ask` on every call. A `remember: true` answer to one of these forced-ask prompts is **not** persisted — the backend deliberately drops the cache key on this path — so the identical command asks again next time rather than silently auto-allowing itself later, including under a different mode.
-- **`autonomous`**: the full tool set is exposed and every permission check is bypassed outright — `permission.Engine` is never consulted, and `permission_request` never fires. A frontend that watches for it shouldn't show a stale "waiting for permission" state in this mode.
-- **`plan`**: the same read-only tool set as `read_only`, plus `write_plan` (its own designated output channel — see below) — and a **distinct system prompt** themed around producing a structured plan rather than attempting the implementation, not just a smaller tool set.
+- **`read_write`** *(the default; clients call it Ask)*: the full tool set is exposed, and permission asking works as it always has *except* `bash`, which is forced to `Ask` on every call. A `remember: true` answer to one of these forced-ask prompts is **not** persisted — the backend deliberately drops the cache key on this path — so the identical command asks again next time rather than silently auto-allowing itself later, including under a different mode.
+- **`accept_edits`** *(v2.21; Edit)*: like `read_write`, except `file_write` and `file_edit` go through without a `permission_request` (a remembered deny still wins). Shell tools (`bash`, the terminal tools) always ask, exactly as in `read_write`, and so does everything else that asks.
+- **`autonomous`** *(Run)*: the full tool set is exposed and every permission check is bypassed outright — `permission.Engine` is never consulted, and `permission_request` never fires. A frontend that watches for it shouldn't show a stale "waiting for permission" state in this mode.
+- **`plan`**: the same read-only tool set as `read_only`, plus `write_plan` (its own designated output channel — see below) — and a **distinct system prompt** themed around producing a structured plan rather than attempting the implementation, not just a smaller tool set. It ends with the user approving the plan into another mode (`approve_plan`, §3.1).
+
+**What a mode means on a given provider** is in the model's `permissionModes` capability (`list_models`, §3.2): per mode, `policy` (`read`/`edit`/`run`/`network` → `allow`/`ask`/`deny`), `enforcedBy` (`"agent"` when the agent's own mode or sandbox backs it, `"yoakeland"` when only the permission bridge does), `native` (the agent's own name for it), `sandbox` (commands run confined to the project) and, on `plan`, `plan` (`"native"`, `"emulated"` or `"yoakeland"`, below). Names and descriptions are the client's; a model without the capability has the five modes with yoakeland enforcing all of them.
 
 **The tool-exposure mechanism is allowlisting, not call-time interception.** Withheld tool definitions are never handed to the model in the first place, so there's nothing for it to call — this mirrors how plan mode works in comparable coding-agent harnesses (e.g. Claude Code's own plan mode): the model can't attempt a mutation it doesn't know exists, rather than attempting one and getting rejected. A backend safeguard still rejects a disallowed tool call outright if one somehow arrives (defense in depth against a misbehaving or stale provider integration, or a mode/toggle flip mid-turn) — but this is a backstop, not the primary mechanism, and a frontend should never rely on it being reached in normal operation.
 
@@ -1651,7 +1663,12 @@ Every session is in exactly one of four modes, switched with `set_mode` (§3.1),
 
 **`ask_user_question`** is available in every mode, including `autonomous` — it's not a mutation, so it's never gated by `permission.Engine` at all; see `ask_user_question_requested`/`ask_user_answer` (§3.1/§3.2).
 
-**CLI agents** (`cli_*`, §6b) have their own tools, so the tool-exposure rules above don't apply to them: each mode is instead mapped onto the agent's own permission mode, and the agent's permission asks are denied (`read_only`/`plan`), prompted (`read_write`), or allowed silently (`autonomous`). See §6b's table.
+**Plans on every provider.** An API model plans with `write_plan`, as above. A CLI agent plans one of three ways, and either way the plan arrives as `plan_written`:
+- *native* — the agent has its own plan mode (Claude Code's `plan`, an ACP agent's `plan` mode). When it asks to leave it (Claude's `ExitPlanMode`, an ACP `switch_mode` request), the plan in that request becomes `plan_written` and the ask a `permission_request` with `plan: true`. Claude's own plan file (`~/.claude/plans/*.md`) is written without asking; every other ask is denied while planning.
+- *emulated* — the agent has no plan mode (Codex, an ACP agent that doesn't advertise one): it runs read-only with an instruction to plan, and its final message becomes the plan.
+- A plan turn that ends without a plan being recorded still records its final message, so every plan turn ends with one.
+
+**CLI agents** (`cli_*`, §6b) have their own tools, so the tool-exposure rules above don't apply to them: each mode is instead mapped onto the agent's own permission mode, and the agent's permission asks are denied (`read_only`/`plan`), prompted (`read_write`), let through if they are file changes (`accept_edits`), or allowed silently (`autonomous`). See §6b's table.
 
 **What none of this changes:** `read_write`'s bash exception aside, permission behavior for exposed tools is unaffected — `file_read` (and `ask_user_question`) have never required permission. Switching mode never touches history, snapshots, or other session state.
 
@@ -1831,15 +1848,18 @@ A `cli_*` provider is not a text model — it's the whole agent. yoakeland hands
 
 - **Text and reasoning** stream as `model_delta` (`content` / `reasoning`), token by token for claude, codex and ACP agents alike.
 - **Tool calls it runs** arrive as `tool_call_requested` then `tool_result`, both with `native: true` plus `title`/`kind`/`locations` (and `tool_result.diffs` for edits) — see those events in §3.2. yoakeland never executes them; the agent already did. They're stored in the chat's history in the order they happened (text → call → result → more text), so `get_session_history` repaints them the same way.
-- **Permission asks** become ordinary `permission_request`s, answered with the usual `permission_response` (§3.1), and show up in `pending_asks`. `remember: true` maps to the agent's own "always allow" (Claude's permission suggestions, Codex's `acceptForSession`, ACP's `allow_always`), not to `<data-dir>/permissions.json`, which only covers yoakeland's built-in tools. **Questions** the agent asks (Claude's `AskUserQuestion`, Codex's `requestUserInput`) become `ask_user_question_requested`, one per question.
-- **Mode** (§4c) is enforced twice: mapped onto the agent's own mode where it has one (below), and at the permission bridge — in `read_only`/`plan` every ask the agent still raises is denied, in `autonomous` every ask is allowed without a prompt, in `read_write` each one is a `permission_request`.
+- **Permission asks** become ordinary `permission_request`s, answered with the usual `permission_response` (§3.1), and show up in `pending_asks`. `remember: true` maps to the agent's own "always allow" (Claude's permission suggestions, Codex's `acceptForSession`, ACP's `allow_always`), not to `<data-dir>/permissions.json`, which only covers yoakeland's built-in tools. **Questions** the agent asks (Claude's `AskUserQuestion`, Codex's `requestUserInput`) become `ask_user_question_requested`, one per question, all raised together so a client can stack them.
+- **Mode** (§4c) is enforced twice: mapped onto the agent's own mode where it has one (below), and at the permission bridge — in `read_only`/`plan` every ask the agent still raises is denied, in `autonomous` every ask is allowed without a prompt, in `accept_edits` file-change asks are allowed and the rest are a `permission_request`, in `read_write` each one is a `permission_request`. **Questions** an agent asks in one go (Claude's `AskUserQuestion` takes several) are all raised before any is answered, so they are pending together.
 
 | yoakeland mode | Claude Code `--permission-mode` | Codex sandbox / approval | ACP agent mode |
 |---|---|---|---|
-| `read_only` | `plan` | `read-only` / `never` | one named like ask/read/plan, if offered |
-| `plan` | `plan` | `read-only` / `never` | one named like plan |
-| `read_write` | `default` | `workspace-write` / `untrusted` | the agent's default |
-| `autonomous` | `bypassPermissions` | `workspace-write` / `never` | one named like yolo/bypass/full/auto |
+| `read_only` | `plan` | `read-only` / `never` | `ask`, `readOnly` or `plan`, if offered |
+| `plan` | `plan` | `read-only` / `never`, told to plan | `plan`, if offered, else told to plan |
+| `read_write` | `default` | `workspace-write` / `untrusted` | `default`/`agent`/`build`, if offered |
+| `accept_edits` | `acceptEdits` | `workspace-write` / `untrusted`, edits approved by the bridge | `acceptEdits`/`autoEdit`, if offered |
+| `autonomous` | `bypassPermissions` | `workspace-write` / `never` | `yolo`, `bypassPermissions`, `fullAccess` or `alwaysApprove`, if offered |
+
+ACP modes are matched by exact name (ignoring case, spaces, `-` and `_`), never by substring — `auto` is a classifier on some agents, not a bypass. The agent's modes are set with `session/set_config_option` when it has a `mode` config option and `session/set_mode` otherwise; a mode with no match leaves the agent where it is and the bridge alone enforces it (`enforcedBy: "yoakeland"`).
 
 **Continuity.** Each turn is one short-lived CLI process, continuing the agent's **own** session: yoakeland stores that session's id with the chat (`<data-dir>/sessions/<id>.json`, `native`), together with the id of the last message it saw. The next turn resumes it (`claude --resume`, Codex `thread/resume`, ACP `session/load` or `session/resume`) and sends only the new message — as long as the chat's history still ends where the agent left off. After an edit, retry, branch switch, a turn on a different provider, or when resuming fails, the agent starts a fresh session instead and gets a plain-text transcript of the conversation so far. The same happens in reverse: a plain API model (or a different CLI agent) is sent a CLI agent's tool steps as text, never as tool calls, since it can't replay another agent's tools.
 

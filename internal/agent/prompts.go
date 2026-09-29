@@ -42,6 +42,15 @@ prose; the user reviews it from there, not from your chat text.
 "@path" in the user's message names a project file; "@path#L10-20" (or "#L10") names
 those lines of it — read that range with file_read's startLine/endLine.`
 
+// NativePlanInstruction leads a native agent's prompt in plan mode when the
+// agent has no plan mode of its own to switch to: its final message is what
+// becomes the plan.
+const NativePlanInstruction = `[Planning mode] Investigate the project read-only and answer with a plan for the request below.
+Do not change any files or run anything that changes state. Make the plan self-contained: exact
+files, functions and steps. Put the plan in your final message; the user reviews it before anything is carried out.
+
+`
+
 // SubagentSystemPrompt is a subagent's own (see subagent.go): it answers to
 // the agent that started it, not to the user, and only its last message
 // travels back.

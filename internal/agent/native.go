@@ -7,6 +7,7 @@ import (
 	"strings"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/tool"
 )
 
 // NativeAgent is a provider that is a whole coding agent (the claude/codex/
@@ -37,6 +38,11 @@ type NativeAsk struct {
 	ToolName    string
 	Description string
 	Diff        *diff.FileDiff
+	// Edit: the ask is for a file change (Accept Edits lets those through).
+	Edit bool
+	// Plan, when set, makes this the agent asking to leave its plan mode with
+	// this plan: it is shown to the user, who approves or sends it back.
+	Plan string
 }
 
 // NativeQuestion is one question a NativeAgent asks the user.
@@ -227,11 +233,20 @@ func flattenNativeTools(history []Message) []Message {
 // askNativePermission turns a native agent's permission ask into the same
 // permission_request flow yoakeland's own tools use, gated by mode.
 func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID string, req NativeAsk) (NativeAnswer, error) {
-	switch a.Mode() {
-	case ModeAutonomous:
-		return NativeAnswer{Allowed: true}, nil
-	case ModeReadOnly, ModePlan:
-		return NativeAnswer{Feedback: "not allowed in " + string(a.Mode()) + " mode"}, nil
+	mode := a.Mode()
+	if req.Plan != "" {
+		a.recordPlan(sessionID, turnID, req.ToolCallID, req.Plan)
+		if mode == ModeAutonomous {
+			return NativeAnswer{Allowed: true}, nil
+		}
+		req.Description = "Approve the plan"
+	} else {
+		switch {
+		case mode == ModeAutonomous, mode == ModeAcceptEdits && req.Edit:
+			return NativeAnswer{Allowed: true}, nil
+		case mode == ModeReadOnly, mode == ModePlan:
+			return NativeAnswer{Feedback: "not allowed in " + string(mode) + " mode"}, nil
+		}
 	}
 	respCh := make(chan permDecision, 1)
 	a.mu.Lock()
@@ -243,6 +258,7 @@ func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID strin
 		Description: req.Description,
 		RequiresAsk: true,
 		Diff:        req.Diff,
+		Plan:        req.Plan != "",
 	}
 	a.addPendingAsk(protocol.PendingAsk{Kind: "permission", SessionID: sessionID, TurnID: turnID, ToolCallID: req.ToolCallID, PermissionRequestData: &data})
 	_ = a.getStream().SendEvent(protocol.EventPermissionRequest, sessionID, turnID, req.ToolCallID, data)
@@ -329,4 +345,36 @@ func MarshalArgs(v any) json.RawMessage {
 		return json.RawMessage("{}")
 	}
 	return b
+}
+
+// recordPlan shows content as the session's plan (plan_written), through the
+// same tool an API model's plan goes through, and notes that this turn has one.
+func (a *Agent) recordPlan(sessionID, turnID, toolCallID, content string) {
+	t, ok := a.tools["write_plan"]
+	if !ok || strings.TrimSpace(content) == "" {
+		return
+	}
+	args, _ := json.Marshal(map[string]string{"content": content})
+	_, _ = t.Execute(context.Background(), tool.ExecutionContext{SessionID: sessionID, TurnID: turnID, ToolCallID: toolCallID, Stream: a.getStream()}, args)
+	a.mu.Lock()
+	a.planTurn = turnID
+	a.mu.Unlock()
+}
+
+func (a *Agent) planRecorded(turnID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.planTurn == turnID
+}
+
+// ResolvePlanApproval approves a native agent's pending request to leave plan
+// mode. False when there isn't one (an API model's plan is just done).
+func (a *Agent) ResolvePlanApproval() bool {
+	for _, ask := range a.PendingAsks() {
+		if ask.PermissionRequestData != nil && ask.Plan {
+			a.HandlePermissionResponse(ask.ToolCallID, true, false, "")
+			return true
+		}
+	}
+	return false
 }

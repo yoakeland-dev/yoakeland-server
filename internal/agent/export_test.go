@@ -25,7 +25,11 @@ func (a *Agent) SetHooks(h Hooks) { a.hooks = h }
 // PermissionTarget exposes permissionTarget to the external test package.
 var PermissionTarget = permissionTarget
 
-// AskQuestions exposes askUserQuestions to the external test package.
+// AskNative and AskQuestions expose the native-agent asks to the external test package.
+func (a *Agent) AskNative(ctx context.Context, sessionID, turnID string, req NativeAsk) (NativeAnswer, error) {
+	return a.askNativePermission(ctx, sessionID, turnID, req)
+}
+
 func (a *Agent) AskQuestions(ctx context.Context, sessionID, turnID string, qs []NativeQuestion) ([]string, error) {
 	return a.askUserQuestions(ctx, sessionID, turnID, qs)
 }
