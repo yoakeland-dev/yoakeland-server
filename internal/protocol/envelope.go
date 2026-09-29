@@ -355,6 +355,8 @@ type SetModelOptionsData struct {
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
 	ContextWindow   int    `json:"contextWindow,omitempty"`
+	// FastMode turns a model's fast mode on or off; absent leaves it as is.
+	FastMode *bool `json:"fastMode,omitempty"`
 
 	// ProjectPath — see SetProviderData.ProjectPath; same reason, since a
 	// brand-new chat can have its model options tuned before its first
@@ -367,6 +369,7 @@ type ModelOptionsSetData struct {
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
 	ContextWindow   int    `json:"contextWindow,omitempty"`
+	FastMode        *bool  `json:"fastMode,omitempty"`
 }
 
 // ModelRole assigns one model role (SPEC.md §4f) to a registered API

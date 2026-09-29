@@ -358,7 +358,7 @@ func TestClaudeAutonomousTurnIsSandboxed(t *testing.T) {
 	}
 	wait()
 	got := strings.Join(args, " ")
-	if !strings.Contains(got, "--permission-mode bypassPermissions") || !strings.Contains(got, "--settings "+claudeAutonomousSandbox) {
+	if !strings.Contains(got, "--permission-mode bypassPermissions") || !strings.Contains(got, `"sandbox":{`) {
 		t.Fatalf("args = %s", got)
 	}
 	var cfg struct {

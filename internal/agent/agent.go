@@ -241,6 +241,9 @@ const maxChatTitleRunes = 60
 type ModelOptions struct {
 	ReasoningEffort string
 	ThinkingBudget  int
+	// FastMode is nil when the request doesn't say; only providers whose
+	// models have a fast mode look at it.
+	FastMode *bool
 }
 
 // ModelOptionsSetter is implemented by providers whose request shape can be

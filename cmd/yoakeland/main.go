@@ -1233,12 +1233,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		pc.Registry.Get(ipc, sessID).SetModelOptions(agent.ModelOptions{
 			ReasoningEffort: data.ReasoningEffort,
 			ThinkingBudget:  data.ThinkingBudget,
+			FastMode:        data.FastMode,
 		}, data.ContextWindow)
 		modelOptsSet := protocol.ModelOptionsSetData{
 			SessionID:       sessID,
 			ReasoningEffort: data.ReasoningEffort,
 			ThinkingBudget:  data.ThinkingBudget,
 			ContextWindow:   data.ContextWindow,
+			FastMode:        data.FastMode,
 		}
 		_ = ipc.SendEvent(protocol.EventModelOptionsSet, sessID, env.TurnID, "", modelOptsSet)
 		deps.peers.BroadcastEvent(peerID, protocol.EventModelOptionsSet, sessID, modelOptsSet)

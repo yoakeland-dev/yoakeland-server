@@ -84,6 +84,7 @@ type CLISubprocessProvider struct {
 	Start procStarter
 
 	effort string
+	fast   bool
 }
 
 func (p *CLISubprocessProvider) ModelName() string { return p.Model }
@@ -91,11 +92,18 @@ func (p *CLISubprocessProvider) ModelName() string { return p.Model }
 func (p *CLISubprocessProvider) RunsOwnTools() {}
 
 // SetModelOptions takes the reasoning effort (claude --effort, codex's turn
-// effort, an ACP agent's thought_level option). ThinkingBudget has no CLI
+// effort, an ACP agent's thought_level option) and Claude's fast mode. ThinkingBudget has no CLI
 // equivalent.
 func (p *CLISubprocessProvider) SetModelOptions(opts agent.ModelOptions) {
-	if opts.ReasoningEffort != "" {
+	switch opts.ReasoningEffort {
+	case "":
+	case "default": // back to the model's own
+		p.effort = ""
+	default:
 		p.effort = opts.ReasoningEffort
+	}
+	if opts.FastMode != nil {
+		p.fast = *opts.FastMode
 	}
 }
 

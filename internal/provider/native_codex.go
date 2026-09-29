@@ -131,7 +131,7 @@ func codexResult(it codexItem) *agent.NativeToolResult {
 }
 
 func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
-	proc, err := p.start()(ctx, "codex", []string{"app-server", "-c", `web_search="live"`}, p.Dir)
+	proc, err := p.start()(ctx, "codex", []string{"app-server", "-c", `web_search="live"`, "-c", `model_reasoning_summary="detailed"`}, p.Dir)
 	if err != nil {
 		return err
 	}

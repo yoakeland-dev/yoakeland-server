@@ -100,14 +100,26 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 	if p.Model != "" {
 		args = append(args, "--model", p.Model)
 	}
-	if p.effort != "" {
-		args = append(args, "--effort", p.effort)
+	// Ultracode is a Claude Code setting on top of xhigh, not an effort level of its own.
+	effort, settings := p.effort, map[string]any{}
+	if effort == "ultracode" {
+		effort, settings["ultracode"] = "xhigh", true
+	}
+	if effort != "" {
+		args = append(args, "--effort", effort)
+	}
+	if p.fast {
+		settings["fastMode"] = true
 	}
 	if nt.ResumeID != "" {
 		args = append(args, "--resume", nt.ResumeID)
 	}
 	if nt.Mode == agent.ModeAutonomous {
-		args = append(args, "--settings", claudeAutonomousSandbox)
+		_ = json.Unmarshal([]byte(claudeAutonomousSandbox), &settings)
+	}
+	if len(settings) > 0 {
+		raw, _ := json.Marshal(settings)
+		args = append(args, "--settings", string(raw))
 	}
 	proc, err := p.start()(ctx, "claude", args, p.Dir)
 	if err != nil {
@@ -115,6 +127,12 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 	}
 	var wmu sync.Mutex
 	write := func(v any) { _ = writeJSONLine(proc.stdin, &wmu, v) }
+	// Headless Claude Code omits thinking text on Sonnet/Opus 4.7+ unless asked;
+	// a CLI that predates the request just answers with an error we ignore.
+	write(map[string]any{
+		"type": "control_request", "request_id": "thinking-display",
+		"request": map[string]any{"subtype": "set_max_thinking_tokens", "thinking_display": "summarized"},
+	})
 	write(map[string]any{
 		"type":               "user",
 		"message":            map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": nt.Prompt}}},

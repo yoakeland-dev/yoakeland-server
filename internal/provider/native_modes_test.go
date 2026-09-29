@@ -119,3 +119,33 @@ func TestCodexPolicyAcceptEdits(t *testing.T) {
 		t.Fatal("claude accept_edits")
 	}
 }
+
+// Ultracode goes to Claude as xhigh plus its own setting; fast mode is a setting too.
+func TestClaudeEffortAndFastMode(t *testing.T) {
+	for _, c := range []struct {
+		effort, want string
+		fast         bool
+	}{
+		{"ultracode", `--effort xhigh --settings {"fastMode":true,"ultracode":true}`, true},
+		{"max", "--effort max", false},
+		{"default", "", false},
+	} {
+		var args []string
+		p := &CLISubprocessProvider{Kind: CLIKindClaude, Dir: t.TempDir()}
+		yes := c.fast
+		p.SetModelOptions(agent.ModelOptions{ReasoningEffort: c.effort, FastMode: &yes})
+		var wait func()
+		p.Start, wait = fakeCLI(t, &args, func(in *bufio.Scanner, out io.Writer) {
+			in.Scan()
+			line(out, map[string]any{"type": "result", "subtype": "success", "result": "ok"})
+		})
+		if _, err := runNative(t, p, (&turnRecorder{}).turn(agent.ModeReadWrite)); err != nil {
+			t.Fatal(err)
+		}
+		wait()
+		got := strings.Join(args, " ")
+		if !strings.Contains(got, c.want) || (c.want == "" && (strings.Contains(got, "--effort") || strings.Contains(got, "--settings"))) {
+			t.Errorf("effort %q fast %v: args = %s", c.effort, c.fast, got)
+		}
+	}
+}
