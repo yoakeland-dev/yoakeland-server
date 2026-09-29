@@ -30,7 +30,19 @@ func fakeCLI(t *testing.T, gotArgs *[]string, script func(in *bufio.Scanner, out
 			defer close(finished)
 			defer close(done)
 			defer outW.Close()
-			sc := bufio.NewScanner(inR)
+			// The thinking-display control request precedes every prompt; scripts don't care.
+			pr, pw := io.Pipe()
+			go func() {
+				fs := bufio.NewScanner(inR)
+				fs.Buffer(make([]byte, 64*1024), 10<<20)
+				for fs.Scan() {
+					if !strings.Contains(fs.Text(), `"request_id":"thinking-display"`) {
+						_, _ = pw.Write(append(fs.Bytes(), '\n'))
+					}
+				}
+				pw.CloseWithError(fs.Err())
+			}()
+			sc := bufio.NewScanner(pr)
 			sc.Buffer(make([]byte, 64*1024), 10<<20)
 			script(sc, outW)
 		}()
@@ -366,5 +378,33 @@ func TestClaudeAutonomousTurnIsSandboxed(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(claudeAutonomousSandbox), &cfg); err != nil || !cfg.Sandbox.Enabled || !cfg.Sandbox.FailIfUnavailable || cfg.Sandbox.AllowUnsandboxedCommands {
 		t.Fatalf("sandbox settings = %+v, %v", cfg, err)
+	}
+}
+
+// Headless Claude Code omits thinking text unless the first line asks for summaries.
+func TestClaudeAsksForThinkingSummaries(t *testing.T) {
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Model: "sonnet", Dir: t.TempDir()}
+	var first string
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	p.Start = func(context.Context, string, []string, string) (*nativeProc, error) {
+		go func() {
+			sc := bufio.NewScanner(inR)
+			sc.Scan()
+			first = sc.Text()
+			sc.Scan() // the prompt
+			line(outW, map[string]any{"type": "result", "subtype": "success"})
+			outW.Close()
+		}()
+		return &nativeProc{stdin: inW, lines: bufio.NewScanner(outR), stderr: func() string { return "" }, wait: func() error { return nil }}, nil
+	}
+	rec := &turnRecorder{}
+	if _, err := runNative(t, p, rec.turn(agent.ModeReadWrite)); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	for _, want := range []string{`"set_max_thinking_tokens"`, `"thinking_display":"summarized"`} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("first stdin line = %s, missing %s", first, want)
+		}
 	}
 }
