@@ -98,7 +98,7 @@ go test ./...
 Just run it — no flags needed to get something a local client can talk to:
 
 ```bash
-./yoakeland -project /path/to/repo -provider anthropic -model claude-3-5-sonnet-20241022
+./yoakeland -project /path/to/repo -provider anthropic -model claude-sonnet-5
 ```
 
 This runs as a long-lived daemon (exits on `SIGINT`/`SIGTERM`, not when any one client disconnects) with a local Unix domain socket always open, at a default path requiring no configuration: `$XDG_RUNTIME_DIR/yoake/yoakeland.sock` on Linux, `$TMPDIR/yoake/yoakeland.sock` on macOS, falling back to `<-state-dir>/yoakeland.sock` (`~/.yoake/yoakeland.sock` by default) when neither env var is set. Pass `-listen unix:/explicit/path.sock` to override that path. No auth token is needed on this socket — see [SPEC.md §2a](SPEC.md) for why (the socket file's `0600` permissions are the boundary — the kernel checks connecting-process UID/GID before the connection is even accepted, same as `ssh-agent`/`dockerd`/Postgres).
@@ -119,14 +119,14 @@ This runs as a long-lived daemon (exits on `SIGINT`/`SIGTERM`, not when any one 
 ./yoakeland -project /path/to/repo -listen :7890 -tls-cert cert.pem -tls-key key.pem
 ```
 
-Every TCP connection must send an `auth` envelope with the daemon's token as its first frame (auto-generated and logged at startup if `-token` isn't passed). TCP is **plaintext by default** — pass `-tls-cert`/`-tls-key`, or tunnel the port (SSH/WireGuard), before exposing it beyond `localhost`. See [SPEC.md §2a](SPEC.md).
+Every TCP connection must send an `auth` envelope with the daemon's token as its first frame (auto-generated and logged at startup if neither `YOAKELAND_TOKEN` nor `-token` is set — prefer the environment variable, since other local users can read a process's flags). The listener is always TLS — yoakeland's own name-constrained CA under `<-state-dir>/tls/` unless you pass a real certificate with `-tls-cert`/`-tls-key`. See [SPEC.md §2a](SPEC.md).
 
 ### Spawn-per-client (`-stdio`)
 
 A different, narrower contract for when a frontend wants to own the whole backend process's lifecycle itself, rather than talk to a persistent daemon — no socket is opened in this mode at all:
 
 ```bash
-./yoakeland -stdio -project /path/to/repo -provider anthropic -model claude-3-5-sonnet-20241022
+./yoakeland -stdio -project /path/to/repo -provider anthropic -model claude-sonnet-5
 ```
 
 A frontend spawns this as a child process and speaks the wire protocol over its `stdin`/`stdout` pipes directly; `stderr` carries operational logs, not protocol frames. The process exits when its `stdin` pipe closes (`EOF`), rather than only on `SIGINT`/`SIGTERM`. This is what `yoake-client`'s default `-bin` spawn mode uses under the hood.
@@ -142,7 +142,7 @@ A provider can be baked in at launch (flags below), or registered at runtime ove
 ```bash
 # Anthropic
 export ANTHROPIC_API_KEY="sk-ant-..."
-./yoakeland -project . -provider anthropic -model claude-3-5-sonnet-20241022
+./yoakeland -project . -provider anthropic -model claude-sonnet-5
 
 # OpenRouter (DeepSeek, Llama, etc.)
 export OPENROUTER_API_KEY="sk-or-..."
@@ -233,7 +233,7 @@ The normalizer (`internal/normalizer/`) sanitizes paths and commands before exec
 
 ### Permission Engine & Persistence
 
-- **Read-Only**: `file_read` and a small safe-command allowlist (`ls`, `pwd`, `echo`, `whoami`, `git status`, `git diff`) are allowed automatically.
+- **Read-Only**: `file_read` is allowed automatically. No `bash` command is — even `git diff` can write (`--output=`), read outside the project (`--no-index`) or run a program (`--ext-diff`).
 - **Mutations & Shells**: `file_write`, `file_edit`, and any other `bash` command default to `ask`.
 - **Persistence**: decisions saved with `remember: true` are stored in `.yoake/permissions.json` as an exact `toolName:target` key and persist across backend restarts — not a glob or path prefix (see above).
 
@@ -246,9 +246,13 @@ Live disk snapshots are captured under `.yoake/snapshots/<snap_id>/` before ever
 
 ### Context Window Manager
 
-- Estimates token usage with a character-count heuristic (~4 chars/token).
-- Truncates large tool outputs (giant logs, minified files) to a bounded head+tail excerpt so one tool call can't blow the whole budget.
-- Compacts history once it exceeds budget: keeps the first user message and the most recent 4 messages verbatim, and replaces everything in between with an actual text summary of what happened (not just a "N messages dropped" notice) — so a long session degrades to a shorter working memory instead of the model losing that stretch of work outright.
+- Keeps each request's prefix byte-identical to the last one's, so providers bill most of the resent conversation at their prompt-cache rate: cache breakpoints on Anthropic, `prompt_cache_key` on OpenAI, automatic caching on OpenRouter's Claude models.
+- Measures fullness with the provider's own count of the last request, falling back to ~4 chars/token.
+- Truncates large tool outputs to a head+tail excerpt that names the cut line range; `file_read` pages long files itself (numbered lines, 2000 lines or 14 KB per call, with where to continue).
+- Compacts as recorded history events, never by rewriting history: first old tool results are stubbed, and only if that isn't enough is everything summarized by the `utility` model. Between compactions nothing changes, so the cache stays warm. See [SPEC.md §4g](SPEC.md).
+- Appends the project's `AGENTS.md` (or `CLAUDE.md`) to the system prompt.
+
+**Model roles** ([SPEC.md §4f](SPEC.md)): `set_model_roles` assigns other models to `plan` (plan-mode turns), `explore` (read-only subagents), `utility` (titles, compaction summaries) and `advisor` (Anthropic's advisor tool) — plan on a strong model, explore and summarize on a cheap one, carry out the plan on the session's own model.
 
 ### Session Storage
 
@@ -260,15 +264,19 @@ Turn history is **server-side state**, persisted per-project at `.yoake/sessions
 
 | Tool | Permission | Description |
 |---|---|---|
-| `file_read` | **Allow** | Reads file contents relative to project root. Symlink safe. |
+| `file_read` | **Allow** | Reads file contents relative to project root, with line numbers, a page at a time. Symlink safe. |
+| `search` | **Allow** | Regex search across project files (`path:line: text`), or file listing; available in read-only modes too. |
 | `file_write` | **Ask** | Creates or overwrites a file. Triggers a pre-mutation snapshot. |
 | `file_edit` | **Ask** | Exact string search-and-replace (`oldString` -> `newString`). Validates single vs multiple occurrences. Triggers a snapshot. |
 | `bash` | **Ask / Dynamic** | Executes shell commands through the sandbox tier described above. |
-| `web_search` / `web_fetch` | **Allow** | Client-side web search/fetch; togglable per project (`set_web_tools_enabled`), output wrapped as untrusted content. |
+| `web_search` / `web_fetch` | **Allow** / **Ask** (per host) | Client-side web search/fetch; togglable per project (`set_web_tools_enabled`), output wrapped as untrusted content. A fetch asks because `file_read` doesn't — otherwise an injected instruction could read a secret and send it out in a URL; "remember" covers the whole host. |
 | `ask_user_question` | **Allow** | Pauses the turn for user input; available in every mode. |
 | `write_plan` | **Allow** | Plan mode's own output channel — records a plan to `.yoake/plans/<sessionId>.md`. |
+| `terminal_start` / `terminal_output` / `terminal_stop` | **Ask** (start, typed input) / **Allow** (reading, stopping its own) | Runs a command in a real, persistent terminal the user also sees as a tab — for dev servers, watchers, long builds. See [SPEC.md §4e](SPEC.md). |
+| `browser` | **Allow** (`evaluate`, and `navigate` off localhost: **Ask**, per host) | Drives the desktop app's browser panel — navigate, snapshot, click/type by ref — e.g. to check a dev server's page. Needs the desktop app connected. |
+| `subagent` | **Allow** | Hands a self-contained task to a parallel helper agent (API providers; CLI agents use their own). `kind: "explore"` is read-only and runs on the `explore` model role. Its own tool calls still ask as usual. |
 
-**Four session modes** (`set_mode`, [SPEC.md §4c](SPEC.md)) — `read_only`, `read_write` (the default), `autonomous`, and `plan` — control which tools the model is even given and how bash's permission behaves: `read_only`/`plan` restrict the model to a read-only allowlist by not sending the model any other tool's definition at all, rather than exposing every tool and denying mutations at call time; `read_write` forces `bash` to always ask (bypassing the safe-command auto-allowlist, with `remember` never persisted for that forced ask); `autonomous` bypasses every permission check outright; `plan` additionally swaps in a distinct system prompt themed around producing a plan, and allowlists `write_plan` for recording it.
+**Four session modes** (`set_mode`, [SPEC.md §4c](SPEC.md)) — `read_only`, `read_write` (the default), `autonomous`, and `plan` — control which tools the model is even given and how bash's permission behaves: `read_only`/`plan` restrict the model to a read-only allowlist by not sending the model any other tool's definition at all, rather than exposing every tool and denying mutations at call time; `read_write` forces `bash` to always ask (with `remember` never persisted for that forced ask); `autonomous` bypasses every permission check outright; `plan` additionally swaps in a distinct system prompt themed around producing a plan, and allowlists `write_plan` for recording it.
 
 ---
 

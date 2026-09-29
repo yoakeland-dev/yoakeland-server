@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 	"yoakeland/internal/diff"
@@ -32,6 +33,7 @@ const (
 	EventListProviders        EventType = "list_providers"
 	EventSetProvider          EventType = "set_provider"
 	EventSetModelOptions      EventType = "set_model_options"
+	EventSetModelRoles        EventType = "set_model_roles"
 	EventOAuthStart           EventType = "openrouter_oauth_start"
 	EventOAuthComplete        EventType = "openrouter_oauth_complete"
 	EventRemoveProvider       EventType = "remove_provider"
@@ -85,6 +87,15 @@ const (
 	EventTerminalClose  EventType = "terminal_close"
 	EventListTerminals  EventType = "list_terminals"
 
+	// Browser relay (SPEC.md § browser): the agent's browser tool drives the
+	// browser panel of a desktop client that offered to host it
+	// (browser_host). The server sends that one client a browser_request;
+	// the client answers with a browser_response carrying the same
+	// requestId.
+	EventBrowserHost     EventType = "browser_host"
+	EventBrowserRequest  EventType = "browser_request"
+	EventBrowserResponse EventType = "browser_response"
+
 	EventModelDelta               EventType = "model_delta"
 	EventToolCallRequested        EventType = "tool_call_requested"
 	EventPermissionRequest        EventType = "permission_request"
@@ -99,6 +110,8 @@ const (
 	EventProviderList             EventType = "provider_list"
 	EventProviderSet              EventType = "provider_set"
 	EventModelOptionsSet          EventType = "model_options_set"
+	EventModelRolesSet            EventType = "model_roles_set"
+	EventContextCompacted         EventType = "context_compacted"
 	EventOAuthURL                 EventType = "openrouter_oauth_url"
 	EventProviderRemoved          EventType = "provider_removed"
 	EventModelList                EventType = "model_list"
@@ -176,14 +189,41 @@ const (
 	EventGitChanges   EventType = "git_changes"
 	EventGetFileDiff  EventType = "get_file_diff"
 	EventFileDiff     EventType = "file_diff"
+
+	// Media preview (images, video, audio, PDFs and fonts the explorer can render instead of just
+	// saying "binary file"): read_media answers with size/mime, then the
+	// client pulls the bytes in bounded chunks with read_media_chunk. Kept
+	// separate from read_file/file_content so a plain text edit never pays
+	// for chunking, and a multi-hundred-MB video never has to land in one
+	// frame or fully in server memory at once.
+	EventReadMedia      EventType = "read_media"
+	EventMediaInfo      EventType = "media_info"
+	EventReadMediaChunk EventType = "read_media_chunk"
+	EventMediaChunk     EventType = "media_chunk"
+
+	// get_usage answers with usage_report: every recorded model round-trip
+	// on this server, bucketed by hour (§3.1 get_usage).
+	EventGetUsage    EventType = "get_usage"
+	EventUsageReport EventType = "usage_report"
 )
 
+// ValidSessionID reports whether id is safe to use as a file name: session
+// ids come straight off the wire and become <id>.json / <id>.md on disk, so
+// a separator ("../../x") would reach any file this user can write.
+func ValidSessionID(id string) bool {
+	return id != "" && len(id) <= 200 && !strings.ContainsAny(id, "/\\:\x00")
+}
+
 type Envelope struct {
-	Type       EventType       `json:"type"`
-	SessionID  string          `json:"sessionId,omitempty"`
-	TurnID     string          `json:"turnId,omitempty"`
-	ToolCallID string          `json:"toolCallId,omitempty"`
-	Data       json.RawMessage `json:"data,omitempty"`
+	Type       EventType `json:"type"`
+	SessionID  string    `json:"sessionId,omitempty"`
+	TurnID     string    `json:"turnId,omitempty"`
+	ToolCallID string    `json:"toolCallId,omitempty"`
+	// ParentToolCallID marks an event a subagent produced: the tool call
+	// (a subagent call, or a CLI agent's own Task) it ran inside of. A
+	// client files the event under that call instead of the main timeline.
+	ParentToolCallID string          `json:"parentToolCallId,omitempty"`
+	Data             json.RawMessage `json:"data,omitempty"`
 }
 
 // AuthData is the required first frame on a TCP connection (§2a), carrying
@@ -328,6 +368,37 @@ type ModelOptionsSetData struct {
 	ContextWindow   int    `json:"contextWindow,omitempty"`
 }
 
+// ModelRole assigns one model role (SPEC.md §4f) to a registered API
+// provider and model, with the reasoning effort that role runs at.
+type ModelRole struct {
+	ProviderName    string `json:"providerName"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+// SetModelRolesData replaces the server-wide role table. Keys are "plan",
+// "explore", "utility" and "advisor"; a role left out runs on the session's
+// own model.
+type SetModelRolesData struct {
+	Roles map[string]ModelRole `json:"roles"`
+}
+
+// ModelRolesSetData reports the role table now in effect: the reply to
+// set_model_roles, broadcast to every peer, and sent once on connect.
+type ModelRolesSetData struct {
+	Roles map[string]ModelRole `json:"roles"`
+}
+
+// ContextCompactedData announces a compaction the agent just recorded in a
+// session's history (SPEC.md §4g). Kind is "clear" (old tool results
+// replaced by stubs) or "summary" (everything before it summarized).
+type ContextCompactedData struct {
+	MessageID    string `json:"messageId"`
+	Kind         string `json:"kind"`
+	TokensBefore int    `json:"tokensBefore"`
+	TokensAfter  int    `json:"tokensAfter"`
+}
+
 // SetModeData switches a session between the four tiers on its next turn —
 // "read_only", "read_write", "autonomous", or "plan" (see SPEC.md §4c).
 type SetModeData struct {
@@ -390,6 +461,90 @@ type OAuthStartData struct {
 type OAuthURLData struct {
 	RequestID string `json:"requestId"`
 	URL       string `json:"url"`
+}
+
+type GetUsageData struct {
+	RequestID string `json:"requestId"`
+	// External also reads the CLIs' own transcripts on the server's machine.
+	External bool `json:"external,omitempty"`
+	// Since drops buckets before this time (RFC 3339); empty means all.
+	Since string `json:"since,omitempty"`
+}
+
+// UsageReportData lists usage per (hour, session, provider, model). Rows
+// point into Sessions/Providers/Models by index to keep the payload small.
+type UsageReportData struct {
+	RequestID string          `json:"requestId"`
+	Error     string          `json:"error,omitempty"`
+	Sessions  []UsageSession  `json:"sessions"`
+	Providers []UsageProvider `json:"providers"`
+	Models    []string        `json:"models"`
+	Rows      []UsageRow      `json:"rows"`
+	// FirstAt is the oldest round-trip on record, regardless of Since.
+	FirstAt string `json:"firstAt,omitempty"`
+	// Deleted is spend of sessions deleted since, which has no timestamps
+	// left, only totals (usage.json).
+	Deleted UsageDeleted `json:"deleted"`
+	// Accounts is what api_key providers' own account APIs report.
+	Accounts []UsageAccount `json:"accounts"`
+}
+
+// UsageAccount is one provider's account as its API reports it. Amounts
+// are in Currency (USD unless it says otherwise).
+type UsageAccount struct {
+	Provider          string        `json:"provider"`
+	Currency          string        `json:"currency,omitempty"`
+	Balance           *float64      `json:"balance,omitempty"`
+	Usage             *UsagePeriods `json:"usage,omitempty"`
+	LimitUSD          *float64      `json:"limitUsd,omitempty"`
+	LimitRemainingUSD *float64      `json:"limitRemainingUsd,omitempty"`
+	Error             string        `json:"error,omitempty"`
+	FetchedAt         time.Time     `json:"fetchedAt"`
+}
+
+// UsagePeriods is spend over the provider's own (UTC) day/week/month.
+type UsagePeriods struct {
+	Day   float64 `json:"day"`
+	Week  float64 `json:"week"`
+	Month float64 `json:"month"`
+	Total float64 `json:"total"`
+}
+
+type UsageSession struct {
+	ID          string `json:"id"`
+	Title       string `json:"title,omitempty"`
+	ProjectPath string `json:"projectPath"`
+	Archived    bool   `json:"archived,omitempty"`
+	// Source is empty for a yoakeland chat, else the CLI whose own
+	// transcript it came from: "claude_code" or "codex".
+	Source string `json:"source,omitempty"`
+}
+
+// UsageProvider is a provider name as stamped on messages; Kind is empty
+// when that provider has since been removed.
+type UsageProvider struct {
+	Name string `json:"name"`
+	Kind string `json:"kind,omitempty"`
+}
+
+type UsageRow struct {
+	Hour         int64   `json:"h"` // unix seconds, start of the UTC hour
+	Session      int     `json:"s"`
+	Provider     int     `json:"p"`
+	Model        int     `json:"m"`
+	Requests     int     `json:"n"`
+	InputTokens  int     `json:"in"`
+	CachedTokens int     `json:"cached,omitempty"`
+	OutputTokens int     `json:"out"`
+	CostUSD      float64 `json:"usd"`
+	GenerationMs int64   `json:"ms"`
+}
+
+type UsageDeleted struct {
+	Sessions     int     `json:"sessions"`
+	InputTokens  int     `json:"inputTokens"`
+	OutputTokens int     `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
 }
 
 type OAuthCompleteData struct {
@@ -503,6 +658,9 @@ type HistoryMessage struct {
 	Reasoning  string            `json:"reasoning,omitempty"`
 	ToolCalls  []HistoryToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
+	// ParentToolCallID marks a message from a subagent's own transcript,
+	// listed just before the result of the subagent call that ran it.
+	ParentToolCallID string `json:"parentToolCallId,omitempty"`
 	// Diffs: a native tool result's file changes (see ToolResultData.Diffs).
 	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
 
@@ -548,6 +706,17 @@ type HistoryMessage struct {
 	// own reply. Omitted for user/tool messages and for a message
 	// persisted before this field existed.
 	Usage *UsageData `json:"usage,omitempty"`
+
+	// Compaction is set on a "compaction" message only (SPEC.md §4g).
+	Compaction *CompactionInfo `json:"compaction,omitempty"`
+}
+
+// CompactionInfo describes a "compaction" history message: what kind it was
+// and how full the context was before and after it.
+type CompactionInfo struct {
+	Kind         string `json:"kind"`
+	TokensBefore int    `json:"tokensBefore"`
+	TokensAfter  int    `json:"tokensAfter"`
 }
 
 // SessionHistoryData is the response to get_session_history: the session's
@@ -852,6 +1021,37 @@ type FileContentData struct {
 	Binary      bool   `json:"binary,omitempty"`
 	TooLarge    bool   `json:"tooLarge,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+// MediaInfoData answers read_media: Size/Mime for a recognized media
+// type under its size cap, or Error (unrecognized type, too
+// large, not found). No Version/conflict handling — media is previewed,
+// never edited through this path.
+type MediaInfoData struct {
+	RequestID string `json:"requestId,omitempty"`
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Mime      string `json:"mime,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// MediaChunkRequestData asks for one bounded slice of a file already
+// described by media_info, starting at Offset.
+type MediaChunkRequestData struct {
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	Path        string `json:"path"`
+	Offset      int64  `json:"offset"`
+}
+
+// MediaChunkData answers read_media_chunk. Last marks the final slice, so
+// the client knows to stop asking without needing Size again.
+type MediaChunkData struct {
+	RequestID string `json:"requestId,omitempty"`
+	Data      []byte `json:"data,omitempty"` // base64 on the wire
+	Offset    int64  `json:"offset"`
+	Last      bool   `json:"last,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // WriteFileData saves a file. BaseVersion is the read_file Version the edit
@@ -1273,6 +1473,9 @@ type NativeToolInfo struct {
 	// execute | think | fetch | other.
 	Kind      string   `json:"kind,omitempty"`
 	Locations []string `json:"locations,omitempty"`
+	// ParentToolCallID: the agent's own subagent call (Claude Code's Task)
+	// this call ran inside of, empty for a top-level call.
+	ParentToolCallID string `json:"parentToolCallId,omitempty"`
 }
 
 type PermissionRequestData struct {
@@ -1303,6 +1506,12 @@ type UsageData struct {
 	OutputTokens int     `json:"outputTokens"`
 	TotalTokens  int     `json:"totalTokens"`
 	CostUSD      float64 `json:"costUsd"`
+	// CachedInputTokens is the part of InputTokens read from the provider's
+	// prompt cache, when it reports one; CacheWriteInputTokens the part
+	// written to it (billed above the plain input rate by providers that
+	// charge for writes).
+	CachedInputTokens     int `json:"cachedInputTokens,omitempty"`
+	CacheWriteInputTokens int `json:"cacheWriteInputTokens,omitempty"`
 
 	// CostKnown marks CostUSD as an authoritative cost reported by the
 	// provider itself (e.g. a CLI subprocess's own billing total), as
@@ -1497,6 +1706,9 @@ type TerminalSnapshotData struct {
 	ExitCode    *int           `json:"exitCode,omitempty"`
 	Label       string         `json:"label"`
 	SandboxTier string         `json:"sandboxTier"`
+	// Name/Agent: see TerminalSummary.
+	Name  string `json:"name,omitempty"`
+	Agent bool   `json:"agent,omitempty"`
 }
 
 // TerminalOutputData.Data is base64-encoded raw bytes — see
@@ -1529,6 +1741,10 @@ type TerminalSummary struct {
 	Status     TerminalStatus `json:"status"`
 	Label      string         `json:"label"`
 	ExitCode   *int           `json:"exitCode,omitempty"`
+	// Name is what the agent called a terminal it started (terminal_start),
+	// and Agent marks one it started — a client shows it like any other tab.
+	Name  string `json:"name,omitempty"`
+	Agent bool   `json:"agent,omitempty"`
 	// Set only in terminal_index, where rows span sessions and projects.
 	SessionID   string `json:"sessionId,omitempty"`
 	ProjectPath string `json:"projectPath,omitempty"`
@@ -1615,15 +1831,44 @@ func (s *IPCStream) Send(env *Envelope) error {
 }
 
 func (s *IPCStream) SendEvent(evtType EventType, sessionID, turnID, toolCallID string, payload any) error {
+	return s.sendEvent(evtType, sessionID, turnID, toolCallID, "", payload)
+}
+
+func (s *IPCStream) sendEvent(evtType EventType, sessionID, turnID, toolCallID, parentToolCallID string, payload any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 	return s.Send(&Envelope{
-		Type:       evtType,
-		SessionID:  sessionID,
-		TurnID:     turnID,
-		ToolCallID: toolCallID,
-		Data:       raw,
+		Type:             evtType,
+		SessionID:        sessionID,
+		TurnID:           turnID,
+		ToolCallID:       toolCallID,
+		ParentToolCallID: parentToolCallID,
+		Data:             raw,
 	})
+}
+
+// BrowserHostData is a client offering (or withdrawing) its browser panel
+// for the agent's browser tool — sent by a desktop client after connecting.
+type BrowserHostData struct {
+	Enabled bool `json:"enabled"`
+}
+
+// BrowserRequestData asks the hosting client to perform one browser action
+// in SessionID's browser panel. Args are the browser tool's own arguments.
+type BrowserRequestData struct {
+	RequestID   string          `json:"requestId"`
+	SessionID   string          `json:"sessionId"`
+	ProjectPath string          `json:"projectPath,omitempty"`
+	Action      string          `json:"action"`
+	Args        json.RawMessage `json:"args"`
+}
+
+// BrowserResponseData answers one browser_request: Output is the text the
+// agent gets back (a page snapshot, an evaluate result), or Error.
+type BrowserResponseData struct {
+	RequestID string `json:"requestId"`
+	Output    string `json:"output,omitempty"`
+	Error     string `json:"error,omitempty"`
 }

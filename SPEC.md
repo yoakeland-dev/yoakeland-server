@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.17)
+# Yoakeland Backend IPC Specification (v2.20)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -61,12 +61,12 @@ yoakeland [flags]
 | `-state-dir` | `string` | `~/.yoake` | Directory for server-level state that belongs to whoever runs the server, not to any one project: `providers.json` (§6b/§6c), `server.json` (identity + remote-access password, §2a), `tls/` (the auto-managed CA + server certificate for the optional TCP listener, §2a), `projects.json` (known projects), and `projects/<id>/`, each project's own state (§6). |
 | `-master-key` | `string` | `""` | Passphrase encrypting `providers.json` at rest (AES-256-GCM, scrypt-derived key). Falls back to the `YOAKELAND_MASTER_KEY` env var if unset (prefer the env var — a flag value is visible in `ps`/shell history). Without either, `providers.json` is plaintext, protected only by its 0600 permissions — the server logs a startup warning when this is the case. See §6c. |
 | `-provider` | `string` | `auto` | **Optional.** Default LLM provider for sessions that haven't picked a registered one: `anthropic`, `openai`, `openrouter`, or `auto` (auto-detects from environment variables). If this can't be resolved (no matching env var, no flags), the server still starts — it just logs a warning and starts with no default; sessions must `register_provider` + `set_provider` (§3.1) before their first `user_prompt`, which fails with `finishReason: "no_provider"` otherwise (§3.2). This is the normal path when credentials are meant to be registered from the client after connecting, rather than baked into how the process is launched. |
-| `-model` | `string` | *(provider default)* | Model ID (e.g. `claude-3-5-sonnet-20241022`, `gpt-4o`, `deepseek/deepseek-chat`). |
+| `-model` | `string` | *(provider default)* | Model ID (e.g. `claude-sonnet-5`, `gpt-4o`, `deepseek/deepseek-chat`). |
 | `-api-key` | `string` | `""` | Optional API key override. If omitted, uses environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.). Leave everything provider-related unset entirely if you intend to register providers only via the wire protocol. |
 | `-base-url` | `string` | *(provider default)* | Custom API endpoint. Enables local endpoints like LM Studio (`http://localhost:1234/v1`) or Ollama (`http://localhost:11434/v1`). |
 | `-stdio` | `bool` | `false` | Opt into the spawn-a-subprocess contract (§1 Process Lifecycle) instead of the default daemon: speak the protocol directly over this process's own `stdin`/`stdout`, and exit when `stdin` hits `EOF`. No unix socket is opened in this mode. Mutually exclusive with `-listen` in practice (a `-stdio` process never listens on anything). |
 | `-listen` | `string` | `""` | Optionally **also** listen here, in addition to the always-on local unix socket (§2a) — ignored if `-stdio` is set. Either a TCP address (e.g. `:7890` or `0.0.0.0:7890`) to add a second, remote/multi-device-reachable listener, or `unix:/path/to/socket` (or bare `unix`/`unix:` to name the default path explicitly) to override where the local socket itself lives, instead of adding anything. |
-| `-token` | `string` | *(auto-generated, or whatever was last set via `set_remote_password`)* | Shared secret clients must present in the `auth` handshake (§2a) before any other traffic is processed, for the optional **TCP** listener only. An explicit `-token` always overrides whatever's persisted in `server.json`. If omitted and nothing was ever persisted, one is generated, printed to the server's log at startup, and persisted so it survives a restart. Not used, and not generated, for any unix socket. Can also be rotated live via `set_remote_password` (§3.1) without a restart. |
+| `-token` | `string` | *(auto-generated, or whatever was last set via `set_remote_password`)* | Shared secret clients must present in the `auth` handshake (§2a) before any other traffic is processed, for the optional **TCP** listener only. An explicit `-token` always overrides whatever's persisted in `server.json`. If omitted and nothing was ever persisted, one is generated, printed to the server's log at startup, and persisted so it survives a restart. Not used, and not generated, for any unix socket. Can also be rotated live via `set_remote_password` (§3.1) without a restart. Prefer the `YOAKELAND_TOKEN` environment variable (same meaning): a flag is readable by every local user through `ps`/`/proc`, so the server warns when `-token`, `-master-key` or `-api-key` is passed on the command line. |
 | `-tls-cert` | `string` | `""` | TLS certificate file for the optional TCP listener. Requires `-tls-key`. Without both, that listener uses yoakeland's own auto-generated, self-managed CA instead of an operator-supplied certificate — never plaintext. See §2a. |
 | `-tls-key` | `string` | `""` | TLS private key file for the optional TCP listener. Requires `-tls-cert`. |
 | `-web-root` | `string` | `""` | Directory holding the built web client. Served to browsers on the optional TCP listener; without it, `/ws` still works but there's no page to load. See §2a "Browser clients". |
@@ -92,6 +92,7 @@ interface Envelope {
   sessionId?: string;         // Identifies the conversation session
   turnId?: string;            // Correlates a specific turn lifecycle
   toolCallId?: string;        // Correlates a specific tool invocation
+  parentToolCallId?: string;  // Set on everything a subagent does: the call it runs inside (§4e)
   data?: Record<string, any>; // Event-specific payload object
 }
 ```
@@ -126,7 +127,8 @@ The opt-in alternative to the daemon above: no socket at all. The first envelope
 
 - If the token matches, the connection proceeds exactly like a local-socket session from that point on — same envelope types, same semantics.
 - If it doesn't match (or the first frame isn't `auth`, or it's malformed), the server sends one `error` envelope with `data.fatal: true` and closes the connection. No other envelope type is processed before authentication succeeds.
-- One shared token authenticates all TCP clients; there is currently no per-client/per-user token or revocation. Treat the token like a root password to the project: anyone who has it can read/write any file in the project and run shell commands in the sandbox. It can be rotated live via `set_remote_password` (§3.1) — already-connected TCP clients keep their session, only the *next* handshake needs the new one.
+- Like OpenSSH's `LoginGraceTime`/`MaxStartups`: a connection gets 10 seconds to send its `auth` frame, at most 32 unauthenticated connections are held at once (more are closed immediately), and a failed attempt is answered only after a 1-second delay.
+- One shared token authenticates all TCP clients; there is currently no per-client/per-user token or revocation. Treat the token like a root password to the project: anyone who has it can read/write any file in the project and run shell commands in the sandbox. A TCP connection can only use projects the server already knows — opened from the local socket, via `-project`, or in an earlier run (`list_projects`); any other `projectPath` (or `open_project` path) is refused with `error`, so a token can't reach the rest of the disk. The sandbox and the file tools also refuse writes to `.git/config`, `.git/hooks` and `.git` itself, which git would otherwise run as code outside the sandbox. It can be rotated live via `set_remote_password` (§3.1) — already-connected TCP clients keep their session, only the *next* handshake needs the new one.
 - `name`/`deviceType`/`avatar` are optional self-reported identity for the peer registry (§3.2 `peer_list`) — `"web"`, `"desktop"`, or `"server"` for `deviceType`; the backend can't otherwise tell what kind of client dialed in from a raw socket. An omitted `name` gets a generated placeholder. `deviceId` is an optional stable id the client generates once and keeps (same value for every server it connects to), so its peer rows can be recognized across reconnects and servers.
 - `avatar` is a data URL (`data:image/png;base64,...` or similar) — **the client is responsible for downscaling it before sending**, the server does no image processing at all. 96x96 is the house convention (small enough that a base64 PNG comes in well under a kilobyte to a few KB). An oversized value (over ~200KB encoded — see `maxAvatarLen`) is silently dropped rather than failing the whole connection, since it's cosmetic, not functional; the peer just shows up without a picture. This travels in every `peer_list` push to every other peer, so don't send a full-resolution image "just in case" — it costs everyone's bandwidth, not just yours.
 
@@ -147,7 +149,7 @@ A browser can't open a raw TCP or TLS socket, so the TCP listener also speaks HT
 - `GET /ws` upgrades to a WebSocket that carries exactly this protocol: **one text message per frame, trailing newline included**, in both directions. Auth is the same `auth` frame with the same token. Only same-origin upgrades are accepted (the `Origin` must match the `Host`), so other sites open in the same browser can't reach it.
 - Any other path serves the web client from `-web-root`, with `index.html` for any path that isn't a file.
 - The listener, certificate and `set_remote_access` on/off are shared with TCP clients, so turning remote access off drops browser clients too.
-- The browser verifies the certificate against its own trust store; a pairing code's CA can't be used. Trust `<-state-dir>/tls/ca.pem` in the browser or OS once, or use `-tls-cert`/`-tls-key` with a real certificate.
+- The browser verifies the certificate against its own trust store; a pairing code's CA can't be used. Trust `<-state-dir>/tls/ca.pem` in the browser or OS once, or use `-tls-cert`/`-tls-key` with a real certificate. The auto-managed CA is name-constrained (RFC 5280, critical) to `localhost`, this machine's hostname, loopback/private/link-local/CGNAT addresses and the public addresses the machine had when the CA was made, and can't sign intermediates — so trusting it can't let a leaked `ca.key` impersonate any other site. A leaf name outside those constraints (a public IP gained later) is left off the certificate; delete `<-state-dir>/tls/` and re-pair to include it. CAs generated before this change carry no constraints until regenerated the same way.
 
 ### Keeping a connection alive
 Once connected, a local-socket or TCP connection that's been idle may receive an unsolicited `ping` (§3.2) from the backend roughly every 30 seconds (plus an extra one whenever the status it carries changes — `ping`'s `data.status`, §3.1: queued turns, subscription rate limits, today/month spend, budgets); reply with `pong` echoing the same `nonce` (a client can also send its own `ping` at any time and expects a `pong` back, e.g. to measure round-trip time). Any traffic at all — a real `ping`/`pong`, or just ordinary chat activity — resets the backend's liveness clock for that connection. If nothing is heard from a connection for about 90 seconds, the backend closes it outright, on the assumption it dropped without a clean close (e.g. a phone losing wifi). The backend also closes the connection immediately, without waiting out the 90 seconds, if sending one of these periodic pings itself fails (the write erroring means the connection is already gone). A client that wants to detect a dead backend rather than wait to be dropped should apply the same idea in reverse: if it doesn't hear anything (data or `ping`) from the backend for a while, treat the connection as dead and reconnect. (`-stdio` mode gets no heartbeat — it's a single dedicated pipe, not a pool of independent connections, and EOF is already the liveness signal there.)
@@ -388,13 +390,30 @@ Tunes the *current* provider's request shape for a session's next turn — reaso
   "data": {"reasoningEffort": "high", "thinkingBudget": 4096, "contextWindow": 100000}
 }
 ```
-- All three fields are optional; a zero/empty field is left unchanged, it doesn't reset anything.
-- `reasoningEffort` is sent through as OpenAI/OpenRouter's `reasoning_effort` request parameter; ignored by Anthropic providers.
-- `thinkingBudget` (tokens) is sent through as Anthropic's extended-thinking `thinking: {type: "enabled", budget_tokens}` block; ignored by OpenAI/OpenRouter providers.
-- `contextWindow` resizes the session's own context-fullness budget (`ContextManager.MaxHistoryTokens`, reported back via `turn_completed.context`, §3.2) — this is local bookkeeping, not a provider request field. When a turn's history grows past this budget, the server compacts it (first user message kept verbatim, an in-between stretch summarized, the most recent messages kept intact) before the next round-trip — and that most-recent window is always widened backward far enough that it never starts on a lone tool result whose originating tool-call message got summarized away, since both Anthropic and OpenAI reject a request shaped like that outright (a 400 error, not a graceful degradation) rather than just ignoring the orphaned entry. A long, tool-heavy turn is the case this matters for: it's the one shape naive fixed-size compaction would otherwise slice through.
+- All three fields are optional; a zero/empty field is left unchanged, it doesn't reset anything. `reasoningEffort: "default"` *(v2.20)* resets effort (and any thinking budget) to the model's own default.
+- `reasoningEffort` is the one effort control across providers *(v2.20)*: OpenAI/OpenRouter's `reasoning_effort` request parameter (e.g. `minimal`/`low`/`medium`/`high`); Anthropic's `output_config.effort` (`low`/`medium`/`high`/`xhigh`/`max`) on models with adaptive thinking (Opus/Sonnet 4.6 and later, the 5 family), which always think adaptively with a summarized reasoning stream; and on older Anthropic models (Claude 3.x, Haiku, Opus/Sonnet 4–4.5), which only take a thinking budget, the same level mapped onto one (`low` 2048 … `max` 32000 tokens).
+- `thinkingBudget` (tokens) is Anthropic's `thinking: {type: "enabled", budget_tokens}` for those older models only — newer ones reject budgets, use `reasoningEffort` there; ignored by OpenAI/OpenRouter providers.
+- `contextWindow` resizes the session's own context budget (`ContextManager.MaxHistoryTokens`, reported back via `turn_completed.context`, §3.2) — local bookkeeping, not a provider request field. When the context outgrows it, the server compacts before the next round-trip; see §4g.
 - `cli_*` providers take `reasoningEffort` (Claude's `--effort`, Codex's turn `effort`, an ACP agent's `thought_level` option) and silently ignore `thinkingBudget`. `sessionId` may be given in `data.sessionId` instead of at the envelope level, same fallback rules as `set_mode` below.
 - **`projectPath`** *(optional)*: resolves the session the same way `set_provider` above does, and matters for the same reason — model options can be tuned on a brand-new chat before its first prompt has bound the session to a project.
 - Response: `model_options_set`, always — it doesn't report whether the active provider actually understood `reasoningEffort`/`thinkingBudget`; check `capabilities` on the model you set (from `model_list`) before assuming either one takes effect.
+
+#### `set_model_roles` *(v2.20)*
+Replaces the server-wide model role table (§4f). Server-wide, like `register_provider`: it isn't tied to a session or project.
+```json
+{
+  "type": "set_model_roles",
+  "data": {"roles": {
+    "plan":    {"providerName": "anthropic-main", "model": "claude-opus-5-5", "reasoningEffort": "high"},
+    "explore": {"providerName": "anthropic-main", "model": "claude-haiku-4-5"},
+    "utility": {"providerName": "openrouter", "model": "google/gemini-flash"},
+    "advisor": {"providerName": "anthropic-main", "model": "claude-opus-5-5"}
+  }}
+}
+```
+- Keys are `plan`, `explore`, `utility`, `advisor`; leave a role out to have it run on each session's own model. `{}` clears them all.
+- `providerName` must be a registered `api_key` provider; `advisor` must be an Anthropic one and name a model. Anything else is rejected with `error` and nothing changes.
+- Persisted in `server.json`. Response: `model_roles_set`, broadcast to every peer. A provider re-registered (new key) or removed later rebuilds the table; a role whose provider is gone falls back to the session model and is logged.
 
 #### `set_mode`
 Switches a session between the four tiers (§4c), effective on that session's *next* turn (a turn already in flight keeps whichever tool set and permission behavior it started with).
@@ -420,6 +439,7 @@ Turns `web_search`/`web_fetch` on or off for an entire project — every session
 }
 ```
 - No `sessionId` — this is project-scoped like `open_project`, not session-bound like `set_provider`/`set_mode`. Resolved against `data.projectPath`, or the server's default project (`-project`) if omitted.
+- It is the project's whole "agent network" switch: off also starts the agent's own terminals (`terminal_start`) without network access, like `bash` always is — otherwise a terminal would be a way around it. A dev server the agent starts is then only reachable inside that terminal, not from the browser panel. The user's own terminals are unaffected. Applies to terminals opened after the change.
 - Response: `web_tools_enabled_set`.
 
 #### `ask_user_answer`
@@ -574,6 +594,14 @@ The explorer, editor and diff views. Every request takes `projectPath` (resolved
 
 After a successful `write_file` or `fs_op` every peer, the sender included, receives `files_changed` (§3.2).
 
+#### `read_media` / `read_media_chunk` *(v2.18)*
+Lets the explorer show an image or video instead of just "binary file". Kept separate from `read_file` so a plain text edit never pays for chunking and a large video never has to land in one frame or fully in server memory at once. No `version`/conflict handling — media is previewed, never edited through this path.
+```json
+{"type": "read_media", "data": {"requestId": "r1", "projectPath": "/home/user/my-repo", "path": "assets/logo.png"}}
+```
+- `read_media` `{path}` → `media_info`: `{size, mime}` for a recognized extension (images `png jpg jpeg jfif gif webp bmp ico cur svg avif apng` / video `mp4 m4v webm ogv mov` / audio `mp3 wav ogg oga opus flac m4a aac` / `pdf` / fonts `ttf otf woff woff2`) under its size cap — 25MB for images and fonts, 200MB for video, audio and PDF — or `error` (unrecognized extension, too large, not found) and no chunks to follow.
+- `read_media_chunk` `{path, offset}` → `media_chunk`: `{data, offset, last}`, one 512KB (decoded) slice of the file starting at `offset`, base64 in `data`. Pull sequentially from `offset: 0`, feeding each reply's own `offset + data.length` back in as the next request's `offset`, until a reply has `last: true`.
+
 #### `detect_cli`
 Checks whether each coding-agent CLI's binary is on `PATH` **on the machine running the backend** — relevant before offering a `cli_*` provider kind (§6b). Takes no data (`{}` is fine).
 - Response: `cli_availability`.
@@ -594,6 +622,15 @@ Uploads a client-side file to the server so it can be attached to a `user_prompt
 ```json
 {"type": "dismiss_notification", "data": {"id": "a1b2c3d4e5f60718"}}
 ```
+
+#### `get_usage`
+Asks for every recorded model round-trip on this server, for a usage page. Replies `usage_report` (§3.2) with the same `requestId`.
+```json
+{"type": "get_usage", "data": {"requestId": "rq-1", "since": "2026-06-30T00:00:00Z", "external": true}}
+```
+- `since` *(optional, RFC 3339)*: leave out hours that ended before it. Omitted, the whole history comes back.
+- `external` *(optional)*: also read what the CLI agents recorded on the server's machine themselves, the same files ccusage and T3 Code read: Claude Code's transcripts (`$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`, `**/*.jsonl`) and Codex's rollouts (`$CODEX_HOME` or `~/.codex`, `sessions/` and `archived_sessions/`, titles from `session_index.jsonl`). A chat yoakeland itself ran on a CLI is left out there (its stored native session id, or Codex's `originator: "yoakeland"`), so nothing counts twice. Claude Code repeats a message's usage on every content block; only the first per `message.id:requestId` counts. A transcript line with no cost of its own is priced from the rate table with its prompt-cache reads and writes at LiteLLM's cache rates. Files are re-read only when their size or mtime changed.
+- Read from the session files themselves (every assistant message stores its round-trip's `provider`, `model`, `createdAt`, `generationMs` and `usage`), across every project data dir under `-state-dir`, including projects removed since, archived branches (§4d) and subagent transcripts. So it covers history from before this request existed; only a deleted session's detail is gone (its totals survive in `usage.json`, reported as `deleted`).
 
 #### `ping`
 Either side may send this at any time, on any connection state, to check liveness / measure round-trip time. See "Keeping a connection alive" in §2a.
@@ -665,6 +702,7 @@ Rotates the TCP listener's shared auth token, persisted under `-state-dir` so it
 ```json
 {"type": "set_remote_password", "data": {"password": "a-new-shared-secret"}}
 ```
+- The password must be at least 16 characters (`error` otherwise): it's the TCP token, and failed `auth` attempts aren't rate-limited.
 - Already-connected TCP clients keep their session uninterrupted; only the *next* `auth` handshake needs the new password.
 - Response: `remote_password_set` on success, `error` on failure or if sent over TCP.
 
@@ -754,6 +792,22 @@ Enumerates every open terminal (tab) in one chat session — what a client repai
 ```
 - Response: `terminal_list`.
 
+#### `browser_host` *(v2.19)*
+Offers (or withdraws) this connection's browser panel to the agent's `browser` tool (§4e). A desktop client sends it once after connecting; clients without a browser panel don't send it.
+```json
+{"type": "browser_host", "data": {"enabled": true}}
+```
+- No response.
+
+#### `browser_response` *(v2.19)*
+Answers one `browser_request` (§3.2) with the text the agent gets back, or an error. Accepted only from the connection the request was sent to; anything else is ignored.
+```json
+{"type": "browser_response", "data": {"requestId": "br-3f2a", "output": "URL: http://localhost:3000/\nTitle: Home\n\n- link \"Docs\" [ref=1]"}}
+```
+```json
+{"type": "browser_response", "data": {"requestId": "br-3f2a", "error": "couldn't load the page: ERR_CONNECTION_REFUSED"}}
+```
+
 ---
 
 ### 3.2 Outbound Events (Backend → Frontend)
@@ -808,7 +862,9 @@ Notifies the frontend that the model has formally requested a tool call.
   `native: true` means the agent already ran (or is running) it — yoakeland won't; `kind` is one of ACP's tool kinds (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `other`). If it needs permission, a `permission_request` with the same `toolCallId` follows; its `tool_result` arrives when the agent reports it finished. The same fields appear on `get_session_history`'s `toolCalls`.
 *UI Action*: Render an in-progress tool execution card/indicator.
 
-**`file_read`'s optional `startLine`/`endLine`:** both are 1-indexed and inclusive; giving neither reads the whole file (unchanged from before this existed). A frontend rendering a `file_read` tool call should show the requested range when either is present, e.g. `"lib/main.dart:12-40"`, rather than only the path.
+**`file_read`'s optional `startLine`/`endLine`:** both are 1-indexed and inclusive; giving neither reads from the start. *(v2.20)* Each line comes back prefixed with its number and a tab (like `cat -n`), and a read stops after 2000 lines or 14,000 bytes with a closing note naming the `startLine` to continue from. A frontend rendering a `file_read` tool call should show the requested range when either is present, e.g. `"lib/main.dart:12-40"`, rather than only the path.
+
+**`search`** *(v2.20)*: args `pattern` (a Go regular expression; omit it to list files instead), `path` (a directory or file under the project root) and `glob` (a file-name pattern, e.g. `*_test.go`). Returns `path:line: text` matches, or paths, at most 200; hidden directories, `node_modules`, symlinks and binary files are skipped. Read-only and permission-free like `file_read`, and available in `read_only`/`plan` — the one way to navigate a project there.
 
 **Git attribution, `bash` calls only:** when this turn's `user_prompt` came from a TCP connection authenticated with a token (`register_token` or the legacy `"default"` one — §3.1), any `bash` call in that turn gets `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` set in its environment from that identity, so a `git commit` the agent runs is attributed to the human who asked for it rather than an anonymous or ambient identity. Set unconditionally on every `bash` call in that turn, not just ones that look like `git commit` — harmless for anything else. Nothing is injected for a unix-socket-originated turn (no credential to attribute to); the sandbox's ambient git config, if any, applies unchanged there, exactly as before this existed.
 
@@ -917,6 +973,7 @@ Signifies that the iterative turn loop has ended.
       "inputTokens": 1420,
       "outputTokens": 380,
       "totalTokens": 1800,
+      "cachedInputTokens": 1024,
       "costUsd": 0.0246
     },
     "context": {
@@ -934,7 +991,7 @@ Signifies that the iterative turn loop has ended.
 - `userMessageId`/`messageId`: the real, server-assigned ids (§3.2's `session_history` `id` field) of the messages this turn touched — `userMessageId` is the prompt this turn is anchored to (the message just created by `user_prompt`/`edit_message`, or, for `retry_message`, the existing user message the retried reply followed), `messageId` is the last message this turn appended (normally the final assistant reply). **This is the primary way a client learns a message's id** — including for the message it just sent or watched stream in — so it always has what it needs to `edit_message`/`retry_message`/`switch_branch` (§4d) that exact message without a follow-up `get_session_history` round trip. Both omitted when the turn ended before any message existed to anchor to or was appended (`no_provider`/`budget_exceeded`, or a `cancelled` turn with zero content — see the `"length"` caveat below for the analogous zero-content case). `session_history` remains the fallback for anything not covered here: a cold-open, a reconnect mid-turn, or `switch_branch`'s own response, which already carries ids for the whole reachable tree.
 - `finishReason`: `"stop"` (normal completion), `"length"` (the model's own final round-trip was cut off at its output-token limit before it finished on its own — Anthropic's `stop_reason: "max_tokens"` and OpenAI/OpenRouter's `finish_reason: "length"` are both normalized to this one value here, so a client only ever has to branch on one string regardless of provider), `"cancelled"` (user aborted), `"budget_exceeded"` (the session was already at/over its `-max-session-cost-usd` cap), or `"no_provider"` (this session has neither a default provider from server startup nor its own `set_provider` call — register one and retry, see §6b). In the latter two cases the model was never called for this turn; `usage`/`context` reflect the session's existing state, not this rejected turn.
 - **`"length"` caveat**: this is only ever reported for a turn's *final* round-trip (the one with no tool calls) — a round-trip that got cut off mid-tool-call instead (rare: it needs a tool call's arguments themselves to straddle the token limit) still executes whatever (possibly malformed) JSON the model had emitted so far, same as before this value existed; the tool's own error on unparseable arguments is the fallback signal in that case. A client that wants to recover a `"length"`-truncated answer that still has *some* content should resend the conversation with a higher `thinkingBudget`/larger model output allowance rather than assume the harness retries automatically — for that case, it doesn't. The one exception: a round-trip that hit the token limit with *zero* content and *zero* tool calls (a reasoning model spending its whole budget on hidden reasoning before writing anything visible) is retried internally, up to twice, before `"length"` is ever reported — a fresh independently-sampled generation each time, not a resend of the same request. Only once all three attempts come back empty does the client see `"length"` with nothing to show for it.
-- `usage`: Token consumption for this turn. For API-key providers, `costUsd` is priced against a live-fetched per-model rate table (LiteLLM's `model_prices_and_context_window.json`, refreshed daily) first, falling back to a small built-in table when a model is in neither. A CLI-subprocess provider (§6b) reports its own authoritative cost instead when it has one — `claude` always does, and ACP agents that send `usage_update` with a cost do; `codex` doesn't, so its turns fall through to the same rate-table pricing as an API-key provider (not a flat `0` as such) and only actually come out `0` if the model it used isn't in either table.
+- `usage`: Token consumption for this turn — every round-trip's, including its subagents' and any compaction summary's (§4g). `cachedInputTokens` *(optional)* is the part of `inputTokens` read from the provider's prompt cache, and `cacheWriteInputTokens` *(optional, v2.20)* the part written to it, when the provider reports them. `context.estimatedTokens` is the size of the last request the provider reported, plus anything appended since. For API-key providers, `costUsd` is priced against a live-fetched per-model rate table (LiteLLM's `model_prices_and_context_window.json`, refreshed daily) first, falling back to a small built-in table when a model is in neither. A CLI-subprocess provider (§6b) reports its own authoritative cost instead when it has one — `claude` always does, and ACP agents that send `usage_update` with a cost do; `codex` doesn't, so its turns fall through to the same rate-table pricing as an API-key provider (not a flat `0` as such) and only actually come out `0` if the model it used isn't in either table.
 - `context`: How full the session's context window estimate is right now (`estimatedTokens` / `maxTokens`). `estimatedTokens` prefers the provider's own reported token count for this turn (exact, and the number that reflects what's actually resent next turn) over yoakeland's own char-count heuristic, used only when the provider hasn't reported usage at all. *UI Action*: render as a context meter/progress bar.
 - `spend`: Running totals persisted in `<data-dir>/usage.json`, surviving process restarts — *UI Action*: render as a running cost display, per-session and/or project-wide.
 - `durationMs`: Wall-clock execution time for the entire turn.
@@ -1074,6 +1131,19 @@ Confirms `set_provider` took effect for a session, echoing back the model that's
 ```json
 {"type": "provider_set", "data": {"sessionId": "session-main", "providerName": "my-anthropic", "model": "claude-sonnet-5"}}
 ```
+
+#### `model_roles_set` *(v2.20)*
+The server-wide model role table now in effect (§4f): the answer to `set_model_roles`, broadcast to every peer, and sent once on connect so a client can show it without asking.
+```json
+{"type": "model_roles_set", "data": {"roles": {"explore": {"providerName": "anthropic-main", "model": "claude-haiku-4-5"}}}}
+```
+
+#### `context_compacted` *(v2.20)*
+A compaction was just recorded in the session's history (§4g) — `messageId` is the new `compaction` message's id.
+```json
+{"type": "context_compacted", "sessionId": "session-main", "turnId": "t4", "data": {"messageId": "m58", "kind": "clear", "tokensBefore": 66200, "tokensAfter": 31000}}
+```
+*UI Action*: Show a "context compacted" divider at that point of the transcript.
 
 #### `model_options_set`
 Confirms `set_model_options` took effect for a session, echoing back whatever was set (fields left unchanged by the request are echoed as empty/zero, not as the value now in effect).
@@ -1280,6 +1350,31 @@ Every unanswered `permission_request` and `ask_user_question_requested` on the s
 #### `upload_progress` / `upload_done` *(v2.14)*
 Replies to `upload_begin`/`upload_chunk` on the uploading connection only: `{"uploadId": "up-1", "received": 524288}` acks a chunk, and `{"uploadId": "up-1", "path": "/home/me/.yoake/uploads/<sha256>/trace.log"}` (or `{"uploadId": ..., "error": "..."}`) ends the upload.
 
+#### `usage_report`
+Reply to `get_usage`. Usage is summed per UTC hour, session, provider and model; `s`/`p`/`m` index into `sessions`/`providers`/`models`.
+```json
+{
+  "type": "usage_report",
+  "data": {
+    "requestId": "rq-1",
+    "sessions": [{"id": "session-1a2b", "title": "Fix login", "projectPath": "/home/me/app", "archived": false}],
+    "providers": [{"name": "claude-subscription", "kind": "cli_claude"}],
+    "models": ["claude-sonnet-5"],
+    "rows": [{"h": 1790503200, "s": 0, "p": 0, "m": 0, "n": 3, "in": 51200, "cached": 40100, "out": 1900, "usd": 0.21, "ms": 18400}],
+    "firstAt": "2026-09-23T19:00:00Z",
+    "deleted": {"sessions": 2, "inputTokens": 1200, "outputTokens": 90, "costUsd": 0.04},
+    "accounts": [
+      {"provider": "openrouter", "currency": "USD", "balance": 7.5, "usage": {"day": 0.2, "week": 1.1, "month": 4.2, "total": 12.5}, "fetchedAt": "2026-09-28T09:00:00Z"},
+      {"provider": "DeepSeek", "currency": "USD", "balance": 2.78, "fetchedAt": "2026-09-28T09:00:00Z"}
+    ]
+  }
+}
+```
+- `h`: start of the UTC hour, unix seconds. `n`: model requests (round-trips). `in` includes `cached` (prompt-cache reads, only from providers that report them, and only for turns since this field existed). `usd` is `turn_completed`'s cost (§3.2): billed for `api_key` providers, the CLI's own API-equivalent figure for `cli_*` ones. `ms`: summed generation time.
+- `providers[].kind` is empty for a provider that has since been removed. `firstAt`: the oldest round-trip on record, whatever `since` was.
+- `sessions[].source`: empty for a yoakeland chat, `"claude_code"`/`"codex"` for a CLI's own session (`external`); those come with provider names `claude_code`/`codex` and kinds `cli_claude`/`cli_codex`, and `ms` 0.
+- `accounts`: what each `api_key` provider's own account API reports, fetched live (5s timeout, cached 5 minutes; the key never leaves the server): OpenRouter's `GET /api/v1/key` (`usage` per UTC day/week/month/total, `limitUsd`/`limitRemainingUsd` for a capped key) and `/api/v1/credits` (`balance`), DeepSeek's `/user/balance`. Providers without such an API (Anthropic's and OpenAI's usage APIs need an org admin key) are left out; a failed read carries `error` instead.
+
 #### `pong`
 Response to a `ping`, from either side.
 ```json
@@ -1454,7 +1549,16 @@ Every terminal on the server, across every chat and project. Sent to each connec
   }
 }
 ```
-*UI Action*: Treat it as a `terminal_list` for every chat at once: a chat missing from it has no terminals. Rows carry the same fields as `terminal_list`'s, plus `sessionId`/`projectPath`; `exitCode` (also on `terminal_list` rows now) is set once the shell has exited.
+*UI Action*: Treat it as a `terminal_list` for every chat at once: a chat missing from it has no terminals. Rows carry the same fields as `terminal_list`'s, plus `sessionId`/`projectPath`; `exitCode` (also on `terminal_list` rows now) is set once the shell has exited. A terminal the agent started (`terminal_start`, §4e) has `"agent": true` and the tab name it gave in `name`, on these rows and on `terminal_snapshot`; it's otherwise an ordinary terminal a user can attach to, type into and close.
+
+#### `browser_request` *(v2.19)*
+Sent to exactly one connection that offered `browser_host`: the agent's `browser` tool wants an action done in `sessionId`'s browser panel (§4e). `args` are the tool's own arguments (`url`, `ref`, `text`, `submit`, `key`, `direction`, `expression`). Answer with `browser_response` carrying the same `requestId`, within 60 seconds.
+```json
+{"type": "browser_request", "sessionId": "session-main", "data": {"requestId": "br-3f2a", "sessionId": "session-main", "projectPath": "/home/user/projects/my-repo", "action": "navigate", "args": {"action": "navigate", "url": "http://localhost:3000"}}}
+```
+`action` is one of `navigate`, `snapshot`, `click`, `type`, `press`, `scroll`, `evaluate`, `back`, `forward`, `reload`. Every action but `evaluate` answers with a fresh snapshot: the page's URL/title/viewport, then its visible text and interactive elements in document order, each interactive one tagged `[ref=N]`; `click`/`type`/`scroll` name one of those refs, valid until the next snapshot. `evaluate` answers with its expression's JSON value.
+
+*UI Action*: Run it in that chat's browser panel (open it if the chat is on screen, so the user watches), resolving `localhost` URLs to the server's host when connected remotely, and answer even on failure — the agent's tool call waits on it.
 
 ---
 
@@ -1536,8 +1640,8 @@ A single `yoakeland` process is **not** limited to one project. Every project (i
 
 Every session is in exactly one of four modes, switched with `set_mode` (§3.1), effective on that session's next turn (a turn already in flight keeps whichever tool set and permission behavior it started with):
 
-- **`read_only`**: the tool definitions sent to the model are reduced to a read-only allowlist (`file_read`, `ask_user_question`) — `file_write`, `file_edit`, `bash`, and the web tools are never handed to the model at all, so there's nothing for it to call.
-- **`read_write`** *(the default)*: the full tool set is exposed, and permission asking works as it always has *except* `bash`, which is forced to `Ask` on every call, bypassing `permission.Engine`'s safe-command auto-allowlist (bare `pwd`, `ls .`, `git status`/`diff`, etc. — see §5). A `remember: true` answer to one of these forced-ask prompts is **not** persisted — the backend deliberately drops the cache key on this path — so the identical command asks again next time rather than silently auto-allowing itself later, including under a different mode.
+- **`read_only`**: the tool definitions sent to the model are reduced to a read-only allowlist (`file_read`, `search`, `ask_user_question`, and `subagent`, whose subagents are read-only too) — `file_write`, `file_edit`, `bash`, and the web tools are never handed to the model at all, so there's nothing for it to call.
+- **`read_write`** *(the default)*: the full tool set is exposed, and permission asking works as it always has *except* `bash`, which is forced to `Ask` on every call. A `remember: true` answer to one of these forced-ask prompts is **not** persisted — the backend deliberately drops the cache key on this path — so the identical command asks again next time rather than silently auto-allowing itself later, including under a different mode.
 - **`autonomous`**: the full tool set is exposed and every permission check is bypassed outright — `permission.Engine` is never consulted, and `permission_request` never fires. A frontend that watches for it shouldn't show a stale "waiting for permission" state in this mode.
 - **`plan`**: the same read-only tool set as `read_only`, plus `write_plan` (its own designated output channel — see below) — and a **distinct system prompt** themed around producing a structured plan rather than attempting the implementation, not just a smaller tool set.
 
@@ -1566,6 +1670,47 @@ A branch point can only ever be a `user` message (`edit_message`'s target) or an
 **Scope.** `edit_message`/`retry_message`/`switch_branch` only ever address a message currently reachable from the session's *active* history — the same one `get_session_history`/`session_history` returns. A branch nested behind another branch point (an edit made, then an earlier message also edited) becomes reachable only after `switch_branch` brings its parent branch back to active first — walking the tree one hop at a time. There's no way to address a deeply nested branch in one call; a client that wants to expose that navigates it the same way, one `switch_branch` at a time.
 
 **What this doesn't do.** None of this reverts real side effects a discarded branch's tool calls made — files written, commands run. Only conversation history moves between branches; the project's filesystem state is whatever it currently is, tracked (and revertible) separately via `restore_snapshot`/`list_snapshots` (§3.1). A client offering "regenerate" or "edit" next to a message that ran tools should make that distinction visible rather than implying a full undo.
+
+### 4e. Agent terminals, the browser, and subagents *(v2.19)*
+
+**Terminals.** `terminal_start` opens a real terminal in the chat — the same kind a user opens with `terminal_open`, through the same sandbox — types the command into its shell, and returns once the command finishes (seen through the shell integration's OSC 633 marks) or `wait_ms` passes. The process keeps running after the call and the turn: a dev server stays up. `terminal_output` reads what a terminal printed since the agent last read it, optionally typing input first; it can read any terminal in the chat, including the user's own. `terminal_stop` closes only terminals the agent started. Clients learn about the new tab from `terminal_index` like any other (`agent: true`, `name`). `terminal_start`, and `terminal_output` with input, ask permission like `bash` does, and in `read_write` always ask.
+
+**Browser.** The `browser` tool drives the browser panel the user already has, not a hidden headless browser, so the user watches the agent work and it sees the same pages. The server relays each action to one connection that sent `browser_host`: preferably one with that chat open; otherwise the most recently connected local (unix-socket) one. A remote connection never receives another chat's browser traffic just by offering to host, and only the connection a request went to can answer it. With no host connected, the tool fails with an explanation. Page content goes back to the model marked as untrusted, like `web_fetch`'s; `evaluate` asks permission, since the page may hold the user's logged-in session, and so does `navigate` to anything but localhost/loopback (remembered per host); `navigate` only accepts `http`/`https` URLs. The args a host receives are re-serialized from what the server parsed (`action`, `url`, `ref`, `text`, `submit`, `key`, `direction`, `expression`), never the model's raw JSON.
+
+**Subagents.** A CLI agent with subagents of its own (Claude Code's Task) runs them itself; their tool calls and results now arrive tagged `parentToolCallId` = the Task call's id (on the envelope, and on `tool_call_requested`'s data and persisted history tool calls), where they used to be dropped. For providers without subagents (the plain API ones), yoakeland offers a `subagent` tool (`description`, `prompt`, and *(v2.20)* optional `kind`): each call runs a fresh agent with the session's provider, mode and tools (minus `subagent` itself and `write_plan`; read-only in `plan`) to completion inside the parent's turn, and its final message becomes the call's result. `kind: "explore"` makes it read-only whatever the mode and runs it on the `explore` model role (§4f) when one is assigned — cheap, parallel investigation that only returns its report; `"general"` (the default) is as described. Calls made in one response run in parallel. Everything a subagent sends — `model_delta`, `tool_call_requested`, `permission_request`, `ask_user_question_requested`, `tool_result`, and its own closing `turn_completed` — carries `parentToolCallId`; its `turnId` is its own (`<parent turn>.<call id>`). Answer its asks with the usual `permission_response`/`ask_user_answer` on the session; they appear in `pending_asks` too. Its usage counts toward the parent turn's `turn_completed`. Its transcript is kept with the call's result, never in the parent's model context, and `session_history` lists it just before that result, each message tagged `parentToolCallId`.
+
+*UI Action*: File any event or history message with `parentToolCallId` under that call, not in the chat's timeline.
+
+### 4f. Model roles *(v2.20)*
+
+A session's own model (`set_provider`) does its main work. Other kinds of work can go to other models, server-wide, via `set_model_roles` (§3.1):
+
+| Role | Runs | Typical choice |
+|---|---|---|
+| `plan` | every turn a session takes in `plan` mode | the strongest model |
+| `explore` | `subagent` calls with `kind: "explore"` (§4e) | a small, fast model |
+| `utility` | chat titles and compaction summaries (§4g) | a small, fast model |
+| `advisor` | Anthropic's server-side advisor tool, offered on main-model turns when the session's model is Anthropic | a stronger Anthropic model than the session's |
+
+A role left unassigned runs on the session's own model, so a server with no roles behaves exactly as before. Roles take API providers only (`api_key` kind, §6b): a CLI agent routes its own models, and a session whose own provider is a CLI agent ignores `plan`/`explore`/`advisor` — `utility` still titles its chats. Each role carries its own `reasoningEffort`. The workflow this is built for: plan on the strong model with explore subagents fanning out on a cheap one; approving the plan (`set_mode` out of `plan`) moves the session onto its own, cheaper model for the many round-trips of carrying it out — the model changes with the mode, with no step of its own. Each assistant message's `provider`/`model` (§3.1 `get_session_history`) record which model actually produced it, so `get_usage` breaks spend down per role's model with no extra bookkeeping.
+
+Prompt caches are per model, so a role switch starts on a cold cache; switching once per task (at plan approval) costs one cache write, not one per message.
+
+### 4g. Context: compaction and prompt caching *(v2.20)*
+
+Every round-trip resends the conversation, so the server keeps what it sends byte-identical from one round-trip to the next — that's what lets providers bill most of it at their prompt-cache rate (roughly 0.1× input) — and changes it only at recorded compactions.
+
+**Caching.** Anthropic requests carry cache breakpoints on the system prompt (covering the tool definitions before it) and on the conversation's last block; consecutive tool results go back in one user message. OpenAI requests carry `prompt_cache_key` (the session id); OpenRouter's Claude models get its automatic `cache_control`; the rest cache on their own. Usage reports cache reads as `cachedInputTokens` and writes as `cacheWriteInputTokens`, both part of `inputTokens`, priced at the provider's cache rates.
+
+**Compaction.** Before a round-trip, when the context — the provider's reported size of the last request plus anything appended since — is over the session's budget (`set_model_options.contextWindow`, never below 8,000 tokens), the server appends a message with `role: "compaction"` to the history and announces it with `context_compacted` (§3.2):
+- **`clear`** first: tool results older than the latest round, and tool-call arguments over 1 KB, are replaced by short stubs in what the model sees, oldest first, until the context is down to about half the budget.
+- **`summary`** only if clearing can't bring it under three quarters of the budget: the `utility` model (§4f), or the session's own, summarizes the whole conversation so far into the compaction message's `content`, and the model sees that summary in place of everything before it. If the summary request fails, the conversation's own text stands in, so compaction never fails a turn.
+
+Stored history is never rewritten — compaction changes only what's sent, and replaying the compaction messages in order reproduces it exactly, which is what keeps the prefix stable between compactions. A compaction message carries `compaction: {kind, tokensBefore, tokensAfter}` in `get_session_history`, and `usage` (with `provider`/`model`) when a summary model ran. *UI Action*: render it as a divider ("context compacted"), not a chat bubble; it can't be edited or retried.
+
+**Anthropic thinking blocks.** Assistant messages keep the model's thinking blocks (with their signatures) and server-tool blocks, server-side only, and send them back verbatim — models with adaptive thinking reason better with them, and Anthropic rejects a replayed thinking block whose conversation changed. So they're replayed only for the trailing messages produced under the current model, system prompt and tool set, and after the latest compaction; older ones are dropped from the front, which the API allows.
+
+**Project instructions.** The first of `AGENTS.md`, `CLAUDE.md` found at the project root (not a symlink out of it; first 16,000 bytes) is appended to the system prompt, read once per turn, so a session doesn't rediscover how to build and test the project.
 
 ---
 
@@ -1708,7 +1853,7 @@ A `cli_*` provider is not a text model — it's the whole agent. yoakeland hands
 
 **Why CLI subprocesses instead of OAuth token reuse**: Anthropic and OpenAI both prohibit third-party tools from using a Claude/ChatGPT *subscription* OAuth token directly against their APIs — that's billing-plan misuse, and Anthropic actively enforces it. Driving the *official, already-authenticated CLI* is the sanctioned pattern instead (T3 Code and waku do the same): the CLI owns its auth end to end. A frontend offering a `cli_*` kind should check the CLI is installed first — send `detect_cli` (§3.1) and gate on `cli_availability` (§3.2); this checks the machine the *backend* runs on, not the frontend's.
 
-**Web search**: available with no extra setup on `anthropic` (Anthropic's native `web_search_20250305` server tool, added to every request unless `ANTHROPIC_DISABLE_WEB_SEARCH` is set — e.g. for an org that has it disabled in the Console, where including it makes the API reject the whole request with a 400) and `openrouter` (`openrouter:web_search`, opt out with `OPENROUTER_DISABLE_WEB_SEARCH`) — both resolved entirely server-side against the same credential already in use, invisible to yoakeland's own tool-call machinery. Plain `openai` gets none (Chat Completions has no general hosted search tool). Separately, a `web_search` *client* tool (in the same family as `file_read`/`bash`, §3.2's `tool_call_requested`) is always registered, for providers/backends with no native option of their own: with `BRAVE_API_KEY` set it queries Brave's JSON API (the reliable path); with no key it falls back to scraping DuckDuckGo's HTML results for free, which works but is best-effort — DuckDuckGo bot-checks non-browser/datacenter traffic, so this path can intermittently return an error instead of results, and a startup log line names which mode a project is running in.
+**Web search**: available with no extra setup on `anthropic` (Anthropic's native web search server tool — `web_search_20260209`, which filters results before they reach the context, on Opus/Sonnet 4.6 and later, `web_search_20250305` otherwise — added to every request unless `ANTHROPIC_DISABLE_WEB_SEARCH` is set — e.g. for an org that has it disabled in the Console, where including it makes the API reject the whole request with a 400) and `openrouter` (`openrouter:web_search`, opt out with `OPENROUTER_DISABLE_WEB_SEARCH`) — both resolved entirely server-side against the same credential already in use, invisible to yoakeland's own tool-call machinery. Plain `openai` gets none (Chat Completions has no general hosted search tool). Separately, a `web_search` *client* tool (in the same family as `file_read`/`bash`, §3.2's `tool_call_requested`) is always registered, for providers/backends with no native option of their own: with `BRAVE_API_KEY` set it queries Brave's JSON API (the reliable path); with no key it falls back to scraping DuckDuckGo's HTML results for free, which works but is best-effort — DuckDuckGo bot-checks non-browser/datacenter traffic, so this path can intermittently return an error instead of results, and a startup log line names which mode a project is running in.
 
 **Web fetch**: a `web_fetch` *client* tool is also always registered (no key needed, no native-provider equivalent to defer to) — it downloads a URL and extracts just the main readable text (title + body, via a Readability.js port) so a search result can be read without shipping raw page HTML through the model's context. Its dialer refuses to connect to loopback/private/link-local/multicast addresses, including on redirect, so a URL surfaced from search results or fetched page content can't be used to reach internal network services.
 

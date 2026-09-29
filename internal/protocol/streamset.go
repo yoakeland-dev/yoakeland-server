@@ -24,6 +24,19 @@ type StreamSet struct {
 	mu      sync.Mutex
 	streams map[*IPCStream]struct{}
 	tap     func(evtType EventType, sessionID, turnID string, payload any)
+
+	// base/parentToolCallID: set on a WithParent view, which has no streams
+	// of its own.
+	base             *StreamSet
+	parentToolCallID string
+}
+
+// WithParent is a view of s for a subagent running inside tool call
+// parentToolCallID: it reaches whoever is subscribed to s at send time, with
+// every event tagged Envelope.ParentToolCallID. The tap never sees these —
+// a subagent's turn_completed isn't the session's turn completing.
+func (s *StreamSet) WithParent(parentToolCallID string) *StreamSet {
+	return &StreamSet{base: s, parentToolCallID: parentToolCallID}
 }
 
 // SetTap installs an observer that sees every event sent through this set,
@@ -73,6 +86,13 @@ func (s *StreamSet) Remove(stream *IPCStream) {
 // any — callers already treat this the same as a single IPCStream.SendEvent
 // error (logged or ignored, never fatal to the turn).
 func (s *StreamSet) SendEvent(evtType EventType, sessionID, turnID, toolCallID string, payload any) error {
+	if s.base != nil {
+		return s.base.send(evtType, sessionID, turnID, toolCallID, s.parentToolCallID, payload)
+	}
+	return s.send(evtType, sessionID, turnID, toolCallID, "", payload)
+}
+
+func (s *StreamSet) send(evtType EventType, sessionID, turnID, toolCallID, parentToolCallID string, payload any) error {
 	s.mu.Lock()
 	streams := make([]*IPCStream, 0, len(s.streams))
 	for st := range s.streams {
@@ -80,13 +100,13 @@ func (s *StreamSet) SendEvent(evtType EventType, sessionID, turnID, toolCallID s
 	}
 	tap := s.tap
 	s.mu.Unlock()
-	if tap != nil {
+	if tap != nil && parentToolCallID == "" {
 		defer tap(evtType, sessionID, turnID, payload)
 	}
 
 	var firstErr error
 	for _, st := range streams {
-		if err := st.SendEvent(evtType, sessionID, turnID, toolCallID, payload); err != nil {
+		if err := st.sendEvent(evtType, sessionID, turnID, toolCallID, parentToolCallID, payload); err != nil {
 			s.Remove(st)
 			if firstErr == nil {
 				firstErr = err
