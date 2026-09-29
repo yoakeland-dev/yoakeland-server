@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -298,7 +299,7 @@ func TestFileReadAndBash(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(tempDir, "data.txt"), []byte("read me"), 0644)
 	rTool := tool.NewFileReadTool(norm)
 	out, err := rTool.Execute(context.Background(), tool.ExecutionContext{}, []byte(`{"path":"data.txt"}`))
-	if err != nil || out != "read me" {
+	if err != nil || out != "     1\tread me" {
 		t.Fatalf("read failed: %v, out: %s", err, out)
 	}
 
@@ -341,5 +342,85 @@ func TestBashTool_InjectsGitAuthorEnvWhenKnown(t *testing.T) {
 	}
 	if !strings.Contains(out, "Command failed") {
 		t.Fatalf("bash output with no known author = %q, want printenv to fail (exit 1) since GIT_AUTHOR_NAME is unset", out)
+	}
+}
+
+// Navigating off localhost asks, and whatever the check read is exactly what
+// the browser host receives.
+func TestBrowserTool_NavigatePermissionAndForwardedArgs(t *testing.T) {
+	bt := tool.NewBrowserTool(nil)
+	for args, want := range map[string]bool{
+		`{"action":"navigate","url":"http://localhost:5173/"}`:                false,
+		`{"action":"navigate","url":"http://127.0.0.1:3000"}`:                 false,
+		`{"action":"navigate","url":"https://example.com"}`:                   true,
+		`{"action":"navigate","url":"http://localhost@evil.example"}`:         true,
+		`{"action":"navigate","url":"https://evil","Url":"http://localhost"}`: false, // parsed as localhost...
+		`{"action":"evaluate","expression":"1"}`:                              true,
+		`{"action":"snapshot"}`:                                               false,
+	} {
+		if got := bt.RequiresPermission([]byte(args)); got != want {
+			t.Errorf("RequiresPermission(%s) = %v, want %v", args, got, want)
+		}
+	}
+	relay := &recordingRelay{}
+	bt = tool.NewBrowserTool(relay)
+	if _, err := bt.Execute(context.Background(), tool.ExecutionContext{}, []byte(`{"action":"navigate","url":"https://evil","Url":"http://localhost"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(relay.args), `"url":"http://localhost"`) || strings.Contains(string(relay.args), "evil") {
+		t.Fatalf("...so that's what must be forwarded, got %s", relay.args)
+	}
+	if _, err := bt.Execute(context.Background(), tool.ExecutionContext{}, []byte(`{"action":"navigate","url":"file:///etc/passwd"}`)); err == nil {
+		t.Fatal("file:// navigate allowed")
+	}
+}
+
+type recordingRelay struct{ args json.RawMessage }
+
+func (r *recordingRelay) Browse(_ context.Context, _, _ string, args json.RawMessage) (string, error) {
+	r.args = args
+	return "ok", nil
+}
+
+func TestWebFetchTool_RequiresPermission(t *testing.T) {
+	if !tool.NewWebFetchTool().RequiresPermission([]byte(`{"url":"https://example.com"}`)) {
+		t.Fatal("web_fetch must ask")
+	}
+}
+
+// A directory swapped for a symlink after validation (the path handed in
+// was fine when checked) must not carry the write out of the project.
+func TestWriteFileAtomic_RefusesSwappedDirectory(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "sub")); err != nil {
+		t.Skip(err)
+	}
+	if err := tool.WriteFileAtomic(root, filepath.Join(root, "sub", "x.txt"), []byte("pwned")); err == nil {
+		t.Fatal("write followed a symlinked directory out of the project")
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("wrote outside the project: %v", entries)
+	}
+}
+
+// file_read refuses a FIFO instead of blocking the turn on it forever.
+func TestFileRead_RefusesNonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := exec.Command("mkfifo", filepath.Join(dir, "pipe")).Run(); err != nil {
+		t.Skip(err)
+	}
+	norm, _ := normalizer.New(dir)
+	done := make(chan error, 1)
+	go func() {
+		_, err := tool.NewFileReadTool(norm).Execute(context.Background(), tool.ExecutionContext{}, []byte(`{"path":"pipe"}`))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("read a FIFO")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("file_read blocked on a FIFO")
 	}
 }
