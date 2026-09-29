@@ -1,5 +1,7 @@
 package agent
 
+import "context"
+
 // WaitBackground blocks until this Agent's title-generation goroutines have
 // finished writing, so a test's TempDir cleanup doesn't race them.
 func (a *Agent) WaitBackground() { a.titleWG.Wait() }
@@ -22,3 +24,8 @@ func (a *Agent) SetHooks(h Hooks) { a.hooks = h }
 
 // PermissionTarget exposes permissionTarget to the external test package.
 var PermissionTarget = permissionTarget
+
+// AskQuestions exposes askUserQuestions to the external test package.
+func (a *Agent) AskQuestions(ctx context.Context, sessionID, turnID string, qs []NativeQuestion) ([]string, error) {
+	return a.askUserQuestions(ctx, sessionID, turnID, qs)
+}

@@ -262,20 +262,23 @@ func (p *CLISubprocessProvider) claudeControl(ctx context.Context, nt *agent.Nat
 			} `json:"questions"`
 		}
 		_ = json.Unmarshal(input, &in)
+		qs := make([]agent.NativeQuestion, len(in.Questions))
+		for i, q := range in.Questions {
+			qs[i] = agent.NativeQuestion{ToolCallID: fmt.Sprintf("%s#%d", callID, i), Question: q.Question}
+			for _, o := range q.Options {
+				qs[i].Options = append(qs[i].Options, o.Label)
+			}
+		}
+		got, err := nt.Questions(ctx, qs)
+		if err != nil {
+			return reply(map[string]any{"behavior": "deny", "message": "The user didn't answer.", "interrupt": true})
+		}
 		answers := map[string]any{}
 		for i, q := range in.Questions {
-			var opts []string
-			for _, o := range q.Options {
-				opts = append(opts, o.Label)
-			}
-			ans, err := nt.Question(ctx, fmt.Sprintf("%s#%d", callID, i), q.Question, opts)
-			if err != nil {
-				return reply(map[string]any{"behavior": "deny", "message": "The user didn't answer.", "interrupt": true})
-			}
 			if q.MultiSelect {
-				answers[q.Question] = []string{ans}
+				answers[q.Question] = []string{got[i]}
 			} else {
-				answers[q.Question] = ans
+				answers[q.Question] = got[i]
 			}
 		}
 		var full map[string]any

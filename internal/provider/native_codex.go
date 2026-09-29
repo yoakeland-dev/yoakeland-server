@@ -282,18 +282,21 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 			}
 			conn.respond(id, map[string]any{"decision": legacy[d]})
 		case "item/tool/requestUserInput":
-			answers := map[string]any{}
-			for _, q := range r.Questions {
-				var opts []string
+			qs := make([]agent.NativeQuestion, len(r.Questions))
+			for i, q := range r.Questions {
+				qs[i] = agent.NativeQuestion{ToolCallID: r.ItemID + "#" + q.ID, Question: q.Question}
 				for _, o := range q.Options {
-					opts = append(opts, o.Label)
+					qs[i].Options = append(qs[i].Options, o.Label)
 				}
-				ans, err := nt.Question(ctx, r.ItemID+"#"+q.ID, q.Question, opts)
-				if err != nil {
-					conn.respondError(id, -32000, "cancelled")
-					return
-				}
-				answers[q.ID] = map[string]any{"answers": []string{ans}}
+			}
+			got, err := nt.Questions(ctx, qs)
+			if err != nil {
+				conn.respondError(id, -32000, "cancelled")
+				return
+			}
+			answers := map[string]any{}
+			for i, q := range r.Questions {
+				answers[q.ID] = map[string]any{"answers": []string{got[i]}}
 			}
 			conn.respond(id, map[string]any{"answers": answers})
 		case "item/permissions/requestApproval":

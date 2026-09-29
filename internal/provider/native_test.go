@@ -84,7 +84,13 @@ func (r *turnRecorder) turn(mode agent.Mode) *agent.NativeTurn {
 			r.asks = append(r.asks, a)
 			return r.answer, nil
 		},
-		Question: func(context.Context, string, string, []string) (string, error) { return "blue", nil },
+		Questions: func(_ context.Context, qs []agent.NativeQuestion) ([]string, error) {
+			out := make([]string, len(qs))
+			for i := range out {
+				out[i] = "blue"
+			}
+			return out, nil
+		},
 	}
 }
 

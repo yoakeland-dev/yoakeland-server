@@ -39,6 +39,13 @@ type NativeAsk struct {
 	Diff        *diff.FileDiff
 }
 
+// NativeQuestion is one question a NativeAgent asks the user.
+type NativeQuestion struct {
+	ToolCallID string
+	Question   string
+	Options    []string
+}
+
 // NativeAnswer is the user's verdict. Remember maps onto the agent's own
 // "always allow/deny" option, where it has one — yoakeland's
 // permissions.json only covers yoakeland's own tools.
@@ -76,8 +83,9 @@ type NativeTurn struct {
 
 	// Ask blocks until the user answers a permission request (or ctx ends).
 	Ask func(ctx context.Context, req NativeAsk) (NativeAnswer, error)
-	// Question blocks until the user answers a question (ask_user_question).
-	Question func(ctx context.Context, toolCallID, question string, options []string) (string, error)
+	// Questions asks all of them at once, so a client can stack their cards,
+	// and blocks until every one is answered; answers come back in order.
+	Questions func(ctx context.Context, qs []NativeQuestion) ([]string, error)
 
 	// SessionID is set by the provider once its native session id is known.
 	SessionID string
@@ -123,8 +131,8 @@ func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []
 	nt.Ask = func(ctx context.Context, req NativeAsk) (NativeAnswer, error) {
 		return a.askNativePermission(ctx, sessionID, turnID, req)
 	}
-	nt.Question = func(ctx context.Context, toolCallID, question string, options []string) (string, error) {
-		return a.askUserQuestion(ctx, sessionID, turnID, toolCallID, question, options)
+	nt.Questions = func(ctx context.Context, qs []NativeQuestion) ([]string, error) {
+		return a.askUserQuestions(ctx, sessionID, turnID, qs)
 	}
 	return nt
 }
@@ -255,26 +263,44 @@ func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID strin
 	}
 }
 
-// askUserQuestion is the ask_user_question round trip, shared by
-// yoakeland's own ask_user_question tool and native agents' questions.
+// askUserQuestion is the ask_user_question round trip for yoakeland's own
+// tool: one question.
 func (a *Agent) askUserQuestion(ctx context.Context, sessionID, turnID, toolCallID, question string, options []string) (string, error) {
-	respCh := make(chan string, 1)
-	a.mu.Lock()
-	a.askUserRequests[toolCallID] = respCh
-	a.mu.Unlock()
-	q := protocol.AskUserQuestionRequestedData{Question: question, Options: options}
-	a.addPendingAsk(protocol.PendingAsk{Kind: "question", SessionID: sessionID, TurnID: turnID, ToolCallID: toolCallID, AskUserQuestionRequestedData: &q})
-	_ = a.getStream().SendEvent(protocol.EventAskUserQuestionRequested, sessionID, turnID, toolCallID, q)
-	select {
-	case <-ctx.Done():
-		a.mu.Lock()
-		delete(a.askUserRequests, toolCallID)
-		a.mu.Unlock()
-		a.removePendingAsk(toolCallID)
-		return "", ctx.Err()
-	case answer := <-respCh:
-		return answer, nil
+	answers, err := a.askUserQuestions(ctx, sessionID, turnID, []NativeQuestion{{toolCallID, question, options}})
+	if err != nil {
+		return "", err
 	}
+	return answers[0], nil
+}
+
+// askUserQuestions raises every question before waiting on any, in order, so
+// they are all pending together and the client stacks them.
+func (a *Agent) askUserQuestions(ctx context.Context, sessionID, turnID string, qs []NativeQuestion) ([]string, error) {
+	chans := make([]chan string, len(qs))
+	for i, nq := range qs {
+		chans[i] = make(chan string, 1)
+		a.mu.Lock()
+		a.askUserRequests[nq.ToolCallID] = chans[i]
+		a.mu.Unlock()
+		q := protocol.AskUserQuestionRequestedData{Question: nq.Question, Options: nq.Options}
+		a.addPendingAsk(protocol.PendingAsk{Kind: "question", SessionID: sessionID, TurnID: turnID, ToolCallID: nq.ToolCallID, AskUserQuestionRequestedData: &q})
+		_ = a.getStream().SendEvent(protocol.EventAskUserQuestionRequested, sessionID, turnID, nq.ToolCallID, q)
+	}
+	answers := make([]string, len(qs))
+	for i := range qs {
+		select {
+		case <-ctx.Done():
+			for _, nq := range qs[i:] {
+				a.mu.Lock()
+				delete(a.askUserRequests, nq.ToolCallID)
+				a.mu.Unlock()
+				a.removePendingAsk(nq.ToolCallID)
+			}
+			return nil, ctx.Err()
+		case answers[i] = <-chans[i]:
+		}
+	}
+	return answers, nil
 }
 
 // attachUsage puts a native turn's usage on message id.
