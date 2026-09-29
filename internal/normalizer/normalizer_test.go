@@ -137,3 +137,50 @@ func TestNormalizer_ParseShellArgv_Adversarial(t *testing.T) {
 		})
 	}
 }
+
+func TestIsGitExecPath(t *testing.T) {
+	root := t.TempDir()
+	n, err := normalizer.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]bool{
+		".git": true, ".git/config": true, ".git/hooks": true, ".git/hooks/pre-commit": true,
+		"sub/.git/config": true, ".GIT/Config": true,
+		".git/HEAD": false, ".git/objects/ab": false, "config": false, ".gitignore": false, "src/hooks/a.go": false,
+	} {
+		p, err := n.ResolveAndValidatePath(rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := n.IsGitExecPath(p); got != want {
+			t.Errorf("IsGitExecPath(%q) = %v, want %v", rel, got, want)
+		}
+	}
+}
+
+// yoakeland's state dir stays unreachable from a project that contains it.
+func TestResolve_RefusesHiddenStateDir(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, ".yoake")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := normalizer.Hidden
+	normalizer.Hidden = []string{state}
+	defer func() { normalizer.Hidden = old }()
+	n, _ := normalizer.New(root)
+	for _, p := range []string{".yoake", ".yoake/server.json", "./x/../.yoake/tls/ca.key", state + "/providers.json"} {
+		if _, err := n.ResolveAndValidatePath(p); err == nil {
+			t.Errorf("%s reachable", p)
+		}
+	}
+	if _, err := n.ResolveAndValidatePath(".yoakeish"); err != nil {
+		t.Errorf("sibling refused: %v", err)
+	}
+	// A project inside the state dir isn't locked out of itself.
+	inner, _ := normalizer.New(state)
+	if _, err := inner.ResolveAndValidatePath("a.txt"); err != nil {
+		t.Errorf("project inside state dir refused: %v", err)
+	}
+}

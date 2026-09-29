@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"syscall"
@@ -58,9 +59,41 @@ func NewWebFetchTool() *WebFetchTool {
 	}
 }
 
+// blockedFetchRanges are IANA special-purpose ranges that net.IP's Is*
+// methods don't cover — the set SSRF libraries such as code.dny.dev/ssrf
+// block by default: CGNAT (where Tailscale lives, a realistic neighbour for
+// this server), "this network" (0.x reaches localhost on Linux), IETF
+// protocol assignments, benchmarking, the documentation nets, class E, and
+// the IPv6 prefixes that embed an IPv4 address (IPv4-compatible, NAT64,
+// 6to4, Teredo), which could otherwise smuggle 127.0.0.1 or 10.x past the
+// checks.
+var blockedFetchRanges = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, p := range []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15",
+		"198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+		"::/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:db8::/32", "2002::/16", "fec0::/10",
+	} {
+		out = append(out, netip.MustParsePrefix(p))
+	}
+	return out
+}()
+
 func isBlockedFetchTarget(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return true // loopback, link-local, multicast, unspecified, RFC 1918, ULA
+	}
+	for _, p := range blockedFetchRanges {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *WebFetchTool) Name() string { return "web_fetch" }
@@ -69,7 +102,10 @@ func (t *WebFetchTool) Description() string {
 	return "Fetch a web page and return its main readable text (title and body), with navigation, ads, and scripts stripped out."
 }
 
-func (t *WebFetchTool) RequiresPermission(_ []byte) bool { return false }
+// RequiresPermission: file_read never asks, so an unasked fetch would let a
+// prompt injection read .env and send it out in a URL. The permission is
+// per host (see agent.permissionTarget), so "remember" covers a whole site.
+func (t *WebFetchTool) RequiresPermission(_ []byte) bool { return true }
 
 func (t *WebFetchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []byte) (string, error) {
 	var args WebFetchArgs

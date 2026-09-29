@@ -78,6 +78,66 @@ func dedupeSorted(in []string) []string {
 	return out
 }
 
+// localRanges are the addresses the CA may always certify: loopback, the
+// private and link-local ranges, and CGNAT (Tailscale and friends).
+var localRanges = []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"}
+
+// permittedIPRanges is localRanges plus each other (public) address the
+// machine had when the CA was made, as a single-address range.
+func permittedIPRanges(ips []net.IP) []*net.IPNet {
+	var out []*net.IPNet
+	for _, r := range localRanges {
+		_, n, _ := net.ParseCIDR(r)
+		out = append(out, n)
+	}
+	for _, ip := range ips {
+		if !ipInRanges(ip, out) {
+			bits := 128
+			if ip.To4() != nil {
+				ip, bits = ip.To4(), 32
+			}
+			out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+		}
+	}
+	return out
+}
+
+func ipInRanges(ip net.IP, ranges []*net.IPNet) bool {
+	for _, n := range ranges {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// permittedSANs drops the names ca's constraints wouldn't let it certify
+// (say, a public IP the machine picked up after the CA was made): a leaf
+// carrying one fails verification in every client, including for the names
+// that are fine. A CA from before name constraints permits everything.
+// ponytail: a dropped name needs a fresh CA (delete <state-dir>/tls, re-pair).
+func permittedSANs(ca *x509.Certificate, sans []string) []string {
+	if len(ca.PermittedDNSDomains) == 0 && len(ca.PermittedIPRanges) == 0 {
+		return sans
+	}
+	var out []string
+	for _, san := range sans {
+		if ip := net.ParseIP(san); ip != nil {
+			if ipInRanges(ip, ca.PermittedIPRanges) {
+				out = append(out, san)
+			}
+			continue
+		}
+		for _, d := range ca.PermittedDNSDomains {
+			if strings.EqualFold(san, d) || strings.HasSuffix(strings.ToLower(san), "."+strings.ToLower(d)) {
+				out = append(out, san)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // splitSANs separates a mixed SAN list into DNS names and IP addresses, the
 // two fields x509.Certificate wants them in separately.
 func splitSANs(sans []string) (dnsNames []string, ips []net.IP) {
@@ -110,12 +170,12 @@ func EnsureServerCert(stateDir string, sans []string) (cert tls.Certificate, caP
 	leafPEMPath := filepath.Join(dir, "leaf.pem")
 	leafKeyPath := filepath.Join(dir, "leaf.key")
 
-	caCert, caKey, err := loadOrCreateCA(caPEMPath, caKeyPath)
+	caCert, caKey, err := loadOrCreateCA(caPEMPath, caKeyPath, sans)
 	if err != nil {
 		return tls.Certificate{}, "", "", fmt.Errorf("CA: %w", err)
 	}
 
-	leafCert, leafKey, err := loadOrCreateLeaf(leafPEMPath, leafKeyPath, caCert, caKey, sans)
+	leafCert, leafKey, err := loadOrCreateLeaf(leafPEMPath, leafKeyPath, caCert, caKey, permittedSANs(caCert, sans))
 	if err != nil {
 		return tls.Certificate{}, "", "", fmt.Errorf("leaf certificate: %w", err)
 	}
@@ -128,7 +188,7 @@ func EnsureServerCert(stateDir string, sans []string) (cert tls.Certificate, caP
 	return tlsCert, caPEMPath, fingerprint(caCert), nil
 }
 
-func loadOrCreateCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
+func loadOrCreateCA(certPath, keyPath string, sans []string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	if cert, key, err := loadCertKeyPair(certPath, keyPath); err == nil {
 		return cert, key, nil
 	}
@@ -143,6 +203,7 @@ func loadOrCreateCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.Private
 		return nil, nil, err
 	}
 
+	dnsNames, ips := splitSANs(sans)
 	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber:          serial,
@@ -152,6 +213,16 @@ func loadOrCreateCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.Private
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
+		// SPEC.md tells browser users to trust this CA in their OS, so it
+		// must not be able to vouch for anything but this server: no
+		// intermediates, and only this machine's names and local/private
+		// addresses (RFC 5280 name constraints, critical). A leaked ca.key
+		// then can't impersonate any real site.
+		MaxPathLen:                  0,
+		MaxPathLenZero:              true,
+		PermittedDNSDomainsCritical: true,
+		PermittedDNSDomains:         dnsNames,
+		PermittedIPRanges:           permittedIPRanges(ips),
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)

@@ -162,7 +162,19 @@ func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoo
 			continue
 		}
 
-		info, err := os.Stat(absPath)
+		// Through an os.Root (normalizer.InRoot): a directory swapped for a
+		// symlink since the tool validated absPath can't pull an outside
+		// file into the backup, which a restore would then write back in.
+		var info os.FileInfo
+		var content []byte
+		err = normalizer.InRoot(projectRoot, absPath, func(r *os.Root, rel string) error {
+			var err error
+			if info, err = r.Stat(rel); err != nil {
+				return err
+			}
+			content, err = r.ReadFile(rel)
+			return err
+		})
 		if os.IsNotExist(err) {
 			// File does not exist yet; rollback means removing it
 			snap.Files[relPath] = FileState{
@@ -173,11 +185,6 @@ func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoo
 			continue
 		} else if err != nil {
 			return nil, false, fmt.Errorf("stat failed on %s: %w", absPath, err)
-		}
-
-		content, err := os.ReadFile(absPath)
-		if err != nil {
-			return nil, false, fmt.Errorf("reading file for snapshot: %w", err)
 		}
 
 		backupName := fmt.Sprintf("file_%d.bak", snap.NextBackupIndex)
@@ -335,33 +342,41 @@ func (s *DiskSnapshotStore) applyLocked(snap *Snapshot, norm *normalizer.Normali
 		if err != nil {
 			return err
 		}
-		// Replace a symlink rather than write through it.
-		if fi, err := os.Lstat(targetPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if err := os.Remove(targetPath); err != nil {
+		var originalData []byte
+		if state.Existed {
+			backupFile, err := safeJoin(snapDir, state.BackupRelLoc)
+			if err != nil {
 				return err
 			}
-		}
-
-		if !state.Existed {
-			if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("failed to remove newly created file %s: %w", relPath, err)
+			if originalData, err = os.ReadFile(backupFile); err != nil {
+				return fmt.Errorf("failed to read backup file %s: %w", backupFile, err)
 			}
-			continue
 		}
-
-		backupFile, err := safeJoin(snapDir, state.BackupRelLoc)
+		// Through an os.Root, so a directory swapped for a symlink since
+		// restoreTarget checked it can't send the restore out of the project.
+		err = normalizer.InRoot(norm.ProjectRoot, targetPath, func(r *os.Root, rel string) error {
+			// Replace a symlink rather than write through it.
+			if fi, err := r.Lstat(rel); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				if err := r.Remove(rel); err != nil {
+					return err
+				}
+			}
+			if !state.Existed {
+				if err := r.Remove(rel); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("failed to remove newly created file %s: %w", relPath, err)
+				}
+				return nil
+			}
+			if err := r.MkdirAll(filepath.Dir(rel), 0755); err != nil {
+				return err
+			}
+			if err := r.WriteFile(rel, originalData, state.FileMode); err != nil {
+				return fmt.Errorf("restoring file %s: %w", targetPath, err)
+			}
+			return nil
+		})
 		if err != nil {
 			return err
-		}
-		originalData, err := os.ReadFile(backupFile)
-		if err != nil {
-			return fmt.Errorf("failed to read backup file %s: %w", backupFile, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(targetPath, originalData, state.FileMode); err != nil {
-			return fmt.Errorf("restoring file %s: %w", targetPath, err)
 		}
 	}
 	return nil

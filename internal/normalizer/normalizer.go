@@ -14,6 +14,24 @@ var (
 	ErrDisallowedChain = errors.New("command chaining or piping is prohibited without explicit permission")
 )
 
+// Hidden lists directories no project may reach even when one contains
+// them — yoakeland's own state dir (tokens, the TLS CA key, provider keys,
+// every project's sessions), which a project opened at $HOME would
+// otherwise include. Set once at startup, before any project opens; the
+// sandbox also mounts an empty tmpfs over each (sandbox_linux.go).
+var Hidden []string
+
+// HiddenIn returns the Hidden dirs strictly inside root.
+func HiddenIn(root string) []string {
+	var out []string
+	for _, h := range Hidden {
+		if rel, err := filepath.Rel(root, h); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 type Normalizer struct {
 	ProjectRoot string
 }
@@ -85,8 +103,53 @@ func (n *Normalizer) ResolveAndValidatePath(rawPath string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: %s resolves outside %s", ErrEscapesRoot, rawPath, n.ProjectRoot)
 	}
+	for _, h := range HiddenIn(n.ProjectRoot) {
+		if r, err := filepath.Rel(h, cleanEval); err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("%w: %s is yoakeland's own state", ErrEscapesRoot, rawPath)
+		}
+	}
 
 	return cleanEval, nil
+}
+
+// InRoot runs fn on abs (a path ResolveAndValidatePath already approved)
+// through an os.Root opened at root. That check is only a snapshot: a
+// process in the sandbox (a dev server, a terminal) can swap a directory for
+// a symlink before the actual open. os.Root resolves every component beneath
+// root in the kernel, so a swapped-in link leading out fails instead of being
+// followed. It also refuses absolute symlinks, which a resolved abs never
+// contains.
+func InRoot(root, abs string, fn func(r *os.Root, rel string) error) error {
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: %s", ErrEscapesRoot, abs)
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return fn(r, rel)
+}
+
+// ErrGitExecPath refuses a write git would later run as code on the host.
+var ErrGitExecPath = errors.New("refusing to write .git/config or .git/hooks: git runs them as code outside the sandbox")
+
+// IsGitExecPath reports whether resolved (a ResolveAndValidatePath result)
+// is a .git entry itself, its config, or its hooks — anything that, once
+// written, git executes the next time it runs on the host.
+func (n *Normalizer) IsGitExecPath(resolved string) bool {
+	rel, err := filepath.Rel(n.ProjectRoot, resolved)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/")
+	for i, p := range parts {
+		if p == ".git" && (i == len(parts)-1 || parts[i+1] == "config" || parts[i+1] == "hooks") {
+			return true
+		}
+	}
+	return false
 }
 
 // ShellCommand represents parsed argv with flagged meta-operations.

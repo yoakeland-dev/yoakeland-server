@@ -1,7 +1,6 @@
 package permission
 
 import (
-	"strings"
 	"sync"
 	"yoakeland/internal/normalizer"
 )
@@ -74,32 +73,12 @@ func (e *Engine) Evaluate(toolName string, target string) (Decision, string) {
 	}
 
 	if toolName == "bash" {
-		parsed, err := e.normalizer.ParseShellArgv(target)
-		if err != nil {
+		if _, err := e.normalizer.ParseShellArgv(target); err != nil {
 			return DecisionDeny, cacheKey
 		}
-		if e.normalizer.IsDestructiveBash(parsed) {
-			return DecisionAsk, cacheKey
-		}
-		if len(parsed.Argv) > 0 {
-			switch parsed.Argv[0] {
-			case "ls":
-				// Unlike pwd/whoami/echo, ls's arguments are attacker-
-				// meaningful paths it can read/list — only auto-allow when
-				// every non-flag argument stays inside the project (or
-				// there are none, i.e. bare "ls"). "ls /etc", "ls ../../etc"
-				// etc. fall through to Ask like any other command.
-				if lsArgsStayInProject(e.normalizer, parsed.Argv[1:]) {
-					return DecisionAllow, cacheKey
-				}
-			case "pwd", "echo", "whoami":
-				return DecisionAllow, cacheKey
-			case "git":
-				if len(parsed.Argv) > 1 && (parsed.Argv[1] == "status" || parsed.Argv[1] == "diff") {
-					return DecisionAllow, cacheKey
-				}
-			}
-		}
+		// No static auto-allow: even "read-only" commands aren't —
+		// `git diff --output=f` writes, `--no-index` reads outside the
+		// project, `--ext-diff` runs a configured program.
 		return DecisionAsk, cacheKey
 	}
 
@@ -109,24 +88,6 @@ func (e *Engine) Evaluate(toolName string, target string) (Decision, string) {
 	}
 
 	return DecisionAsk, cacheKey
-}
-
-// lsArgsStayInProject reports whether every non-flag argument to `ls`
-// resolves inside the project root — the same containment check
-// file_read/file_write/file_edit already use — so bare `ls`, `ls .`,
-// `ls src/` keep auto-approving while `ls /etc`, `ls ../../etc`, `ls ~`
-// don't. Flags (anything starting with "-") are skipped rather than
-// resolved as paths.
-func lsArgsStayInProject(norm *normalizer.Normalizer, args []string) bool {
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		if _, err := norm.ResolveAndValidatePath(arg); err != nil {
-			return false
-		}
-	}
-	return true
 }
 
 func (e *Engine) RecordDecision(cacheKey string, allowed bool, persist bool) {

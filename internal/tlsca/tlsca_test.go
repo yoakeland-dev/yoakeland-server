@@ -108,7 +108,7 @@ func TestEnsureServerCert_RegeneratesLeafOnlyWhenSANsChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cert, _, fp2, err := tlsca.EnsureServerCert(stateDir, []string{"localhost", "192.0.2.1"})
+	cert, _, fp2, err := tlsca.EnsureServerCert(stateDir, []string{"localhost", "192.168.50.7"})
 	if err != nil {
 		t.Fatalf("second EnsureServerCert with different SANs: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestEnsureServerCert_RegeneratesLeafOnlyWhenSANsChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(leaf.IPAddresses) != 1 || leaf.IPAddresses[0].String() != "192.0.2.1" {
+	if len(leaf.IPAddresses) != 1 || leaf.IPAddresses[0].String() != "192.168.50.7" {
 		t.Errorf("expected the regenerated leaf to carry the new SAN, got IPs %v", leaf.IPAddresses)
 	}
 }

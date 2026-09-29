@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/normalizer"
@@ -50,8 +49,11 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 	if err != nil {
 		return "", fmt.Errorf("path error: %w", err)
 	}
+	if t.normalizer.IsGitExecPath(safePath) {
+		return "", normalizer.ErrGitExecPath
+	}
 
-	contentBytes, err := os.ReadFile(safePath)
+	contentBytes, err := readInProject(t.normalizer, safePath)
 	if err != nil {
 		return "", fmt.Errorf("failed reading file to edit: %w", err)
 	}
@@ -77,20 +79,8 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 		updated = strings.Replace(content, args.OldString, args.NewString, 1)
 	}
 
-	// O_NOFOLLOW: refuse a symlink planted at safePath between the read
-	// above and this write, rather than silently writing through it to
-	// wherever it points (possibly outside the project root).
-	f, err := openNoFollow(safePath, os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
+	if err := WriteFileAtomic(t.normalizer.ProjectRoot, safePath, []byte(updated)); err != nil {
 		return "", fmt.Errorf("failed writing edit to disk: %w", err)
-	}
-	_, writeErr := f.Write([]byte(updated))
-	closeErr := f.Close()
-	if writeErr != nil {
-		return "", fmt.Errorf("failed writing edit to disk: %w", writeErr)
-	}
-	if closeErr != nil {
-		return "", fmt.Errorf("failed writing edit to disk: %w", closeErr)
 	}
 
 	return fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", occurrences, args.Path), nil
@@ -136,7 +126,7 @@ func (t *FileEditTool) PreviewDiff(argsJSON []byte) (*diff.FileDiff, error) {
 		return nil, err
 	}
 
-	existingBytes, err := os.ReadFile(safePath)
+	existingBytes, err := readInProject(t.normalizer, safePath)
 	if err != nil {
 		return nil, err
 	}

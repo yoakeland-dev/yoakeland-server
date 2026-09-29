@@ -2,12 +2,14 @@ package tool
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/normalizer"
+	"yoakeland/internal/protocol"
 )
 
 type FileWriteArgs struct {
@@ -45,50 +47,87 @@ func (t *FileWriteTool) Execute(_ context.Context, execCtx ExecutionContext, arg
 	if err != nil {
 		return "", fmt.Errorf("path error: %w", err)
 	}
+	if t.normalizer.IsGitExecPath(safePath) {
+		return "", normalizer.ErrGitExecPath
+	}
 
 	// Automatic snapshot before mutation
 	if err := capturePreMutationSnapshot(execCtx, "file_write: "+args.Path, t.normalizer.ProjectRoot, safePath); err != nil {
 		return "", fmt.Errorf("failed to create snapshot before write: %w", err)
 	}
 
-	if err := WriteFileAtomic(safePath, []byte(args.Content)); err != nil {
+	if err := WriteFileAtomic(t.normalizer.ProjectRoot, safePath, []byte(args.Content)); err != nil {
 		return "", err
 	}
 
 	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(args.Content), args.Path), nil
 }
 
-// WriteFileAtomic replaces path's content via a temp file in the same
-// directory and a rename, so a reader never sees a half-written file. The
-// temp file is created exclusively under a random name, so a symlink planted
-// in the meantime can't redirect the write. An existing file keeps its mode.
-func WriteFileAtomic(path string, data []byte) error {
-	mode := os.FileMode(0644)
-	if fi, err := os.Stat(path); err == nil {
-		mode = fi.Mode().Perm()
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+// WriteFileAtomic replaces path's content (path inside root, already
+// validated) via a temp file in the same directory and a rename, so a reader
+// never sees a half-written file. Everything goes through an os.Root at root
+// (normalizer.InRoot), so a directory swapped for a symlink after validation
+// can't redirect the write out of the project; the temp file is created
+// exclusively under a random name, so a symlink planted at it is never
+// written through. An existing file keeps its mode.
+func WriteFileAtomic(root, path string, data []byte) error {
+	return normalizer.InRoot(root, path, func(r *os.Root, rel string) error {
+		mode := os.FileMode(0644)
+		if fi, err := r.Stat(rel); err == nil {
+			mode = fi.Mode().Perm()
+		}
+		dir := filepath.Dir(rel)
+		if err := r.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+		tmp := filepath.Join(dir, "."+filepath.Base(rel)+"."+rand.Text()+".tmp")
+		f, err := r.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to write buffer: %w", err)
+		}
+		_, err = f.Write(data)
+		if err == nil {
+			err = f.Chmod(mode)
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err == nil {
+			err = r.Rename(tmp, rel)
+		}
+		if err != nil {
+			_ = r.Remove(tmp)
+			return fmt.Errorf("failed to write %s: %w", filepath.Base(rel), err)
+		}
+		return nil
+	})
+}
+
+// readInProject reads abs (validated, inside n's root) through an os.Root —
+// see WriteFileAtomic — refusing anything but a regular file, so a FIFO or
+// device node can't hang the turn.
+func readInProject(n *normalizer.Normalizer, abs string) ([]byte, error) {
+	var data []byte
+	err := normalizer.InRoot(n.ProjectRoot, abs, func(r *os.Root, rel string) error {
+		var err error
+		data, err = readRegular(r.Stat, r.ReadFile, rel)
 		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	})
+	return data, err
+}
+
+func readRegular(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), p string) ([]byte, error) {
+	info, err := stat(p)
 	if err != nil {
-		return fmt.Errorf("failed to write buffer: %w", err)
+		return nil, err
 	}
-	_, err = f.Write(data)
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", filepath.Base(p))
 	}
-	if err == nil {
-		err = os.Chmod(f.Name(), mode)
+	if info.Size() > protocol.MaxFrameSize {
+		return nil, fmt.Errorf("file exceeds maximum readable size (10MB)")
 	}
-	if err == nil {
-		err = os.Rename(f.Name(), path)
-	}
-	if err != nil {
-		_ = os.Remove(f.Name())
-		return fmt.Errorf("failed to write %s: %w", filepath.Base(path), err)
-	}
-	return nil
+	return read(p)
 }
 
 func (t *FileWriteTool) Definition() ToolDefinition {
@@ -124,7 +163,7 @@ func (t *FileWriteTool) PreviewDiff(argsJSON []byte) (*diff.FileDiff, error) {
 	}
 
 	var beforeContent string
-	if existingBytes, err := os.ReadFile(safePath); err == nil {
+	if existingBytes, err := readInProject(t.normalizer, safePath); err == nil {
 		beforeContent = string(existingBytes)
 	}
 

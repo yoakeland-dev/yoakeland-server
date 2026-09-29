@@ -44,8 +44,8 @@ func (t *WritePlanTool) Execute(_ context.Context, execCtx ExecutionContext, arg
 	if err := json.Unmarshal(argsJSON, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	if execCtx.SessionID == "" {
-		return "", fmt.Errorf("write_plan requires a session")
+	if !protocol.ValidSessionID(execCtx.SessionID) {
+		return "", fmt.Errorf("write_plan requires a valid session id")
 	}
 
 	if err := os.MkdirAll(t.plansDir, 0755); err != nil {
