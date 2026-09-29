@@ -224,6 +224,8 @@ type claudeTurn struct {
 	seen atomic.Bool     // the session has said something since the prompt went in
 	over atomic.Bool     // the turn has ended, so there is nothing left to steer
 
+	lastAssistant atomic.Value // uuid of the last assistant message: where this turn ends, to fork at later
+
 	mu       sync.Mutex
 	names    map[string]string           // tool_use_id -> tool name
 	proposed map[string][]*diff.FileDiff // tool_use_id -> diff computed before it ran
@@ -247,6 +249,9 @@ func (t *claudeTurn) handle(ln claudeLine) {
 			}
 		}
 	case "assistant":
+		if topLevel && ln.UUID != "" {
+			t.lastAssistant.Store(ln.UUID)
+		}
 		// Text already streamed as deltas; only the tool calls are new.
 		// A subagent's (Task) own calls carry the Task's id as parent.
 		for _, b := range ln.Message.Content {
@@ -347,6 +352,11 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 	}
 	if nt.ResumeID != "" {
 		args = append(args, "--resume", nt.ResumeID)
+		if nt.ForkAt != "" {
+			// A new session holding this one as it was at that message. --resume-session-at
+			// isn't in --help but truncates the fork there (checked against the CLI).
+			args = append(args, "--fork-session", "--resume-session-at", nt.ForkAt)
+		}
 	}
 	if l.settings != "" {
 		args = append(args, "--settings", l.settings)
@@ -356,7 +366,11 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 	if err != nil {
 		return nil, err
 	}
-	s := &claudeSession{proc: proc, exited: make(chan struct{}), id: nt.ResumeID, model: p.Model, permMode: launchMode, waiting: map[string]chan claudeLine{}}
+	id := nt.ResumeID
+	if nt.ForkAt != "" {
+		id = "" // the fork has an id of its own, known when it says so
+	}
+	s := &claudeSession{proc: proc, exited: make(chan struct{}), id: id, model: p.Model, permMode: launchMode, waiting: map[string]chan claudeLine{}}
 	go s.read()
 	// Headless Claude Code omits thinking text on Sonnet/Opus 4.7+ unless asked;
 	// a CLI that predates the request just answers with an error we ignore.
@@ -371,9 +385,17 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 // answered anything, so the turn can be sent again to a new one.
 var errStaleSession = errors.New("the agent process had already exited")
 
+// errForkFailed: the session couldn't be forked at the checkpoint, before it said anything.
+var errForkFailed = errors.New("the agent's session couldn't be forked there")
+
 func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
 	err := p.runClaudeOnce(ctx, nt, emit)
 	if errors.Is(err, errStaleSession) {
+		err = p.runClaudeOnce(ctx, nt, emit)
+	}
+	if errors.Is(err, errForkFailed) {
+		// Start over from the transcript rather than failing the turn.
+		nt.ResumeID, nt.ForkAt, nt.Prompt = "", "", nt.FreshPrompt
 		err = p.runClaudeOnce(ctx, nt, emit)
 	}
 	return err
@@ -386,8 +408,8 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 		cs := ns.(*claudeSession)
 		cs.mu.Lock()
 		defer cs.mu.Unlock()
-		// A live process can't start a different conversation, or fall back to the default model.
-		return cs.id == nt.ResumeID && (p.Model != "" || cs.model == "")
+		// A live process can't start a different conversation, fork one, or fall back to the default model.
+		return nt.ForkAt == "" && cs.id == nt.ResumeID && (p.Model != "" || cs.model == "")
 	}
 	ns, reused, release, err := acquireSession(nt, CLIKindClaude, sig, usable, func() (nativeSession, error) { return p.startClaude(nt, l) })
 	if err != nil {
@@ -456,6 +478,9 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 			if reused && !t.seen.Load() {
 				return errStaleSession
 			}
+			if nt.ForkAt != "" && !t.seen.Load() {
+				return errForkFailed
+			}
 			msg := "claude exited without a result"
 			if tail := s.proc.stderr(); tail != "" {
 				msg += ": " + lastLines(tail, 5)
@@ -476,6 +501,9 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 	}
 
 	// total_cost_usd is the process's running total; usage is this turn's.
+	if u, ok := t.lastAssistant.Load().(string); ok {
+		nt.Checkpoint = u
+	}
 	s.mu.Lock()
 	cost := res.TotalCostUSD - s.cost
 	if cost < 0 {

@@ -1341,7 +1341,8 @@ turn:
 			a.mu.Lock()
 			hist := append([]Message(nil), a.history...)
 			a.mu.Unlock()
-			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist)
+			forker, _ := turnProvider.(NativeForker)
+			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist, forker != nil && forker.CanFork())
 			a.beginSteering(turnID, nt)
 			streamCtx = WithNativeTurn(turnCtx, nt)
 			toolDefs, systemPrompt = nil, ""
@@ -1768,7 +1769,20 @@ turn:
 		if n := len(a.history); n > 0 {
 			cursor = a.history[n-1].ID
 		}
-		a.native = &NativeSessionRef{Provider: a.providerName, SessionID: nt.SessionID, Cursor: cursor, CostUSD: nt.SessionCostUSD}
+		next := &NativeSessionRef{Provider: a.providerName, SessionID: nt.SessionID, Cursor: cursor, CostUSD: nt.SessionCostUSD}
+		if old := a.native; old != nil && old.Provider == a.providerName {
+			next.Checkpoints = make(map[string]NativeCheckpoint, len(old.Checkpoints)+1)
+			for k, v := range old.Checkpoints {
+				next.Checkpoints[k] = v
+			}
+		}
+		if nt.Checkpoint != "" && cursor != "" {
+			if next.Checkpoints == nil {
+				next.Checkpoints = map[string]NativeCheckpoint{}
+			}
+			next.Checkpoints[cursor] = NativeCheckpoint{SessionID: nt.SessionID, Point: nt.Checkpoint}
+		}
+		a.native = next
 		a.mu.Unlock()
 	}
 

@@ -95,6 +95,12 @@ func (p *CLISubprocessProvider) ModelName() string { return p.Model }
 
 func (p *CLISubprocessProvider) RunsOwnTools() {}
 
+// CanFork: Claude Code and Codex can fork their own session at a point in it.
+// The ACP agents can't (a fork copies the whole conversation, with no turn to cut at).
+func (p *CLISubprocessProvider) CanFork() bool {
+	return p.Kind == CLIKindClaude || p.Kind == CLIKindCodex
+}
+
 // SetModelOptions takes the reasoning effort (claude --effort, codex's turn
 // effort, an ACP agent's thought_level option) and Claude's fast mode. ThinkingBudget has no CLI
 // equivalent.

@@ -715,3 +715,144 @@ func TestCodexAutoReviewIsPerTurn(t *testing.T) {
 		t.Fatalf("turn after auto = %v", two)
 	}
 }
+
+func TestClaudeForksAtACheckpoint(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["type"] != "user" {
+			return
+		}
+		id := "sess-1"
+		if l > 0 {
+			id = "forked"
+		}
+		line(out, map[string]any{"type": "system", "subtype": "init", "session_id": id})
+		line(out, map[string]any{"type": "assistant", "uuid": "a-1", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "hi"}}}})
+		line(out, map[string]any{"type": "assistant", "uuid": "a-2", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "hi again"}}}})
+		line(out, map[string]any{"type": "result", "subtype": "success", "usage": map[string]any{}})
+	})}
+	nt1 := liveTurn(key, agent.ModeReadWrite, "", "first")
+	if _, err := runNative(t, p, nt1); err != nil {
+		t.Fatal(err)
+	}
+	if nt1.Checkpoint != "a-2" {
+		t.Fatalf("checkpoint = %q, want the turn's last assistant message", nt1.Checkpoint)
+	}
+
+	// Going back to it: a new process forked from that point, whose own id is what the chat follows.
+	nt2 := liveTurn(key, agent.ModeReadWrite, "sess-1", "edited")
+	nt2.ForkAt = "a-2"
+	if _, err := runNative(t, p, nt2); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 2 || !strings.Contains(f.args(1), "--resume sess-1 --fork-session --resume-session-at a-2") {
+		t.Fatalf("launches = %v", f.launches)
+	}
+	if nt2.SessionID != "forked" {
+		t.Fatalf("session = %q, want the fork's own id", nt2.SessionID)
+	}
+	// And the next turn continues on the fork.
+	if _, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "forked", "after")); err != nil {
+		t.Fatal(err)
+	}
+	if f.launchCount() != 2 {
+		t.Fatalf("the fork was restarted: %v", f.launches)
+	}
+}
+
+func TestClaudeForkFailureFallsBackToTheTranscript(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if l == 0 && m["type"] == "user" {
+			_ = out.(*io.PipeWriter).Close() // no such message: it exits without a word
+			return
+		}
+		claudeScript(0.1)(l, m, out)
+	})}
+	nt := liveTurn(key, agent.ModeReadWrite, "sess-1", "edited")
+	nt.ForkAt, nt.FreshPrompt = "gone", "TRANSCRIPT edited"
+	if _, err := runNative(t, p, nt); err != nil {
+		t.Fatalf("a failed fork should fall back, not fail: %v", err)
+	}
+	if f.launchCount() != 2 || strings.Contains(f.args(1), "--resume") || strings.Contains(f.args(1), "--fork-session") {
+		t.Fatalf("launches = %v", f.launches)
+	}
+	if got := f.prompts(); got[len(got)-1] != "TRANSCRIPT edited" {
+		t.Fatalf("prompts = %v", got)
+	}
+}
+
+func TestCodexForksAtATurn(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := false
+	script := codexScript(&hang)
+	p := &CLISubprocessProvider{Kind: CLIKindCodex, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["method"] == "thread/fork" {
+			line(out, map[string]any{"jsonrpc": "2.0", "id": m["id"], "result": map[string]any{"thread": map[string]any{"id": "forked"}}})
+			return
+		}
+		script(l, m, out)
+	})}
+	nt1 := liveTurn(key, agent.ModeReadWrite, "", "first")
+	if _, err := runNative(t, p, nt1); err != nil {
+		t.Fatal(err)
+	}
+	if nt1.Checkpoint != "turn1" {
+		t.Fatalf("checkpoint = %q", nt1.Checkpoint)
+	}
+	// The same live thread, cut back: a fork through that turn, not a resume of it.
+	nt2 := liveTurn(key, agent.ModeReadWrite, "th1", "edited")
+	nt2.ForkAt = "turn1"
+	if _, err := runNative(t, p, nt2); err != nil {
+		t.Fatal(err)
+	}
+	forks := f.rpc("thread/fork")
+	if len(forks) != 1 || f.launchCount() != 1 {
+		t.Fatalf("forks %d, launches %d", len(forks), f.launchCount())
+	}
+	fp := forks[0]["params"].(map[string]any)
+	if fp["threadId"] != "th1" || fp["lastTurnId"] != "turn1" {
+		t.Fatalf("thread/fork = %v", fp)
+	}
+	if nt2.SessionID != "forked" {
+		t.Fatalf("session = %q", nt2.SessionID)
+	}
+	turns := f.rpc("turn/start")
+	if turns[1]["params"].(map[string]any)["threadId"] != "forked" {
+		t.Fatalf("the turn ran on %v, not the fork", turns[1]["params"])
+	}
+}
+
+func TestCodexForkFailureFallsBackToTheTranscript(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	hang := false
+	script := codexScript(&hang)
+	p := &CLISubprocessProvider{Kind: CLIKindCodex, Dir: t.TempDir(), Start: f.starter(func(l int, m map[string]any, out io.Writer) {
+		if m["method"] == "thread/fork" {
+			line(out, map[string]any{"jsonrpc": "2.0", "id": m["id"], "error": map[string]any{"code": -32600, "message": "no rollout found"}})
+			return
+		}
+		script(l, m, out)
+	})}
+	nt := liveTurn(key, agent.ModeReadWrite, "old", "edited")
+	nt.ForkAt, nt.FreshPrompt = "turn9", "TRANSCRIPT edited"
+	if _, err := runNative(t, p, nt); err != nil {
+		t.Fatalf("a failed fork should fall back: %v", err)
+	}
+	starts := f.rpc("thread/start")
+	if len(starts) != 1 || starts[0]["params"].(map[string]any)["lastTurnId"] != nil {
+		t.Fatalf("thread/start = %v", starts)
+	}
+	in := f.rpc("turn/start")[0]["params"].(map[string]any)["input"].([]any)[0].(map[string]any)
+	if in["text"] != "TRANSCRIPT edited" {
+		t.Fatalf("turn input = %v", in)
+	}
+}

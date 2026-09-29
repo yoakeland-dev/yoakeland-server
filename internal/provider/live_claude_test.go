@@ -141,3 +141,45 @@ func TestLiveClaudeAuto(t *testing.T) {
 		t.Fatal("haiku accepted auto mode")
 	}
 }
+
+// Live: a turn forked at an earlier turn's checkpoint remembers only what came before it.
+func TestLiveClaudeForkAtCheckpoint(t *testing.T) {
+	if os.Getenv("YK_LIVE") == "" {
+		t.Skip("YK_LIVE not set")
+	}
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Model: "haiku", Dir: t.TempDir()}
+	ask := func(resume, forkAt, prompt string) (string, *agent.NativeTurn) {
+		rec := &turnRecorder{answer: agent.NativeAnswer{Allowed: true}}
+		nt := rec.turn(agent.ModeReadWrite)
+		nt.SessionKey, nt.ResumeID, nt.ForkAt, nt.Prompt, nt.FreshPrompt = key, resume, forkAt, prompt, prompt
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, nt), nil, nil, "")
+		var sb strings.Builder
+		for c := range chunks {
+			if c.Kind == agent.StreamChunkDelta {
+				sb.WriteString(c.Delta)
+			}
+		}
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		return sb.String(), nt
+	}
+	_, nt1 := ask("", "", "Remember the code word ZEBRA. Reply OK.")
+	_, nt2 := ask(nt1.SessionID, "", "Remember a second code word: LLAMA. Reply OK.")
+	t.Logf("turn 1: session %s checkpoint %s | turn 2: session %s checkpoint %s", nt1.SessionID, nt1.Checkpoint, nt2.SessionID, nt2.Checkpoint)
+	if nt1.Checkpoint == "" || nt2.Checkpoint == "" || nt1.Checkpoint == nt2.Checkpoint {
+		t.Fatalf("checkpoints: %q %q", nt1.Checkpoint, nt2.Checkpoint)
+	}
+	got, nt3 := ask(nt1.SessionID, nt1.Checkpoint, "What code words do you remember? One line.")
+	t.Logf("forked at turn 1: %q (session %s)", got, nt3.SessionID)
+	if nt3.SessionID == "" || nt3.SessionID == nt1.SessionID {
+		t.Fatalf("the fork kept the old session id: %q", nt3.SessionID)
+	}
+	if !strings.Contains(strings.ToUpper(got), "ZEBRA") || strings.Contains(strings.ToUpper(got), "LLAMA") {
+		t.Fatalf("the fork remembered the wrong things: %q", got)
+	}
+}

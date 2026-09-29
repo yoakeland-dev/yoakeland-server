@@ -211,3 +211,69 @@ func TestAgent_AutoModeAsksTheUserWhatTheReviewerEscalates(t *testing.T) {
 		t.Fatalf("want the user asked once, got %d: %s", n, out.String())
 	}
 }
+
+// forkNative is an agent that can fork its own session: every turn it reports
+// a checkpoint, and a turn asked to fork says where it came from.
+type forkNative struct {
+	turns []agent.NativeTurn
+}
+
+func (*forkNative) RunsOwnTools() {}
+func (*forkNative) CanFork() bool { return true }
+
+func (f *forkNative) StreamTurn(ctx context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	c, e := make(chan agent.ModelStreamChunk, 2), make(chan error, 1)
+	nt := agent.NativeTurnFromContext(ctx)
+	n := len(f.turns) + 1
+	nt.SessionID = "sess-" + string(rune('0'+n))
+	if nt.ForkAt == "" && nt.ResumeID != "" {
+		nt.SessionID = nt.ResumeID // continued in place
+	}
+	nt.Checkpoint = "cp-" + string(rune('0'+n))
+	f.turns = append(f.turns, *nt)
+	c <- agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: "reply " + string(rune('0'+n))}
+	close(c)
+	close(e)
+	return c, e
+}
+
+// Cutting the history back to where the agent's own session has a checkpoint
+// (an edit, a retry) continues from a fork of it instead of a transcript.
+func TestAgent_EditForksTheNativeSession(t *testing.T) {
+	native := &forkNative{}
+	ag, store, _ := testAgent(t, native)
+	ag.SetProvider(native, "cc")
+	ag.SetMode(agent.ModeAutonomous)
+
+	for i, prompt := range []string{"one", "two", "three"} {
+		if err := ag.RunTurn(context.Background(), "s", "t"+string(rune('1'+i)), prompt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, _ := store.Load("s")
+	if st.Native == nil || len(st.Native.Checkpoints) != 3 {
+		t.Fatalf("checkpoints = %+v", st.Native)
+	}
+	// Turn 3 continued turn 2's session in place.
+	if nt := native.turns[2]; nt.ResumeID != native.turns[1].SessionID || nt.ForkAt != "" {
+		t.Fatalf("turn 3 = %+v", nt)
+	}
+
+	// Edit the second message: the history is cut back to the end of turn one.
+	var editID string
+	for _, m := range st.History {
+		if m.Role == "user" && m.Content == "two" {
+			editID = m.ID
+		}
+	}
+	if err := ag.EditMessage(context.Background(), "s", "t4", editID, "two, edited", false); err != nil {
+		t.Fatal(err)
+	}
+	nt := native.turns[3]
+	if nt.ResumeID != native.turns[0].SessionID || nt.ForkAt != "cp-1" || nt.Prompt != "two, edited" {
+		t.Fatalf("the edit didn't fork turn one's checkpoint: %+v", nt)
+	}
+	if !strings.Contains(nt.FreshPrompt, "User: one") {
+		t.Fatalf("no transcript to fall back on: %q", nt.FreshPrompt)
+	}
+}

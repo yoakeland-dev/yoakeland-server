@@ -75,6 +75,26 @@ type NativeSessionRef struct {
 	SessionID string  `json:"sessionId"`
 	Cursor    string  `json:"cursor"`
 	CostUSD   float64 `json:"costUsd,omitempty"` // see NativeTurn.SessionCostUSD
+
+	// Checkpoints are the points of the agent's own sessions a chat can go back
+	// to, by the ID of the last message of a turn there. A history cut back to
+	// one of those messages (an edit, a retry, another branch) continues from a
+	// fork of the agent's session at that point instead of a transcript. Entries
+	// are never removed: each stays valid for the session it names, which is
+	// kept.
+	Checkpoints map[string]NativeCheckpoint `json:"checkpoints,omitempty"`
+}
+
+// NativeCheckpoint is a point in one of an agent's sessions: whatever that agent
+// forks at (Claude's message uuid, Codex's turn id).
+type NativeCheckpoint struct {
+	SessionID string `json:"sessionId"`
+	Point     string `json:"point"`
+}
+
+// NativeForker is a NativeAgent that can fork its own session at a checkpoint.
+type NativeForker interface {
+	CanFork() bool
 }
 
 // NativeTurn is what a NativeAgent gets for one turn, via ctx.
@@ -95,6 +115,14 @@ type NativeTurn struct {
 	// Questions asks all of them at once, so a client can stack their cards,
 	// and blocks until every one is answered; answers come back in order.
 	Questions func(ctx context.Context, qs []NativeQuestion) ([]string, error)
+
+	// ForkAt, with ResumeID, asks for a fork of that native session as it was at
+	// the checkpoint, to continue from. A provider that can't fork it (or fails
+	// to) starts a fresh session with FreshPrompt instead.
+	ForkAt string
+	// Checkpoint is set by the provider when the turn ends: where in the
+	// session this turn's end is, for a later ForkAt.
+	Checkpoint string
 
 	// SessionKey names the chat for a provider that keeps its CLI process alive
 	// between turns; "" means one process per turn.
@@ -152,7 +180,7 @@ func NativeTurnFromContext(ctx context.Context) *NativeTurn {
 
 // newNativeTurn decides resume-vs-fresh from a.native and builds the prompt.
 // history already ends with the user message this turn answers.
-func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []Message) *NativeTurn {
+func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []Message, canFork bool) *NativeTurn {
 	nt := &NativeTurn{Mode: a.Mode(), SessionKey: NativeSessionKey(sessionID, a.projectRoot)}
 	last := len(history) - 1
 	for last >= 0 && history[last].Role != "user" {
@@ -171,8 +199,14 @@ func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []
 			renderTranscript(contextView(history[:last], "")) + "\n---\n\n" + msg
 	}
 	nt.Prompt = nt.FreshPrompt
-	if ref != nil && ref.Provider == providerName && last > 0 && history[last-1].ID == ref.Cursor {
-		nt.ResumeID, nt.Prompt, nt.SessionCostUSD = ref.SessionID, msg, ref.CostUSD
+	if ref != nil && ref.Provider == providerName && last > 0 {
+		prev := history[last-1].ID
+		if cp, ok := ref.Checkpoints[prev]; ok && prev != ref.Cursor && canFork {
+			// The history was cut back to a point the agent's session passed through.
+			nt.ResumeID, nt.ForkAt, nt.Prompt = cp.SessionID, cp.Point, msg
+		} else if prev == ref.Cursor {
+			nt.ResumeID, nt.Prompt, nt.SessionCostUSD = ref.SessionID, msg, ref.CostUSD
+		}
 	}
 	nt.Ask = func(ctx context.Context, req NativeAsk) (NativeAnswer, error) {
 		return a.askNativePermission(ctx, sessionID, turnID, req)

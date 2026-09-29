@@ -453,19 +453,25 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 	s.mu.Lock()
 	threadID := s.thread
 	s.mu.Unlock()
-	if nt.ResumeID == "" || nt.ResumeID != threadID {
+	if nt.ForkAt != "" || nt.ResumeID == "" || nt.ResumeID != threadID {
 		threadID = ""
 		var thread json.RawMessage
 		if nt.ResumeID != "" {
+			method := "thread/resume"
 			threadParams["threadId"] = nt.ResumeID
-			thread, err = conn.call(ctx, "thread/resume", threadParams)
+			if nt.ForkAt != "" {
+				// A new thread holding this one through that turn.
+				method, threadParams["lastTurnId"] = "thread/fork", nt.ForkAt
+			}
+			thread, err = conn.call(ctx, method, threadParams)
 			if err != nil {
 				if s.dead() {
 					return failed(err)
 				}
-				// The rollout is gone (deleted, other machine): start over from
-				// the transcript rather than failing the turn.
+				// The rollout is gone (deleted, other machine), or it can't be
+				// forked there: start over from the transcript rather than failing the turn.
 				delete(threadParams, "threadId")
+				delete(threadParams, "lastTurnId")
 				prompt = nt.FreshPrompt
 				thread = nil
 			}
@@ -541,6 +547,7 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 		return err
 	})
 
+	nt.Checkpoint = st.Turn.ID // fork here, through this turn, to come back to it
 	var turn struct {
 		Status string `json:"status"`
 		Error  *struct {
