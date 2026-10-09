@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/protocol"
 )
 
 // Live: drives the real claude binary through the provider (skipped unless YK_LIVE=1).
@@ -181,5 +182,64 @@ func TestLiveClaudeForkAtCheckpoint(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToUpper(got), "ZEBRA") || strings.Contains(strings.ToUpper(got), "LLAMA") {
 		t.Fatalf("the fork remembered the wrong things: %q", got)
+	}
+}
+
+// Live: the real claude binary's get_context_usage, after a real turn (skipped unless YK_LIVE=1).
+// Checks what the parser assumes of the answer: the categories add up to the total, the window is
+// known, and once the API has answered the total is the provider's own count.
+func TestLiveClaudeContextBreakdown(t *testing.T) {
+	if os.Getenv("YK_LIVE") == "" {
+		t.Skip("YK_LIVE not set")
+	}
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Model: "haiku", Dir: t.TempDir()}
+	rec := &turnRecorder{answer: agent.NativeAnswer{Allowed: true}}
+	nt := rec.turn(agent.ModeReadWrite)
+	nt.SessionKey, nt.Prompt = key, "Reply with the single word OK."
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, nt), nil, nil, "")
+	var usage *protocol.UsageData
+	for c := range chunks {
+		if c.Kind == agent.StreamChunkUsage {
+			usage = c.Usage
+		}
+	}
+	// An expired login fails the turn but leaves the process able to count its context, which is
+	// still worth checking; only what needs a real reply is skipped then.
+	turnErr := <-errs
+	if turnErr != nil {
+		t.Logf("the claude turn failed (is the login current?): %v", turnErr)
+	}
+	t.Logf("turn usage: %+v", usage)
+
+	got, err := p.ContextBreakdown(ctx, key)
+	if err != nil || got == nil {
+		t.Fatalf("breakdown = %+v, %v", got, err)
+	}
+	used, spare := sumTokens(got.Categories)
+	t.Logf("total %d window %d compact-at %d source %s cache %+v; used %d spare %d", got.TotalTokens, got.WindowTokens, got.AutoCompactAt, got.Source, got.Cache, used, spare)
+	for _, c := range got.Categories {
+		t.Logf("  %-14s %8d exact=%v", c.Key, c.Tokens, c.Exact)
+	}
+	if got.TotalTokens == 0 || got.WindowTokens == 0 {
+		t.Fatalf("no total or window: %+v", got)
+	}
+	if d := used - got.TotalTokens; d < -got.TotalTokens/100 || d > got.TotalTokens/100 {
+		t.Fatalf("categories add up to %d, the total is %d", used, got.TotalTokens)
+	}
+	if turnErr != nil {
+		return
+	}
+	if got.Source != "provider" || got.Cache == nil {
+		t.Fatalf("after a real reply the count is the provider's, with its cache use: %+v", got)
+	}
+	if usage != nil && usage.ContextTokens > 0 {
+		// Both are the last request's size; the CLI's count may include a few tokens the API didn't bill.
+		if d := usage.ContextTokens - got.TotalTokens; d < -got.TotalTokens/5 || d > got.TotalTokens/5 {
+			t.Errorf("turn snapshot says %d in context, get_context_usage says %d", usage.ContextTokens, got.TotalTokens)
+		}
 	}
 }

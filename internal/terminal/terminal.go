@@ -38,12 +38,12 @@ const (
 	maxCols     = 1000
 	maxRows     = 500
 
-	// historyLimit bounds the scrollback replayed to a client on attach —
-	// ponytail: a fixed byte cap per terminal, not a true VT-aware screen
-	// model (what a client-side xterm.js buffer already reconstructs from
-	// replayed bytes); bump this or move to persisted history if very long
-	// scrollback across restarts ever matters.
-	historyLimit = 256 * 1024
+	// The scrollback replayed to a client on attach is capped at
+	// sandbox.CurrentLimits().TerminalHistoryBytes (runtime setting
+	// terminalHistoryKB) — ponytail: a byte cap per terminal, not a true
+	// VT-aware screen model (what a client-side xterm.js buffer already
+	// reconstructs from replayed bytes); move to persisted history if very
+	// long scrollback across restarts ever matters.
 
 	maxInputBytes  = 64 * 1024
 	maxEnvVars     = 128
@@ -288,8 +288,8 @@ func (t *Terminal) appendOutput(chunk []byte) {
 	t.written += uint64(len(data))
 	t.scanMarks(data)
 	t.history = append(t.history, data...)
-	if len(t.history) > historyLimit {
-		t.history = t.history[len(t.history)-historyLimit:]
+	if limit := sandbox.CurrentLimits().TerminalHistoryBytes; len(t.history) > limit {
+		t.history = t.history[len(t.history)-limit:]
 	}
 	t.sequence++
 	oc := outputChunk{data: data, seq: t.sequence}

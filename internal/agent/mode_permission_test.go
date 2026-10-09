@@ -69,13 +69,10 @@ func waitForAsk(t *testing.T, ag *agent.Agent, toolCallID string, timeout time.D
 	t.Errorf("timed out waiting for a pending ask on %q", toolCallID)
 }
 
-// TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember guards tier 2's
-// bash semantics: bash stays exposed, but every call is forced to Ask —
-// bypassing the permission engine's safe-command auto-allowlist (e.g. a
-// bare "pwd", which permission.Engine would otherwise auto-allow) — and a
-// "remember" answer on that forced ask is never persisted, so the identical
-// command asks again rather than silently auto-allowing itself later.
-func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
+// TestAgent_ReadWriteModeAsksForBashUntilARuleAllowsIt: bash stays exposed and
+// every call asks when no rule covers it (not even a "read-only" `pwd`), and
+// a remembered answer stores a rule so the identical command no longer asks.
+func TestAgent_ReadWriteModeAsksForBashUntilARuleAllowsIt(t *testing.T) {
 	tempDir := t.TempDir()
 	norm, _ := normalizer.New(tempDir)
 	engine := permission.New(norm, nil)
@@ -86,14 +83,18 @@ func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
 
 	tools := []tool.Tool{tool.NewBashTool(norm, sb)}
 
-	bashArgs, _ := json.Marshal(map[string]string{"command": "pwd"})
-
+	call := func(id, cmd string) []agent.ModelStreamChunk {
+		args, _ := json.Marshal(map[string]string{"command": cmd})
+		return []agent.ModelStreamChunk{{Kind: agent.StreamChunkToolCall, ToolCall: &agent.ToolCall{ID: id, Name: "bash", Args: args}}}
+	}
+	done := func(s string) []agent.ModelStreamChunk {
+		return []agent.ModelStreamChunk{{Kind: agent.StreamChunkDelta, Delta: s}}
+	}
 	provider := &capturingProvider{
 		turns: [][]agent.ModelStreamChunk{
-			{{Kind: agent.StreamChunkToolCall, ToolCall: &agent.ToolCall{ID: "tc-bash-1", Name: "bash", Args: bashArgs}}},
-			{{Kind: agent.StreamChunkDelta, Delta: "done 1"}},
-			{{Kind: agent.StreamChunkToolCall, ToolCall: &agent.ToolCall{ID: "tc-bash-2", Name: "bash", Args: bashArgs}}},
-			{{Kind: agent.StreamChunkDelta, Delta: "done 2"}},
+			call("tc-bash-1", "pwd"), done("done 1"),
+			call("tc-bash-2", "pwd"), done("done 2"),
+			call("tc-bash-3", "ls"), done("done 3"),
 		},
 	}
 
@@ -103,9 +104,7 @@ func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
 	t.Cleanup(ag.WaitBackground)
 	ag.SetMode(agent.ModeReadWrite)
 
-	// First turn: "pwd" would auto-allow under the engine's normal static
-	// policy (see permission.Engine.Evaluate) — tier 2 must still force an
-	// Ask. Answer it with remember: true.
+	// First turn: nothing allows `pwd`, so it asks. Answer with remember.
 	var asksChanged atomic.Int32
 	ag.SetHooks(agent.Hooks{AsksChanged: func() { asksChanged.Add(1) }})
 	pendingWhileAsking := make(chan []protocol.PendingAsk, 1)
@@ -117,30 +116,43 @@ func TestAgent_ReadWriteModeForcesBashToAskAndDoesNotRemember(t *testing.T) {
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "run pwd"); err != nil {
 		t.Fatalf("turn 1: %v", err)
 	}
-	// The ask is listed while open (for pending_asks on reconnect), and gone
-	// once answered, with a change signalled each way.
-	if p := <-pendingWhileAsking; len(p) != 1 || p[0].Kind != "permission" || p[0].ToolCallID != "tc-bash-1" || p[0].PermissionRequestData == nil {
+	// The ask is listed while open (for pending_asks on reconnect), carries
+	// the rules it could remember, and is gone once answered.
+	p := <-pendingWhileAsking
+	if len(p) != 1 || p[0].Kind != "permission" || p[0].ToolCallID != "tc-bash-1" || p[0].PermissionRequestData == nil {
 		t.Fatalf("pending asks while asking = %+v", p)
+	}
+	if sg := p[0].PermissionRequestData.Suggestions; len(sg) != 2 || sg[0].ID != "prefix" || sg[1].ID != "exact" {
+		t.Fatalf("suggestions = %+v", sg)
 	}
 	if p := ag.PendingAsks(); len(p) != 0 || asksChanged.Load() != 2 {
 		t.Fatalf("after answer: pending %+v, %d change signals", p, asksChanged.Load())
 	}
-	if !strings.Contains(out.String(), `"toolCallId":"tc-bash-1"`) || !strings.Contains(out.String(), "permission_request") {
-		t.Fatalf("expected a permission_request for the forced-ask bash call, got: %s", out.String())
+	if n := strings.Count(out.String(), `"type":"permission_request"`); n != 1 {
+		t.Fatalf("expected one permission_request, got %d: %s", n, out.String())
 	}
 
-	// Second turn, identical command: if the "remember" answer above had
-	// been persisted, this would auto-allow with no second ask. It must ask
-	// again.
-	go func() {
-		waitForAsk(t, ag, "tc-bash-2", 5*time.Second)
-		ag.HandlePermissionResponse("tc-bash-2", true, false, "")
-	}()
+	// Second turn, identical command: the remembered rule allows it, no ask.
 	if err := ag.RunTurn(context.Background(), "s1", "t2", "run pwd again"); err != nil {
 		t.Fatalf("turn 2: %v", err)
 	}
+	if n := strings.Count(out.String(), `"type":"permission_request"`); n != 1 {
+		t.Fatalf("a remembered command asked again (%d requests): %s", n, out.String())
+	}
 	if !strings.Contains(out.String(), `"toolCallId":"tc-bash-2"`) {
-		t.Fatalf("expected a second permission_request — remembering a forced-ask decision must not persist, got: %s", out.String())
+		t.Fatalf("second call never ran: %s", out.String())
+	}
+
+	// A different command still asks.
+	go func() {
+		waitForAsk(t, ag, "tc-bash-3", 5*time.Second)
+		ag.HandlePermissionResponse("tc-bash-3", false, false, "")
+	}()
+	if err := ag.RunTurn(context.Background(), "s1", "t3", "run ls"); err != nil {
+		t.Fatalf("turn 3: %v", err)
+	}
+	if n := strings.Count(out.String(), `"type":"permission_request"`); n != 2 {
+		t.Fatalf("expected a second permission_request for ls, got %d", n)
 	}
 }
 
@@ -266,6 +278,44 @@ func TestAgent_AskUserQuestionBlocksAndResumes(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "which approach?") {
 		t.Fatalf("expected the question in ask_user_question_requested, got: %s", out.String())
+	}
+}
+
+// Several questions in one call are all pending together, each answerable on its
+// own, and the turn resumes once the last is answered.
+func TestAgent_AskUserQuestionsStackAndResume(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20)
+
+	askArgs, _ := json.Marshal(map[string]any{"questions": []map[string]any{{"question": "first?"}, {"question": "second?", "options": []string{"a", "b"}}}})
+	provider := &capturingProvider{
+		turns: [][]agent.ModelStreamChunk{
+			{{Kind: agent.StreamChunkToolCall, ToolCall: &agent.ToolCall{ID: "tc", Name: "ask_user_question", Args: askArgs}}},
+			{{Kind: agent.StreamChunkDelta, Delta: "thanks"}},
+		},
+	}
+	out := &syncBuf{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), out)
+	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{tool.NewAskUserQuestionTool()}, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
+
+	go func() {
+		waitForSubstring(t, out, "second?", 2*time.Second)
+		if n := len(ag.PendingAsks()); n != 2 {
+			t.Errorf("pending asks = %d, want 2", n)
+		}
+		ag.HandleAskUserAnswer("tc#1", "b")
+		ag.HandleAskUserAnswer("tc#0", "yes")
+	}()
+	if err := ag.RunTurn(context.Background(), "s1", "t1", "ask me"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if !strings.Contains(out.String(), `"total":2`) {
+		t.Fatalf("expected index/total on the questions, got: %s", out.String())
 	}
 }
 

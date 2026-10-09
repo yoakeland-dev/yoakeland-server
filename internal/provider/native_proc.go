@@ -30,6 +30,8 @@ type procStarter func(ctx context.Context, name string, args []string, dir strin
 func startProc(ctx context.Context, name string, args []string, dir string) (*nativeProc, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	ownProcessGroup(cmd)
+	cmd.Cancel = func() error { return killTree(cmd) }
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -45,7 +47,7 @@ func startProc(ctx context.Context, name string, args []string, dir string) (*na
 	}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 64*1024), protocol.MaxFrameSize)
-	return &nativeProc{stdin: stdin, lines: sc, stderr: errBuf.String, wait: cmd.Wait, kill: func() { _ = cmd.Process.Kill() }}, nil
+	return &nativeProc{stdin: stdin, lines: sc, stderr: errBuf.String, wait: cmd.Wait, kill: func() { _ = killTree(cmd) }}, nil
 }
 
 // tailBuffer keeps the last 4 KiB written to it.
@@ -123,7 +125,6 @@ func newRPCConn(p *nativeProc, onNotify func(string, json.RawMessage), onRequest
 }
 
 func (c *rpcConn) readLoop() {
-	defer close(c.done)
 	for c.p.lines.Scan() {
 		var msg struct {
 			ID     json.RawMessage `json:"id"`
@@ -156,6 +157,11 @@ func (c *rpcConn) readLoop() {
 		}
 	}
 	c.readErr = c.p.lines.Err()
+	close(c.done)
+	// Reap the exited child so it doesn't stay a zombie until the daemon exits.
+	if c.p.wait != nil {
+		_ = c.p.wait()
+	}
 }
 
 // call sends a request and waits for its response, the process exiting, or

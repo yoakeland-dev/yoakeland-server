@@ -167,6 +167,9 @@ func (t *ampTurn) handle(ln claudeLine) {
 			t.usage.InputTokens += in
 			t.usage.OutputTokens += u.OutputTokens
 			t.usage.CachedInputTokens += u.CacheReadInputTokens
+			if in > 0 { // the sums above are spend; the last request's size is the context
+				t.usage.ContextTokens = claudeContextTokens(u.InputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens)
+			}
 			t.mu.Unlock()
 			// The assistant stopping for its own reasons, not to call a tool, ends the turn.
 			if ln.Message.StopReason == "end_turn" {

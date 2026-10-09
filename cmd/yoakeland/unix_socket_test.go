@@ -189,7 +189,7 @@ func TestSetupUnixListener_CreatesOwnerOnlySocket(t *testing.T) {
 	// A freshly accepted connection also gets an unsolicited peer_list and
 	// server_identity push (peer.go/settings.go) ahead of any response to
 	// what the client itself sent — skip past those to find the pong.
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 20; i++ {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			t.Fatalf("reading over unix socket: %v", err)

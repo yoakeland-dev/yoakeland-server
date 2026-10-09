@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/audit"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
@@ -51,7 +52,6 @@ func main() {
 	var apiKey string
 	var baseURL string
 	var listenAddr string
-	var authToken string
 	var tlsCert string
 	var tlsKey string
 	var maxSessionCostUSD float64
@@ -59,21 +59,22 @@ func main() {
 	var stdioMode bool
 	var webRoot string
 
-	flag.StringVar(&projectDir, "project", "", "Default project root — pre-opened at startup and used as the fallback project for sessions/requests that don't specify their own projectPath. Unset by default: a server launched with no -project has no fallback and every request must give its own projectPath. Additional projects can be opened on demand via open_project/user_prompt.")
+	flag.StringVar(&projectDir, "project", "", "Default project root — pre-opened at startup and used as the fallback project for sessions/requests that don't specify their own projectPath. Kept for the -stdio spawn contract (yoake-client -bin \"yoakeland -project X\" sends no projectPath); a daemon's clients pass projectPath and open projects with open_project, so don't set it there.")
 	flag.StringVar(&stateDir, "state-dir", sockpath.DefaultStateDir(), "Directory for server-level state that isn't tied to any one project: providers.json, and the fallback unix socket path. Defaults to ~/.yoake (Linux), ~/Library/Application Support/yoake (macOS), or %AppData%\\yoake (Windows).")
-	flag.StringVar(&providerName, "provider", "auto", "Provider: 'anthropic', 'openai', 'openrouter', or 'auto'")
-	flag.StringVar(&modelName, "model", "", "Model name (defaults: claude-3-5-sonnet-20241022, gpt-4o, etc.)")
-	flag.StringVar(&apiKey, "api-key", "", "API key (or use ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)")
-	flag.StringVar(&baseURL, "base-url", "", "Custom API base URL (e.g. http://localhost:1234/v1 for LM Studio)")
+	flag.StringVar(&providerName, "provider", "auto", "DEPRECATED, seeds default_provider once (use register_provider + set_default_provider): 'anthropic', 'openai', 'openrouter', or 'auto'")
+	flag.StringVar(&modelName, "model", "", "DEPRECATED, seeds default_provider once (use set_default_provider): model name")
+	flag.StringVar(&apiKey, "api-key", "", "DEPRECATED, seeds default_provider once (use register_provider): API key. ANTHROPIC_API_KEY, OPENAI_API_KEY and OPENROUTER_API_KEY in the environment still pick a fallback default when none is configured")
+	flag.StringVar(&baseURL, "base-url", "", "DEPRECATED, seeds default_provider once (use register_provider): custom API base URL (e.g. http://localhost:1234/v1 for LM Studio)")
 	flag.BoolVar(&stdioMode, "stdio", false, "Speak the protocol directly over this process's own stdin/stdout and exit when stdin closes, instead of running as a daemon. This is the spawn-a-subprocess-per-client contract (what yoake-client's default -bin mode uses under the hood). Most local usage wants the default instead: a long-running process that always has a local unix socket open, exiting on SIGINT/SIGTERM rather than stdin EOF. Mutually exclusive with -listen.")
-	flag.StringVar(&listenAddr, "listen", "", "Optionally ALSO listen here, in addition to the always-on local unix socket (a named pipe on Windows; ignored if -stdio is set): a TCP address (e.g. ':7890') for remote/multi-device access, or 'unix:/path/to/socket' to override where the local socket itself lives. A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent.")
-	flag.StringVar(&authToken, "token", "", "Shared auth token required from clients of the optional TCP listener (auto-generated if empty). Not used for any unix socket. Prefer YOAKELAND_TOKEN: flags are visible to other local users.")
-	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate file for the optional TCP listener (requires -tls-key). Without both, yoakeland auto-generates and uses its own self-managed CA under -state-dir/tls/ instead — the listener is always TLS, never plaintext.")
-	flag.StringVar(&webRoot, "web-root", "", "Directory holding the built web client (the GUI's build/). Served to browsers on the remote TCP listener, which also accepts the protocol over a WebSocket at /ws; without it, /ws still works but there's no page to load.")
-	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key file for the optional TCP listener (requires -tls-cert)")
-	flag.Float64Var(&maxSessionCostUSD, "max-session-cost-usd", 0, "Refuse to start a new turn once a session has already spent this much (0 = unlimited)")
-	flag.StringVar(&masterKey, "master-key", "", "Passphrase encrypting providers.json at rest (AES-256-GCM, scrypt-derived key). Falls back to YOAKELAND_MASTER_KEY if unset. Without either, providers.json is plaintext (0600 perms only).")
+	flag.StringVar(&listenAddr, "listen", "", "'unix:/path/to/socket' overrides where the always-on local socket lives (a named pipe on Windows; ignored if -stdio is set). A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent. A TCP address (e.g. ':7890') is DEPRECATED: it seeds remote access once; use set_remote_access.")
+	flag.StringVar(&tlsCert, "tls-cert", "", "DEPRECATED, seeds remote access once (use set_remote_access {tlsCert, tlsKey}): TLS certificate file for the TCP listener (requires -tls-key). Without both, yoakeland uses its own self-managed CA under -state-dir/tls/ — the listener is always TLS, never plaintext.")
+	flag.StringVar(&webRoot, "web-root", "", "DEPRECATED, seeds remote access once (use set_remote_access {webRoot}): directory holding the built web client (the GUI's build/), served to browsers on the remote TCP listener.")
+	flag.StringVar(&tlsKey, "tls-key", "", "DEPRECATED, seeds remote access once (use set_remote_access {tlsKey}): TLS private key file (requires -tls-cert)")
+	flag.Float64Var(&maxSessionCostUSD, "max-session-cost-usd", 0, "DEPRECATED, seeds maxSessionCostUsd once (use set_runtime_settings): pause a session's turns once it has spent this much (0 = unlimited)")
+	flag.StringVar(&masterKey, "master-key", "", "Passphrase encrypting providers.json at rest (AES-256-GCM, scrypt-derived key). Prefer the YOAKELAND_MASTER_KEY environment variable, which this falls back to: it has to be known before providers.json opens, so it can't be a runtime setting. Without either, providers.json is plaintext (0600 perms only).")
 	flag.Parse()
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 	// State must never land in the working directory, which may be a project.
 	if stateDir == "" {
@@ -98,12 +99,8 @@ func main() {
 	if masterKey == "" {
 		masterKey = os.Getenv("YOAKELAND_MASTER_KEY")
 	}
-	if authToken == "" {
-		authToken = os.Getenv("YOAKELAND_TOKEN")
-	}
 	// CLI agents (native_proc.go) inherit this process's environment.
 	_ = os.Unsetenv("YOAKELAND_MASTER_KEY")
-	_ = os.Unsetenv("YOAKELAND_TOKEN")
 	warnSecretFlags()
 	if masterKey == "" {
 		logWarnDetail(
@@ -115,7 +112,10 @@ func main() {
 	// A default provider is optional, not required to start: a session with
 	// no default and no explicit set_provider call is rejected on its first
 	// turn (see Agent.RunTurn's nil-provider guard), rather than blocking the
-	// whole server from starting before any credentials are registered.
+	// whole server from starting before any credentials are registered. This
+	// one is only the fallback, built from the environment (and, for one more
+	// release, the deprecated flags): the default_provider setting, once one is
+	// stored, takes precedence over it (defaultProviderSource).
 	modelProv, err := provider.ResolveProvider(provider.Config{
 		ProviderName: providerName,
 		Model:        modelName,
@@ -123,9 +123,9 @@ func main() {
 		BaseURL:      baseURL,
 	})
 	if err != nil {
-		logWarnDetail(
-			fmt.Sprintf("no default provider configured: %v", err),
-			fmt.Sprintf("no default provider configured (%v) — sessions must register_provider + set_provider before their first user_prompt", err),
+		logInfoDetail(
+			"no environment default provider; use set_default_provider or set_provider per session",
+			fmt.Sprintf("no provider could be picked from the environment (%v) — register one with register_provider, then set_default_provider (or set_provider per session) before the first user_prompt", err),
 		)
 	}
 
@@ -152,15 +152,6 @@ func main() {
 	peers := NewPeerRegistry()
 	browser := newBrowserBroker(peers)
 	projects.browser = browser
-	var defaultProjectRoot string
-	if projectDir != "" {
-		defaultProject, err := projects.Get(projectDir)
-		if err != nil {
-			logFatal("failed to open default project %q: %v", projectDir, err)
-		}
-		defaultProjectRoot = defaultProject.Root
-	}
-
 	// Providers/credentials belong to whoever is running the server, not to
 	// any one project.
 	providerStore, err := provider.NewProviderStore(stateDir, masterKey)
@@ -184,6 +175,14 @@ func main() {
 	agent.SetLivePricingSource(func(model string, u protocol.UsageData) (float64, bool) {
 		return pricingCache.CostUSD(model, u.InputTokens, u.CachedInputTokens, u.CacheWriteInputTokens, u.OutputTokens)
 	})
+	// The same table's max_input_tokens is the last stop for a model's
+	// context window, after OpenRouter's own context_length.
+	agent.SetContextWindowLookup(func(model string) int {
+		if n := provider.OpenRouterContextLength(model); n > 0 {
+			return n
+		}
+		return pricingCache.ContextWindow(model)
+	})
 
 	// Settings (server identity, remote-access password) are server-level
 	// state like providerStore, persisted under -state-dir so they survive
@@ -194,22 +193,59 @@ func main() {
 	}
 	reloadRoles(projects.roles, providerStore, settings)
 
-	if authToken != "" {
-		// An explicit -token always wins over whatever was persisted from a
-		// previous set_remote_password call — a launch-time flag is an
-		// explicit operator override.
-		_ = settings.SetToken(authToken)
+	// Deprecated launch flags hand their value over once, then the stored
+	// setting rules (runtime_dispatch.go).
+	tcpAddr, localSocketPath := "", ""
+	if listenAddr != "" && !stdioMode {
+		network, address := parseListenAddr(listenAddr, stateDir)
+		if network == "unix" {
+			localSocketPath = address
+		} else {
+			tcpAddr = address
+		}
 	}
-	notify := NewNotificationFeed(peers)
+	seedFromFlags(launchFlags{
+		provider: providerName, model: modelName, apiKey: apiKey, baseURL: baseURL,
+		maxSessionCostUSD: maxSessionCostUSD, tcpAddr: tcpAddr,
+		tlsCert: tlsCert, tlsKey: tlsKey, webRoot: webRoot,
+	}, setFlags, settings, providerStore)
+
+	// The runtime settings' consumers: attached before any project opens, so
+	// each one is born with the current values.
+	settings.OnRuntimeChange(projects.ApplyRuntime)
+	settings.OnRuntimeChange(applyProcessLimits(pricingCache))
+	notify := OpenNotificationFeed(peers, filepath.Join(stateDir, "notifications.jsonl"), settings.GetNotifyPrefs)
 	projects.SetNotifications(notify)
+	// The audit trail (internal/audit): a failure to open it is loud but not
+	// fatal, and leaves a nil log, which records nothing.
+	auditLog, err := audit.Open(filepath.Join(stateDir, "audit"))
+	if err != nil {
+		logWarn("audit log unavailable, security events will not be recorded: %v", err)
+	} else {
+		auditLog.Warn = logWarn
+	}
+	projects.SetAudit(auditLog)
 	hub := newStatusHub(peers, stateDir)
 	projects.SetStatusHub(hub)
+	projects.SetDefaultSource(defaultProviderSource(settings, providerStore, hub))
 	uploads, err := NewUploadStore(stateDir)
 	if err != nil {
 		logFatal("failed to initialize upload store: %v", err)
 	}
 
-	rc := &remoteControl{tlsCert: tlsCert, tlsKey: tlsKey, stateDir: stateDir, settings: settings}
+	// Pre-opened (failing fast on a bad path) only after everything a
+	// project's sessions read at creation exists.
+	var defaultProjectRoot string
+	if projectDir != "" {
+		defaultProject, err := projects.Get(projectDir)
+		if err != nil {
+			logFatal("failed to open default project %q: %v", projectDir, err)
+		}
+		defaultProjectRoot = defaultProject.Root
+	}
+
+	rc := &remoteControl{stateDir: stateDir, settings: settings}
+	rc.apply(settings.Remote())
 	deps := connDeps{
 		projects:           projects,
 		defaultProjectRoot: defaultProjectRoot,
@@ -219,13 +255,13 @@ func main() {
 		manifestCache:      manifestCache,
 		peers:              peers,
 		notify:             notify,
+		audit:              auditLog,
 		presence:           newPresenceNotes(notify),
 		uploads:            uploads,
 		settings:           settings,
 		remote:             rc,
 		status:             hub,
 		browser:            browser,
-		webRoot:            webRoot,
 		turnWG:             &sync.WaitGroup{},
 	}
 	rc.deps = deps
@@ -244,25 +280,19 @@ func main() {
 		// this process has already gone): give any turn still running the chance
 		// to finish its own final save rather than dropping it with the process.
 		drainTurns(deps.turnWG)
+		deps.projects.CloseMCP()
 		return
 	}
 
 	// Daemon mode (the default): always open a local unix socket, so any
 	// local client can connect immediately with no extra flags — see
-	// sockpath and SPEC.md §2a. -listen never replaces this; a TCP address
-	// there ADDS an optional, remote-reachable second listener, and a
-	// 'unix:<path>' there only overrides where the always-on local socket
-	// lives.
+	// sockpath and SPEC.md §2a. Remote access never replaces this: the TCP
+	// listener (set_remote_access) ADDS an optional, remote-reachable second
+	// one, and a -listen 'unix:<path>' only overrides where the always-on
+	// local socket lives.
 	defaultSocketPath := sockpath.DefaultSocketPath(sockpath.DefaultRuntimeDir(stateDir))
-	localSocketPath := defaultSocketPath
-	var tcpAddr string
-	if listenAddr != "" {
-		network, address := parseListenAddr(listenAddr, stateDir)
-		if network == "unix" {
-			localSocketPath = address
-		} else {
-			tcpAddr = address
-		}
+	if localSocketPath == "" {
+		localSocketPath = defaultSocketPath
 	}
 
 	localLn, err := setupLocalListener(localSocketPath, localSocketPath == defaultSocketPath)
@@ -273,15 +303,18 @@ func main() {
 	// its owner-only ACL is the same boundary the socket file's 0600 is.
 	go acceptLoop(ctx, localLn, "unix", deps, nil, nil)
 
-	if tcpAddr != "" {
-		rc.addr = tcpAddr
+	// Remote access comes back on its own if it was left on (set_remote_access
+	// persists it). A listener that cannot bind is reported, not fatal: the
+	// local socket is what a client needs to turn it off or move it.
+	if settings.Remote().Enabled {
 		if err := rc.Start(ctx); err != nil {
-			logFatal("failed to listen on %s: %v", tcpAddr, err)
+			logWarn("remote access is enabled but the listener failed to start: %v", err)
 		}
 	}
 
 	<-ctx.Done()
 	drainTurns(deps.turnWG)
+	deps.projects.CloseMCP() // the MCP servers' processes don't outlive the daemon
 }
 
 // turnDrainTimeout bounds how long a shutdown waits for in-flight turns.
@@ -326,7 +359,6 @@ const minRemotePasswordLen = 16
 // that carries a secret: a process's argv is readable by every local user
 // (/proc/<pid>/cmdline, ps), its environment only by the same user.
 var secretFlags = map[string]string{
-	"token":      "YOAKELAND_TOKEN",
 	"master-key": "YOAKELAND_MASTER_KEY",
 	"api-key":    "ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY",
 }
@@ -550,6 +582,17 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(preAuthTimeout))
 	}
+	// A stranger presenting a wrong credential is what the audit log wants;
+	// one that just connects and goes away is not.
+	badCredential := false
+	if lookupToken != nil {
+		inner := lookupToken
+		lookupToken = func(token string) (string, TokenRecord, bool) {
+			name, rec, found := inner(token)
+			badCredential = badCredential || !found
+			return name, rec, found
+		}
+	}
 	who, pending, ok := handshake(ipc, network, lookupToken)
 	if network == "tcp" {
 		if !ok {
@@ -559,6 +602,9 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 		_ = conn.SetReadDeadline(time.Time{})
 	}
 	if !ok {
+		if badCredential {
+			deps.recordAuthFail(remoteIP(conn, network), network)
+		}
 		return
 	}
 	if who.DeviceType == "" {
@@ -567,6 +613,8 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 
 	peer := deps.peers.Add(ipc, conn, network, who)
 	defer deps.peers.Remove(peer.ID)
+	deps.recordPeer(audit.PeerJoin, peer)
+	defer deps.recordPeer(audit.PeerLeave, peer)
 	defer deps.uploads.DropPeer(peer.ID)
 	defer deps.browser.DropPeer(peer.ID)
 	// The poller idles with nobody connected; catch up for this client.
@@ -589,6 +637,8 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
 	_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
 	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
+	_ = ipc.SendEvent(protocol.EventNotifyPrefs, "", "", "", deps.settings.GetNotifyPrefs())
+	sendRuntimeState(ipc, deps, network)
 	deps.status.SendPendingAsks(ipc)
 	for _, st := range deps.projects.GitStatuses() {
 		_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
@@ -771,6 +821,7 @@ type connDeps struct {
 	manifestCache      *provider.ManifestCache
 	peers              *PeerRegistry
 	notify             *NotificationFeed
+	audit              *audit.Log
 	presence           *presenceNotes
 	uploads            *UploadStore
 	settings           *ServerSettings
@@ -1004,7 +1055,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 				return
 			}
-			pc.Registry.Get(ipc, sessID).HandlePermissionResponse(env.ToolCallID, data.Allowed, data.Remember, data.Feedback)
+			pc.Registry.Get(ipc, sessID).HandlePermissionResponse(env.ToolCallID, data.Allowed, data.Remember, data.Feedback, agent.PermissionChoice{RuleID: data.RuleID, Scope: data.Scope, By: deps.actorName(ipc, peerID)})
 		}
 
 	case protocol.EventRestoreSnapshot:
@@ -1016,10 +1067,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				return
 			}
 			if rErr := pc.SnapStore.RestoreSnapshot(data.SnapshotID, pc.Root); rErr != nil {
+				deps.record(ipc, peerID, audit.Event{Kind: audit.SnapshotRestore, Project: pc.Root, Session: env.SessionID, Target: data.SnapshotID, Outcome: "error", Detail: map[string]any{"error": rErr.Error()}})
 				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 					Message: fmt.Sprintf("failed to restore snapshot %s: %v", data.SnapshotID, rErr),
 				})
 			} else {
+				deps.record(ipc, peerID, audit.Event{Kind: audit.SnapshotRestore, Project: pc.Root, Session: env.SessionID, Target: data.SnapshotID, Outcome: "ok"})
 				restored := protocol.SnapshotEventData{SnapshotID: data.SnapshotID}
 				_ = ipc.SendEvent(protocol.EventSnapshotRestored, env.SessionID, env.TurnID, "", restored)
 				// This reverted real files on disk — every other peer with
@@ -1106,6 +1159,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		// Never the key: what was registered, and where it points.
+		deps.record(ipc, peerID, audit.Event{Kind: audit.ProviderAdd, Target: cfg.Name, Outcome: "ok", Detail: map[string]any{
+			"providerKind": string(cfg.Kind), "httpProvider": cfg.HTTPProvider, "baseUrl": cfg.BaseURL, "authMethod": cfg.AuthMethod,
+		}})
 		registered := protocol.ProviderRegisteredData{Name: cfg.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", registered)
 		// Server-wide state (§6b/§6c) — every peer's provider list needs it,
@@ -1147,25 +1204,37 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		models, err := provider.ListModels(cfg, deps.manifestCache)
-		if err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to list models for %q: %v", data.ProviderName, err),
+		// Discovery spawns the CLI or dials the endpoint, tens of seconds when
+		// that host is down; inline it would stall every other request on this
+		// connection (list_directory, get_session_history, ...) behind it.
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func() {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			defer recoverTurnPanic(ipc, env.SessionID, env.TurnID)
+			models, err := provider.ListModels(cfg, deps.manifestCache)
+			if err != nil {
+				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+					Message: fmt.Sprintf("failed to list models for %q: %v", data.ProviderName, err),
+				})
+				return
+			}
+			favorites := make(map[string]bool, len(cfg.FavoriteModels))
+			for _, id := range cfg.FavoriteModels {
+				favorites[id] = true
+			}
+			summaries := make([]protocol.ModelSummary, 0, len(models))
+			for _, m := range models {
+				summaries = append(summaries, protocol.ModelSummary{ID: m.ID, DisplayName: m.DisplayName, IsFavorite: favorites[m.ID], Capabilities: m.Capabilities, IsLegacy: m.IsLegacy})
+			}
+			_ = ipc.SendEvent(protocol.EventModelList, env.SessionID, env.TurnID, "", protocol.ModelListData{
+				ProviderName: data.ProviderName,
+				Models:       summaries,
 			})
-			return
-		}
-		favorites := make(map[string]bool, len(cfg.FavoriteModels))
-		for _, id := range cfg.FavoriteModels {
-			favorites[id] = true
-		}
-		summaries := make([]protocol.ModelSummary, 0, len(models))
-		for _, m := range models {
-			summaries = append(summaries, protocol.ModelSummary{ID: m.ID, DisplayName: m.DisplayName, IsFavorite: favorites[m.ID], Capabilities: m.Capabilities, IsLegacy: m.IsLegacy})
-		}
-		_ = ipc.SendEvent(protocol.EventModelList, env.SessionID, env.TurnID, "", protocol.ModelListData{
-			ProviderName: data.ProviderName,
-			Models:       summaries,
-		})
+		}()
 
 	case protocol.EventSetFavoriteModels:
 		var data protocol.SetFavoriteModelsData
@@ -1324,7 +1393,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
-		pc.Registry.Get(ipc, sessID).SetMode(mode)
+		ag := pc.Registry.Get(ipc, sessID)
+		prevMode := ag.Mode()
+		ag.SetMode(mode)
+		if prevMode != mode { // clients re-assert their cached mode on reconnect: only a change is news
+			deps.record(ipc, peerID, audit.Event{Kind: audit.ModeChange, Project: pc.Root, Session: sessID, Target: string(mode), Outcome: "ok", Detail: map[string]any{"from": string(prevMode), "to": string(mode)}})
+		}
 		modeSet := protocol.ModeSetData{
 			SessionID: sessID,
 			Mode:      string(mode),
@@ -1362,7 +1436,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			handleEnvelope(ctx, ipc, deps, network, peerID, &protocol.Envelope{Type: t, SessionID: sessID, TurnID: env.TurnID, Data: raw})
 		}
 		as(protocol.EventSetMode, protocol.SetModeData{SessionID: sessID, Mode: data.Mode, ProjectPath: data.ProjectPath})
-		if pc.Registry.Get(ipc, sessID).ResolvePlanApproval() {
+		if pc.Registry.Get(ipc, sessID).ResolvePlanApproval(deps.actorName(ipc, peerID)) {
 			return // the agent's own turn was waiting on it and carries on
 		}
 		off := false
@@ -1390,6 +1464,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.SettingsChange, Project: pc.Root, Target: "webToolsEnabled", Outcome: "ok", Detail: map[string]any{"keys": []string{"webToolsEnabled"}, "enabled": data.Enabled}})
 		pc.Registry.SetWebToolsEnabled(data.Enabled)
 		pc.Terminals.SetAgentNetwork(data.Enabled)
 		webToolsSet := protocol.WebToolsEnabledSetData{
@@ -1414,6 +1489,13 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				return
 			}
 			pc.Registry.Get(ipc, sessID).HandleAskUserAnswer(env.ToolCallID, data.Answer)
+			if strings.HasPrefix(env.ToolCallID, "limit-") { // a soft round/cost limit's Continue / Stop
+				outcome := "stop"
+				if strings.EqualFold(strings.TrimSpace(data.Answer), "continue") {
+					outcome = "continue"
+				}
+				deps.record(ipc, peerID, audit.Event{Kind: audit.LimitPause, Project: pc.Root, Session: sessID, Outcome: outcome})
+			}
 		}
 
 	case protocol.EventOAuthStart:
@@ -1471,6 +1553,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.ProviderAdd, Target: cfg.Name, Outcome: "ok", Detail: map[string]any{
+			"httpProvider": cfg.HTTPProvider, "authMethod": cfg.AuthMethod,
+		}})
 		oauthRegistered := protocol.ProviderRegisteredData{Name: cfg.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", oauthRegistered)
 		deps.peers.BroadcastEvent(peerID, protocol.EventProviderRegistered, "", oauthRegistered)
@@ -1490,6 +1575,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.ProviderRemove, Target: data.Name, Outcome: "ok"})
 		deps.status.ForgetRateLimits(data.Name)
 		reloadRoles(deps.projects.roles, deps.providerStore, deps.settings)
 		removed := protocol.ProviderRemovedData{Name: data.Name}
@@ -1500,6 +1586,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		var data protocol.ListSessionsData
 		_ = json.Unmarshal(env.Data, &data)
 
+		if data.ProjectPath == protocol.ChatProject {
+			_ = ipc.SendEvent(protocol.EventSessionList, env.SessionID, env.TurnID, "", protocol.SessionListData{
+				ProjectPath: protocol.ChatProject,
+				Sessions:    deps.projects.ListChats(),
+				SandboxTier: deps.projects.chatTier,
+			})
+			return
+		}
 		projectPath := data.ProjectPath
 		if projectPath == "" {
 			projectPath = deps.defaultProjectRoot
@@ -1535,7 +1629,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if err != nil {
 				continue
 			}
-			summaries = append(summaries, sessionSummaryFrom(state))
+			summaries = append(summaries, sessionSummaryFrom(pc.Root, state))
 		}
 		_ = ipc.SendEvent(protocol.EventSessionList, env.SessionID, env.TurnID, "", protocol.SessionListData{
 			ProjectPath: pc.Root,
@@ -1574,11 +1668,46 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			// the live mode is still the truth a client should adopt.
 			mode = string(ag.Mode())
 		} // a session with no persisted history yet isn't an error — it just has none
+		ctxData, spend := pc.Registry.SessionReport(data.SessionID, history)
 		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
 			SessionID: data.SessionID,
 			Messages:  toHistoryMessages(history, branches),
 			Mode:      mode,
+			Context:   ctxData,
+			Spend:     spend,
 		})
+
+	case protocol.EventGetContextBreakdown:
+		var data protocol.GetContextBreakdownData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed get_context_breakdown payload (sessionId is required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		var history []agent.Message
+		if state, err := pc.SessStore.Load(data.SessionID); err == nil {
+			history = state.History
+		}
+		// A native agent may take a while to count its context, so keep it off the read loop.
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func() {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 19*time.Second)
+			defer cancel()
+			out := pc.Registry.ContextBreakdown(ctx, data.SessionID, history)
+			out.RequestID = data.RequestID
+			_ = ipc.SendEvent(protocol.EventContextBreakdown, data.SessionID, env.TurnID, "", out)
+		}()
 
 	case protocol.EventEditMessage:
 		var data protocol.EditMessageData
@@ -1675,9 +1804,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			history = state.History
 			branches = state.Branches
 		}
+		ctxData, spend := pc.Registry.SessionReport(data.SessionID, history)
 		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
 			SessionID: data.SessionID,
 			Messages:  toHistoryMessages(history, branches),
+			Context:   ctxData,
+			Spend:     spend,
 		})
 
 	case protocol.EventSetSessionTitle:
@@ -1701,8 +1833,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: sessionWriteError(data.SessionID, "save", err)})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(state))
-		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(state))
+		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(pc.Root, state))
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(pc.Root, state))
 
 	case protocol.EventSetSessionArchived:
 		var data protocol.SetSessionArchivedData
@@ -1731,8 +1863,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: sessionWriteError(data.SessionID, "save", err)})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(state))
-		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(state))
+		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(pc.Root, state))
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(pc.Root, state))
 
 	case protocol.EventSetSessionLayout:
 		var data protocol.SetSessionLayoutData
@@ -1755,8 +1887,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: sessionWriteError(data.SessionID, "save", err)})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(state))
-		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(state))
+		_ = ipc.SendEvent(protocol.EventSessionUpdated, data.SessionID, env.TurnID, "", sessionSummaryFrom(pc.Root, state))
+		deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, data.SessionID, sessionSummaryFrom(pc.Root, state))
 
 	case protocol.EventDeleteSession:
 		var data protocol.DeleteSessionData
@@ -1780,7 +1912,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.SessionDelete, Project: pc.Root, Session: data.SessionID, Outcome: "ok"})
 		deps.projects.Unbind(data.SessionID)
+		deps.projects.DropChat(pc.Root)
 		_ = ipc.SendEvent(protocol.EventSessionDeleted, data.SessionID, env.TurnID, "", protocol.SessionDeletedData{
 			SessionID: data.SessionID,
 		})
@@ -1804,6 +1938,23 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Path:    abs,
 			Entries: entries,
 		})
+
+	case protocol.EventListPermissionRules, protocol.EventAddPermissionRule, protocol.EventDeletePermissionRule:
+		handlePermissionRuleRequest(ipc, deps, peerID, env)
+
+	case protocol.EventListMCPServers, protocol.EventSaveMCPServer, protocol.EventRemoveMCPServer, protocol.EventSetMCPServerEnabled,
+		protocol.EventSetMCPToolEnabled, protocol.EventReconnectMCPServer, protocol.EventMCPOAuthStart, protocol.EventMCPOAuthComplete, protocol.EventMCPSignOut,
+		protocol.EventImportMCPServers:
+		handleMCPRequest(ctx, ipc, deps, peerID, env)
+
+	case protocol.EventScanMCPImports:
+		handleMCPScan(ipc, deps, env)
+
+	case protocol.EventListSkills, protocol.EventSetSkillEnabled, protocol.EventGetSkill:
+		handleSkillsRequest(ipc, deps, peerID, env)
+
+	case protocol.EventListAudit:
+		handleListAudit(ipc, deps, env)
 
 	case protocol.EventListNotifications:
 		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", protocol.NotificationListData{Notifications: deps.notify.List()})
@@ -1841,6 +1992,39 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = json.Unmarshal(env.Data, &data)
 		deps.notify.Dismiss(data.ID)
 
+	case protocol.EventMarkNotificationsRead:
+		var data protocol.MarkNotificationsReadData
+		_ = json.Unmarshal(env.Data, &data)
+		deps.notify.MarkRead(data.IDs...)
+
+	case protocol.EventSetPresence:
+		var data protocol.SetPresenceData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return
+		}
+		if deps.peers.SetPresence(peerID, data.SessionIDs, data.Focused, data.Visible) && data.Focused && data.Visible {
+			for _, id := range data.SessionIDs {
+				deps.notify.MarkSessionRead(id) // looking at a chat is reading it
+			}
+		}
+
+	case protocol.EventSetNotifyPrefs:
+		var data protocol.NotifyPrefsData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed set_notify_prefs payload",
+			})
+			return
+		}
+		stored, err := deps.settings.SetNotifyPrefs(data)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("failed to save notification settings: %v", err),
+			})
+			return
+		}
+		deps.peers.BroadcastEvent("", protocol.EventNotifyPrefs, "", stored)
+
 	case protocol.EventUploadBegin:
 		var data protocol.UploadBeginData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
@@ -1874,6 +2058,42 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			// once this arrives, so a big upload never queues ahead of chat.
 			_ = ipc.SendEvent(protocol.EventUploadProgress, "", "", "", protocol.UploadProgressData{UploadID: data.UploadID, Received: received})
 		}
+
+	case protocol.EventImportChatFiles:
+		var data protocol.ImportChatFilesData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" || data.Target == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed import_chat_files payload (sessionId and target are required)",
+			})
+			return
+		}
+		reply := func(out protocol.ChatFilesImportedData) {
+			out.RequestID, out.SessionID = data.RequestID, data.SessionID
+			_ = ipc.SendEvent(protocol.EventChatFilesImported, data.SessionID, env.TurnID, "", out)
+		}
+		chat, err := deps.projects.Resolve(data.SessionID, protocol.ChatProject, "")
+		if err == nil {
+			_, err = chat.SessStore.Load(data.SessionID)
+		}
+		if err != nil {
+			reply(protocol.ChatFilesImportedData{Error: "no such chat"})
+			return
+		}
+		target, err := projectKey(data.Target)
+		if err != nil || deps.projects.isChat(target) || !deps.projects.Known(target) {
+			reply(protocol.ChatFilesImportedData{Error: "target must be a project this server knows"})
+			return
+		}
+		go func() {
+			dir, files, size, err := importChatFiles(chat.Root, target, data.SessionID)
+			out := protocol.ChatFilesImportedData{Target: target, Dir: dir, Files: files, Bytes: size}
+			outcome := "ok"
+			if err != nil {
+				out, outcome = protocol.ChatFilesImportedData{Target: target, Error: err.Error()}, "error"
+			}
+			deps.record(ipc, peerID, audit.Event{Kind: audit.FsOp, Project: target, Session: data.SessionID, Tool: "import_chat_files", Target: out.Dir, Outcome: outcome})
+			reply(out)
+		}()
 
 	case protocol.EventListSnapshots:
 		var data protocol.ListSnapshotsData
@@ -1947,6 +2167,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.TerminalOpen, Project: pc.Root, Session: sessID, Target: data.Cwd, Outcome: "ok", Detail: map[string]any{"terminalId": data.TerminalID}})
 		_ = ipc.SendEvent(protocol.EventTerminalSnapshot, sessID, env.TurnID, "", snap)
 
 	case protocol.EventTerminalAttach:
@@ -2133,6 +2354,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.ProjectRemove, Project: key, Outcome: "ok"})
 		_ = ipc.SendEvent(protocol.EventProjectRemoved, env.SessionID, env.TurnID, "", protocol.ProjectRemovedData{
 			Path: key,
 		})
@@ -2221,10 +2443,13 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// token) — there's no per-user identity yet to scope this more
 		// tightly against, so restricting it further would be security
 		// theater rather than a real boundary.
+		targetName, targetIP, _, _ := deps.peers.Identify(data.PeerID)
 		if !deps.peers.Disconnect(data.PeerID) {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("unknown peer %q", data.PeerID),
 			})
+		} else {
+			deps.record(ipc, peerID, audit.Event{Kind: audit.PeerKick, Target: targetName, Outcome: "ok", Detail: map[string]any{"targetIp": targetIP}})
 		}
 
 	case protocol.EventSetServerIdentity:
@@ -2277,21 +2502,22 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		var rErr error
-		if data.Enabled {
-			rErr = deps.remote.Start(ctx)
-		} else {
-			deps.remote.Stop()
-		}
+		cfg, rErr := applyRemoteAccess(ctx, deps, data)
 		if rErr != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("failed to enable remote access: %v", rErr),
 			})
 			return
 		}
-		_ = ipc.SendEvent(protocol.EventRemoteAccessSet, env.SessionID, env.TurnID, "", protocol.RemoteAccessSetData{
-			Enabled: data.Enabled,
-		})
+		deps.record(ipc, peerID, audit.Event{Kind: audit.RemoteAccess, Outcome: "ok", Detail: map[string]any{"enabled": cfg.Enabled, "addr": cfg.Addr}})
+		_ = ipc.SendEvent(protocol.EventRemoteAccessSet, env.SessionID, env.TurnID, "", remoteAccessData(cfg, true))
+		broadcastRemoteAccess(deps, peerID)
+
+	case protocol.EventSetRuntimeSettings:
+		handleSetRuntimeSettings(ipc, env, peerID, deps)
+
+	case protocol.EventSetDefaultProvider:
+		handleSetDefaultProvider(ipc, env, peerID, deps)
 
 	case protocol.EventSetRemotePassword:
 		if network != "unix" {
@@ -2320,6 +2546,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.RemotePassword, Outcome: "ok"}) // the fact, never the password
 		_ = ipc.SendEvent(protocol.EventRemotePasswordSet, env.SessionID, env.TurnID, "", protocol.RemotePasswordSetData{})
 
 	case protocol.EventRegisterToken:
@@ -2349,6 +2576,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenAdd, Target: data.Name, Outcome: "ok"}) // the name, never the token
 		// Best-effort: a client can still pair by pasting the CA separately
 		// (or doesn't need one at all, on an operator-supplied cert) if this
 		// fails, so a CA read error shouldn't fail token registration itself.
@@ -2397,7 +2625,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// Revocation should actually end the session, not just block the next
 		// handshake — otherwise someone already connected on this credential
 		// stays connected until they happen to disconnect on their own.
-		deps.peers.DisconnectByToken(data.Name)
+		dropped := deps.peers.DisconnectByToken(data.Name)
+		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenRemove, Target: data.Name, Outcome: "ok", Detail: map[string]any{"disconnected": dropped}})
 		_ = ipc.SendEvent(protocol.EventTokenRemoved, env.SessionID, env.TurnID, "", protocol.TokenRemovedData{
 			Name: data.Name,
 		})

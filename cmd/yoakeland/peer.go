@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"time"
 	"yoakeland/internal/protocol"
@@ -36,6 +37,10 @@ type Peer struct {
 	Network     string // "unix" or "tcp"
 	// BrowserHost: offered its browser panel to the agent (browser_host).
 	BrowserHost bool
+
+	// Presence is the last set_presence heartbeat (see PeerRegistry.Viewing).
+	// Not in PeerInfo: it changes too often to broadcast.
+	presence presenceState
 
 	conn io.Closer
 	ipc  *protocol.IPCStream
@@ -215,6 +220,56 @@ func (r *PeerRegistry) SetActivity(id, sessionID, projectPath string) bool {
 		r.Broadcast()
 	}
 	return ok
+}
+
+// presenceTTL is how long a set_presence heartbeat counts. Clients repeat it
+// every minute, so a longer silence means the device is asleep or gone.
+const presenceTTL = 5 * time.Minute
+
+type presenceState struct {
+	sessions         []string
+	focused, visible bool
+	at               time.Time
+}
+
+// SetPresence stores a device's heartbeat. Reports whether id was a live peer.
+func (r *PeerRegistry) SetPresence(id string, sessions []string, focused, visible bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.peers[id]
+	if ok {
+		p.presence = presenceState{slices.Clone(sessions), focused, visible, time.Now()}
+	}
+	return ok
+}
+
+// Viewing reports whether some device shows sessionID in a focused, visible
+// window right now.
+func (r *PeerRegistry) Viewing(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	return r.anyPresent(func(s presenceState) bool { return slices.Contains(s.sessions, sessionID) })
+}
+
+// Attended reports whether any device is in use right now.
+func (r *PeerRegistry) Attended() bool {
+	return r.anyPresent(func(presenceState) bool { return true })
+}
+
+func (r *PeerRegistry) anyPresent(match func(presenceState) bool) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.peers {
+		s := p.presence
+		if s.focused && s.visible && time.Since(s.at) < presenceTTL && match(s) {
+			return true
+		}
+	}
+	return false
 }
 
 // All returns every live peer, for callers (like a server_identity push)

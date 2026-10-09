@@ -3,6 +3,7 @@ package provider
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"yoakeland/internal/agent"
 )
@@ -26,6 +27,8 @@ type pooled struct {
 	sig      string
 	busy     int
 	lastUsed time.Time
+	// evicted: replaced while a turn was still on it; the last release closes it.
+	evicted bool
 }
 
 type sessionPool struct {
@@ -36,7 +39,56 @@ type sessionPool struct {
 
 var nativePool = &sessionPool{live: map[string]*pooled{}}
 
-const idleTimeout = 30 * time.Minute
+// Pool limits, set from the runtime settings poolIdleMinutes / poolMaxLive.
+var (
+	poolIdle    atomic.Int64 // nanoseconds; 0 = default
+	poolMaxLive atomic.Int64 // 0 = unlimited
+)
+
+const defaultIdleTimeout = 30 * time.Minute
+
+// SetPoolLimits sets how long an unused CLI process lives and how many may
+// live at once (0 = no cap). The cap is soft: a turn is never refused, the
+// least recently used idle process is evicted to make room, and if every one
+// is mid-turn the pool just goes over.
+func SetPoolLimits(idle time.Duration, maxLive int) {
+	poolIdle.Store(int64(idle))
+	poolMaxLive.Store(int64(maxLive))
+}
+
+func idleTimeout() time.Duration {
+	if d := time.Duration(poolIdle.Load()); d > 0 {
+		return d
+	}
+	return defaultIdleTimeout
+}
+
+// PoolStats is what the status payload reports about live CLI processes.
+type PoolStats struct {
+	Live, Busy, Max int
+	IdleTimeoutSec  int
+	ByKind          map[string]int
+	OldestIdleSec   int
+}
+
+func NativePoolStats() PoolStats {
+	pl := nativePool
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	st := PoolStats{Max: int(poolMaxLive.Load()), IdleTimeoutSec: int(idleTimeout() / time.Second), ByKind: map[string]int{}}
+	for k, e := range pl.live {
+		st.Live++
+		if kind := k[strings.LastIndex(k, "|")+1:]; kind != "" {
+			st.ByKind[kind]++
+		}
+		if e.busy > 0 {
+			st.Busy++
+		} else if idle := int(time.Since(e.lastUsed) / time.Second); idle > st.OldestIdleSec {
+			st.OldestIdleSec = idle
+		}
+	}
+	return st
+}
 
 func poolKey(nt *agent.NativeTurn, kind CLIKind) string {
 	if nt.SessionKey == "" {
@@ -70,8 +122,12 @@ func acquireSession(nt *agent.NativeTurn, kind CLIKind, sig string, usable func(
 		return old.sess, true, func() { pl.release(key, old) }, nil
 	}
 	delete(pl.live, key)
+	closeOld := old != nil && old.busy == 0
+	if old != nil && !closeOld {
+		old.evicted = true // never kill a turn that is mid-flight
+	}
 	pl.mu.Unlock()
-	if old != nil {
+	if closeOld {
 		old.sess.close()
 	}
 
@@ -79,20 +135,58 @@ func acquireSession(nt *agent.NativeTurn, kind CLIKind, sig string, usable func(
 	if err != nil {
 		return nil, false, nil, err
 	}
-	e := &pooled{sess: s, sig: sig, busy: 1, lastUsed: time.Now()}
 	pl.mu.Lock()
+	// launch ran outside the lock: another acquirer may have won the race.
+	if cur := pl.live[key]; cur != nil && cur.sig == sig && !cur.sess.dead() {
+		cur.busy++
+		pl.mu.Unlock()
+		s.close()
+		return cur.sess, true, func() { pl.release(key, cur) }, nil
+	}
+	var evicted []*pooled
+	if max := int(poolMaxLive.Load()); max > 0 {
+		evicted = pl.evictLRULocked(len(pl.live) + 1 - max)
+	}
+	e := &pooled{sess: s, sig: sig, busy: 1, lastUsed: time.Now()}
 	pl.live[key] = e
 	pl.mu.Unlock()
+	closeAll(evicted)
 	return s, false, func() { pl.release(key, e) }, nil
+}
+
+// evictLRULocked removes up to n idle sessions, least recently used first,
+// and returns them to be closed after the lock is dropped. Busy sessions are
+// never touched.
+func (pl *sessionPool) evictLRULocked(n int) []*pooled {
+	var out []*pooled
+	for ; n > 0; n-- {
+		var oldestKey string
+		var oldest *pooled
+		for k, e := range pl.live {
+			if e.busy == 0 && (oldest == nil || e.lastUsed.Before(oldest.lastUsed)) {
+				oldestKey, oldest = k, e
+			}
+		}
+		if oldest == nil {
+			break
+		}
+		delete(pl.live, oldestKey)
+		out = append(out, oldest)
+	}
+	return out
 }
 
 func (pl *sessionPool) release(key string, e *pooled) {
 	pl.mu.Lock()
-	defer pl.mu.Unlock()
 	e.busy--
 	e.lastUsed = time.Now()
 	if e.sess.dead() && pl.live[key] == e {
 		delete(pl.live, key)
+	}
+	closeNow := e.evicted && e.busy == 0
+	pl.mu.Unlock()
+	if closeNow {
+		e.sess.close()
 	}
 }
 
@@ -126,15 +220,27 @@ func (pl *sessionPool) closeWhere(match func(key string) bool) {
 		}
 	}
 	pl.mu.Unlock()
+	closeAll(doomed)
+}
+
+// closeAll closes in parallel: a wedged process takes up to 3s to give up, and
+// N of them shouldn't make shutdown or a chat deletion take 3N.
+func closeAll(doomed []*pooled) {
+	var wg sync.WaitGroup
 	for _, e := range doomed {
-		e.sess.close()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.sess.close()
+		}()
 	}
+	wg.Wait()
 }
 
 // reap closes sessions nobody has used for idleTimeout, never one mid-turn.
 func (pl *sessionPool) reap() {
-	for range time.Tick(5 * time.Minute) {
-		pl.closeIdle(idleTimeout)
+	for range time.Tick(time.Minute) {
+		pl.closeIdle(idleTimeout())
 	}
 }
 
@@ -142,13 +248,12 @@ func (pl *sessionPool) closeIdle(after time.Duration) {
 	pl.mu.Lock()
 	var doomed []*pooled
 	for k, e := range pl.live {
-		if e.busy == 0 && time.Since(e.lastUsed) > after {
+		// A crashed idle process is pruned now instead of waiting out the timeout.
+		if e.busy == 0 && (e.sess.dead() || time.Since(e.lastUsed) > after) {
 			doomed = append(doomed, e)
 			delete(pl.live, k)
 		}
 	}
 	pl.mu.Unlock()
-	for _, e := range doomed {
-		e.sess.close()
-	}
+	closeAll(doomed)
 }

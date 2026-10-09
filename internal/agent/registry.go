@@ -23,12 +23,17 @@ type Registry struct {
 	ctxMgr        *ContextManager
 	usageStore    *UsageStore
 
-	maxSessionSpendUSD float64
-	webToolsEnabled    bool
-	eventTap           func(protocol.EventType, string, string, any)
-	hooks              Hooks
-	roles              *Roles
-	projectRoot        string
+	limits          *Limits
+	webToolsEnabled bool
+	shellDisabled   bool
+	defaultSource   func(projectRoot string) (ModelProvider, string) // preferred over provider (SetDefaultSource)
+	eventTap        func(protocol.EventType, string, string, any)
+	hooks           Hooks
+	roles           *Roles
+	projectRoot     string
+	chat            bool
+	source          tool.Source
+	skillSrc        SkillSource
 }
 
 // SetHooks installs hooks on every session's Agent, current and future.
@@ -117,16 +122,92 @@ func NewRegistry(
 		ctxMgr:          ctxMgr,
 		usageStore:      usageStore,
 		webToolsEnabled: webToolsEnabled,
+		limits:          NewLimits(0, 0),
 	}
 }
 
-// SetMaxSessionSpendUSD applies a per-session spend cap (see
-// Agent.SetMaxSessionSpendUSD) to every session created from here on.
-// Sessions already created keep whatever cap they had.
+// SetMaxSessionSpendUSD sets the per-session spend cap in this registry's
+// Limits, live for sessions already created as well as future ones. A server
+// installs one shared Limits over all its registries with SetLimits instead.
 func (r *Registry) SetMaxSessionSpendUSD(limit float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.maxSessionSpendUSD = limit
+	rounds, _ := r.limits.Get()
+	r.limits.Set(rounds, limit)
+}
+
+// SetLimits shares l with every session, current and future (limits.go).
+func (r *Registry) SetLimits(l *Limits) {
+	if l == nil {
+		l = NewLimits(0, 0)
+	}
+	r.mu.Lock()
+	r.limits = l
+	agents := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		agents = append(agents, ag)
+	}
+	r.mu.Unlock()
+	for _, ag := range agents {
+		ag.SetLimits(l)
+	}
+}
+
+// SetShellDisabled withholds bash and the terminal_* tools from every
+// session, current and future (Agent.SetShellDisabled).
+func (r *Registry) SetShellDisabled(disabled bool) {
+	r.mu.Lock()
+	r.shellDisabled = disabled
+	agents := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		agents = append(agents, ag)
+	}
+	r.mu.Unlock()
+	for _, ag := range agents {
+		ag.SetShellDisabled(disabled)
+	}
+}
+
+// SetDefaultSource makes new sessions take their default provider from fn
+// (falling back to the one given to NewRegistry when fn returns nil), and
+// gives a live session that has no provider the current default too, so
+// setting one takes effect without reopening chats.
+func (r *Registry) SetDefaultSource(fn func(projectRoot string) (ModelProvider, string)) {
+	r.mu.Lock()
+	r.defaultSource = fn
+	r.mu.Unlock()
+	r.ApplyDefaultProvider()
+}
+
+// ApplyDefaultProvider re-reads the default source for sessions that still
+// have no provider of their own.
+func (r *Registry) ApplyDefaultProvider() {
+	r.mu.Lock()
+	p, name := r.defaultProviderLocked()
+	agents := make([]*Agent, 0, len(r.sessions))
+	for _, ag := range r.sessions {
+		agents = append(agents, ag)
+	}
+	r.mu.Unlock()
+	if p == nil {
+		return
+	}
+	for _, ag := range agents {
+		ag.mu.Lock()
+		if ag.provider == nil {
+			ag.provider, ag.providerName = p, name
+		}
+		ag.mu.Unlock()
+	}
+}
+
+func (r *Registry) defaultProviderLocked() (ModelProvider, string) {
+	if r.defaultSource != nil {
+		if p, name := r.defaultSource(r.projectRoot); p != nil {
+			return p, name
+		}
+	}
+	return r.provider, r.providerName
 }
 
 // SetWebToolsEnabled applies the project-wide web_search/web_fetch toggle
@@ -167,6 +248,20 @@ func (r *Registry) SetRoles(roles *Roles) {
 	}
 }
 
+// SetChat marks this registry's sessions as project-less chats.
+func (r *Registry) SetChat(chat bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.chat = chat
+}
+
+// IsChat reports SetChat's value.
+func (r *Registry) IsChat() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.chat
+}
+
 // SetProjectRoot is where sessions read the project's instructions file
 // from (instructions.go).
 func (r *Registry) SetProjectRoot(root string) {
@@ -190,13 +285,16 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	// and every session in a project shared the same *ContextManager
 	// before this — one session picking a small-context model silently
 	// resized every other concurrent session's context-window budget too.
-	ag := NewAgent(stream, r.provider, r.providerName, r.tools, r.permEngine, r.snapshotStore, r.sessionStore, &ContextManager{
+	defProv, defName := r.defaultProviderLocked()
+	ag := NewAgent(stream, defProv, defName, r.tools, r.permEngine, r.snapshotStore, r.sessionStore, &ContextManager{
 		MaxHistoryTokens:    r.ctxMgr.GetMaxHistoryTokens(),
 		MaxToolOutputTokens: r.ctxMgr.MaxToolOutputTokens,
 	}, r.usageStore)
-	ag.SetMaxSessionSpendUSD(r.maxSessionSpendUSD)
+	ag.SetLimits(r.limits)
 	ag.SetWebToolsEnabled(r.webToolsEnabled)
-	ag.roles, ag.projectRoot = r.roles, r.projectRoot
+	ag.SetShellDisabled(r.shellDisabled)
+	ag.roles, ag.projectRoot, ag.chat = r.roles, r.projectRoot, r.chat
+	ag.source, ag.skillSrc = r.source, r.skillSrc
 	if r.eventTap != nil {
 		ag.stream.SetTap(r.eventTap)
 	}
@@ -204,6 +302,31 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	_ = ag.LoadSession(sessionID)
 	r.sessions[sessionID] = ag
 	return ag
+}
+
+// SessionReport is the context meter and running spend of sessionID as
+// turn_completed would report them for history, for a client that has just
+// opened the session or switched branch. The context is nil for an empty
+// history, the spend nil without a usage store.
+func (r *Registry) SessionReport(sessionID string, history []Message) (*protocol.ContextData, *protocol.SpendData) {
+	var ctx *protocol.ContextData
+	if len(history) > 0 {
+		cm, model, overhead := r.ctxMgr, "", 0
+		if ag := r.Lookup(sessionID); ag != nil {
+			cm, model, overhead = ag.contextManager, ag.getModelName(), ag.requestOverhead()
+		}
+		c := cm.Report(history, model, overhead)
+		ctx = &c
+	}
+	var spend *protocol.SpendData
+	if r.usageStore != nil {
+		sess, proj := r.usageStore.SessionTotal(sessionID), r.usageStore.ProjectTotal()
+		spend = &protocol.SpendData{
+			SessionTotalUSD: sess.CostUSD, ProjectTotalUSD: proj.CostUSD,
+			SessionCostUnknown: sess.CostUnknown, ProjectCostUnknown: proj.CostUnknown,
+		}
+	}
+	return ctx, spend
 }
 
 // Lookup returns sessionID's live Agent without creating one, or nil.

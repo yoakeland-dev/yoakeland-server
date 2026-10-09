@@ -11,7 +11,8 @@
 # reading a command line and before running it, and never for an empty
 # line. Not a DEBUG trap: that also fires inside subshells and $(...).
 # ponytail: no command-line (E) marker, PS0 can't see the line reliably
-# (history is skipped under HISTCONTROL=ignorespace). zsh sends it.
+# (history is skipped under HISTCONTROL=ignorespace). zsh sends it; read it
+# from `history 1` here if the client ever needs the command text in bash.
 
 [ -n "$YOAKE_SHELL_INTEGRATION" ] && return
 export YOAKE_SHELL_INTEGRATION=1

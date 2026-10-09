@@ -35,9 +35,13 @@ func serverStatus(deps connDeps) *protocol.ServerStatus {
 		st.Peers = deps.peers.Count()
 	}
 	st.Load1, st.MemTotalBytes, st.MemAvailBytes = readHostStats()
+	if ps := provider.NativePoolStats(); ps.Live > 0 {
+		st.NativeSessions = &protocol.NativeSessionsStatus{Live: ps.Live, Busy: ps.Busy, Max: ps.Max,
+			IdleTimeoutSec: ps.IdleTimeoutSec, ByKind: ps.ByKind, OldestIdleSec: ps.OldestIdleSec}
+	}
 	if deps.projects != nil {
 		st.QueuedTurns = deps.projects.QueuedTurns()
-		if limit := deps.projects.maxSpendUSD; limit > 0 {
+		if _, limit := deps.projects.limits.Get(); limit > 0 {
 			st.Budgets = []protocol.Budget{{Scope: "session", Period: "total", LimitUSD: limit}}
 		}
 	}
@@ -317,7 +321,7 @@ func (h *statusHub) BroadcastGit(st protocol.GitStatusData) {
 // <-state-dir>/spend.json — the per-project usage.json files only keep
 // running totals, which can't answer "today" or "this month". Spend from
 // before this ledger existed isn't in it.
-// ponytail: one map entry per day forever (a few KB a decade).
+// One map entry per day forever (a few KB a decade).
 type spendLedger struct {
 	mu   sync.Mutex
 	path string

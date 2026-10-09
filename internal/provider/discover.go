@@ -3,7 +3,10 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -67,6 +70,9 @@ func (c *discoveryCache) get(kind CLIKind, fetch func(context.Context) ([]ModelI
 		e.loading = false
 		if err != nil || len(models) == 0 {
 			e.failedAt = time.Now()
+			if err != nil {
+				log.Printf("model discovery for %s failed, using the manifest: %v", kind, err)
+			}
 			return nil, err
 		}
 		e.models, e.at, e.failedAt = models, time.Now(), time.Time{}
@@ -106,6 +112,8 @@ type claudeModelInfo struct {
 	SupportsAutoMode      bool     `json:"supportsAutoMode"`
 }
 
+var errClaudeLoggedOut = errors.New("claude is not logged in (run `claude auth login`)")
+
 // discoverClaudeModels asks a throwaway `claude` for the models this account
 // can use, with what each supports.
 func discoverClaudeModels(ctx context.Context, dir string) ([]ModelInfo, error) {
@@ -132,7 +140,10 @@ func discoverClaudeModels(ctx context.Context, dir string) ([]ModelInfo, error) 
 					RequestID string `json:"request_id"`
 					Error     string `json:"error"`
 					Response  struct {
-						Models []claudeModelInfo `json:"models"`
+						Models  []claudeModelInfo `json:"models"`
+						Account struct {
+							TokenSource string `json:"tokenSource"`
+						} `json:"account"`
 					} `json:"response"`
 				} `json:"response"`
 			}
@@ -141,6 +152,12 @@ func discoverClaudeModels(ctx context.Context, dir string) ([]ModelInfo, error) 
 			}
 			if ln.Response.Subtype != "success" {
 				done <- result{err: fmt.Errorf("claude initialize: %s", ln.Response.Error)}
+				return
+			}
+			// Logged out, Claude Code still answers, but with a generic list
+			// (no legacy models, no account's own): not worth caching.
+			if ln.Response.Response.Account.TokenSource == "none" {
+				done <- result{err: errClaudeLoggedOut}
 				return
 			}
 			done <- result{models: ln.Response.Response.Models}
@@ -185,6 +202,10 @@ func claudeModelsFrom(in []claudeModelInfo) []ModelInfo {
 		if name == "" {
 			name = m.Value
 		}
+		// Claude Code says "Opus 5.5"; "default" is its own label for whatever it picks.
+		if m.Value != "default" && !strings.HasPrefix(name, "Claude") {
+			name = "Claude " + name
+		}
 		info := ModelInfo{ID: m.Value, DisplayName: name}
 		if len(caps) > 0 {
 			info.Capabilities = caps
@@ -195,7 +216,8 @@ func claudeModelsFrom(in []claudeModelInfo) []ModelInfo {
 }
 
 // withManifest adds what Claude Code doesn't report about a model but the
-// manifest knows: the ultracode setting on top of xhigh, and context windows.
+// manifest knows: the ultracode setting on top of xhigh, context windows, and
+// which models are legacy.
 // A model is matched by its resolved name, the longest manifest slug it starts with.
 func withManifest(models, manifest []ModelInfo) []ModelInfo {
 	out := make([]ModelInfo, len(models))
@@ -228,6 +250,7 @@ func withManifest(models, manifest []ModelInfo) []ModelInfo {
 			caps["contextWindows"] = w
 		}
 		out[i].Capabilities = caps
+		out[i].IsLegacy = best.IsLegacy // the picker's divider
 	}
 	return out
 }
@@ -349,13 +372,25 @@ func codexModelsFrom(in []codexModelInfo) []ModelInfo {
 		if name == "" {
 			name = id
 		}
-		info := ModelInfo{ID: id, DisplayName: name}
+		info := ModelInfo{ID: id, DisplayName: codexDisplayName(name)}
 		if len(caps) > 0 {
 			info.Capabilities = caps
 		}
 		out = append(out, info)
 	}
 	return out
+}
+
+var codexNameDashes = regexp.MustCompile(`^(GPT-\d[\d.]*)-(.+)$`)
+
+// codexDisplayName reads "GPT-6-Luna" as "GPT-6 Luna": the dash belongs to the
+// version, not to what follows it.
+func codexDisplayName(name string) string {
+	m := codexNameDashes.FindStringSubmatch(name)
+	if m == nil {
+		return name
+	}
+	return m[1] + " " + strings.ReplaceAll(m[2], "-", " ")
 }
 
 // CodexModelsDiscovered is Codex's own model list for this account (cached),

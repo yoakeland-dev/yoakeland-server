@@ -182,6 +182,7 @@ func TestPeerRegistry_DeviceAndActivity(t *testing.T) {
 // client without a device id gets both straight away, as before.
 func TestPresenceNotes_ReconnectGrace(t *testing.T) {
 	feed := NewNotificationFeed(NewPeerRegistry())
+	feed.prefs = testPrefs // device presence is off by default
 	n := newPresenceNotes(feed)
 	n.grace = 50 * time.Millisecond
 	phone := &Peer{ID: "a", Name: "phone", DeviceID: "dev-phone"}

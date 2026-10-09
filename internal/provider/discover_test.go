@@ -38,7 +38,7 @@ func TestDiscoverClaudeModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 || got[1].ID != "opus" || got[1].DisplayName != "Opus 5.5" {
+	if len(got) != 3 || got[1].ID != "opus" || got[1].DisplayName != "Claude Opus 5.5" {
 		t.Fatalf("models = %+v", got)
 	}
 	if !reflect.DeepEqual(got[1].Capabilities["reasoningEfforts"], []string{"low", "medium", "high", "xhigh", "max"}) || got[1].Capabilities["fastMode"] != true || got[1].Capabilities["autoMode"] != true {
@@ -48,6 +48,18 @@ func TestDiscoverClaudeModels(t *testing.T) {
 		t.Fatalf("haiku claims what it doesn't support: %v", got[2].Capabilities)
 	}
 	f.waitClosed(t, 0) // the throwaway process was let go
+}
+
+func TestDiscoverClaudeModelsLoggedOut(t *testing.T) {
+	f := &liveFake{}
+	useDiscovery(t, f, func(_ int, m map[string]any, out io.Writer) {
+		line(out, map[string]any{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": m["request_id"], "response": map[string]any{"models": claudeInit, "account": map[string]any{"tokenSource": "none"}}}})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := discoverClaudeModels(ctx, t.TempDir()); !errors.Is(err, errClaudeLoggedOut) {
+		t.Fatalf("err = %v, want errClaudeLoggedOut", err)
+	}
 }
 
 func TestDiscoverClaudeModelsProcessGone(t *testing.T) {
@@ -69,9 +81,12 @@ func TestManifestAddsWhatClaudeDoesNotReport(t *testing.T) {
 	manifest := []ModelInfo{
 		{ID: "claude-opus-5", Capabilities: map[string]any{"reasoningEfforts": []string{"low", "xhigh", "max", "ultracode"}, "contextWindows": []string{"200k", "1m"}}},
 		{ID: "claude-opus-4-6", Capabilities: map[string]any{"reasoningEfforts": []string{"low", "high", "max"}, "contextWindows": []string{"200k", "1m"}}},
-		{ID: "claude-haiku-4-5"},
+		{ID: "claude-haiku-4-5", IsLegacy: true},
 	}
 	got := withManifest(discoveredModels, manifest)
+	if got[0].DisplayName != "Claude Opus 5.5" || got[0].IsLegacy || !got[1].IsLegacy {
+		t.Fatalf("names/legacy = %q %v %v", got[0].DisplayName, got[0].IsLegacy, got[1].IsLegacy)
+	}
 	if e := got[0].Capabilities["reasoningEfforts"].([]string); e[len(e)-1] != "ultracode" {
 		t.Fatalf("opus efforts = %v, want ultracode added", e)
 	}
@@ -176,5 +191,19 @@ func TestDiscoveryCache(t *testing.T) {
 	}
 	if got := c.get(CLIKindCodex, bad, fallback); got[0].ID != "fallback" || fails != 1 {
 		t.Fatalf("a failure was retried at once: %d", fails)
+	}
+}
+
+func TestCodexDisplayName(t *testing.T) {
+	for in, want := range map[string]string{
+		"GPT-6-Luna":        "GPT-6 Luna",
+		"GPT-5.6-Terra":     "GPT-5.6 Terra",
+		"GPT-5.5":           "GPT-5.5",
+		"GPT-5.1-Codex-Max": "GPT-5.1 Codex Max",
+		"o3":                "o3",
+	} {
+		if got := codexDisplayName(in); got != want {
+			t.Errorf("codexDisplayName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

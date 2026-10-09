@@ -47,7 +47,8 @@ type gitWatcher struct {
 // 2.38) so a bare repo committed inside the tree is never picked up as the
 // repository. -c reaches submodule git processes too (GIT_CONFIG_PARAMETERS).
 // ponytail: filter.*.clean drivers still run; the sandbox keeps .git/config
-// and submodule configs read-only so the agent can't add one.
+// and submodule configs read-only so the agent can't add one; blank
+// filter.*.clean via -c too if a global/system config ever defines one.
 func hostGit(args ...string) *exec.Cmd {
 	return exec.Command("git", append([]string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "safe.bareRepository=explicit"}, args...)...)
 }

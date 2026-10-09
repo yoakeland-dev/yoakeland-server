@@ -115,7 +115,7 @@ func ipInRanges(ip net.IP, ranges []*net.IPNet) bool {
 // (say, a public IP the machine picked up after the CA was made): a leaf
 // carrying one fails verification in every client, including for the names
 // that are fine. A CA from before name constraints permits everything.
-// ponytail: a dropped name needs a fresh CA (delete <state-dir>/tls, re-pair).
+// A dropped name needs a fresh CA (delete <state-dir>/tls, re-pair).
 func permittedSANs(ca *x509.Certificate, sans []string) []string {
 	if len(ca.PermittedDNSDomains) == 0 && len(ca.PermittedIPRanges) == 0 {
 		return sans

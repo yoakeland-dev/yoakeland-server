@@ -89,8 +89,8 @@ func TestAgent_TurnCompletedReportsContextAndSpend(t *testing.T) {
 	if data.Context == nil {
 		t.Fatal("expected context data on turn_completed")
 	}
-	if data.Context.MaxTokens != 100 {
-		t.Fatalf("context.maxTokens = %d, want 100 (the configured budget)", data.Context.MaxTokens)
+	if data.Context.MaxTokens != 8000 {
+		t.Fatalf("context.maxTokens = %d, want 8000 (the configured budget 100, raised to the compaction minimum, as no window is known)", data.Context.MaxTokens)
 	}
 	if data.Context.EstimatedTokens <= 0 {
 		t.Fatalf("context.estimatedTokens = %d, want > 0 after a turn with history", data.Context.EstimatedTokens)
@@ -101,5 +101,83 @@ func TestAgent_TurnCompletedReportsContextAndSpend(t *testing.T) {
 	}
 	if data.Spend.SessionTotalUSD != wantCost || data.Spend.ProjectTotalUSD != wantCost {
 		t.Fatalf("spend totals = %+v, want session and project both %v", data.Spend, wantCost)
+	}
+}
+
+// unpricedProvider runs on a model no rate table knows.
+type unpricedProvider struct{ *ScriptedProvider }
+
+func (unpricedProvider) ModelName() string { return "some-unlisted-local-model" }
+
+// A turn on a model with no known rate is reported as unpriced (usage
+// costUnknown, spend *CostUnknown) instead of quietly counting as free.
+func TestAgent_TurnCompletedFlagsUnknownCost(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	usageStore, err := agent.NewUsageStore(tempDir)
+	if err != nil {
+		t.Fatalf("NewUsageStore: %v", err)
+	}
+	provider := unpricedProvider{&ScriptedProvider{turns: [][]agent.ModelStreamChunk{{
+		{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{InputTokens: 500, OutputTokens: 50, TotalTokens: 550}},
+		{Kind: agent.StreamChunkDelta, Delta: "done"},
+	}}}}
+
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{}, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(100, 20), usageStore)
+	t.Cleanup(ag.WaitBackground)
+
+	if err := ag.RunTurn(context.Background(), "session-unpriced", "turn-1", "Hello"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	data := lastTurnCompleted(t, outBuf.String())
+	if data.Usage == nil || !data.Usage.CostUnknown || data.Usage.CostKnown || data.Usage.CostUSD != 0 {
+		t.Fatalf("expected an unpriced turn, got %+v", data.Usage)
+	}
+	if data.Spend == nil || !data.Spend.SessionCostUnknown || !data.Spend.ProjectCostUnknown {
+		t.Fatalf("expected the spend totals flagged unknown, got %+v", data.Spend)
+	}
+	if !usageStore.SessionTotal("session-unpriced").CostUnknown {
+		t.Fatal("expected the unknown-cost flag to be persisted with the session's totals")
+	}
+	if data.Context == nil || data.Context.Source != "provider" || data.Context.EstimatedTokens != 550 {
+		t.Fatalf("expected the provider's count as the context figure, got %+v", data.Context)
+	}
+}
+
+// nativeScripted plays a CLI agent that runs its own tools.
+type nativeScripted struct{ *ScriptedProvider }
+
+func (nativeScripted) RunsOwnTools() {}
+
+// A native agent's turn usage sums its requests; the context meter must use
+// the last request's snapshot and the window the agent reported.
+func TestAgent_TurnCompletedUsesNativeContextSnapshot(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	prov := nativeScripted{&ScriptedProvider{turns: [][]agent.ModelStreamChunk{{
+		{Kind: agent.StreamChunkDelta, Delta: "done"},
+		{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{
+			InputTokens: 900_000, OutputTokens: 4000, TotalTokens: 904_000, CostUSD: 1, CostKnown: true,
+			ContextTokens: 60_000, WindowTokens: 200_000,
+		}},
+	}}}}
+
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, prov, "native", []tool.Tool{}, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(100, 20), nil)
+	t.Cleanup(ag.WaitBackground)
+
+	if err := ag.RunTurn(context.Background(), "session-native", "turn-1", "Hello"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	c := lastTurnCompleted(t, outBuf.String()).Context
+	if c == nil || c.EstimatedTokens != 60_000 || c.MaxTokens != 200_000 || c.WindowTokens != 200_000 || c.Source != "provider" {
+		t.Fatalf("got %+v", c)
 	}
 }

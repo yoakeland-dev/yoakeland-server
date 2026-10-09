@@ -264,6 +264,7 @@ func (t *codexTurn) notify(method string, params json.RawMessage) {
 					CachedInputTokens int `json:"cachedInputTokens"`
 					OutputTokens      int `json:"outputTokens"`
 				} `json:"last"`
+				ModelContextWindow int `json:"modelContextWindow"`
 			} `json:"tokenUsage"`
 		}
 		if json.Unmarshal(params, &n) == nil {
@@ -271,6 +272,15 @@ func (t *codexTurn) notify(method string, params json.RawMessage) {
 			t.usage.InputTokens += n.TokenUsage.Last.InputTokens
 			t.usage.OutputTokens += n.TokenUsage.Last.OutputTokens
 			t.usage.CachedInputTokens += n.TokenUsage.Last.CachedInputTokens
+			// The sums are spend; the last request alone is the context (its
+			// reasoning tokens are counted in outputTokens, though not always
+			// resent, so this can run a little high).
+			if last := n.TokenUsage.Last; last.InputTokens > 0 {
+				t.usage.ContextTokens = last.InputTokens + last.OutputTokens
+			}
+			if w := n.TokenUsage.ModelContextWindow; w > 0 {
+				t.usage.WindowTokens = w
+			}
 			t.mu.Unlock()
 		}
 	case "error":
@@ -327,7 +337,11 @@ func (t *codexTurn) request(id json.RawMessage, method string, params json.RawMe
 		if r.Reason != "" {
 			desc += " — " + r.Reason
 		}
-		return nt.Ask(ctx, agent.NativeAsk{ToolCallID: callID, ToolName: toolName, Description: desc, Diff: d, Edit: edit})
+		na := agent.NativeAsk{ToolCallID: callID, ToolName: toolName, Description: desc, Diff: d, Edit: edit}
+		if toolName == "shell" {
+			na.Tool, na.Target = "bash", r.Command
+		}
+		return nt.Ask(ctx, na)
 	}
 	decision := func(ans agent.NativeAnswer, err error) string {
 		switch {

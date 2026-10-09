@@ -255,10 +255,10 @@ func (s acpSession) applyMode(ctx context.Context, conn *rpcConn, m agent.Mode) 
 // acpInit starts an ACP agent and runs initialize, returning the connection
 // and whether it supports session/load. The process is bound to procCtx, the
 // initialize call to ctx.
-func (p *CLISubprocessProvider) acpInit(ctx, procCtx context.Context, spec cliSpec, onNotify func(string, json.RawMessage), onRequest func(*rpcConn, json.RawMessage, string, json.RawMessage)) (*rpcConn, bool, error) {
+func (p *CLISubprocessProvider) acpInit(ctx, procCtx context.Context, spec cliSpec, onNotify func(string, json.RawMessage), onRequest func(*rpcConn, json.RawMessage, string, json.RawMessage)) (*rpcConn, acpCaps, error) {
 	proc, err := p.start()(procCtx, spec.Binary, spec.Args, p.Dir)
 	if err != nil {
-		return nil, false, err
+		return nil, acpCaps{}, err
 	}
 	var conn *rpcConn
 	conn = newRPCConn(proc, onNotify, func(id json.RawMessage, method string, params json.RawMessage) { onRequest(conn, id, method, params) })
@@ -268,15 +268,26 @@ func (p *CLISubprocessProvider) acpInit(ctx, procCtx context.Context, spec cliSp
 		"clientInfo":         map[string]string{"name": "yoakeland", "version": "1"},
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("%s: %w", spec.Binary, err)
+		return nil, acpCaps{}, fmt.Errorf("%s: %w", spec.Binary, err)
 	}
 	var init struct {
 		AgentCapabilities struct {
-			LoadSession bool `json:"loadSession"`
+			LoadSession     bool `json:"loadSession"`
+			MCPCapabilities struct {
+				HTTP bool `json:"http"`
+				SSE  bool `json:"sse"`
+			} `json:"mcpCapabilities"`
 		} `json:"agentCapabilities"`
 	}
 	_ = json.Unmarshal(raw, &init)
-	return conn, init.AgentCapabilities.LoadSession, nil
+	c := init.AgentCapabilities
+	return conn, acpCaps{loadSession: c.LoadSession, mcpHTTP: c.MCPCapabilities.HTTP, mcpSSE: c.MCPCapabilities.SSE}, nil
+}
+
+// acpCaps is what an ACP agent said it can do in initialize.
+type acpCaps struct {
+	loadSession     bool
+	mcpHTTP, mcpSSE bool
 }
 
 // acpErr makes the common "not logged in" failure actionable.
@@ -293,6 +304,7 @@ type acpLive struct {
 	conn    *rpcConn
 	spec    cliSpec
 	canLoad bool
+	caps    acpCaps
 
 	mu      sync.Mutex
 	turn    *acpTurn
@@ -351,6 +363,9 @@ type acpTurn struct {
 	calls map[string]*acpToolCall
 	done  map[string]bool
 	cost  float64 // latest cumulative usage_update cost in USD, -1 = none seen
+	// used and size are the latest usage_update's context tokens in use and
+	// the context window; 0 = none seen.
+	used, size int
 }
 
 func (t *acpTurn) seenAnything() bool { return t.seen.Load() }
@@ -368,6 +383,8 @@ func (a *acpLive) onNotify(method string, params json.RawMessage) {
 				Amount   float64 `json:"amount"`
 				Currency string  `json:"currency"`
 			} `json:"cost"`
+			Used int `json:"used"`
+			Size int `json:"size"`
 		} `json:"update"`
 	}
 	if json.Unmarshal(params, &n) != nil {
@@ -385,6 +402,11 @@ func (a *acpLive) onNotify(method string, params json.RawMessage) {
 	}
 	if t == nil {
 		return
+	}
+	if u.SessionUpdate == "usage_update" && (u.Used > 0 || u.Size > 0) {
+		t.mu.Lock()
+		t.used, t.size = u.Used, u.Size
+		t.mu.Unlock()
 	}
 	t.update(u.SessionUpdate, u.Content, u.Cost, params)
 }
@@ -517,11 +539,11 @@ func (p *CLISubprocessProvider) startACP(spec cliSpec) (*acpLive, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	// The process outlives the turn that started it, so it isn't bound to the turn's context.
-	conn, canLoad, err := p.acpInit(ctx, context.Background(), spec, a.onNotify, a.onRequest)
+	conn, caps, err := p.acpInit(ctx, context.Background(), spec, a.onNotify, a.onRequest)
 	if err != nil {
 		return nil, acpErr(spec.Binary, err)
 	}
-	a.conn, a.canLoad = conn, canLoad
+	a.conn, a.canLoad, a.caps = conn, caps.loadSession, caps
 	return a, nil
 }
 
@@ -563,7 +585,7 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 		sess = acpSession{}
 		resumed := false
 		if nt.ResumeID != "" {
-			params := map[string]any{"sessionId": nt.ResumeID, "cwd": p.Dir, "mcpServers": []any{}}
+			params := map[string]any{"sessionId": nt.ResumeID, "cwd": p.Dir, "mcpServers": acpMCPServers(nt.MCP, a.caps)}
 			method := "session/resume" // no history replay
 			if a.canLoad {
 				method = "session/load"
@@ -586,7 +608,7 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 		if !resumed {
 			prompt = nt.FreshPrompt
 			baseline = 0
-			raw, err := conn.call(ctx, "session/new", map[string]any{"cwd": p.Dir, "mcpServers": []any{}})
+			raw, err := conn.call(ctx, "session/new", map[string]any{"cwd": p.Dir, "mcpServers": acpMCPServers(nt.MCP, a.caps)})
 			if err != nil {
 				return failed(err)
 			}
@@ -720,6 +742,9 @@ wait:
 		usage.CachedInputTokens = u.CachedReadTokens
 	}
 	t.mu.Lock()
+	// The prompt's own usage sums its requests; usage_update says how full
+	// the context is.
+	usage.ContextTokens, usage.WindowTokens = t.used, t.size
 	if t.cost >= 0 {
 		nt.SessionCostUSD = t.cost
 		if t.cost >= baseline {

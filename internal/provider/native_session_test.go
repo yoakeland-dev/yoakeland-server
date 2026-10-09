@@ -901,8 +901,8 @@ func TestAmpTurn(t *testing.T) {
 	if r := chunks[3].ToolResult; r.Output != "a.txt" || r.Name != "Bash" {
 		t.Fatalf("tool result = %+v", r)
 	}
-	if u := chunks[5].Usage; u.InputTokens != 10 || u.OutputTokens != 4 {
-		t.Fatalf("usage = %+v", u)
+	if u := chunks[5].Usage; u.InputTokens != 10 || u.OutputTokens != 4 || u.ContextTokens != 7 {
+		t.Fatalf("usage = %+v (want the two messages summed, and the last one's size as the context)", u)
 	}
 	if nt.SessionID != "T-1" {
 		t.Fatalf("session = %q", nt.SessionID)

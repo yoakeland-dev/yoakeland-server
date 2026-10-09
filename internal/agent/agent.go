@@ -12,9 +12,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/audit"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/skills"
 	"yoakeland/internal/snapshot"
 	"yoakeland/internal/tool"
 )
@@ -77,6 +79,10 @@ type Message struct {
 	// in up to this point" with no separate running total to track;
 	// OutputTokens is naturally just this round-trip's own reply.
 	Usage *protocol.UsageData `json:"usage,omitempty"`
+	// UsageIsAggregate: Usage sums several model requests (a native agent's
+	// whole turn), so its input tokens measure spend, not how full the
+	// context is; contextTokens uses Usage.ContextTokens instead.
+	UsageIsAggregate bool `json:"usageIsAggregate,omitempty"`
 
 	// RawContent is the provider's own content blocks for an assistant
 	// message, kept only when they carry something the fields above can't
@@ -291,6 +297,8 @@ var readOnlyTools = map[string]bool{
 	"file_read":         true,
 	"search":            true,
 	"ask_user_question": true,
+	// Loading a skill reads files the user put in a skill folder, nothing more.
+	tool.SkillToolName: true,
 	// Not a mutation itself: its subagent runs read-only in these modes too
 	// (see newSubagent).
 	SubagentToolName: true,
@@ -313,13 +321,16 @@ type Agent struct {
 	toolDefsPlan     []tool.ToolDefinition
 	mode             Mode
 	webToolsEnabled  bool
+	shellDisabled    bool // bash and terminal_* withheld (SetShellDisabled)
 	permEngine       *permission.Engine
 	snapshotStore    snapshot.SnapshotStore
 	sessionStore     SessionStore
 	contextManager   *ContextManager
 	usageStore       *UsageStore
 
-	maxSessionSpendUSD float64 // 0 = unlimited
+	// limits are the soft round and spend limits, shared server-wide and read
+	// live (limits.go). Never nil.
+	limits *Limits
 
 	sessionID         string
 	history           []Message
@@ -327,7 +338,7 @@ type Agent struct {
 	nextMsgSeq        int                    // see SessionState.NextMsgSeq
 	mu                sync.Mutex
 	permRequests      map[string]chan permDecision
-	permRequestKeys   map[string]string
+	permAsks          map[string]permAsk
 	askUserRequests   map[string]chan string
 	activeTurnCancels map[string]context.CancelFunc
 
@@ -374,6 +385,8 @@ type Agent struct {
 	// native ask (under mu).
 	native         *NativeSessionRef
 	nativeRemember map[string]bool
+	// nativeRuleID is the agent-own suggestion the answer picked, by ask.
+	nativeRuleID map[string]string
 
 	// systemPrompt overrides the mode's prompt (a subagent's own); subagents
 	// are the running ones by the id of the call that started each (under mu).
@@ -384,6 +397,13 @@ type Agent struct {
 	// where the project's instructions file is read from (instructions.go).
 	roles       *Roles
 	projectRoot string
+	// chat: a project-less chat (SPEC.md §4b); it gets ChatSystemPrompt.
+	chat bool
+
+	// source supplies tools that come and go (MCP servers); skillSrc the skills
+	// the model may load (extensions.go). Both under mu; nil means none.
+	source   tool.Source
+	skillSrc SkillSource
 }
 
 // Hooks lets the server react to agent state that isn't a session event:
@@ -392,6 +412,9 @@ type Agent struct {
 type Hooks struct {
 	QueueChanged func()
 	AsksChanged  func()
+	// Audit hears every security-relevant thing this session does or is
+	// answered (audit.Event); the server adds project and actor context.
+	Audit func(audit.Event)
 }
 
 func (h Hooks) queueChanged() {
@@ -552,6 +575,7 @@ func NewAgent(
 		toolDefsPlan:      toolDefsPlan,
 		mode:              ModeReadWrite,
 		webToolsEnabled:   true,
+		limits:            NewLimits(0, 0),
 		permEngine:        engine,
 		snapshotStore:     snapStore,
 		sessionStore:      sessStore,
@@ -560,7 +584,7 @@ func NewAgent(
 		history:           make([]Message, 0),
 		branches:          make(map[string][][]Message),
 		permRequests:      make(map[string]chan permDecision),
-		permRequestKeys:   make(map[string]string),
+		permAsks:          make(map[string]permAsk),
 		askUserRequests:   make(map[string]chan string),
 		activeTurnCancels: make(map[string]context.CancelFunc),
 		steerSig:          make(chan struct{}, 1),
@@ -568,6 +592,7 @@ func NewAgent(
 		queuedTurns:       make(map[string]context.CancelFunc),
 		pendingAsks:       make(map[string]protocol.PendingAsk),
 		nativeRemember:    make(map[string]bool),
+		nativeRuleID:      make(map[string]string),
 		subagents:         make(map[string]*Agent),
 	}
 }
@@ -611,6 +636,14 @@ func (a *Agent) LoadSession(sessionID string) error {
 	for i := range a.history {
 		if a.history[i].ID == "" {
 			a.history[i].ID = a.nextMessageIDLocked()
+		}
+		// Likewise for UsageIsAggregate/ContextTokens: a native reply saved
+		// before them holds a whole turn's summed usage, which would read
+		// as the context size. ponytail: only the session's current native
+		// provider is recognised, not one it used earlier.
+		m := &a.history[i]
+		if m.Usage != nil && !m.UsageIsAggregate && m.Usage.ContextTokens == 0 && a.native != nil && m.Provider == a.native.Provider {
+			m.UsageIsAggregate = true
 		}
 	}
 	return nil
@@ -701,7 +734,7 @@ func (a *Agent) SetModelOptions(opts ModelOptions, contextWindow int) (didApplyP
 		didApplyProviderOptions = true
 	}
 	if contextWindow > 0 && cm != nil {
-		cm.SetMaxHistoryTokens(contextWindow)
+		cm.SetContextWindow(contextWindow)
 	}
 	return didApplyProviderOptions
 }
@@ -759,6 +792,22 @@ func (a *Agent) WebToolsEnabled() bool {
 	return a.webToolsEnabled
 }
 
+// SetShellDisabled withholds bash and the terminal_* tools from the model, and
+// refuses them at dispatch. The server turns it on for a project with no real
+// sandbox when disableBashWhenUnsandboxed is set. Takes effect on the next
+// round-trip.
+func (a *Agent) SetShellDisabled(disabled bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.shellDisabled = disabled
+}
+
+func (a *Agent) ShellDisabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.shellDisabled
+}
+
 // editTools are what Accept Edits lets through without asking.
 var editTools = map[string]bool{
 	"file_write": true,
@@ -806,6 +855,9 @@ func permissionTarget(toolName string, args json.RawMessage) string {
 	case "file_write", "file_edit":
 		return filepath.Clean(a.Path)
 	}
+	if isMCPTool(toolName) { // a rule covers the tool, not its arguments; the target is for the audit log
+		return truncateRunes(string(args), 300)
+	}
 	return string(args)
 }
 
@@ -830,20 +882,35 @@ var webToolNames = map[string]bool{
 // the mode-restricted subset, further filtered by the web-tools toggle.
 func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 	a.mu.Lock()
+	mode := a.mode
 	base := a.toolDefsForModeLocked()
 	webEnabled := a.webToolsEnabled
+	shellOff := a.shellDisabled
 	a.mu.Unlock()
 
-	if webEnabled {
-		return base
+	// The skill tool is only worth its definition when there is a skill to load.
+	hideSkill := a.tools[tool.SkillToolName] != nil && !a.skillsAvailable()
+	if webEnabled && !shellOff && !hideSkill {
+		return a.withSourceDefs(base, mode)
 	}
 	filtered := make([]tool.ToolDefinition, 0, len(base))
 	for _, def := range base {
-		if !webToolNames[def.Name] {
-			filtered = append(filtered, def)
+		if (!webEnabled && webToolNames[def.Name]) || (shellOff && isShellTool(def.Name)) || (hideSkill && def.Name == tool.SkillToolName) {
+			continue
 		}
+		filtered = append(filtered, def)
 	}
-	return filtered
+	return a.withSourceDefs(filtered, mode)
+}
+
+// withSourceDefs adds the source's tools (MCP) after the fixed ones, in the
+// order the source gives them, which is stable so the prompt prefix caches.
+func (a *Agent) withSourceDefs(base []tool.ToolDefinition, mode Mode) []tool.ToolDefinition {
+	extra := a.sourceDefs(mode)
+	if len(extra) == 0 {
+		return base
+	}
+	return append(base[:len(base):len(base)], extra...)
 }
 
 // toolDefsForModeLocked returns the precomputed slice for the current mode.
@@ -867,10 +934,20 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 	a.mu.Lock()
 	mode := a.mode
 	webEnabled := a.webToolsEnabled
+	shellOff := a.shellDisabled
 	a.mu.Unlock()
 
 	if webToolNames[name] && !webEnabled {
 		return false
+	}
+	if shellOff && isShellTool(name) {
+		return false
+	}
+	if _, fixed := a.tools[name]; !fixed && name != SubagentToolName {
+		// A tool from the source: offered in read-only and plan modes only when
+		// its server calls it read-only.
+		t, ok := a.lookupTool(name)
+		return ok && offeredByMode(t, mode)
 	}
 	switch mode {
 	case ModeReadOnly:
@@ -891,18 +968,40 @@ func (a *Agent) activeSystemPrompt() string {
 	if a.Mode() == ModePlan {
 		return PlanSystemPrompt
 	}
+	if a.chat {
+		return ChatSystemPrompt
+	}
 	return DefaultSystemPrompt
 }
 
-// SetMaxSessionSpendUSD caps how much this session may have already spent
-// (per the UsageStore) before a new turn is refused outright. 0 (the
-// default) means unlimited. This is a per-turn-start gate, not a mid-turn
-// kill switch: a single very expensive turn can still land above the cap,
-// but a runaway sequence of turns won't keep compounding past it.
+// SetMaxSessionSpendUSD caps how much this session may spend (per the
+// UsageStore) and detaches it from the server-wide Limits, keeping its round
+// ceiling. 0 (the default) means unlimited. The cap is checked before a new
+// turn (refused outright with budget_exceeded) and before every model
+// round-trip of a running one, where reaching it pauses the turn and asks
+// whether to continue rather than killing it (limits.go). Servers set the
+// shared Limits through Registry.SetLimits instead.
+//
+// The cap only sees priced usage. A turn on a model with no known rate
+// (EstimateCost known=false) adds nothing to the total, but is not silently
+// free: the total is flagged unknown on the wire (SpendData.SessionCostUnknown),
+// the turn's usage carries costUnknown, and the server logs it. A user who
+// needs a hard cap on such a model can give it a rate in pricing-overrides.json.
 func (a *Agent) SetMaxSessionSpendUSD(limit float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.maxSessionSpendUSD = limit
+	rounds, _ := a.limits.Get()
+	a.limits = NewLimits(rounds, limit)
+}
+
+// SetLimits shares l (server-wide, read live) with this session.
+func (a *Agent) SetLimits(l *Limits) {
+	if l == nil {
+		l = NewLimits(0, 0)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.limits = l
 }
 
 // CancelTurn stops turnID, whether it's running or still queued.
@@ -968,23 +1067,38 @@ type permDecision struct {
 	feedback string
 }
 
-func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool, feedback string) {
+func (a *Agent) HandlePermissionResponse(toolCallID string, allowed bool, remember bool, feedback string, choice ...PermissionChoice) {
 	if child := a.subagentAsking(toolCallID); child != nil {
-		child.HandlePermissionResponse(toolCallID, allowed, remember, feedback)
+		child.HandlePermissionResponse(toolCallID, allowed, remember, feedback, choice...)
 		return
+	}
+	var ch0 PermissionChoice
+	if len(choice) > 0 {
+		ch0 = choice[0]
 	}
 	a.mu.Lock()
 	ch, exists := a.permRequests[toolCallID]
-	cacheKey := a.permRequestKeys[toolCallID]
+	asked, hadAsk := a.permAsks[toolCallID]
 	delete(a.permRequests, toolCallID)
-	delete(a.permRequestKeys, toolCallID)
+	delete(a.permAsks, toolCallID)
 	if _, ok := a.nativeRemember[toolCallID]; ok {
-		a.nativeRemember[toolCallID] = remember
+		a.nativeRemember[toolCallID] = remember || ch0.RuleID != ""
+		a.nativeRuleID[toolCallID] = ch0.RuleID
 	}
 	a.mu.Unlock()
 
-	if remember && cacheKey != "" {
-		a.permEngine.RecordDecision(cacheKey, allowed, true)
+	if hadAsk {
+		rule := a.rememberPermission(asked, allowed, remember, ch0)
+		d := map[string]any{"mode": string(asked.mode), "remember": remember || ch0.RuleID != "", "scope": ch0.Scope}
+		if rule != nil {
+			d["ruleId"] = rule.ID
+		} else if ch0.RuleID != "" {
+			d["choice"] = ch0.RuleID // a native agent's own rule, kept by the agent
+		}
+		if feedback != "" {
+			d["feedback"] = true
+		}
+		a.audit(audit.Event{Kind: audit.PermDecision, Actor: ch0.By, Session: asked.session, Tool: asked.tool, Target: asked.target, Outcome: outcomeOf(allowed), Detail: d})
 	}
 	a.removePendingAsk(toolCallID)
 
@@ -1079,9 +1193,7 @@ func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (RoleBi
 		return RoleBinding{}, fmt.Errorf("session %s has no provider configured — call register_provider and set_provider first", sessionID)
 	}
 
-	a.mu.Lock()
-	spendCap := a.maxSessionSpendUSD
-	a.mu.Unlock()
+	_, spendCap := a.getLimits().Get()
 	if a.usageStore != nil && spendCap > 0 {
 		if spent := a.usageStore.SessionTotal(sessionID).CostUSD; spent >= spendCap {
 			_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("budget_exceeded", protocol.UsageData{}, startTime, "", ""))
@@ -1154,6 +1266,7 @@ func (a *Agent) applyGeneratedTitle(sessID, turnID, title string) {
 	if err == nil && titleJustSet {
 		_ = a.getStream().SendEvent(protocol.EventSessionUpdated, sessID, turnID, "", protocol.SessionSummary{
 			SessionID:       state.SessionID,
+			ProjectPath:     a.projectRoot,
 			UpdatedAt:       state.UpdatedAt,
 			MessageCount:    len(state.History),
 			Title:           state.Title,
@@ -1297,6 +1410,13 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 		nt       *NativeTurn
 	)
 	_, isNative := turnProvider.(NativeAgent)
+	if !isNative {
+		// What the project's skills are, once per turn like the instructions (see
+		// requestSuffix); and any the user named with $name, loaded as if the
+		// model had asked for them.
+		instructions += skills.Listing(a.skillsFor(turnProvider))
+		a.preloadSkills(turnID, bound)
+	}
 
 	// emptyLengthRetries caps how many times a round-trip that produced no
 	// visible text and no tool call — just finish_reason "length" — gets
@@ -1312,6 +1432,7 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 	// One model round-trip per iteration; each iteration either finishes the turn
 	// (no tool calls), runs tools and loops, or breaks out early when the turn is
 	// cancelled or the provider fails mid-stream.
+	var tl turnLimits
 turn:
 	for {
 		assistantText, toolCalls, segCalls = "", nil, nil
@@ -1325,7 +1446,8 @@ turn:
 		// that (possibly malformed) call instead of being flagged, since
 		// telling those two cases apart needs buffering tool calls until the
 		// stream's final stop reason is known. Tool execution's own
-		// json.Unmarshal error is the fallback signal for that case today.
+		// json.Unmarshal error is the fallback signal for that case today
+		// (one wasted round trip); buffer if that ever costs more.
 		var providerFinishReason string
 		select {
 		case <-turnCtx.Done():
@@ -1334,6 +1456,28 @@ turn:
 		default:
 		}
 
+		// The soft limits (limits.go): before starting another model call, if
+		// the turn has used up its rounds or the session its budget, pause and
+		// ask rather than kill the turn. A native agent runs its own loop and
+		// answers for its own safety, so it is never limited.
+		if !isNative {
+			if kind, why := a.limitHit(&tl, totalUsage.CostUSD); kind != limitNone {
+				carryOn, err := a.pauseForLimit(turnCtx, sessionID, turnID, &tl, kind, why)
+				if err != nil {
+					finishReason, cutShort = "cancelled", true
+					break turn
+				}
+				if !carryOn {
+					finishReason = LimitReached
+					break turn
+				}
+			}
+			tl.rounds++
+		}
+
+		if !isNative {
+			a.prepareSource(turnCtx) // start the MCP servers a turn can use, so this request already offers their tools
+		}
 		streamCtx, toolDefs, systemPrompt := turnCtx, a.activeToolDefs(), a.activeSystemPrompt()+instructions
 		prefixKey := requestPrefixKey(bound.Model, systemPrompt, toolDefs)
 		var activeContext []Message
@@ -1341,13 +1485,22 @@ turn:
 			a.mu.Lock()
 			hist := append([]Message(nil), a.history...)
 			a.mu.Unlock()
+			for i := len(hist) - 1; i >= 0; i-- { // the agent's own way of being told to run a skill
+				if hist[i].Role == "user" {
+					hist[i].Content = a.skillPromptFor(turnProvider, hist[i].Content)
+					break
+				}
+			}
 			forker, _ := turnProvider.(NativeForker)
 			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist, forker != nil && forker.CanFork())
+			if src, ok := a.toolSource().(tool.AgentServerSource); ok {
+				nt.MCP = src.AgentServers()
+			}
 			a.beginSteering(turnID, nt)
 			streamCtx = WithNativeTurn(turnCtx, nt)
 			toolDefs, systemPrompt = nil, ""
 		} else {
-			overhead := a.contextManager.EstimateTokens(systemPrompt) + a.contextManager.EstimateTokens(fmt.Sprint(toolDefs))
+			overhead := a.contextManager.estimateOverhead(systemPrompt, toolDefs)
 			if u := a.maybeCompact(turnCtx, turnID, bound, overhead); u.TotalTokens > 0 || u.CostUSD > 0 {
 				addUsage(&totalUsage, u)
 				totalUsage.CostUSD += u.CostUSD
@@ -1508,12 +1661,9 @@ turn:
 		// the turn's total — a turn can span models (plan role, subagents,
 		// the compaction summarizer), so re-pricing the total later on one
 		// model would be wrong.
-		if !roundTripUsage.CostKnown && bound.Model != "" {
-			roundTripUsage.CostUSD = EstimateCostUSD(bound.Model, roundTripUsage)
-		}
+		priceUsage(bound.Model, &roundTripUsage)
 		addUsage(&totalUsage, roundTripUsage)
 		totalUsage.CostUSD += roundTripUsage.CostUSD
-		totalUsage.CostKnown = true
 
 		if cutShort || streamErr != nil {
 			break turn
@@ -1555,8 +1705,10 @@ turn:
 				CreatedAt:    time.Now(),
 				GenerationMs: time.Since(segStart).Milliseconds(),
 				Usage:        &usage,
-				RawContent:   rawContent,
-				PrefixKey:    prefixKey,
+				// A native turn's usage covers all its requests.
+				UsageIsAggregate: isNative,
+				RawContent:       rawContent,
+				PrefixKey:        prefixKey,
 			})
 			a.mu.Unlock()
 			roundRecorded = true
@@ -1568,8 +1720,8 @@ turn:
 
 		// A native agent planning without a plan tool of its own: its final
 		// message is the plan.
-		// ponytail: a clarifying question ending a plan turn is shown as the
-		// plan too; the user just answers it.
+		// A clarifying question ending a plan turn is shown as the plan too;
+		// the user just answers it.
 		if isNative && nt != nil && nt.Mode == ModePlan && assistantText != "" && !a.planRecorded(turnID) {
 			a.recordPlan(sessionID, turnID, "plan-"+turnID, assistantText)
 		}
@@ -1595,53 +1747,58 @@ turn:
 			if _, ok := subs[tc.ID]; ok {
 				continue
 			}
-			toolImpl, exists := a.tools[tc.Name]
+			toolImpl, exists := a.lookupTool(tc.Name)
 			if !exists {
 				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s not recognized", tc.Name))
 				continue
 			}
 			mode := a.Mode()
 			if !a.isToolAllowedInMode(tc.Name) {
-				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s is unavailable in the current mode", tc.Name))
+				a.recordToolResult(turnID, tc, "", a.toolUnavailableMessage(tc.Name))
 				continue
 			}
 
 			allowed := true
-			var denyFeedback string
+			var denyFeedback, ruleDenied string
+			mutating := toolImpl.RequiresPermission(tc.Args)
+			target := ""
+			if mutating {
+				target = permissionTarget(tc.Name, tc.Args)
+			}
+			via := "" // how a call that goes ahead got through, for the audit log
 			if mode == ModeAutonomous {
 				// Autonomous: every permission check is bypassed outright,
 				// permission.Engine is never consulted (SPEC.md §4c).
-			} else if toolImpl.RequiresPermission(tc.Args) {
-				target := permissionTarget(tc.Name, tc.Args)
-
-				var decision permission.Decision
-				var cacheKey string
-				if (mode == ModeReadWrite || mode == ModeAcceptEdits || mode == ModeAuto) && shellTools[tc.Name] {
-					// Read/Write+Prompts: bash always asks, bypassing the
-					// engine's safe-command auto-allowlist. cacheKey is left
-					// empty so a "remember" answer here is never persisted
-					// (HandlePermissionResponse only calls RecordDecision
-					// when cacheKey != "") — otherwise a remembered bash
-					// command would silently auto-allow itself again later,
-					// including in other modes.
-					decision, cacheKey = permission.DecisionAsk, ""
-				} else {
-					decision, cacheKey = a.permEngine.Evaluate(tc.Name, target)
+				if mutating {
+					via = "autonomous"
+					a.auditAuto(sessionID, tc.Name, target, "allow", mode, nil, via)
 				}
-				// Accept Edits: project edits go through; a remembered deny still wins.
-				if mode == ModeAcceptEdits && editTools[tc.Name] && decision == permission.DecisionAsk {
+			} else if mutating {
+
+				// Rules answer first, shell tools included: a bash call asks
+				// unless a rule (or a read-only preset) allows that argv.
+				res := a.permEngine.Check(permission.Request{Tool: tc.Name, Target: target, Mode: string(mode)})
+				decision, cacheKey := res.Decision, res.CacheKey
+				// Accept Edits: project edits go through; a deny rule still wins,
+				// and so does an explicit ask rule.
+				if mode == ModeAcceptEdits && editTools[tc.Name] && decision == permission.DecisionAsk && res.Rule == nil {
 					decision = permission.DecisionAllow
+					via = "accept_edits"
 				}
 
 				switch decision {
 				case permission.DecisionDeny:
 					allowed = false
+					denyFeedback = ""
+					ruleDenied = denyReason(res)
+					a.auditAuto(sessionID, tc.Name, target, "deny", mode, res.Rule, viaRule(res.Rule))
 				case permission.DecisionAsk:
 					respCh := make(chan permDecision, 1)
 					a.mu.Lock()
 					a.permRequests[tc.ID] = respCh
-					a.permRequestKeys[tc.ID] = cacheKey
+					a.permAsks[tc.ID] = permAsk{mode: mode, suggestions: res.Suggestions, tool: tc.Name, target: target, session: sessionID}
 					a.mu.Unlock()
+					via = "user"
 
 					// Compute unified diff preview if tool is diffable
 					var computedDiff *diff.FileDiff
@@ -1657,6 +1814,7 @@ turn:
 						RequiresAsk: true,
 						CacheKey:    cacheKey,
 						Diff:        computedDiff,
+						Suggestions: wireSuggestions(res.Suggestions),
 					}
 					a.addPendingAsk(protocol.PendingAsk{Kind: "permission", SessionID: sessionID, TurnID: turnID, ToolCallID: tc.ID, PermissionRequestData: &req})
 					_ = a.getStream().SendEvent(protocol.EventPermissionRequest, a.sessionID, turnID, tc.ID, req)
@@ -1665,7 +1823,7 @@ turn:
 					case <-turnCtx.Done():
 						a.mu.Lock()
 						delete(a.permRequests, tc.ID)
-						delete(a.permRequestKeys, tc.ID)
+						delete(a.permAsks, tc.ID)
 						a.mu.Unlock()
 						a.removePendingAsk(tc.ID)
 						finishReason, cutShort = "cancelled", true
@@ -1676,11 +1834,20 @@ turn:
 					}
 				case permission.DecisionAllow:
 					allowed = true
+					if via == "" {
+						via = viaRule(res.Rule)
+					}
+					if !isPreset(res.Rule) {
+						a.auditAuto(sessionID, tc.Name, target, "allow", mode, res.Rule, via)
+					}
 				}
 			}
 
 			if !allowed {
 				reason := "permission denied by user or policy"
+				if ruleDenied != "" {
+					reason = ruleDenied
+				}
 				if denyFeedback != "" {
 					reason = fmt.Sprintf("permission denied by user: %s", denyFeedback)
 				}
@@ -1689,24 +1856,29 @@ turn:
 			}
 
 			toolCallID := tc.ID
+			readable := func() []string {
+				a.mu.Lock()
+				defer a.mu.Unlock()
+				return a.sessionAttachmentsLocked()
+			}()
+			readable = append(readable[:len(readable):len(readable)], a.skillDirs()...)
 			execCtx := tool.ExecutionContext{
-				SessionID:     a.sessionID,
-				TurnID:        turnID,
-				ToolCallID:    toolCallID,
-				SnapshotStore: a.snapshotStore,
-				Stream:        a.getStream(),
-				AuthorName:    author.Name,
-				AuthorEmail:   author.Email,
-				ExtraReadPaths: func() []string {
-					a.mu.Lock()
-					defer a.mu.Unlock()
-					return a.sessionAttachmentsLocked()
-				}(),
-				AskUser: func(question string, options []string) (string, error) {
-					return a.askUserQuestion(turnCtx, sessionID, turnID, toolCallID, question, options)
+				SessionID:      a.sessionID,
+				TurnID:         turnID,
+				ToolCallID:     toolCallID,
+				SnapshotStore:  a.snapshotStore,
+				Stream:         a.getStream(),
+				AuthorName:     author.Name,
+				AuthorEmail:    author.Email,
+				ExtraReadPaths: readable,
+				AskUsers: func(qs []tool.Question) ([]string, error) {
+					return a.askUserQuestion(turnCtx, sessionID, turnID, toolCallID, qs)
 				},
 			}
 
+			if mutating {
+				a.auditExec(sessionID, tc.Name, target, mode, via)
+			}
 			output, execErr := toolImpl.Execute(turnCtx, execCtx, tc.Args)
 			truncatedOutput := a.contextManager.TruncateToolOutput(output)
 
@@ -1744,9 +1916,7 @@ turn:
 	if (cutShort || streamErr != nil) && !roundRecorded && (assistantText != "" || len(toolCalls) > 0 || len(segCalls) > 0) {
 		providerName, modelName := bound.ProviderName, bound.Model
 		usage := roundTripUsage
-		if !usage.CostKnown && modelName != "" {
-			usage.CostUSD = EstimateCostUSD(modelName, usage)
-		}
+		priceUsage(modelName, &usage)
 		a.mu.Lock()
 		lastMessageID = a.nextMessageIDLocked()
 		a.history = append(a.history, Message{
@@ -1759,6 +1929,8 @@ turn:
 			CreatedAt:    time.Now(),
 			GenerationMs: time.Since(roundTripStart).Milliseconds(),
 			Usage:        &usage,
+
+			UsageIsAggregate: isNative,
 		})
 		a.mu.Unlock()
 	}
@@ -2044,26 +2216,33 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 	historySnapshot := a.history
 	a.mu.Unlock()
 
-	// A provider (e.g. a CLI subprocess) may already report an authoritative
-	// cost; only fall back to the pricing table when it hasn't (CostKnown
-	// distinguishes "no cost reported" from "provider reported a real $0").
-	if !usage.CostKnown {
-		if modelName := a.getModelName(); modelName != "" {
-			usage.CostUSD = EstimateCostUSD(modelName, usage)
-		}
-	}
+	// Every part of usage was priced when it was recorded (a provider's own
+	// cost, or the rate tables; priceUsage), so the total is settled unless
+	// some part had no rate at all.
+	usage.CostKnown = !usage.CostUnknown
 
+	// Unpriced usage is not free: it is recorded as unknown next to the
+	// priced total, and reported as such, rather than counting as $0 towards
+	// the per-session spend cap without a word. The cap can only act on what
+	// has a price, so it is a floor when SessionCostUnknown is set.
 	var spend *protocol.SpendData
 	if a.usageStore != nil {
+		if usage.CostUnknown {
+			a.usageStore.MarkCostUnknown(sessionID)
+			log.Printf("session %s: %s has no known price, so this turn's cost is unknown and not counted towards its spend total or cap", sessionID, a.getModelName())
+		}
 		sessTotals, projTotals := a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
-		spend = &protocol.SpendData{SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD}
+		spend = &protocol.SpendData{
+			SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD,
+			SessionCostUnknown: sessTotals.CostUnknown, ProjectCostUnknown: projTotals.CostUnknown,
+		}
 	}
 
 	// The provider's own reported size of the last request (its actual
 	// tokenizer, system prompt and tool schemas included) beats a char/4
 	// estimate; the turn's summed usage would count every round-trip's
 	// resent history over again.
-	estimatedTokens := a.contextManager.contextTokens(historySnapshot, contextView(historySnapshot, ""), 0)
+	ctxData := a.contextManager.Report(historySnapshot, a.getModelName(), a.requestOverhead())
 
 	return protocol.TurnCompletedData{
 		FinishReason:  finishReason,
@@ -2071,12 +2250,9 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 		UserMessageID: userMessageID,
 		MessageID:     messageID,
 		Usage:         &usage,
-		Context: &protocol.ContextData{
-			EstimatedTokens: estimatedTokens,
-			MaxTokens:       a.contextManager.GetMaxHistoryTokens(),
-		},
-		Spend:      spend,
-		DurationMs: time.Since(startTime).Milliseconds(),
+		Context:       &ctxData,
+		Spend:         spend,
+		DurationMs:    time.Since(startTime).Milliseconds(),
 	}
 }
 

@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
+// AskUserQuestionArgs takes one or more questions; the single question/options
+// pair is kept so an older call (or a model that prefers it) still works.
 type AskUserQuestionArgs struct {
-	Question string   `json:"question"`
-	Options  []string `json:"options,omitempty"`
+	Questions []Question `json:"questions,omitempty"`
+	Question  string     `json:"question,omitempty"`
+	Options   []string   `json:"options,omitempty"`
 }
 
 // AskUserQuestionTool pauses the turn and asks the user a clarifying
@@ -28,7 +32,7 @@ func (t *AskUserQuestionTool) Name() string {
 }
 
 func (t *AskUserQuestionTool) Description() string {
-	return "Ask the user a clarifying question and wait for their answer. Use when ambiguous instructions would otherwise force a guess."
+	return "Ask the user one or more clarifying questions and wait for their answers. Put every question you have in one call: they are shown together as a stack. Use when ambiguous instructions would otherwise force a guess."
 }
 
 func (t *AskUserQuestionTool) RequiresPermission(_ []byte) bool {
@@ -40,13 +44,33 @@ func (t *AskUserQuestionTool) Execute(_ context.Context, execCtx ExecutionContex
 	if err := json.Unmarshal(argsJSON, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	if args.Question == "" {
-		return "", fmt.Errorf("question must not be empty")
+	qs := args.Questions
+	if args.Question != "" {
+		qs = append([]Question{{args.Question, args.Options}}, qs...)
 	}
-	if execCtx.AskUser == nil {
+	for _, q := range qs {
+		if q.Question == "" {
+			return "", fmt.Errorf("question must not be empty")
+		}
+	}
+	if len(qs) == 0 {
+		return "", fmt.Errorf("questions must not be empty")
+	}
+	if execCtx.AskUsers == nil {
 		return "", fmt.Errorf("ask_user_question is not available in this context")
 	}
-	return execCtx.AskUser(args.Question, args.Options)
+	answers, err := execCtx.AskUsers(qs)
+	if err != nil {
+		return "", err
+	}
+	if len(qs) == 1 {
+		return answers[0], nil
+	}
+	var b strings.Builder
+	for i, q := range qs {
+		fmt.Fprintf(&b, "Q: %s\nA: %s\n\n", q.Question, answers[i])
+	}
+	return strings.TrimSpace(b.String()), nil
 }
 
 func (t *AskUserQuestionTool) Definition() ToolDefinition {
@@ -56,17 +80,24 @@ func (t *AskUserQuestionTool) Definition() ToolDefinition {
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"question": map[string]any{
-					"type":        "string",
-					"description": "The question to ask the user.",
-				},
-				"options": map[string]any{
+				"questions": map[string]any{
 					"type":        "array",
-					"items":       map[string]any{"type": "string"},
-					"description": "Optional multiple-choice options for the user to pick from.",
+					"description": "The questions to ask, all at once.",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"question": map[string]any{"type": "string", "description": "The question to ask the user."},
+							"options": map[string]any{
+								"type":        "array",
+								"items":       map[string]any{"type": "string"},
+								"description": "Optional multiple-choice options for the user to pick from.",
+							},
+						},
+						"required": []string{"question"},
+					},
 				},
 			},
-			"required": []string{"question"},
+			"required": []string{"questions"},
 		},
 	}
 }

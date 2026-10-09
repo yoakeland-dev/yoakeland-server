@@ -54,7 +54,8 @@ func claudePermissionMode(m agent.Mode) string {
 // every Bash command, no unsandboxed retry, and a refusal to start rather
 // than a silent unsandboxed fallback when bubblewrap is missing.
 // ponytail: covers Claude's Bash only — its Edit/Write tools still follow the
-// permission mode; upgrade path is running the whole CLI under bwrap.
+// permission mode; upgrade path is running the whole CLI under bwrap, once
+// autonomous mode is used on repos you don't trust.
 const claudeAutonomousSandbox = `{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}`
 
 type claudeBlock struct {
@@ -104,7 +105,13 @@ type claudeLine struct {
 	Result       string  `json:"result"`
 	IsError      bool    `json:"is_error"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
-	Usage        struct {
+	// ModelUsage is per model, including the window Claude Code uses for it.
+	ModelUsage map[string]struct {
+		ContextWindow int `json:"contextWindow"`
+	} `json:"modelUsage"`
+	// Usage sums every request of the turn (cache reads once per step), so it
+	// is spend, not context size: that is the last assistant message's usage.
+	Usage struct {
 		InputTokens              int `json:"input_tokens"`
 		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
@@ -235,6 +242,7 @@ type claudeTurn struct {
 	over atomic.Bool     // the turn has ended, so there is nothing left to steer
 
 	lastAssistant atomic.Value // uuid of the last assistant message: where this turn ends, to fork at later
+	contextTokens atomic.Int64 // what the last request held: its input plus its reply
 
 	mu       sync.Mutex
 	names    map[string]string           // tool_use_id -> tool name
@@ -261,6 +269,9 @@ func (t *claudeTurn) handle(ln claudeLine) {
 	case "assistant":
 		if topLevel && ln.UUID != "" {
 			t.lastAssistant.Store(ln.UUID)
+		}
+		if u := ln.Message.Usage; topLevel && u.InputTokens+u.CacheCreationInputTokens+u.CacheReadInputTokens > 0 {
+			t.contextTokens.Store(int64(claudeContextTokens(u.InputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens)))
 		}
 		// Text already streamed as deltas; only the tool calls are new.
 		// A subagent's (Task) own calls carry the Task's id as parent.
@@ -321,6 +332,7 @@ type claudeLaunch struct {
 	effort   string
 	settings string // --settings JSON, "" for none
 	permMode string
+	mcp      string // --mcp-config JSON, "" for none
 }
 
 func (p *CLISubprocessProvider) claudeLaunch(nt *agent.NativeTurn) claudeLaunch {
@@ -335,7 +347,7 @@ func (p *CLISubprocessProvider) claudeLaunch(nt *agent.NativeTurn) claudeLaunch 
 	if nt.Mode == agent.ModeAutonomous {
 		_ = json.Unmarshal([]byte(claudeAutonomousSandbox), &settings)
 	}
-	l := claudeLaunch{effort: effort, permMode: claudePermissionMode(nt.Mode)}
+	l := claudeLaunch{effort: effort, permMode: claudePermissionMode(nt.Mode), mcp: claudeMCPConfig(nt.MCP)}
 	if len(settings) > 0 {
 		raw, _ := json.Marshal(settings)
 		l.settings = string(raw)
@@ -371,9 +383,19 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 	if l.settings != "" {
 		args = append(args, "--settings", l.settings)
 	}
+	removeMCP := func() {}
+	if l.mcp != "" {
+		// A file, not an argument: the servers' environment and headers hold secrets.
+		path, remove, err := writeSecretFile("mcp-*.json", []byte(l.mcp))
+		if err != nil {
+			return nil, err
+		}
+		args, removeMCP = append(args, "--mcp-config", path), remove
+	}
 	// The process outlives the turn that started it, so it isn't bound to the turn's context.
 	proc, err := p.start()(context.Background(), "claude", args, p.Dir)
 	if err != nil {
+		removeMCP()
 		return nil, err
 	}
 	id := nt.ResumeID
@@ -382,6 +404,7 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 	}
 	s := &claudeSession{proc: proc, exited: make(chan struct{}), id: id, model: p.Model, permMode: launchMode, waiting: map[string]chan claudeLine{}}
 	go s.read()
+	go func() { <-s.exited; removeMCP() }()
 	// Headless Claude Code omits thinking text on Sonnet/Opus 4.7+ unless asked;
 	// a CLI that predates the request just answers with an error we ignore.
 	s.write(map[string]any{
@@ -413,7 +436,7 @@ func (p *CLISubprocessProvider) runClaude(ctx context.Context, nt *agent.NativeT
 
 func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
 	l := p.claudeLaunch(nt)
-	sig := strings.Join([]string{p.Dir, l.effort, l.settings}, "\x00")
+	sig := strings.Join([]string{p.Dir, l.effort, l.settings, l.mcp}, "\x00")
 	usable := func(ns nativeSession) bool {
 		cs := ns.(*claudeSession)
 		cs.mu.Lock()
@@ -522,11 +545,19 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 	s.cost = res.TotalCostUSD
 	s.mu.Unlock()
 	input := res.Usage.InputTokens + res.Usage.CacheCreationInputTokens + res.Usage.CacheReadInputTokens
+	// Subagents may run other models; the largest window is the main one's
+	// whenever they differ, since a subagent's is never larger in practice.
+	window := 0
+	for _, mu := range res.ModelUsage {
+		window = max(window, mu.ContextWindow)
+	}
 	emit(agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{
 		InputTokens:       input,
 		OutputTokens:      res.Usage.OutputTokens,
 		TotalTokens:       input + res.Usage.OutputTokens,
 		CachedInputTokens: res.Usage.CacheReadInputTokens,
+		ContextTokens:     int(t.contextTokens.Load()),
+		WindowTokens:      window,
 		CostUSD:           cost,
 		CostKnown:         true,
 	}})
@@ -534,6 +565,12 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 		return fmt.Errorf("claude: %s", strings.TrimSpace(res.Result))
 	}
 	return nil
+}
+
+// claudeContextTokens is how much the context held after a request: all the
+// input it read (cached or not) plus the reply, which the next request resends.
+func claudeContextTokens(input, cacheWrite, cacheRead, output int) int {
+	return input + cacheWrite + cacheRead + output
 }
 
 // controlError is the message of a control_response that failed, else "".
@@ -625,7 +662,8 @@ func (p *CLISubprocessProvider) claudeControl(ctx context.Context, nt *agent.Nat
 	if ds := claudeProposedDiffs(req.ToolName, input); len(ds) > 0 {
 		d = ds[0]
 	}
-	ask := agent.NativeAsk{ToolCallID: callID, ToolName: req.ToolName, Description: desc, Diff: d}
+	ask := agent.NativeAsk{ToolCallID: callID, ToolName: req.ToolName, Description: desc, Diff: d, Suggestions: claudeSuggestions(req.Suggestions)}
+	ask.Tool, ask.Target = claudeAskTarget(req.ToolName, input)
 	switch req.ToolName {
 	case "Edit", "MultiEdit", "Write", "NotebookEdit":
 		ask.Edit = true
@@ -654,7 +692,9 @@ func (p *CLISubprocessProvider) claudeControl(ctx context.Context, nt *agent.Nat
 	}
 	allow := map[string]any{"behavior": "allow", "updatedInput": input}
 	if ans.Remember && len(req.Suggestions) > 0 {
-		allow["updatedPermissions"] = req.Suggestions // Claude's own "always allow" rules
+		if picked := claudeChosenSuggestions(req.Suggestions, ans.RuleID); len(picked) > 0 {
+			allow["updatedPermissions"] = picked // Claude's own "always allow" rules
+		}
 	}
 	return reply(allow)
 }

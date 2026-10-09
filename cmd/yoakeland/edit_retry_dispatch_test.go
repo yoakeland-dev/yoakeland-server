@@ -62,6 +62,14 @@ func TestServeConnection_EditMessageAndSwitchBranchRoundTrip(t *testing.T) {
 	if len(initial.Messages) != 2 || initial.Messages[1].Content != "first reply" {
 		t.Fatalf("unexpected initial history: %+v", initial.Messages)
 	}
+	// The meters come with the history, so a cold open or a second device
+	// has them without a turn.
+	if initial.Context == nil || initial.Context.EstimatedTokens <= 0 || initial.Context.MaxTokens <= 0 || initial.Context.Source == "" {
+		t.Fatalf("expected session_history to carry the context meter, got %+v", initial.Context)
+	}
+	if initial.Spend == nil {
+		t.Fatal("expected session_history to carry the running spend")
+	}
 	origUserID := initial.Messages[0].ID
 	if origUserID == "" {
 		t.Fatalf("expected the user message to carry an id: %+v", initial.Messages[0])
@@ -101,6 +109,9 @@ func TestServeConnection_EditMessageAndSwitchBranchRoundTrip(t *testing.T) {
 	}
 	if len(switched.Messages) != 2 || switched.Messages[0].Content != "hi" || switched.Messages[1].Content != "first reply" {
 		t.Fatalf("switch_branch didn't restore the original branch: %+v", switched.Messages)
+	}
+	if switched.Context == nil || switched.Spend == nil {
+		t.Fatalf("expected switch_branch's session_history to carry context and spend, got %+v / %+v", switched.Context, switched.Spend)
 	}
 	if len(switched.Messages[0].AlternateIDs) != 1 || switched.Messages[0].AlternateIDs[0] != newUserID {
 		t.Fatalf("expected the edited branch listed as an alternate after switching away from it, got %+v", switched.Messages[0].AlternateIDs)

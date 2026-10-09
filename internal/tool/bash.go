@@ -59,10 +59,20 @@ func (t *BashTool) Execute(ctx context.Context, execCtx ExecutionContext, argsJS
 
 	if res.ExitCode != 0 {
 		return fmt.Sprintf("Command failed (exit code %d)\nSTDOUT:\n%s\nSTDERR:\n%s",
-			res.ExitCode, res.Stdout, res.Stderr), nil
+			res.ExitCode, wrapCommandOutput(res.Stdout), wrapCommandOutput(res.Stderr)), nil
 	}
 
-	return res.Stdout, nil
+	return wrapCommandOutput(res.Stdout), nil
+}
+
+// wrapCommandOutput marks what a command printed as data: it can carry text
+// from anywhere (curl, a cloned file, a dev server's log), so it gets the same
+// untrusted-content framing as web pages. Empty output stays empty.
+func wrapCommandOutput(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return s
+	}
+	return WrapUntrusted("a command's output", s)
 }
 
 // gitAuthorEnv returns GIT_AUTHOR_*/GIT_COMMITTER_* env vars for whichever

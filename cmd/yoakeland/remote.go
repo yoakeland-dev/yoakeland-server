@@ -9,14 +9,15 @@ import (
 	"yoakeland/internal/tlsca"
 )
 
-// defaultRemoteAddr is where set_remote_access binds the TCP listener when
-// the server was started without -listen (so no address was ever
-// configured) and a client enables remote access live.
+// defaultRemoteAddr is where set_remote_access binds the TCP listener when no
+// address has been configured (RemoteSettings.Addr) and a client enables
+// remote access.
 const defaultRemoteAddr = ":7890"
 
 // remoteControl owns the optional TCP listener's live state, so it can be
-// started/stopped both at boot (-listen) and at runtime (set_remote_access)
-// through the same code path rather than two divergent ones.
+// started/stopped both at boot (when RemoteSettings.Enabled was persisted) and
+// at runtime (set_remote_access) through the same code path rather than two
+// divergent ones.
 type remoteControl struct {
 	mu      sync.Mutex
 	ln      net.Listener
@@ -29,6 +30,14 @@ type remoteControl struct {
 	stateDir string
 	deps     connDeps
 	settings *ServerSettings
+}
+
+// apply copies the persisted remote-access settings into what Start binds and
+// presents; it does not touch a listener that is already running.
+func (r *remoteControl) apply(cfg RemoteSettings) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addr, r.tlsCert, r.tlsKey = cfg.Addr, cfg.TLSCert, cfg.TLSKey
 }
 
 // Start binds the TCP listener (if not already running) and begins
@@ -77,7 +86,10 @@ func (r *remoteControl) Start(ctx context.Context) error {
 // loads the persisted CA rather than regenerating it, so this works even
 // before remote access has ever been turned on.
 func (r *remoteControl) CAPEM() (string, error) {
-	if r.tlsCert != "" || r.tlsKey != "" {
+	r.mu.Lock()
+	operatorCert := r.tlsCert != "" || r.tlsKey != ""
+	r.mu.Unlock()
+	if operatorCert {
 		return "", nil
 	}
 	_, caPEMPath, _, err := tlsca.EnsureServerCert(r.stateDir, tlsca.DefaultSANs())

@@ -6,12 +6,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/audit"
+	"yoakeland/internal/mcp"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/projectstore"
@@ -19,6 +22,7 @@ import (
 	"yoakeland/internal/provider"
 	"yoakeland/internal/sandbox"
 	"yoakeland/internal/settings"
+	"yoakeland/internal/skills"
 	"yoakeland/internal/snapshot"
 	"yoakeland/internal/terminal"
 	"yoakeland/internal/tool"
@@ -37,9 +41,14 @@ type ProjectContext struct {
 	SandboxTier   string
 	SettingsStore *settings.Store
 	Terminals     *terminal.Manager
+	// Permissions is the rule engine the project's agents consult; the
+	// permission-rule requests read and edit it.
+	Permissions *permission.Engine
+	// MCP runs the project's MCP servers; nil when MCP could not be opened.
+	MCP *mcp.Manager
 }
 
-func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64, browser tool.BrowserRelay) (*ProjectContext, error) {
+func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider, defaultProviderName string, limits *agent.Limits, disableBashUnsandboxed bool, browser tool.BrowserRelay, skillCat *skills.Catalog) (*ProjectContext, error) {
 	norm, err := normalizer.New(root)
 	if err != nil {
 		return nil, fmt.Errorf("normalizer: %w", err)
@@ -78,6 +87,9 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 			fmt.Sprintf("no sandbox isolation available for project %q (bubblewrap and Linux namespaces both unavailable) — the bash tool runs with NO process/filesystem isolation beyond the project-root path check; a command can see and touch anything this OS user can. Install bubblewrap (bwrap) for real isolation.", norm.ProjectRoot),
 		)
 	}
+	// The read-only presets (ls, git status...) are only trusted where bash
+	// really is confined by bubblewrap.
+	permEngine.SetPresets(sb.Mode() == sandbox.ModeBubblewrap)
 	// Reuses the same sb this project's bash tool runs through (see the
 	// sandbox-tier warning above) — a remote peer's interactive terminal
 	// gets exactly the isolation an agent-issued command does, not more.
@@ -104,6 +116,12 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		)
 	}
 	tools = append(tools, tool.NewWebSearchTool(braveKey), tool.NewWebFetchTool())
+	var projSkills agent.SkillSource
+	if skillCat != nil {
+		ps := projectSkills{cat: skillCat, root: norm.ProjectRoot}
+		tools = append(tools, tool.NewSkillTool(ps))
+		projSkills = ps
+	}
 
 	ctxMgr := agent.NewContextManager(64000, 4000)
 	usageStore, err := agent.NewUsageStore(dataDir)
@@ -112,10 +130,13 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 	}
 
 	registry := agent.NewRegistry(defaultProvider, defaultProviderName, tools, permEngine, snapStore, sessStore, ctxMgr, usageStore, projSettings.WebToolsEnabled)
-	registry.SetMaxSessionSpendUSD(maxSessionSpendUSD)
+	registry.SetLimits(limits)
 	registry.SetProjectRoot(norm.ProjectRoot)
+	if projSkills != nil {
+		registry.SetSkills(projSkills)
+	}
 
-	return &ProjectContext{
+	pc := &ProjectContext{
 		Root:          norm.ProjectRoot,
 		SnapStore:     snapStore,
 		SessStore:     sessStore,
@@ -123,7 +144,19 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		SandboxTier:   string(sb.Mode()),
 		SettingsStore: settingsStore,
 		Terminals:     terminals,
-	}, nil
+		Permissions:   permEngine,
+	}
+	pc.applyShellPolicy(disableBashUnsandboxed)
+	return pc, nil
+}
+
+// applyShellPolicy withholds bash and the terminal_* tools from this
+// project's sessions when the server's disableBashWhenUnsandboxed setting is
+// on and the project has no real sandbox (tier local_restricted_fallback).
+// Any real tier keeps them, whatever the setting. A remote peer's own
+// interactive terminal is not affected: that is the user, not the model.
+func (pc *ProjectContext) applyShellPolicy(disableWhenUnsandboxed bool) {
+	pc.Registry.SetShellDisabled(disableWhenUnsandboxed && pc.SandboxTier == string(sandbox.ModeLocalRestr))
 }
 
 // toHistoryMessages converts a session's stored agent.Message history into
@@ -198,9 +231,10 @@ func alternateIDs(alts [][]agent.Message) []string {
 
 // sessionSummaryFrom builds the wire summary shared by session_list and
 // session_updated from a persisted session's state.
-func sessionSummaryFrom(state *agent.SessionState) protocol.SessionSummary {
+func sessionSummaryFrom(root string, state *agent.SessionState) protocol.SessionSummary {
 	return protocol.SessionSummary{
 		SessionID:       state.SessionID,
+		ProjectPath:     root,
 		UpdatedAt:       state.UpdatedAt,
 		MessageCount:    len(state.History),
 		Title:           state.Title,
@@ -308,11 +342,21 @@ type ProjectRegistry struct {
 	sessionProject      map[string]string          // sessionID -> project key
 	defaultProvider     agent.ModelProvider
 	defaultProviderName string
-	maxSpendUSD         float64
-	known               *projectstore.Store // persisted "which projects exist", server-wide
-	stateDir            string
-	notify              *NotificationFeed
-	hub                 *statusHub
+	// limits is the one soft round/spend limit holder every project's sessions
+	// read live; disableBashUnsandboxed is the runtime setting applied to each
+	// project by its sandbox tier. Both are written by ApplyRuntime.
+	limits                 *agent.Limits
+	disableBashUnsandboxed bool
+	defaultSource          func(root string) (agent.ModelProvider, string)
+	known                  *projectstore.Store // persisted "which projects exist", server-wide
+	stateDir               string
+	// chatsDir (canonical) holds one scratch root per project-less chat;
+	// chatTier is the sandbox tier they get.
+	chatsDir string
+	chatTier string
+	notify   *NotificationFeed
+	audit    *audit.Log
+	hub      *statusHub
 	// gits watches every known project's git state, open or not, so a
 	// client sees all its repos (SPEC.md §3.2 git_status). A nil entry is
 	// a known non-repo, so it isn't re-checked on every open.
@@ -323,6 +367,8 @@ type ProjectRegistry struct {
 	browser *browserBroker
 	// roles is the server-wide model role table every session shares.
 	roles *agent.Roles
+	// ext is the MCP servers and skills every project shares (extensions.go).
+	ext *extensions
 }
 
 // SetNotifications routes every project's session events (current and
@@ -331,6 +377,17 @@ func (r *ProjectRegistry) SetNotifications(feed *NotificationFeed) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.notify = feed
+	for _, pc := range r.projects {
+		r.installLocked(pc)
+	}
+}
+
+// SetAudit routes every project's (current and future) audit events, tagged
+// with their project, into log.
+func (r *ProjectRegistry) SetAudit(log *audit.Log) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.audit = log
 	for _, pc := range r.projects {
 		r.installLocked(pc)
 	}
@@ -361,7 +418,7 @@ func (r *ProjectRegistry) ensureGit(root string) {
 	_, ok := r.gits[root]
 	hub := r.hub
 	r.mu.Unlock()
-	if ok || hub == nil {
+	if ok || hub == nil || r.isChat(root) {
 		return
 	}
 	w := startGitWatcher(root, hub.BroadcastGit)
@@ -418,11 +475,27 @@ func (r *ProjectRegistry) Terminals() []protocol.TerminalSummary {
 // and status hub, whichever are set. Safe to repeat.
 func (r *ProjectRegistry) installLocked(pc *ProjectContext) {
 	hub := r.hub
+	var hooks agent.Hooks
+	if log := r.audit; log != nil {
+		root := pc.Root
+		hooks.Audit = func(e audit.Event) {
+			e.Project = root
+			log.Append(e)
+		}
+	}
 	if hub != nil {
-		pc.Registry.SetHooks(agent.Hooks{QueueChanged: hub.PushStatus, AsksChanged: hub.BroadcastPendingAsks})
+		asksChanged := hub.BroadcastPendingAsks
+		if feed := r.notify; feed != nil {
+			asksChanged = func() {
+				hub.BroadcastPendingAsks()
+				feed.Reconcile(r.PendingAsks(), r.sessionTitle)
+			}
+		}
+		hooks.QueueChanged, hooks.AsksChanged = hub.PushStatus, asksChanged
 		pc.Terminals.SetOnChange(hub.BroadcastTerminals)
 		go r.ensureGit(pc.Root)
 	}
+	pc.Registry.SetHooks(hooks)
 	var notifyTap func(protocol.EventType, string, string, any)
 	if r.notify != nil {
 		notifyTap = r.notify.sessionTap(pc.Root, pc.SessStore)
@@ -439,6 +512,17 @@ func (r *ProjectRegistry) installLocked(pc *ProjectContext) {
 			r.git(root).Poke() // a turn's writes don't touch .git, so the mtime poll can't see them
 		}
 	})
+}
+
+// sessionTitle names a chat for a notification body.
+func (r *ProjectRegistry) sessionTitle(root, sessionID string) string {
+	r.mu.Lock()
+	pc := r.projects[root]
+	r.mu.Unlock()
+	if pc == nil {
+		return "Untitled chat"
+	}
+	return sessionLabel(pc.SessStore, sessionID)
 }
 
 // QueuedTurns sums waiting turns across every open project.
@@ -498,17 +582,77 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 	if err != nil {
 		return nil, fmt.Errorf("project list store: %w", err)
 	}
+	chatsDir := filepath.Join(stateDir, "chats")
+	if err := os.MkdirAll(chatsDir, 0o700); err != nil {
+		return nil, fmt.Errorf("chats dir: %w", err)
+	}
+	if chatsDir, err = projectKey(chatsDir); err != nil {
+		return nil, fmt.Errorf("chats dir: %w", err)
+	}
+	pruneChats(stateDir, chatsDir)
 	return &ProjectRegistry{
+		chatsDir:            chatsDir,
+		chatTier:            string(sandbox.NewSandbox(chatsDir, time.Second).Mode()),
 		projects:            make(map[string]*ProjectContext),
 		sessionProject:      make(map[string]string),
 		defaultProvider:     defaultProvider,
 		defaultProviderName: defaultProviderName,
-		maxSpendUSD:         maxSessionSpendUSD,
+		limits:              agent.NewLimits(0, maxSessionSpendUSD),
 		known:               known,
 		stateDir:            stateDir,
 		gits:                make(map[string]*gitWatcher),
 		roles:               agent.NewRoles(),
+		ext:                 newExtensions(stateDir),
 	}, nil
+}
+
+// ApplyRuntime pushes the runtime settings this registry consumes (the soft
+// round and spend limits, and the bash-when-unsandboxed policy) into every
+// open project and remembers them for projects opened later. It is the
+// ServerSettings.OnRuntimeChange hook for those settings.
+func (r *ProjectRegistry) ApplyRuntime(rs protocol.RuntimeSettings) {
+	r.limits.Set(rs.MaxRoundsPerTurn, rs.MaxSessionCostUSD)
+	r.browser.SetBlockCrossOrigin(rs.BrowserBlockCrossOrigin)
+	r.mu.Lock()
+	r.disableBashUnsandboxed = rs.DisableBashWhenUnsandboxed
+	pcs := make([]*ProjectContext, 0, len(r.projects))
+	for _, pc := range r.projects {
+		pcs = append(pcs, pc)
+	}
+	r.mu.Unlock()
+	for _, pc := range pcs {
+		pc.applyShellPolicy(rs.DisableBashWhenUnsandboxed)
+	}
+}
+
+// SetDefaultSource makes every project's new (and provider-less) sessions
+// take their default provider from fn: the server's persisted
+// default_provider setting. Reapply after that setting changes.
+func (r *ProjectRegistry) SetDefaultSource(fn func(root string) (agent.ModelProvider, string)) {
+	r.mu.Lock()
+	r.defaultSource = fn
+	pcs := make([]*ProjectContext, 0, len(r.projects))
+	for _, pc := range r.projects {
+		pcs = append(pcs, pc)
+	}
+	r.mu.Unlock()
+	for _, pc := range pcs {
+		pc.Registry.SetDefaultSource(fn)
+	}
+}
+
+// ApplyDefaultProvider gives every open project's provider-less sessions the
+// current default provider (after set_default_provider).
+func (r *ProjectRegistry) ApplyDefaultProvider() {
+	r.mu.Lock()
+	pcs := make([]*ProjectContext, 0, len(r.projects))
+	for _, pc := range r.projects {
+		pcs = append(pcs, pc)
+	}
+	r.mu.Unlock()
+	for _, pc := range pcs {
+		pc.Registry.ApplyDefaultProvider()
+	}
 }
 
 // projectKey canonicalizes root the same way normalizer.New does (symlinks
@@ -539,19 +683,30 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 	if r.browser != nil {
 		browser = r.browser
 	}
-	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.maxSpendUSD, browser)
+	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.limits, r.disableBashUnsandboxed, browser, r.ext.skills)
 	if err != nil {
 		return nil, err
 	}
+	if r.ext.mcpStore != nil {
+		var notifier mcpNotifier
+		pc.MCP = mcp.NewManager(key, r.ext.mcpStore, r.ext.mcpAuth, r.ext.mcpFlow, func() { notifier.poke(func() { r.broadcastMCP(pc) }) })
+		pc.Registry.SetToolSource(pc.MCP)
+	}
+	pc.Permissions.SetGlobal(permission.OpenGlobal(r.stateDir))
 	r.projects[key] = pc
 	r.installLocked(pc)
+	pc.Registry.SetChat(r.isChat(key))
 	pc.Registry.SetRoles(r.roles)
+	pc.Registry.SetDefaultSource(r.defaultSource)
 
 	// Only recorded on an actual fresh open (not the map-hit fast path
 	// above), so a hot session doesn't turn every envelope it touches into
 	// a projects.json rewrite. ponytail: LastOpenedAt only advances once
 	// per process-lifetime per project, not per request — fine for a
 	// "recent projects" sort, not meant as a precise last-touched clock.
+	if r.isChat(key) {
+		return pc, nil // a chat's scratch root isn't a project to list
+	}
 	if err := r.known.Upsert(key); err != nil {
 		logWarn("failed to record project %q in projects.json: %v", key, err)
 	}
@@ -606,8 +761,35 @@ func (r *ProjectRegistry) Remove(root string) error {
 	r.gits[key].Stop()
 	delete(r.gits, key)
 	r.mu.Unlock()
+	if ok && pc.MCP != nil {
+		pc.MCP.Close()
+	}
+	if r.ext.mcpStore != nil {
+		r.ext.mcpStore.ForgetProject(key)
+	}
 
 	return r.known.Remove(key)
+}
+
+// broadcastMCP pushes a project's MCP server status to every peer, for a server
+// that finished connecting, failed, or changed its tools.
+func (r *ProjectRegistry) broadcastMCP(pc *ProjectContext) {
+	r.mu.Lock()
+	hub := r.hub
+	r.mu.Unlock()
+	if hub == nil || hub.peers == nil {
+		return
+	}
+	hub.peers.BroadcastEvent("", protocol.EventMCPServers, "", mcpPayload(pc))
+}
+
+// CloseMCP stops every project's MCP servers (at shutdown).
+func (r *ProjectRegistry) CloseMCP() {
+	for _, pc := range r.open() {
+		if pc.MCP != nil {
+			pc.MCP.Close()
+		}
+	}
 }
 
 // List returns every project this server has ever opened, most-recently-used
@@ -632,7 +814,7 @@ func (r *ProjectRegistry) Known(key string) bool {
 	r.mu.Lock()
 	_, open := r.projects[key]
 	r.mu.Unlock()
-	return open || slices.Contains(r.List(), key)
+	return open || r.isChat(key) || slices.Contains(r.List(), key)
 }
 
 // scopeRemoteProject keeps a TCP peer to projects the server already knows
@@ -643,7 +825,8 @@ func (r *ProjectRegistry) Known(key string) bool {
 // case-variant of the key is checked, since encoding/json matches field
 // names case-insensitively.
 // ponytail: a known project nested inside another can still be swapped for a
-// symlink from the outer one's sandbox between here and the handler.
+// symlink from the outer one's sandbox between here and the handler; closing
+// it means fd-based (openat/RESOLVE_BENEATH) path handling in every handler.
 func scopeRemoteProject(deps connDeps, env *protocol.Envelope) error {
 	field := "projectPath"
 	if env.Type == protocol.EventOpenProject {
@@ -659,7 +842,7 @@ func scopeRemoteProject(deps connDeps, env *protocol.Envelope) error {
 			continue
 		}
 		var p string
-		if json.Unmarshal(raw, &p) != nil || p == "" {
+		if json.Unmarshal(raw, &p) != nil || p == "" || p == protocol.ChatProject {
 			continue
 		}
 		key, err := projectKey(p)
@@ -684,7 +867,13 @@ func scopeRemoteProject(deps connDeps, env *protocol.Envelope) error {
 //   - otherwise it's an error: nothing to resolve against
 func (r *ProjectRegistry) Resolve(sessionID, explicitPath, defaultRoot string) (*ProjectContext, error) {
 	if explicitPath != "" {
-		key, err := projectKey(explicitPath)
+		var key string
+		var err error
+		if explicitPath == protocol.ChatProject {
+			key, err = r.chatRoot(sessionID)
+		} else {
+			key, err = projectKey(explicitPath)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("resolving project path %q: %w", explicitPath, err)
 		}
@@ -723,4 +912,112 @@ func (r *ProjectRegistry) Resolve(sessionID, explicitPath, defaultRoot string) (
 	}
 
 	return nil, fmt.Errorf("session %s has no project bound and no projectPath given", sessionID)
+}
+
+var chatIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// isChat reports whether key is a project-less chat's scratch root.
+func (r *ProjectRegistry) isChat(key string) bool {
+	return filepath.Dir(key) == r.chatsDir
+}
+
+// chatRoot creates (if needed) and returns the scratch root of a project-less
+// chat: <state-dir>/chats/<sessionID>, an ordinary directory the session's
+// sandbox, terminals and tools treat as a project root.
+func (r *ProjectRegistry) chatRoot(sessionID string) (string, error) {
+	if !chatIDPattern.MatchString(sessionID) {
+		return "", fmt.Errorf("a chat needs a sessionId of letters, digits, '-' and '_'")
+	}
+	dir := filepath.Join(r.chatsDir, sessionID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// ListChats is every project-less chat's session, read straight from disk so
+// listing doesn't open a ProjectContext per chat.
+func (r *ProjectRegistry) ListChats() []protocol.SessionSummary {
+	entries, _ := os.ReadDir(r.chatsDir)
+	out := []protocol.SessionSummary{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		store, err := agent.NewDiskSessionStore(projectstore.DataDir(r.stateDir, filepath.Join(r.chatsDir, e.Name())))
+		if err != nil {
+			continue
+		}
+		ids, _ := store.List()
+		for _, id := range ids {
+			if st, err := store.Load(id); err == nil {
+				sum := sessionSummaryFrom(filepath.Join(r.chatsDir, e.Name()), st)
+				sum.WorkspaceBytes = dirSize(sum.ProjectPath)
+				out = append(out, sum)
+			}
+		}
+	}
+	return out
+}
+
+// DropChat forgets a deleted chat's context and removes its scratch root and
+// state. Callers have already cancelled its session.
+func (r *ProjectRegistry) DropChat(root string) {
+	if !r.isChat(root) {
+		return
+	}
+	r.mu.Lock()
+	delete(r.projects, root)
+	r.mu.Unlock()
+	_ = os.RemoveAll(root)
+	_ = os.RemoveAll(projectstore.DataDir(r.stateDir, root))
+}
+
+// dirSize is the total size of root's regular files, counting at most
+// dirSizeMaxEntries entries so a chat that unpacked a huge tree can't make
+// listing slow; past that it reports what it had counted.
+// ponytail: a lower bound for very large workspaces, a cached size if it matters.
+const dirSizeMaxEntries = 20000
+
+func dirSize(root string) int64 {
+	var total int64
+	n := 0
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if n++; n > dirSizeMaxEntries {
+			return fs.SkipAll
+		}
+		if d.Type().IsRegular() {
+			if info, err := d.Info(); err == nil {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	return total
+}
+
+// pruneChats removes scratch roots left by a chat that was set up but never
+// prompted (set_mode/set_provider create the directory before the first
+// message): no session on disk and untouched for a day. Runs at startup only,
+// so it can't race a chat being created in this process.
+func pruneChats(stateDir, chatsDir string) {
+	entries, _ := os.ReadDir(chatsDir)
+	for _, e := range entries {
+		root := filepath.Join(chatsDir, e.Name())
+		info, err := e.Info()
+		if !e.IsDir() || err != nil || time.Since(info.ModTime()) < 24*time.Hour {
+			continue
+		}
+		data := projectstore.DataDir(stateDir, root)
+		if store, err := agent.NewDiskSessionStore(data); err == nil {
+			if ids, _ := store.List(); len(ids) > 0 {
+				continue
+			}
+		}
+		_ = os.RemoveAll(root)
+		_ = os.RemoveAll(data)
+	}
 }

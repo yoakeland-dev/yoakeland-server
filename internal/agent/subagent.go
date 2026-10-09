@@ -149,6 +149,8 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 func (a *Agent) newSubagent(parentToolCallID string, bound RoleBinding, explore bool) *Agent {
 	a.mu.Lock()
 	mode, web, sessionID, roles, root := a.mode, a.webToolsEnabled, a.sessionID, a.roles, a.projectRoot
+	shellOff, limits := a.shellDisabled, a.limits
+	src, skillSrc := a.source, a.skillSrc
 	a.mu.Unlock()
 	child := NewAgent(nil, bound.Provider, bound.ProviderName, a.toolList, a.permEngine, a.snapshotStore, nil, &ContextManager{
 		MaxHistoryTokens:    a.contextManager.GetMaxHistoryTokens(),
@@ -158,7 +160,9 @@ func (a *Agent) newSubagent(parentToolCallID string, bound RoleBinding, explore 
 	child.sessionID = sessionID
 	child.hooks = a.hooks
 	child.webToolsEnabled = web
+	child.shellDisabled, child.limits = shellOff, limits
 	child.roles, child.projectRoot = roles, root
+	child.source, child.skillSrc = src, skillSrc
 	if mode == ModePlan || explore {
 		mode = ModeReadOnly
 	}

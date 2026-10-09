@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/audit"
 	"yoakeland/internal/diff"
 )
 
@@ -21,59 +22,86 @@ const MaxFrameSize = 10 * 1024 * 1024
 type EventType string
 
 const (
-	EventUserPrompt           EventType = "user_prompt"
-	EventEditMessage          EventType = "edit_message"
-	EventRetryMessage         EventType = "retry_message"
-	EventSwitchBranch         EventType = "switch_branch"
-	EventPermissionResponse   EventType = "permission_response"
-	EventCancelTurn           EventType = "cancel_turn"
-	EventSteerTurn            EventType = "steer_turn"
-	EventSteerAccepted        EventType = "steer_accepted"
-	EventSteerRejected        EventType = "steer_rejected"
-	EventRestoreSnapshot      EventType = "restore_snapshot"
-	EventAuth                 EventType = "auth"
-	EventRegisterProvider     EventType = "register_provider"
-	EventListProviders        EventType = "list_providers"
-	EventSetProvider          EventType = "set_provider"
-	EventSetModelOptions      EventType = "set_model_options"
-	EventSetModelRoles        EventType = "set_model_roles"
-	EventOAuthStart           EventType = "openrouter_oauth_start"
-	EventOAuthComplete        EventType = "openrouter_oauth_complete"
-	EventRemoveProvider       EventType = "remove_provider"
-	EventListModels           EventType = "list_models"
-	EventSetFavoriteModels    EventType = "set_favorite_models"
-	EventListSessions         EventType = "list_sessions"
-	EventDetectCLI            EventType = "detect_cli"
-	EventPing                 EventType = "ping"
-	EventOpenProject          EventType = "open_project"
-	EventListProjects         EventType = "list_projects"
-	EventRemoveProject        EventType = "remove_project"
-	EventListFiles            EventType = "list_files"
-	EventSetMode              EventType = "set_mode"
-	EventApprovePlan          EventType = "approve_plan"
-	EventSetWebToolsEnabled   EventType = "set_web_tools_enabled"
-	EventAskUserAnswer        EventType = "ask_user_answer"
-	EventGetSessionHistory    EventType = "get_session_history"
-	EventSetSessionTitle      EventType = "set_session_title"
-	EventSetSessionArchived   EventType = "set_session_archived"
-	EventDeleteSession        EventType = "delete_session"
-	EventSetSessionLayout     EventType = "set_session_layout"
-	EventListDirectory        EventType = "list_directory"
-	EventListSnapshots        EventType = "list_snapshots"
-	EventSetPeerName          EventType = "set_peer_name"
-	EventSetPeerAvatar        EventType = "set_peer_avatar"
-	EventDisconnectPeer       EventType = "disconnect_peer"
-	EventSetRemoteAccess      EventType = "set_remote_access"
-	EventSetRemotePassword    EventType = "set_remote_password"
-	EventSetServerIdentity    EventType = "set_server_identity"
-	EventSetAutoGenerateTitle EventType = "set_auto_generate_title"
-	EventRegisterToken        EventType = "register_token"
-	EventListTokens           EventType = "list_tokens"
-	EventRemoveToken          EventType = "remove_token"
-	EventListNotifications    EventType = "list_notifications"
-	EventDismissNotification  EventType = "dismiss_notification"
-	EventUploadBegin          EventType = "upload_begin"
-	EventUploadChunk          EventType = "upload_chunk"
+	EventUserPrompt            EventType = "user_prompt"
+	EventEditMessage           EventType = "edit_message"
+	EventRetryMessage          EventType = "retry_message"
+	EventSwitchBranch          EventType = "switch_branch"
+	EventPermissionResponse    EventType = "permission_response"
+	EventCancelTurn            EventType = "cancel_turn"
+	EventSteerTurn             EventType = "steer_turn"
+	EventSteerAccepted         EventType = "steer_accepted"
+	EventSteerRejected         EventType = "steer_rejected"
+	EventRestoreSnapshot       EventType = "restore_snapshot"
+	EventAuth                  EventType = "auth"
+	EventRegisterProvider      EventType = "register_provider"
+	EventListProviders         EventType = "list_providers"
+	EventSetProvider           EventType = "set_provider"
+	EventSetModelOptions       EventType = "set_model_options"
+	EventSetModelRoles         EventType = "set_model_roles"
+	EventOAuthStart            EventType = "openrouter_oauth_start"
+	EventOAuthComplete         EventType = "openrouter_oauth_complete"
+	EventRemoveProvider        EventType = "remove_provider"
+	EventListModels            EventType = "list_models"
+	EventSetFavoriteModels     EventType = "set_favorite_models"
+	EventListSessions          EventType = "list_sessions"
+	EventDetectCLI             EventType = "detect_cli"
+	EventPing                  EventType = "ping"
+	EventOpenProject           EventType = "open_project"
+	EventListProjects          EventType = "list_projects"
+	EventRemoveProject         EventType = "remove_project"
+	EventListFiles             EventType = "list_files"
+	EventSetMode               EventType = "set_mode"
+	EventApprovePlan           EventType = "approve_plan"
+	EventSetWebToolsEnabled    EventType = "set_web_tools_enabled"
+	EventAskUserAnswer         EventType = "ask_user_answer"
+	EventGetSessionHistory     EventType = "get_session_history"
+	EventSetSessionTitle       EventType = "set_session_title"
+	EventSetSessionArchived    EventType = "set_session_archived"
+	EventDeleteSession         EventType = "delete_session"
+	EventSetSessionLayout      EventType = "set_session_layout"
+	EventListDirectory         EventType = "list_directory"
+	EventListSnapshots         EventType = "list_snapshots"
+	EventImportChatFiles       EventType = "import_chat_files"
+	EventChatFilesImported     EventType = "chat_files_imported"
+	EventSetPeerName           EventType = "set_peer_name"
+	EventSetPeerAvatar         EventType = "set_peer_avatar"
+	EventDisconnectPeer        EventType = "disconnect_peer"
+	EventSetRemoteAccess       EventType = "set_remote_access"
+	EventSetRemotePassword     EventType = "set_remote_password"
+	EventSetServerIdentity     EventType = "set_server_identity"
+	EventSetAutoGenerateTitle  EventType = "set_auto_generate_title"
+	EventSetRuntimeSettings    EventType = "set_runtime_settings"
+	EventSetDefaultProvider    EventType = "set_default_provider"
+	EventRegisterToken         EventType = "register_token"
+	EventListTokens            EventType = "list_tokens"
+	EventRemoveToken           EventType = "remove_token"
+	EventListNotifications     EventType = "list_notifications"
+	EventListPermissionRules   EventType = "list_permission_rules"
+	EventAddPermissionRule     EventType = "add_permission_rule"
+	EventDeletePermissionRule  EventType = "delete_permission_rule"
+	EventDismissNotification   EventType = "dismiss_notification"
+	EventMarkNotificationsRead EventType = "mark_notifications_read"
+	EventListAudit             EventType = "list_audit"
+	EventSetNotifyPrefs        EventType = "set_notify_prefs"
+	EventSetPresence           EventType = "set_presence"
+	EventUploadBegin           EventType = "upload_begin"
+	EventUploadChunk           EventType = "upload_chunk"
+
+	// MCP servers and skills (SPEC.md §3.1 "MCP servers" and "Skills").
+	EventListMCPServers      EventType = "list_mcp_servers"
+	EventSaveMCPServer       EventType = "save_mcp_server"
+	EventRemoveMCPServer     EventType = "remove_mcp_server"
+	EventSetMCPServerEnabled EventType = "set_mcp_server_enabled"
+	EventSetMCPToolEnabled   EventType = "set_mcp_tool_enabled"
+	EventReconnectMCPServer  EventType = "reconnect_mcp_server"
+	EventMCPOAuthStart       EventType = "mcp_oauth_start"
+	EventMCPOAuthComplete    EventType = "mcp_oauth_complete"
+	EventMCPSignOut          EventType = "mcp_sign_out"
+	EventScanMCPImports      EventType = "scan_mcp_imports"
+	EventImportMCPServers    EventType = "import_mcp_servers"
+	EventListSkills          EventType = "list_skills"
+	EventSetSkillEnabled     EventType = "set_skill_enabled"
+	EventGetSkill            EventType = "get_skill"
 
 	// Terminal events (§ built-in terminal): a real, interactive shell —
 	// distinct from the bash tool's single-command-no-shell design — that a
@@ -100,6 +128,11 @@ const (
 	EventBrowserRequest  EventType = "browser_request"
 	EventBrowserResponse EventType = "browser_response"
 
+	EventMCPServers               EventType = "mcp_servers"
+	EventMCPOAuthURL              EventType = "mcp_oauth_url"
+	EventMCPImportCandidates      EventType = "mcp_import_candidates"
+	EventSkills                   EventType = "skills"
+	EventSkillDetail              EventType = "skill_detail"
 	EventModelDelta               EventType = "model_delta"
 	EventToolCallRequested        EventType = "tool_call_requested"
 	EventPermissionRequest        EventType = "permission_request"
@@ -116,6 +149,8 @@ const (
 	EventModelOptionsSet          EventType = "model_options_set"
 	EventModelRolesSet            EventType = "model_roles_set"
 	EventContextCompacted         EventType = "context_compacted"
+	EventGetContextBreakdown      EventType = "get_context_breakdown"
+	EventContextBreakdown         EventType = "context_breakdown"
 	EventOAuthURL                 EventType = "openrouter_oauth_url"
 	EventProviderRemoved          EventType = "provider_removed"
 	EventModelList                EventType = "model_list"
@@ -141,6 +176,8 @@ const (
 	EventRemotePasswordSet        EventType = "remote_password_set"
 	EventServerIdentity           EventType = "server_identity"
 	EventAutoGenerateTitle        EventType = "auto_generate_title"
+	EventRuntimeSettings          EventType = "runtime_settings"
+	EventDefaultProviderSet       EventType = "default_provider_set"
 	EventTokenRegistered          EventType = "token_registered"
 	EventTokenList                EventType = "token_list"
 	EventTokenRemoved             EventType = "token_removed"
@@ -148,7 +185,11 @@ const (
 	EventGitStatus                EventType = "git_status"
 	EventPendingAsks              EventType = "pending_asks"
 	EventNotificationList         EventType = "notification_list"
+	EventPermissionRules          EventType = "permission_rules"
 	EventNotificationDismissed    EventType = "notification_dismissed"
+	EventNotificationsRead        EventType = "notifications_read"
+	EventAuditList                EventType = "audit_list"
+	EventNotifyPrefs              EventType = "notify_prefs"
 	EventUploadProgress           EventType = "upload_progress"
 	EventUploadDone               EventType = "upload_done"
 
@@ -406,6 +447,80 @@ type ContextCompactedData struct {
 	TokensAfter  int    `json:"tokensAfter"`
 }
 
+// GetContextBreakdownData asks for a session's context split by category
+// (SPEC.md §3.1 get_context_breakdown); answered with context_breakdown.
+type GetContextBreakdownData struct {
+	SessionID   string `json:"sessionId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	RequestID   string `json:"requestId,omitempty"`
+}
+
+// Context category keys (ContextCategory.Key). A client keys its colours on
+// these; Label is what to print, and a key a client doesn't know is "other".
+const (
+	CtxSystem      = "system"       // system prompt
+	CtxTools       = "tools"        // tool definitions
+	CtxMemory      = "memory"       // memory / instruction files (Claude Code)
+	CtxSkills      = "skills"       // skill listings (Claude Code)
+	CtxAgents      = "agents"       // custom agent listings (Claude Code)
+	CtxMCP         = "mcp"          // MCP tool definitions (Claude Code)
+	CtxUser        = "user"         // the user's messages
+	CtxAssistant   = "assistant"    // the model's replies
+	CtxToolCalls   = "tool_calls"   // the model's tool calls' arguments
+	CtxToolResults = "tool_results" // what tools returned
+	CtxReasoning   = "reasoning"    // the model's reasoning / thinking
+	CtxAttachments = "attachments"  // attached files and images
+	CtxSummary     = "summary"      // the summary a compaction left
+	CtxMessages    = "messages"     // messages, not split further
+	CtxOther       = "other"
+	CtxFree        = "free"   // room left before compaction
+	CtxBuffer      = "buffer" // reserved: room the window has beyond the compaction point
+)
+
+// ContextCategory is one slice of the context. Exact means the provider
+// itself counted it (Claude Code counts each category with the token-count
+// API); otherwise it is yoakeland's character-based estimate, scaled so all
+// the used slices add up to the provider's reported total when there is one.
+type ContextCategory struct {
+	Key    string `json:"key"`
+	Label  string `json:"label"`
+	Tokens int    `json:"tokens"`
+	Exact  bool   `json:"exact"`
+}
+
+// ContextCache is what the last request read from and wrote to the prompt
+// cache, out of Input (its whole prompt). Omitted when the provider gave no
+// per-request figure.
+type ContextCache struct {
+	Read  int `json:"read"`
+	Write int `json:"write"`
+	Input int `json:"input"`
+}
+
+// ContextBreakdownData answers get_context_breakdown. Used categories come
+// first, then free and buffer; WindowTokens, when known, is what they all add
+// up to. TotalTokens is what the context holds now. Source says where the
+// total came from ("provider": counted by the provider for its last request;
+// "estimated": a character heuristic; "unknown": nothing to measure yet);
+// each category's Exact says how its own figure was arrived at.
+type ContextBreakdownData struct {
+	RequestID string `json:"requestId,omitempty"`
+	SessionID string `json:"sessionId"`
+	Model     string `json:"model,omitempty"`
+
+	TotalTokens  int `json:"totalTokens"`
+	WindowTokens int `json:"windowTokens,omitempty"`
+	// AutoCompactAt is the size at which the session compacts itself; 0 when
+	// the agent does that on its own terms and doesn't say.
+	AutoCompactAt int    `json:"autoCompactAt,omitempty"`
+	Source        string `json:"source"`
+
+	Categories []ContextCategory `json:"categories"`
+	Cache      *ContextCache     `json:"cache,omitempty"`
+	Spend      *SpendData        `json:"spend,omitempty"`
+	Error      string            `json:"error,omitempty"`
+}
+
 // SetModeData switches a session between the modes on its next turn —
 // "read_only", "read_write", "accept_edits", "auto", "autonomous", or "plan" (see SPEC.md §4c).
 // ApprovePlanData approves the plan a session has shown (SPEC.md §3.1
@@ -459,6 +574,10 @@ type AskUserAnswerData struct {
 type AskUserQuestionRequestedData struct {
 	Question string   `json:"question"`
 	Options  []string `json:"options,omitempty"`
+	// Index (1-based) and Total place this question among those raised together,
+	// so a client can say "2 of 3" however many have been answered; 0 when unset.
+	Index int `json:"index,omitempty"`
+	Total int `json:"total,omitempty"`
 }
 
 // PlanWrittenData carries the plan, so clients never read the server's disk.
@@ -586,6 +705,12 @@ type SessionSummary struct {
 	Title           string    `json:"title,omitempty"`
 	Archived        bool      `json:"archived,omitempty"`
 	LinkedSessionID *string   `json:"linkedSessionId,omitempty"`
+	// ProjectPath is the canonical root the session runs in. For a chat
+	// (projectPath "@chat") it's the only way to learn its scratch directory.
+	ProjectPath string `json:"projectPath,omitempty"`
+	// WorkspaceBytes is the size of a chat's scratch directory (a "@chat"
+	// listing only; capped, see ProjectRegistry.ListChats).
+	WorkspaceBytes int64 `json:"workspaceBytes,omitempty"`
 	// Mode is the session's persisted current mode ("read_only"/"read_write"/
 	// "autonomous"/"plan"), empty for the default (read_write) — see §4c.
 	Mode string `json:"mode,omitempty"`
@@ -615,6 +740,27 @@ type DeleteSessionData struct {
 	ProjectPath string `json:"projectPath,omitempty"`
 }
 
+// ImportChatFilesData copies a project-less chat's workspace into a project
+// (SPEC.md §4b "Moving a chat"). SessionID names the chat; Target is a project
+// the server already knows.
+type ImportChatFilesData struct {
+	SessionID string `json:"sessionId"`
+	Target    string `json:"target"`
+	RequestID string `json:"requestId,omitempty"`
+}
+
+// ChatFilesImportedData answers it: the new directory's name inside Target
+// (relative to it) and what was copied, or Error.
+type ChatFilesImportedData struct {
+	RequestID string `json:"requestId,omitempty"`
+	SessionID string `json:"sessionId"`
+	Target    string `json:"target,omitempty"`
+	Dir       string `json:"dir,omitempty"`
+	Files     int    `json:"files,omitempty"`
+	Bytes     int64  `json:"bytes,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 // SessionDeletedData confirms a delete_session, echoing the id back since
 // there's no more session state left to summarize.
 type SessionDeletedData struct {
@@ -640,6 +786,9 @@ type ListSessionsData struct {
 type SessionListData struct {
 	ProjectPath string           `json:"projectPath"`
 	Sessions    []SessionSummary `json:"sessions"`
+	// SandboxTier is set on the "@chat" listing only: the tier a chat's scratch
+	// directory gets, so a client knows whether a new chat can safely default to Run.
+	SandboxTier string `json:"sandboxTier,omitempty"`
 }
 
 // GetSessionHistoryData requests the full persisted message history for one
@@ -749,6 +898,12 @@ type SessionHistoryData struct {
 	// another peer may have changed it since this client last had the
 	// session open.
 	Mode string `json:"mode,omitempty"`
+	// Context and Spend are what the last turn_completed of this session
+	// would report now, so a client that opens the session cold (reload,
+	// second device) or switches branch has its meters without a turn.
+	// Context is omitted for a session with no messages.
+	Context *ContextData `json:"context,omitempty"`
+	Spend   *SpendData   `json:"spend,omitempty"`
 }
 
 // OpenProjectData validates and lazily initializes a project (its own
@@ -862,12 +1017,29 @@ type DisconnectPeerData struct {
 // SetRemoteAccessData opens or closes the optional TCP listener live,
 // local-socket-only (a remote peer can't be allowed to open the door it's
 // not already through).
+//
+// Addr, TLSCert, TLSKey and WebRoot are optional: an omitted field keeps its
+// persisted value, "" clears it. Changing one while the listener is running
+// restarts it. They replace the old -listen host:port, -tls-cert, -tls-key
+// and -web-root launch flags.
 type SetRemoteAccessData struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool    `json:"enabled"`
+	Addr    *string `json:"addr,omitempty"`
+	TLSCert *string `json:"tlsCert,omitempty"`
+	TLSKey  *string `json:"tlsKey,omitempty"`
+	WebRoot *string `json:"webRoot,omitempty"`
 }
 
+// RemoteAccessSetData is the remote listener's persisted state: pushed on
+// connect, and to every peer after set_remote_access. TLSCert/TLSKey/WebRoot
+// are only filled in for a local-socket peer.
 type RemoteAccessSetData struct {
 	Enabled bool `json:"enabled"`
+	// Addr is the TCP address the listener binds ("" means ":7890").
+	Addr    string `json:"addr,omitempty"`
+	TLSCert string `json:"tlsCert,omitempty"`
+	TLSKey  string `json:"tlsKey,omitempty"`
+	WebRoot string `json:"webRoot,omitempty"`
 }
 
 // SetRemotePasswordData rotates the TCP listener's shared auth token,
@@ -960,6 +1132,63 @@ type SetAutoGenerateTitleData struct {
 // whenever the server-wide default changes.
 type AutoGenerateTitleData struct {
 	Enabled bool `json:"enabled"`
+}
+
+// RuntimeSettings are the server's tunables that used to be launch flags or
+// hard-coded constants. One typed struct: persisted in server.json, pushed to
+// every peer on connect and after each change (runtime_settings), and changed
+// with set_runtime_settings. Adding a setting means adding a field here plus
+// its default and clamp in cmd/yoakeland/runtime_settings.go.
+//
+// A value of 0 means the setting's default, or "unlimited" where noted. The
+// server clamps out-of-range values rather than rejecting them; the
+// runtime_settings reply carries what was actually stored.
+//
+// Every field is enforced: the limits and bash policy by the project registry,
+// the sandbox/terminal caps by internal/sandbox, the pool caps by
+// internal/provider, the pricing interval by the pricing cache and
+// BrowserBlockCrossOrigin by the browser broker.
+type RuntimeSettings struct {
+	// MaxRoundsPerTurn pauses a turn to ask "continue?" after this many model
+	// round-trips (0 = unlimited). Applies to yoakeland's own API-provider
+	// loop; native CLI agents run their own loop and are never limited.
+	MaxRoundsPerTurn int `json:"maxRoundsPerTurn"`
+	// MaxSessionCostUSD pauses a turn (and refuses a new one) once a session
+	// has spent this much (0 = unlimited).
+	MaxSessionCostUSD float64 `json:"maxSessionCostUsd"`
+	// DisableBashWhenUnsandboxed withholds bash and the terminal_* tools from
+	// the model in any project whose sandbox tier is
+	// local_restricted_fallback.
+	DisableBashWhenUnsandboxed bool `json:"disableBashWhenUnsandboxed"`
+
+	ExecTimeoutSec          int  `json:"execTimeoutSec"`          // default 60, 1-3600
+	ExecOutputMaxBytes      int  `json:"execOutputMaxBytes"`      // default 1 MiB
+	TerminalMemoryMaxMB     int  `json:"terminalMemoryMaxMB"`     // default 2048, >= 64
+	TerminalPidsMax         int  `json:"terminalPidsMax"`         // default 512, >= 16
+	TerminalReadMaxChars    int  `json:"terminalReadMaxChars"`    // default 12000
+	TerminalHistoryKB       int  `json:"terminalHistoryKB"`       // default 256
+	PoolIdleMinutes         int  `json:"poolIdleMinutes"`         // default 30
+	PoolMaxLive             int  `json:"poolMaxLive"`             // 0 = unlimited
+	PricingRefreshHours     int  `json:"pricingRefreshHours"`     // default 24
+	BrowserBlockCrossOrigin bool `json:"browserBlockCrossOrigin"` // default true
+}
+
+// SetRuntimeSettingsData is a partial update: a JSON object holding only the
+// RuntimeSettings keys to change (unknown keys are an error).
+type SetRuntimeSettingsData = map[string]json.RawMessage
+
+// SetDefaultProviderData picks the registered provider (and model) sessions
+// use until they call set_provider themselves. An empty ProviderName clears
+// it. Replaces the -provider/-model/-api-key/-base-url launch flags.
+type SetDefaultProviderData struct {
+	ProviderName string `json:"providerName"`
+	Model        string `json:"model,omitempty"`
+}
+
+// DefaultProviderSetData is pushed on connect and to every peer after a change.
+type DefaultProviderSetData struct {
+	ProviderName string `json:"providerName,omitempty"`
+	Model        string `json:"model,omitempty"`
 }
 
 // ListProjectsData takes no fields; it's a request marker.
@@ -1183,6 +1412,19 @@ type ServerStatus struct {
 	RateLimits map[string]ProviderRateLimits `json:"rateLimits,omitempty"`
 	Spend      *ServerSpend                  `json:"spend,omitempty"`
 	Budgets    []Budget                      `json:"budgets,omitempty"`
+	// NativeSessions is the pool of live CLI-agent processes (one per chat
+	// and agent kind), bounded by the poolIdleMinutes / poolMaxLive settings.
+	NativeSessions *NativeSessionsStatus `json:"nativeSessions,omitempty"`
+}
+
+// NativeSessionsStatus describes the pool of live CLI-agent processes.
+type NativeSessionsStatus struct {
+	Live           int            `json:"live"`
+	Busy           int            `json:"busy"`
+	Max            int            `json:"max,omitempty"` // 0 = no cap
+	IdleTimeoutSec int            `json:"idleTimeoutSec"`
+	ByKind         map[string]int `json:"byKind,omitempty"`
+	OldestIdleSec  int            `json:"oldestIdleSec,omitempty"`
 }
 
 // RateLimitWindow is one subscription usage window. ResetsAt is RFC 3339.
@@ -1327,14 +1569,31 @@ type PendingAsksData struct {
 // (SPEC.md §3.2 notification) — broadcast to every peer when raised, and
 // replayed by list_notifications for a client that connected afterward.
 type Notification struct {
-	ID          string    `json:"id"`
-	Level       string    `json:"level"` // "info" | "success" | "warning" | "error"
-	Kind        string    `json:"kind"`  // e.g. "turn_completed", "permission_request", "peer_joined"
-	Title       string    `json:"title"`
-	Body        string    `json:"body,omitempty"`
-	SessionID   string    `json:"sessionId,omitempty"`
-	ProjectPath string    `json:"projectPath,omitempty"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ID    string `json:"id"`
+	Level string `json:"level"` // "info" | "success" | "warning" | "error": the icon
+	// Priority says how loudly to raise it: "urgent" (needs you: an ask, an
+	// error, a spend cap), "normal" (worth knowing: a long turn finished) or
+	// "quiet" (bell only: a device connected).
+	Priority string `json:"priority"`
+	Kind     string `json:"kind"` // e.g. "turn_done", "permission_request", "peer_joined"
+	Title    string `json:"title"`
+	Body     string `json:"body,omitempty"`
+	// Count is how many times this happened while it sat unread (a repeat
+	// within a minute replaces the entry instead of adding one). 1 when omitted.
+	Count       int    `json:"count,omitempty"`
+	SessionID   string `json:"sessionId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	// ToolCallID names the pending ask a permission_request /
+	// ask_user_question_requested entry mirrors; it is retracted (dismissed)
+	// when that ask is answered or cancelled.
+	ToolCallID string `json:"toolCallId,omitempty"`
+	// Read is server-side, so it follows you across devices. An entry raised
+	// for the chat someone was already looking at is born read.
+	Read bool `json:"read,omitempty"`
+	// Attended: a device was in use (window focused) when this was raised, so
+	// the others should not add an OS-level alert on top.
+	Attended  bool      `json:"attended,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 type NotificationListData struct {
@@ -1346,6 +1605,55 @@ type NotificationListData struct {
 // notification_dismissed to every peer.
 type DismissNotificationData struct {
 	ID string `json:"id,omitempty"`
+}
+
+// ListAuditData asks for a page of the audit log (SPEC.md §3.1 list_audit),
+// newest first. Before is the Seq of the last event of the previous page.
+type ListAuditData struct {
+	RequestID string   `json:"requestId,omitempty"`
+	Before    int64    `json:"before,omitempty"`
+	Limit     int      `json:"limit,omitempty"` // default 100, at most 500
+	Kinds     []string `json:"kinds,omitempty"`
+	SessionID string   `json:"sessionId,omitempty"`
+	Project   string   `json:"projectPath,omitempty"`
+	Since     string   `json:"since,omitempty"` // RFC 3339
+}
+
+// AuditListData answers list_audit. More says older matches remain: ask
+// again with Before set to the last event's Seq.
+type AuditListData struct {
+	RequestID string        `json:"requestId,omitempty"`
+	Events    []audit.Event `json:"events"`
+	More      bool          `json:"more"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// MarkNotificationsReadData marks the listed notifications read, or every
+// one when IDs is empty. Echoed back verbatim as notifications_read to every
+// peer.
+type MarkNotificationsReadData struct {
+	IDs []string `json:"ids,omitempty"`
+}
+
+// NotifyPrefsData is the server-wide notification policy (set_notify_prefs
+// in, notify_prefs out). Urgent/Normal/Quiet switch a whole priority tier;
+// Muted silences single kinds inside a tier that is on. MinTurnSec is how
+// long a turn must have run before its "response ready" is worth raising.
+type NotifyPrefsData struct {
+	Urgent     bool     `json:"urgent"`
+	Normal     bool     `json:"normal"`
+	Quiet      bool     `json:"quiet"`
+	MinTurnSec int      `json:"minTurnSec"`
+	Muted      []string `json:"muted"`
+}
+
+// SetPresenceData is a device's heartbeat: which chats it shows (the main
+// one and the sidebar's) and whether its window is focused and visible. The
+// server treats one older than five minutes as gone.
+type SetPresenceData struct {
+	SessionIDs []string `json:"sessionIds,omitempty"`
+	Focused    bool     `json:"focused"`
+	Visible    bool     `json:"visible"`
 }
 
 // UploadBeginData starts a chunked client→server file upload (SPEC.md §3.1
@@ -1381,6 +1689,11 @@ type UploadDoneData struct {
 type PongData struct {
 	Nonce string `json:"nonce,omitempty"`
 }
+
+// ChatProject is the projectPath that binds a session to its own scratch
+// directory on the server instead of a project: a chat with no project. As
+// list_sessions' projectPath it lists every such chat.
+const ChatProject = "@chat"
 
 // UserPromptData starts or continues a session. ProjectPath is only
 // meaningful the first time a given sessionId is used — it binds that
@@ -1525,12 +1838,78 @@ type PermissionRequestData struct {
 	// `plan_written` just showed; approve it with approve_plan, or answer
 	// with feedback to send it back for changes.
 	Plan bool `json:"plan,omitempty"`
+	// Suggestions are rules the user may pick instead of a bare "always
+	// allow" (answer with permission_response.ruleId). For a CLI agent's ask
+	// they are the agent's own "always allow" options (Native: true).
+	Suggestions []PermissionSuggestion `json:"suggestions,omitempty"`
+}
+
+// PermissionSuggestion is one "stop asking about this" option on a
+// permission_request. The server rebuilds the rule from its own copy when
+// the answer names ID, so a client never supplies a pattern.
+type PermissionSuggestion struct {
+	ID      string   `json:"id"`
+	Label   string   `json:"label"`
+	Tool    string   `json:"tool,omitempty"`
+	Pattern []string `json:"pattern,omitempty"`
+	// Scope is the default scope offered: session | project | global.
+	Scope  string `json:"scope,omitempty"`
+	Native bool   `json:"native,omitempty"`
 }
 
 type PermissionResponseData struct {
 	Allowed  bool   `json:"allowed"`
 	Remember bool   `json:"remember"`
 	Feedback string `json:"feedback,omitempty"`
+	// RuleID picks one of the request's suggestions to remember instead of
+	// the plain exact-match Remember; Scope overrides where it is stored
+	// (session | project | global). Both are ignored without an allow/deny.
+	RuleID string `json:"ruleId,omitempty"`
+	Scope  string `json:"scope,omitempty"`
+}
+
+// PermissionRuleData is one permission rule on the wire (§3.1 "Permission rules").
+type PermissionRuleData struct {
+	ID        string   `json:"id,omitempty"`
+	Tool      string   `json:"tool"`
+	Pattern   []string `json:"pattern"`
+	Text      string   `json:"text,omitempty"` // the pattern as typed, for display; read on add if Pattern is empty
+	Decision  string   `json:"decision"`
+	Scope     string   `json:"scope,omitempty"`
+	Modes     []string `json:"modes,omitempty"`
+	Source    string   `json:"source,omitempty"`
+	CreatedAt string   `json:"createdAt,omitempty"`
+	Match     []string `json:"match,omitempty"`
+	NotMatch  []string `json:"notMatch,omitempty"`
+	// Readonly marks a built-in preset.
+	Readonly bool `json:"readonly,omitempty"`
+}
+
+type ListPermissionRulesData struct {
+	ProjectPath string `json:"projectPath,omitempty"`
+}
+
+type AddPermissionRuleData struct {
+	ProjectPath string             `json:"projectPath,omitempty"`
+	Scope       string             `json:"scope"`
+	Rule        PermissionRuleData `json:"rule"`
+}
+
+type DeletePermissionRuleData struct {
+	ProjectPath string `json:"projectPath,omitempty"`
+	ID          string `json:"id"`
+}
+
+// PermissionRulesData answers the three rule requests, and is broadcast to
+// every peer when rules change. Errors are rule files that failed to load
+// (approvals ask until fixed); Notes are v1 entries migration dropped.
+type PermissionRulesData struct {
+	ProjectPath string               `json:"projectPath"`
+	Rules       []PermissionRuleData `json:"rules"`
+	Errors      []string             `json:"errors,omitempty"`
+	Notes       []string             `json:"notes,omitempty"`
+	// Error is why the request that produced this reply was refused.
+	Error string `json:"error,omitempty"`
 }
 
 type ToolResultData struct {
@@ -1554,26 +1933,53 @@ type UsageData struct {
 	CachedInputTokens     int `json:"cachedInputTokens,omitempty"`
 	CacheWriteInputTokens int `json:"cacheWriteInputTokens,omitempty"`
 
-	// CostKnown marks CostUSD as an authoritative cost reported by the
-	// provider itself (e.g. a CLI subprocess's own billing total), as
-	// opposed to zero-value default. Not part of the wire contract — it only
-	// controls whether the agent falls back to the static per-model pricing
-	// table, since a bare CostUSD==0 can't otherwise distinguish "provider
-	// hasn't reported a cost" from "provider reported a genuine $0".
-	CostKnown bool `json:"-"`
+	// ContextTokens is how many tokens the context held after the last
+	// model request this usage covers (that request's input plus its
+	// reply); WindowTokens is the model's context window, when the provider
+	// says. Unlike the counts above they are not sums: a native agent's
+	// turn makes many requests, and only the last one's size says how full
+	// the context is. Zero when the provider reports neither.
+	ContextTokens int `json:"contextTokens,omitempty"`
+	WindowTokens  int `json:"windowTokens,omitempty"`
+
+	// CostKnown marks CostUSD as settled: reported by the provider itself
+	// (e.g. a CLI subprocess's own billing total) or priced from a rate
+	// table, as opposed to the zero value. It controls whether the agent
+	// prices this usage again, since a bare CostUSD==0 can't distinguish
+	// "provider hasn't reported a cost" from "provider reported a genuine
+	// $0". On a turn's total it means every part of the total was priced.
+	CostKnown bool `json:"costKnown,omitempty"`
+	// CostUnknown marks usage no rate exists for: CostUSD is 0 (or, on a
+	// total, only the priced part) but the real cost is not.
+	CostUnknown bool `json:"costUnknown,omitempty"`
 }
 
 // ContextData reports how full the model's context window is after a turn,
 // so a frontend can render a context meter.
 type ContextData struct {
 	EstimatedTokens int `json:"estimatedTokens"`
-	MaxTokens       int `json:"maxTokens"`
+	// MaxTokens is the meter's denominator: the model's context window when
+	// known, else BudgetTokens.
+	MaxTokens int `json:"maxTokens"`
+	// WindowTokens is the model's real context window; omitted when unknown.
+	WindowTokens int `json:"windowTokens,omitempty"`
+	// BudgetTokens is the size at which the session compacts itself: the
+	// configured budget, clamped to the window and never below the minimum.
+	BudgetTokens int `json:"budgetTokens,omitempty"`
+	// Source is where EstimatedTokens came from: "provider" (a count the
+	// provider reported for its last request), "estimated" (a character
+	// heuristic), or "unknown" (nothing in the context yet to measure).
+	Source string `json:"source,omitempty"`
 }
 
 // SpendData reports running cost totals, persisted across process restarts.
 type SpendData struct {
 	SessionTotalUSD float64 `json:"sessionTotalUsd"`
 	ProjectTotalUSD float64 `json:"projectTotalUsd"`
+	// SessionCostUnknown / ProjectCostUnknown: some usage counted in the
+	// total had no rate, so the true total is higher than shown.
+	SessionCostUnknown bool `json:"sessionCostUnknown,omitempty"`
+	ProjectCostUnknown bool `json:"projectCostUnknown,omitempty"`
 }
 
 type TurnCompletedData struct {
@@ -1904,6 +2310,14 @@ type BrowserRequestData struct {
 	ProjectPath string          `json:"projectPath,omitempty"`
 	Action      string          `json:"action"`
 	Args        json.RawMessage `json:"args"`
+	// AllowedHosts are the hostnames the agent may end up on in this chat:
+	// the ones it navigated to (each passed the permission check) plus
+	// loopback. With BlockCrossOrigin set, a host that enforces it must stop
+	// any other main-frame navigation an agent action causes (a click on an
+	// off-site link, a redirect) and tell the agent to use navigate, which
+	// asks the user. Old clients ignore both fields.
+	AllowedHosts     []string `json:"allowedHosts,omitempty"`
+	BlockCrossOrigin bool     `json:"blockCrossOrigin,omitempty"`
 }
 
 // BrowserResponseData answers one browser_request: Output is the text the

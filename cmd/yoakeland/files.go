@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+	"yoakeland/internal/audit"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
@@ -130,6 +131,7 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		out.Error = errString(err)
 		reply(protocol.EventFileWritten, out)
 		if err == nil && !out.Conflict {
+			deps.record(ipc, "", audit.Event{Kind: audit.FileWrite, Project: pc.Root, Target: d.Path, Outcome: "ok", Detail: map[string]any{"bytes": len(d.Content)}})
 			filesChanged(deps, pc.Root, d.Path)
 		}
 
@@ -142,6 +144,7 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		}
 		reply(protocol.EventFsOpDone, protocol.FsOpDoneData{RequestID: d.RequestID, Error: errString(err)})
 		if err == nil {
+			deps.record(ipc, "", audit.Event{Kind: audit.FsOp, Project: pc.Root, Target: d.Path, Outcome: "ok", Detail: map[string]any{"op": d.Op, "to": d.NewPath}})
 			filesChanged(deps, pc.Root, d.Path, d.NewPath)
 		}
 

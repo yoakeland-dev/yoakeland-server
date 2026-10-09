@@ -21,7 +21,7 @@ import (
 // connection keeps acceptLoop's connection tracking exact.
 func serveWeb(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
 	mux := http.NewServeMux()
-	mux.Handle("/", spaHandler(deps.webRoot))
+	mux.Handle("/", spaHandler(deps.webRootDir()))
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// Default options reject cross-origin upgrades.
 		ws, err := websocket.Accept(w, r, nil)
@@ -39,7 +39,7 @@ func serveWeb(ctx context.Context, conn net.Conn, network string, deps connDeps,
 func spaHandler(root string) http.Handler {
 	if root == "" {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "this yoakeland server has no web UI (start it with -web-root)", http.StatusNotFound)
+			http.Error(w, "this yoakeland server has no web UI (set a web root with set_remote_access)", http.StatusNotFound)
 		})
 	}
 	files := http.FileServer(http.Dir(root))

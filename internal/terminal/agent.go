@@ -25,7 +25,8 @@ var (
 // scanMarks updates ready/busy/finished/lastExit from one output chunk's
 // OSC 633 marks, in order. Callers hold t.mu.
 // ponytail: a mark split across two pty reads is missed; the agent then just
-// waits out its timeout instead of returning early.
+// waits out its timeout instead of returning early; carry a partial-mark tail
+// between reads if that timeout is ever seen in practice.
 func (t *Terminal) scanMarks(data []byte) {
 	for {
 		i := bytes.Index(data, []byte("\x1b]633;"))

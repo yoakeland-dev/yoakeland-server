@@ -145,3 +145,40 @@ func TestBrowserTool_RelaysThroughProject(t *testing.T) {
 	}
 	t.Fatal("no browser tool result")
 }
+
+// Every request carries the hosts this chat's agent navigated to, so the
+// desktop panel can refuse to follow a link anywhere else.
+func TestBrowserBroker_SendsApprovedHosts(t *testing.T) {
+	peers := NewPeerRegistry()
+	b := newBrowserBroker(peers)
+	host, reqs := browserPeer(t, peers, "unix")
+	peers.SetBrowserHost(host.ID, true)
+	do := func(sessionID, action, args string) protocol.BrowserRequestData {
+		t.Helper()
+		go func() {
+			req := <-reqs
+			b.Respond(host.ID, protocol.BrowserResponseData{RequestID: req.RequestID, Output: "ok"})
+			reqs <- req // hand the request back to the caller
+		}()
+		if _, err := b.Browse(context.Background(), sessionID, action, json.RawMessage(args)); err != nil {
+			t.Fatal(err)
+		}
+		return <-reqs
+	}
+
+	if r := do("s1", "snapshot", `{}`); !r.BlockCrossOrigin || len(r.AllowedHosts) != 0 {
+		t.Fatalf("before any navigate: %+v", r)
+	}
+	do("s1", "navigate", `{"url":"https://Docs.Example.com/x"}`)
+	r := do("s1", "click", `{"ref":"3"}`)
+	if len(r.AllowedHosts) != 1 || r.AllowedHosts[0] != "docs.example.com" {
+		t.Fatalf("hosts = %v", r.AllowedHosts)
+	}
+	if r := do("s2", "snapshot", `{}`); len(r.AllowedHosts) != 0 {
+		t.Fatalf("another chat inherited hosts: %v", r.AllowedHosts)
+	}
+	b.SetBlockCrossOrigin(false)
+	if r := do("s1", "click", `{"ref":"3"}`); r.BlockCrossOrigin || len(r.AllowedHosts) != 0 {
+		t.Fatalf("setting off but still enforcing: %+v", r)
+	}
+}

@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -128,7 +129,8 @@ func (t *BrowserTool) Execute(ctx context.Context, execCtx ExecutionContext, arg
 	}
 	out, err := t.relay.Browse(ctx, execCtx.SessionID, a.Action, forwarded)
 	if err != nil {
-		return "", err
+		// The host's error can quote page-controlled text (a script exception, say).
+		return "", errors.New(WrapUntrusted("the browser page", err.Error()))
 	}
 	return WrapUntrusted("the browser page", out), nil
 }

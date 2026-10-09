@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 	"yoakeland/internal/diff"
+	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
 )
@@ -43,6 +44,15 @@ type NativeAsk struct {
 	Diff        *diff.FileDiff
 	// Edit: the ask is for a file change (Accept Edits lets those through).
 	Edit bool
+	// Tool and Target, when the provider can name them, say what the agent
+	// wants to do in yoakeland's own terms ("bash" + the command line,
+	// "file_write"/"file_edit" + the path, "web_fetch" + the host), so
+	// yoakeland's deny rules can refuse it. Allow rules never apply here:
+	// the agent owns its own safety.
+	Tool, Target string
+	// Suggestions are the agent's own "always allow" options, offered by
+	// label. None means one generic option when the agent can remember.
+	Suggestions []NativeSuggestion
 	// Plan, when set, makes this the agent asking to leave its plan mode with
 	// this plan: it is shown to the user, who approves or sends it back.
 	Plan string
@@ -62,7 +72,19 @@ type NativeAnswer struct {
 	Allowed  bool
 	Remember bool
 	Feedback string
+	// RuleID is the NativeSuggestion.ID the user picked ("" = all of them,
+	// what Remember alone always meant).
+	RuleID string
 }
+
+// NativeSuggestion is one of the agent's own "always allow" options.
+type NativeSuggestion struct {
+	ID, Label string
+}
+
+// NativeSuggestionAgent is the generic option for an agent that can remember
+// an approval but doesn't describe it (Codex's acceptForSession, ACP's allow_always).
+const NativeSuggestionAgent = "agent"
 
 // NativeSessionRef is the CLI agent's own session this chat continues, and
 // Cursor is the ID of the last message that session has seen. A turn resumes
@@ -127,6 +149,10 @@ type NativeTurn struct {
 	// SessionKey names the chat for a provider that keeps its CLI process alive
 	// between turns; "" means one process per turn.
 	SessionKey string
+
+	// MCP are the user's MCP servers handed to the agent to run itself, in a
+	// stable order. A provider that can take them does; one that can't ignores them.
+	MCP []tool.AgentServer
 
 	steer func(text string) error // see SetSteer
 
@@ -197,6 +223,9 @@ func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []
 	if last > 0 {
 		nt.FreshPrompt = "Earlier in this conversation (you don't have this in your context, it's a transcript):\n\n" +
 			renderTranscript(contextView(history[:last], "")) + "\n---\n\n" + msg
+	}
+	if a.chat {
+		nt.FreshPrompt = NativeChatInstruction + nt.FreshPrompt
 	}
 	nt.Prompt = nt.FreshPrompt
 	if ref != nil && ref.Provider == providerName && last > 0 {
@@ -304,6 +333,28 @@ func flattenNativeTools(history []Message) []Message {
 	return out
 }
 
+// nativeTool and nativeTarget name what a native agent asks to do, for the
+// audit log: yoakeland's own tool and target when the provider gave them.
+func nativeTool(req NativeAsk) string {
+	switch {
+	case req.Plan != "":
+		return "plan"
+	case req.Tool != "":
+		return req.Tool
+	}
+	return req.ToolName
+}
+
+func nativeTarget(req NativeAsk) string {
+	switch {
+	case req.Plan != "":
+		return "approve the plan"
+	case req.Target != "":
+		return req.Target
+	}
+	return req.Description
+}
+
 // askNativePermission turns a native agent's permission ask into the same
 // permission_request flow yoakeland's own tools use, gated by mode.
 func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID string, req NativeAsk) (NativeAnswer, error) {
@@ -311,21 +362,36 @@ func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID strin
 	if req.Plan != "" {
 		a.recordPlan(sessionID, turnID, req.ToolCallID, req.Plan)
 		if mode == ModeAutonomous {
+			a.auditAuto(sessionID, "plan", "approve the plan", "allow", mode, nil, "autonomous")
 			return NativeAnswer{Allowed: true}, nil
 		}
 		req.Description = "Approve the plan"
 	} else {
+		// yoakeland's deny rules hold over a native agent too (autonomous
+		// excepted, like everywhere); its allow rules do not.
+		if mode != ModeAutonomous && req.Tool != "" {
+			if res := a.permEngine.Check(permission.Request{Tool: req.Tool, Target: req.Target, Mode: string(mode)}); res.Decision == permission.DecisionDeny && res.Rule != nil {
+				a.auditAuto(sessionID, req.Tool, req.Target, "deny", mode, res.Rule, viaRule(res.Rule))
+				return NativeAnswer{Feedback: denyReason(res)}, nil
+			}
+		}
 		switch {
 		case mode == ModeAutonomous, mode == ModeAcceptEdits && req.Edit:
+			a.auditAuto(sessionID, nativeTool(req), nativeTarget(req), "allow", mode, nil, map[bool]string{true: "autonomous", false: "accept_edits"}[mode == ModeAutonomous])
 			return NativeAnswer{Allowed: true}, nil
 		case mode == ModeReadOnly, mode == ModePlan:
+			a.auditAuto(sessionID, nativeTool(req), nativeTarget(req), "deny", mode, nil, string(mode))
 			return NativeAnswer{Feedback: "not allowed in " + string(mode) + " mode"}, nil
 		}
 	}
 	respCh := make(chan permDecision, 1)
 	a.mu.Lock()
 	a.permRequests[req.ToolCallID] = respCh
+	// No suggestions: the agent keeps its own rules. This only carries what
+	// was asked about to the audit log when the answer comes.
+	a.permAsks[req.ToolCallID] = permAsk{mode: mode, tool: nativeTool(req), target: nativeTarget(req), session: sessionID}
 	a.nativeRemember[req.ToolCallID] = false
+	a.nativeRuleID[req.ToolCallID] = ""
 	a.mu.Unlock()
 	data := protocol.PermissionRequestData{
 		ToolName:    req.ToolName,
@@ -334,33 +400,53 @@ func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID strin
 		Diff:        req.Diff,
 		Plan:        req.Plan != "",
 	}
+	if req.Plan == "" {
+		sugg := req.Suggestions
+		if len(sugg) == 0 {
+			sugg = []NativeSuggestion{{ID: NativeSuggestionAgent, Label: "Always allow (the agent's own rule)"}}
+		}
+		for _, s := range sugg {
+			data.Suggestions = append(data.Suggestions, protocol.PermissionSuggestion{ID: s.ID, Label: s.Label, Native: true})
+		}
+	}
 	a.addPendingAsk(protocol.PendingAsk{Kind: "permission", SessionID: sessionID, TurnID: turnID, ToolCallID: req.ToolCallID, PermissionRequestData: &data})
 	_ = a.getStream().SendEvent(protocol.EventPermissionRequest, sessionID, turnID, req.ToolCallID, data)
 	select {
 	case <-ctx.Done():
 		a.mu.Lock()
 		delete(a.permRequests, req.ToolCallID)
+		delete(a.permAsks, req.ToolCallID)
 		delete(a.nativeRemember, req.ToolCallID)
+		delete(a.nativeRuleID, req.ToolCallID)
 		a.mu.Unlock()
 		a.removePendingAsk(req.ToolCallID)
 		return NativeAnswer{}, ctx.Err()
 	case d := <-respCh:
 		a.mu.Lock()
-		remember := a.nativeRemember[req.ToolCallID]
+		remember, ruleID := a.nativeRemember[req.ToolCallID], a.nativeRuleID[req.ToolCallID]
 		delete(a.nativeRemember, req.ToolCallID)
+		delete(a.nativeRuleID, req.ToolCallID)
 		a.mu.Unlock()
-		return NativeAnswer{Allowed: d.allowed, Remember: remember, Feedback: d.feedback}, nil
+		if ruleID == NativeSuggestionAgent {
+			ruleID = ""
+		}
+		return NativeAnswer{Allowed: d.allowed, Remember: remember, Feedback: d.feedback, RuleID: ruleID}, nil
 	}
 }
 
 // askUserQuestion is the ask_user_question round trip for yoakeland's own
-// tool: one question.
-func (a *Agent) askUserQuestion(ctx context.Context, sessionID, turnID, toolCallID, question string, options []string) (string, error) {
-	answers, err := a.askUserQuestions(ctx, sessionID, turnID, []NativeQuestion{{toolCallID, question, options}})
-	if err != nil {
-		return "", err
+// tool. A lone question keeps the call's id; several get "<id>#<i>", like a
+// native agent's, so each can be answered on its own.
+func (a *Agent) askUserQuestion(ctx context.Context, sessionID, turnID, toolCallID string, qs []tool.Question) ([]string, error) {
+	nqs := make([]NativeQuestion, len(qs))
+	for i, q := range qs {
+		id := toolCallID
+		if len(qs) > 1 {
+			id = fmt.Sprintf("%s#%d", toolCallID, i)
+		}
+		nqs[i] = NativeQuestion{ToolCallID: id, Question: q.Question, Options: q.Options}
 	}
-	return answers[0], nil
+	return a.askUserQuestions(ctx, sessionID, turnID, nqs)
 }
 
 // askUserQuestions raises every question before waiting on any, in order, so
@@ -372,7 +458,7 @@ func (a *Agent) askUserQuestions(ctx context.Context, sessionID, turnID string, 
 		a.mu.Lock()
 		a.askUserRequests[nq.ToolCallID] = chans[i]
 		a.mu.Unlock()
-		q := protocol.AskUserQuestionRequestedData{Question: nq.Question, Options: nq.Options}
+		q := protocol.AskUserQuestionRequestedData{Question: nq.Question, Options: nq.Options, Index: i + 1, Total: len(qs)}
 		a.addPendingAsk(protocol.PendingAsk{Kind: "question", SessionID: sessionID, TurnID: turnID, ToolCallID: nq.ToolCallID, AskUserQuestionRequestedData: &q})
 		_ = a.getStream().SendEvent(protocol.EventAskUserQuestionRequested, sessionID, turnID, nq.ToolCallID, q)
 	}
@@ -398,14 +484,12 @@ func (a *Agent) attachUsage(id string, usage protocol.UsageData) {
 	if id == "" || usage == (protocol.UsageData{}) {
 		return
 	}
-	if !usage.CostKnown {
-		usage.CostUSD = EstimateCostUSD(a.getModelName(), usage)
-	}
+	priceUsage(a.getModelName(), &usage)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for i := len(a.history) - 1; i >= 0; i-- {
 		if a.history[i].ID == id {
-			a.history[i].Usage = &usage
+			a.history[i].Usage, a.history[i].UsageIsAggregate = &usage, true
 			return
 		}
 	}
@@ -505,10 +589,14 @@ func (a *Agent) recordSteers(sessionID, turnID string, flush func()) {
 
 // ResolvePlanApproval approves a native agent's pending request to leave plan
 // mode. False when there isn't one (an API model's plan is just done).
-func (a *Agent) ResolvePlanApproval() bool {
+func (a *Agent) ResolvePlanApproval(by ...string) bool {
+	var choice PermissionChoice
+	if len(by) > 0 {
+		choice.By = by[0]
+	}
 	for _, ask := range a.PendingAsks() {
 		if ask.PermissionRequestData != nil && ask.Plan {
-			a.HandlePermissionResponse(ask.ToolCallID, true, false, "")
+			a.HandlePermissionResponse(ask.ToolCallID, true, false, "", choice)
 			return true
 		}
 	}

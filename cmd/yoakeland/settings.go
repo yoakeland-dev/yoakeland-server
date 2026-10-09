@@ -55,6 +55,18 @@ type ServerSettings struct {
 	// SPEC.md §4f), keyed by role name.
 	ModelRoles map[string]protocol.ModelRole `json:"modelRoles,omitempty"`
 
+	// Notify is the notification policy (set_notify_prefs, notify_prefs);
+	// nil means defaultNotifyPrefs. Accessors live in notify_prefs.go.
+	Notify *protocol.NotifyPrefsData `json:"notify,omitempty"`
+
+	// The server's runtime tunables, remote-listener configuration and default
+	// provider (runtime_settings.go). Each is nil until first stored, which is
+	// what lets a deprecated launch flag seed it exactly once.
+	RuntimeState         *runtimeState           `json:"runtime,omitempty"`
+	RemoteState          *RemoteSettings         `json:"remote,omitempty"`
+	DefaultProviderState *DefaultProviderSetting `json:"defaultProvider,omitempty"`
+	runtimeHooks         []runtimeHook
+
 	// Token is the legacy single-secret field from before per-person
 	// tokens existed. Only ever read at load time, to migrate into
 	// Tokens["default"] — GetToken/SetToken/save all operate on Tokens
@@ -78,7 +90,11 @@ func NewServerSettings(dir string) (*ServerSettings, error) {
 		if err := json.Unmarshal(data, s); err != nil {
 			logWarn("server settings: server.json failed to parse, resetting to empty: %v", err)
 			s.Identity, s.Token, s.Tokens = "", "", map[string]TokenRecord{}
+			s.RuntimeState, s.RemoteState, s.DefaultProviderState = nil, nil, nil
 		}
+	}
+	if s.RuntimeState != nil {
+		s.RuntimeState.RuntimeSettings = normalizeRuntimeSettings(s.RuntimeState.RuntimeSettings)
 	}
 	if s.Tokens == nil {
 		s.Tokens = map[string]TokenRecord{}

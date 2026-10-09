@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/sandbox"
 	"yoakeland/internal/terminal"
 )
 
@@ -19,8 +20,6 @@ import (
 
 const (
 	maxTerminalWait = 120 * time.Second
-	// maxTerminalOutput is how much of a read's tail the model sees.
-	maxTerminalOutput = 12000
 )
 
 func clampWait(ms int, def time.Duration) time.Duration {
@@ -76,16 +75,18 @@ func reportTerminal(m *terminal.Manager, sessionID, id string, finishedBefore in
 	}
 	b.WriteString("\n")
 	text := cleanTerminalOutput(out)
-	if skipped > 0 || len(text) > maxTerminalOutput {
-		if len(text) > maxTerminalOutput {
-			text = text[len(text)-maxTerminalOutput:]
+	// How much of a read's tail the model sees: runtime setting terminalReadMaxChars.
+	maxOut := sandbox.CurrentLimits().TerminalReadMaxChars
+	if skipped > 0 || len(text) > maxOut {
+		if len(text) > maxOut {
+			text = text[len(text)-maxOut:]
 		}
 		b.WriteString("[earlier output omitted]\n")
 	}
 	if strings.TrimSpace(text) == "" {
 		b.WriteString("(no new output)")
 	} else {
-		b.WriteString(text)
+		b.WriteString(WrapUntrusted("a terminal", text))
 	}
 	return b.String(), nil
 }
