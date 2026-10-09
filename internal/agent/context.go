@@ -1,29 +1,47 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/tool"
 )
 
 type ContextManager struct {
+	// MaxHistoryTokens is the compaction budget: how big the context may
+	// grow before maybeCompact shrinks it. Not the model's window (see
+	// Window), though it is clamped to it.
 	MaxHistoryTokens    int
 	MaxToolOutputTokens int
 
-	// mu guards MaxHistoryTokens: set_model_options (SetMaxHistoryTokens)
-	// can land from a different connection/goroutine than an in-flight
-	// turn reading it (maybeCompact, or the context-fullness report at
-	// turn end), both against the field directly rather than an atomic —
-	// this closes that race.
-	mu sync.Mutex
+	// mu guards MaxHistoryTokens and userWindow: set_model_options
+	// (SetContextWindow) can land from a different connection/goroutine
+	// than an in-flight turn reading them (maybeCompact, or the
+	// context-fullness report at turn end), both against the fields
+	// directly rather than an atomic — this closes that race.
+	mu         sync.Mutex
+	userWindow int // set_model_options' contextWindow; 0 = not set
+}
+
+// contextWindowLookup finds a model's window from a catalog (OpenRouter's,
+// then LiteLLM's); 0 when it has none. A hook, like livePricingSource,
+// because the catalogs live in internal/provider, which imports this package.
+var contextWindowLookup func(model string) int
+
+// SetContextWindowLookup wires a catalog lookup into ContextManager.Window.
+func SetContextWindowLookup(lookup func(model string) int) {
+	contextWindowLookup = lookup
 }
 
 func NewContextManager(maxHistoryTokens, maxToolOutputTokens int) *ContextManager {
@@ -39,40 +57,142 @@ func NewContextManager(maxHistoryTokens, maxToolOutputTokens int) *ContextManage
 	}
 }
 
-// SetMaxHistoryTokens updates the context-window budget (set_model_options'
-// contextWindow). Safe against a concurrent read from an in-flight turn.
-func (cm *ContextManager) SetMaxHistoryTokens(n int) {
+// SetContextWindow applies set_model_options' contextWindow: the user's word
+// for the model's window, which also becomes the compaction budget (clamped
+// back under the window by compactionBudget). Safe against a concurrent read
+// from an in-flight turn.
+func (cm *ContextManager) SetContextWindow(n int) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	cm.MaxHistoryTokens = n
+	cm.MaxHistoryTokens, cm.userWindow = n, n
 }
 
-// GetMaxHistoryTokens reads the context-window budget. Safe against a
-// concurrent SetMaxHistoryTokens from another connection on the same
-// session.
+// GetMaxHistoryTokens reads the compaction budget. Safe against a
+// concurrent SetContextWindow from another connection on the same session.
 func (cm *ContextManager) GetMaxHistoryTokens() int {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.MaxHistoryTokens
 }
 
-// EstimateTokens calculates an approximate token count (~4 characters per token heuristic).
-func (cm *ContextManager) EstimateTokens(text string) int {
-	return (len(text) + 3) / 4
+// Window is model's context window in tokens, 0 when nothing knows it. In
+// order: the user's override, the window a provider reported on the latest
+// reply from this model (a native agent knows its own; it survives a
+// restart because the reply's usage is stored), then the catalogs
+// (contextWindowLookup: OpenRouter's context_length, LiteLLM's
+// max_input_tokens).
+func (cm *ContextManager) Window(model string, history []Message) int {
+	cm.mu.Lock()
+	user := cm.userWindow
+	cm.mu.Unlock()
+	if user > 0 {
+		return user
+	}
+	for i := len(history) - 1; i >= 0; i-- {
+		m := history[i]
+		if m.Role == "assistant" && m.Usage != nil && m.Usage.WindowTokens > 0 && (m.Model == model || m.Model == "" || model == "") {
+			return m.Usage.WindowTokens
+		}
+	}
+	if contextWindowLookup != nil && model != "" {
+		return contextWindowLookup(model)
+	}
+	return 0
 }
 
+// compactionBudget is the size maybeCompact lets the context reach: the
+// configured budget, kept under the model's window (compacting at the very
+// edge leaves no room for the reply) and above minCompactionBudget (below
+// that there's no room to work in after the system prompt and tools, and
+// compacting would just repeat every round). window 0 = unknown.
+func (cm *ContextManager) compactionBudget(window int) int {
+	budget := cm.GetMaxHistoryTokens()
+	if window > 0 {
+		budget = min(budget, window*9/10)
+	}
+	budget = max(budget, minCompactionBudget)
+	if window > 0 {
+		budget = min(budget, window)
+	}
+	return budget
+}
+
+// Report is the context meter for history: what turn_completed and
+// session_history carry. model is the one the next request goes to; overhead
+// is the system prompt and tools, which only the estimate needs (a
+// provider's own count already includes them).
+func (cm *ContextManager) Report(history []Message, model string, overhead int) protocol.ContextData {
+	if model == "" {
+		for i := len(history) - 1; i >= 0 && model == ""; i-- {
+			model = history[i].Model
+		}
+	}
+	used, source := cm.contextTokens(history, contextView(history, ""), overhead)
+	window := cm.Window(model, history)
+	budget := cm.compactionBudget(window)
+	return protocol.ContextData{
+		EstimatedTokens: used,
+		MaxTokens:       cmp.Or(window, budget),
+		WindowTokens:    window,
+		BudgetTokens:    budget,
+		Source:          source,
+	}
+}
+
+// EstimateTokens approximates a token count: ~4 bytes per token for ASCII,
+// ~1.5 characters per token for anything else (CJK and other scripts cost
+// far more than their UTF-8 length suggests to a byte-length heuristic).
+func (cm *ContextManager) EstimateTokens(text string) int {
+	ascii, wide := 0, 0
+	for _, r := range text {
+		if r < utf8.RuneSelf {
+			ascii++
+		} else {
+			wide++
+		}
+	}
+	return (ascii+3)/4 + (wide*2+2)/3
+}
+
+// imageTokens is the flat allowance for an image attachment, whose size in
+// the context depends on the provider and can't be known from the path.
+const imageTokens = 1500
+
+var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
+
 // EstimateHistoryTokens sums the token estimate across an entire message
-// history, including tool call arguments. Used to report context-window
-// fullness to the frontend.
+// history: content, reasoning (or the raw provider blocks that carry it),
+// tool call arguments, and attachments. Used to report context-window
+// fullness to the frontend and to decide when to compact.
 func (cm *ContextManager) EstimateHistoryTokens(history []Message) int {
 	total := 0
 	for _, m := range history {
 		total += cm.EstimateTokens(m.Content)
+		if len(m.RawContent) > 0 {
+			// Replayed verbatim (contextView drops it where it isn't), and
+			// it already holds the thinking text Reasoning shows.
+			total += cm.EstimateTokens(string(m.RawContent))
+		} else {
+			total += cm.EstimateTokens(m.Reasoning)
+		}
 		for _, tc := range m.ToolCalls {
 			total += cm.EstimateTokens(string(tc.Args))
 		}
+		for _, path := range m.Attachments {
+			total += cm.EstimateTokens(path)
+			if imageExts[strings.ToLower(filepath.Ext(path))] {
+				total += imageTokens
+			}
+		}
 	}
 	return total
+}
+
+// estimateOverhead sizes what every request carries besides the history:
+// the system prompt and the tool definitions as they go on the wire.
+func (cm *ContextManager) estimateOverhead(systemPrompt string, toolDefs []tool.ToolDefinition) int {
+	defs, _ := json.Marshal(toolDefs)
+	return cm.EstimateTokens(systemPrompt) + cm.EstimateTokens(string(defs))
 }
 
 // TruncateToolOutput bounds giant file readings or bash stdout dumps,
@@ -232,21 +352,50 @@ func requestPrefixKey(model, systemPrompt string, tools any) string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-// contextTokens is how full the context is: the provider's own count for
-// the last reply since the latest compaction plus an estimate of what was
-// appended after it, or an estimate of the whole view when there's no such
-// reply yet. overhead is the system prompt and tool definitions.
-func (cm *ContextManager) contextTokens(history, view []Message, overhead int) int {
+// requestOverhead is estimateOverhead for a request the session would make
+// now; 0 for a native agent, which brings its own system prompt and tools.
+func (a *Agent) requestOverhead() int {
+	if _, native := a.getProvider().(NativeAgent); native {
+		return 0
+	}
+	return a.contextManager.estimateOverhead(a.activeSystemPrompt()+a.requestSuffix(a.getProvider()), a.activeToolDefs())
+}
+
+// contextTokens is how full the context is, and where that figure came from
+// (protocol.ContextData.Source): the provider's own count for the last reply
+// since the latest compaction plus an estimate of what was appended after
+// it, or an estimate of the whole view when there's no such reply yet.
+// overhead is the system prompt and tool definitions.
+//
+// The count is the last request's input plus its reply. A reply's usage is
+// only that when it is one request's (an API provider's, or a native
+// agent's ContextTokens snapshot); the sum over a native turn's requests
+// (UsageIsAggregate) re-counts the resent history every step and would read
+// as far more than the context holds, so it is skipped.
+// For Anthropic with extended thinking the reply's output tokens include
+// thinking that may not be resent next request, so this can run slightly
+// high right after such a reply; the next request's count corrects it.
+func (cm *ContextManager) contextTokens(history, view []Message, overhead int) (int, string) {
 	for i := len(history) - 1; i >= 0; i-- {
 		m := history[i]
 		if m.Role == "compaction" {
 			break
 		}
-		if m.Role == "assistant" && m.Usage != nil && m.Usage.InputTokens > 0 {
-			return m.Usage.InputTokens + m.Usage.OutputTokens + cm.EstimateHistoryTokens(history[i+1:])
+		if m.Role != "assistant" || m.Usage == nil {
+			continue
+		}
+		reported := m.Usage.ContextTokens
+		if reported == 0 && !m.UsageIsAggregate {
+			reported = m.Usage.InputTokens + m.Usage.OutputTokens
+		}
+		if reported > 0 {
+			return reported + cm.EstimateHistoryTokens(history[i+1:]), "provider"
 		}
 	}
-	return overhead + cm.EstimateHistoryTokens(view)
+	if len(view) == 0 {
+		return 0, "unknown"
+	}
+	return overhead + cm.EstimateHistoryTokens(view), "estimated"
 }
 
 // planClear works out a clear compaction for a context of used tokens:
@@ -339,17 +488,15 @@ Be specific and dense: exact names, paths and values, no preamble, no advice.`
 // definitions' size.
 func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBinding, overhead int) protocol.UsageData {
 	cm := a.contextManager
-	// Below this there's no room to work in after the system prompt and
-	// tools, and compacting would just repeat every round.
-	budget := max(cm.GetMaxHistoryTokens(), minCompactionBudget)
 	a.mu.Lock()
 	history := append([]Message(nil), a.history...)
 	a.mu.Unlock()
+	budget := cm.compactionBudget(cm.Window(bound.Model, history))
 	view := contextView(history, "")
 	if len(view) < 3 {
 		return protocol.UsageData{}
 	}
-	used := cm.contextTokens(history, view, overhead)
+	used, _ := cm.contextTokens(history, view, overhead)
 	if used <= budget {
 		return protocol.UsageData{}
 	}
@@ -395,9 +542,7 @@ func summarize(ctx context.Context, b RoleBinding, view []Message) (string, prot
 		}
 	}
 	err := <-errs
-	if !usage.CostKnown && b.Model != "" {
-		usage.CostUSD = EstimateCostUSD(b.Model, usage)
-	}
+	priceUsage(b.Model, &usage)
 	if summary := strings.TrimSpace(sb.String()); err == nil && summary != "" {
 		return summary, usage
 	}

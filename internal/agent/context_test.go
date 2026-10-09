@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/tool"
 )
 
 // The view only changes when a compaction is appended: that's what keeps
@@ -74,11 +75,188 @@ func TestContextTokens_PrefersReportedUsageSinceLastCompaction(t *testing.T) {
 		{Role: "assistant", Content: "ok", Usage: &protocol.UsageData{InputTokens: 900, OutputTokens: 100}},
 		{Role: "tool", Content: strings.Repeat("y", 400)},
 	}
-	if got := cm.contextTokens(history, history, 0); got != 1100 {
-		t.Fatalf("expected reported 1000 + 100 estimated, got %d", got)
+	if got, src := cm.contextTokens(history, history, 0); got != 1100 || src != "provider" {
+		t.Fatalf("expected reported 1000 + 100 estimated from the provider, got %d (%s)", got, src)
 	}
 	history = append(history, Message{Role: "compaction", Compaction: &Compaction{Kind: CompactionClear}})
-	if got := cm.contextTokens(history, history[:3], 50); got >= 1000 {
-		t.Fatalf("expected a fresh estimate after compaction, got %d", got)
+	if got, src := cm.contextTokens(history, history[:3], 50); got >= 1000 || src != "estimated" {
+		t.Fatalf("expected a fresh estimate after compaction, got %d (%s)", got, src)
+	}
+}
+
+func TestContextTokens_Sources(t *testing.T) {
+	cm := NewContextManager(1000, 100)
+	user := Message{Role: "user", Content: strings.Repeat("u", 400)}
+	tests := []struct {
+		name    string
+		history []Message
+		want    int
+		source  string
+	}{
+		{"api reply: input plus output", []Message{user, {Role: "assistant", Usage: &protocol.UsageData{InputTokens: 900, OutputTokens: 100}}}, 1000, "provider"},
+		{"native aggregate with a snapshot uses the snapshot", []Message{user, {Role: "assistant", UsageIsAggregate: true,
+			Usage: &protocol.UsageData{InputTokens: 900_000, OutputTokens: 500, ContextTokens: 50_000}}}, 50_000, "provider"},
+		{"native aggregate without a snapshot is spend, not context", []Message{user, {Role: "assistant", UsageIsAggregate: true,
+			Usage: &protocol.UsageData{InputTokens: 900_000, OutputTokens: 500}}}, 100, "estimated"},
+		{"what came after the reply is estimated on top", []Message{user, {Role: "assistant", Usage: &protocol.UsageData{ContextTokens: 700}}, {Role: "tool", Content: strings.Repeat("t", 400)}}, 800, "provider"},
+		{"nothing yet", nil, 0, "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, src := cm.contextTokens(tt.history, contextView(tt.history, ""), 0)
+			if got != tt.want || src != tt.source {
+				t.Fatalf("got %d (%s), want %d (%s)", got, src, tt.want, tt.source)
+			}
+		})
+	}
+
+	// Nothing before a compaction counts, the snapshot included.
+	history := []Message{user, {Role: "assistant", Usage: &protocol.UsageData{ContextTokens: 9000}}, {Role: "compaction", Compaction: &Compaction{Kind: CompactionClear}}}
+	if got, src := cm.contextTokens(history, []Message{user}, 50); got != 150 || src != "estimated" {
+		t.Fatalf("after compaction got %d (%s), want 150 (estimated)", got, src)
+	}
+}
+
+func TestWindow_Precedence(t *testing.T) {
+	t.Cleanup(func() { SetContextWindowLookup(nil) })
+	SetContextWindowLookup(func(model string) int {
+		if model == "m" {
+			return 200_000
+		}
+		return 0
+	})
+	reported := []Message{{Role: "assistant", Model: "m", Usage: &protocol.UsageData{WindowTokens: 1_000_000}}}
+
+	cm := NewContextManager(64000, 100)
+	if got := cm.Window("unlisted", nil); got != 0 {
+		t.Fatalf("unknown model: got %d, want 0", got)
+	}
+	if got := cm.Window("m", nil); got != 200_000 {
+		t.Fatalf("catalog: got %d, want 200000", got)
+	}
+	if got := cm.Window("m", reported); got != 1_000_000 {
+		t.Fatalf("provider-reported beats the catalog: got %d", got)
+	}
+	if got := cm.Window("other", reported); got != 0 {
+		t.Fatalf("a window reported by another model doesn't apply: got %d", got)
+	}
+	cm.SetContextWindow(32_000)
+	if got := cm.Window("m", reported); got != 32_000 {
+		t.Fatalf("user override beats everything: got %d", got)
+	}
+}
+
+func TestReport_MaxIsWindowAndBudgetIsClamped(t *testing.T) {
+	t.Cleanup(func() { SetContextWindowLookup(nil) })
+	history := []Message{{Role: "user", Content: "hi"}, {Role: "assistant", Model: "m", Usage: &protocol.UsageData{InputTokens: 10, OutputTokens: 5}}}
+
+	SetContextWindowLookup(func(string) int { return 0 })
+	cm := NewContextManager(64000, 100)
+	r := cm.Report(history, "m", 0)
+	if r.MaxTokens != 64000 || r.BudgetTokens != 64000 || r.WindowTokens != 0 || r.EstimatedTokens != 15 || r.Source != "provider" {
+		t.Fatalf("unknown window: %+v", r)
+	}
+
+	SetContextWindowLookup(func(string) int { return 1_000_000 })
+	if r := cm.Report(history, "m", 0); r.MaxTokens != 1_000_000 || r.WindowTokens != 1_000_000 || r.BudgetTokens != 64000 {
+		t.Fatalf("large window keeps the configured budget: %+v", r)
+	}
+
+	SetContextWindowLookup(func(string) int { return 32_000 })
+	if r := cm.Report(history, "", 0); r.MaxTokens != 32_000 || r.BudgetTokens != 28_800 {
+		t.Fatalf("a small window (model taken from the history) caps the budget at 90%%: %+v", r)
+	}
+
+	// What maybeCompact compares against is what the meter reports.
+	if got := NewContextManager(100, 100).Report(history, "m", 0).BudgetTokens; got != minCompactionBudget {
+		t.Fatalf("budget below the minimum: got %d, want %d", got, minCompactionBudget)
+	}
+}
+
+func TestEstimateTokens_RuneAware(t *testing.T) {
+	cm := NewContextManager(0, 0)
+	if got := cm.EstimateTokens(strings.Repeat("a", 400)); got != 100 {
+		t.Errorf("ascii: got %d, want 100", got)
+	}
+	cjk := strings.Repeat("字", 300) // 900 bytes: byte/4 would say 225
+	if got := cm.EstimateTokens(cjk); got != 200 {
+		t.Errorf("cjk: got %d, want 200 (1 token per 1.5 chars)", got)
+	}
+	if got := cm.EstimateTokens(""); got != 0 {
+		t.Errorf("empty: got %d", got)
+	}
+}
+
+func TestEstimateHistoryTokens_CountsReasoningRawContentAndAttachments(t *testing.T) {
+	cm := NewContextManager(0, 0)
+	text := strings.Repeat("x", 400) // 100 tokens
+	tests := []struct {
+		name string
+		m    Message
+		want int
+	}{
+		{"content", Message{Content: text}, 100},
+		{"reasoning", Message{Reasoning: text}, 100},
+		{"raw content stands in for the reasoning it holds", Message{Reasoning: text, RawContent: []byte(text)}, 100},
+		{"tool call args", Message{ToolCalls: []ToolCall{{Args: []byte(text)}}}, 100},
+		{"image attachment gets a flat allowance", Message{Attachments: []string{"/tmp/shot.PNG"}}, imageTokens + 4},
+		{"other attachments only cost their note", Message{Attachments: []string{"/tmp/a.txt"}}, 3},
+	}
+	for _, tt := range tests {
+		if got := cm.EstimateHistoryTokens([]Message{tt.m}); got != tt.want {
+			t.Errorf("%s: got %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestEstimateOverhead_UsesTheWireJSON(t *testing.T) {
+	cm := NewContextManager(0, 0)
+	defs := []tool.ToolDefinition{{Name: "t", Description: strings.Repeat("d", 400), Parameters: map[string]any{"type": "object"}}}
+	if got := cm.estimateOverhead(strings.Repeat("s", 40), defs); got < 110 {
+		t.Fatalf("overhead %d should cover the 10-token prompt and the 100+ token definition", got)
+	}
+}
+
+func TestPriceUsage_UnknownModelIsFlaggedNotFree(t *testing.T) {
+	used := protocol.UsageData{InputTokens: 1000, OutputTokens: 100}
+
+	u := used
+	priceUsage("some-unlisted-local-model", &u)
+	if !u.CostUnknown || u.CostKnown || u.CostUSD != 0 {
+		t.Fatalf("unpriced model: %+v", u)
+	}
+
+	u = used
+	priceUsage("gpt-4o", &u)
+	if u.CostUnknown || !u.CostKnown || u.CostUSD <= 0 {
+		t.Fatalf("priced model: %+v", u)
+	}
+
+	u = used
+	priceUsage("", &u) // a provider with no model name can't be priced either
+	if !u.CostUnknown {
+		t.Fatalf("no model: %+v", u)
+	}
+
+	u = protocol.UsageData{CostUSD: 0.5, CostKnown: true, InputTokens: 10}
+	priceUsage("some-unlisted-local-model", &u)
+	if u.CostUnknown || u.CostUSD != 0.5 {
+		t.Fatalf("a provider-reported cost is left alone: %+v", u)
+	}
+
+	u = protocol.UsageData{}
+	priceUsage("some-unlisted-local-model", &u)
+	if u.CostUnknown {
+		t.Fatalf("no tokens, nothing to price: %+v", u)
+	}
+}
+
+func TestAddUsage_CostUnknownAndSnapshots(t *testing.T) {
+	var total protocol.UsageData
+	addUsage(&total, protocol.UsageData{InputTokens: 10, ContextTokens: 500, WindowTokens: 1000})
+	addUsage(&total, protocol.UsageData{InputTokens: 10, CostUnknown: true, ContextTokens: 700})
+	addUsage(&total, protocol.UsageData{InputTokens: 10})
+	if total.InputTokens != 30 || !total.CostUnknown || total.ContextTokens != 700 || total.WindowTokens != 1000 {
+		t.Fatalf("got %+v", total)
 	}
 }
