@@ -3,7 +3,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -57,7 +56,8 @@ func (s *DarwinSandbox) Execute(ctx context.Context, argv []string, extraEnv []s
 		return nil, fmt.Errorf("empty command")
 	}
 
-	execCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	timeout := execTimeout(s.timeout)
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// allowNetwork=false: same deliberate boundary on an agent-issued
@@ -65,9 +65,9 @@ func (s *DarwinSandbox) Execute(ctx context.Context, argv []string, extraEnv []s
 	cmd := s.buildCmd(execCtx, argv, false)
 	cmd.Env = s.baseEnv(extraEnv, false)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := newCapped(), newCapped()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 
@@ -75,7 +75,7 @@ func (s *DarwinSandbox) Execute(ctx context.Context, argv []string, extraEnv []s
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("execution timed out after %v: %w", s.timeout, execCtx.Err())
+		return nil, fmt.Errorf("execution timed out after %v: %w", timeout, execCtx.Err())
 	}
 
 	exitCode := 0

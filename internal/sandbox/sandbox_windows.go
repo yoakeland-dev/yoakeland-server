@@ -3,7 +3,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -16,13 +15,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Default resource caps applied to a spawned terminal session via a Job
-// Object — the closest Windows analogue to cgroup_linux.go's cgroup v2
-// limits. Same values, same "not yet configurable" ponytail note.
-const (
-	windowsMemoryLimitBytes = 2 << 30 // 2 GiB
-	windowsActiveProcessCap = 512
-)
+// A spawned terminal session's resource caps come from Limits, applied via a
+// Job Object — the closest Windows analogue to cgroup_linux.go's cgroup v2 limits.
 
 // WindowsSandbox has no bubblewrap-equivalent filesystem/namespace isolation
 // — Windows has no single well-known tool that plays bubblewrap's role, and
@@ -75,16 +69,17 @@ func (s *WindowsSandbox) Execute(ctx context.Context, argv []string, extraEnv []
 		return nil, fmt.Errorf("empty command")
 	}
 
-	execCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	timeout := execTimeout(s.timeout)
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
 	cmd.Dir = s.projectRoot
 	cmd.Env = windowsBaseEnv(s.projectRoot, extraEnv)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := newCapped(), newCapped()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 
@@ -92,7 +87,7 @@ func (s *WindowsSandbox) Execute(ctx context.Context, argv []string, extraEnv []
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("execution timed out after %v: %w", s.timeout, execCtx.Err())
+		return nil, fmt.Errorf("execution timed out after %v: %w", timeout, execCtx.Err())
 	}
 
 	exitCode := 0
@@ -208,9 +203,9 @@ func applyJobObjectLimits(pid int) (cleanup func(), applied bool) {
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{
 		BasicLimitInformation: windows.JOBOBJECT_BASIC_LIMIT_INFORMATION{
 			LimitFlags:         windows.JOB_OBJECT_LIMIT_PROCESS_MEMORY | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-			ActiveProcessLimit: windowsActiveProcessCap,
+			ActiveProcessLimit: uint32(CurrentLimits().TerminalPids),
 		},
-		ProcessMemoryLimit: windowsMemoryLimitBytes,
+		ProcessMemoryLimit: uintptr(CurrentLimits().TerminalMemoryBytes),
 	}
 	if _, err := windows.SetInformationJobObject(
 		job,

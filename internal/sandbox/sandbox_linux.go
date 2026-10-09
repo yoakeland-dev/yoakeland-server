@@ -3,7 +3,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -69,7 +68,8 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 		return nil, fmt.Errorf("empty command")
 	}
 
-	execCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	timeout := execTimeout(s.timeout)
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// --new-session (severs any inherited controlling tty) and network
@@ -79,9 +79,9 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 	cmd := s.buildCmd(execCtx, argv, "", true, false)
 	cmd.Env = s.baseEnv(extraEnv, false)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := newCapped(), newCapped()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 
@@ -90,7 +90,7 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("execution timed out after %v: %w", s.timeout, execCtx.Err())
+		return nil, fmt.Errorf("execution timed out after %v: %w", timeout, execCtx.Err())
 	}
 
 	exitCode := 0
@@ -216,7 +216,8 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, 
 			"--unshare-ipc",
 			"--unshare-uts",
 			"--die-with-parent",
-			// ponytail: namespace/mount isolation only — no seccomp filter.
+			// ponytail: namespace/mount isolation only — no seccomp filter;
+			// add one if agents start running untrusted code.
 			// SpawnPTY additionally applies memory/pids cgroup v2 limits
 			// when this process has delegation for one (applyCgroupLimits,
 			// cgroup_linux.go) — Execute doesn't bother, since its

@@ -12,15 +12,9 @@ import (
 	"sync"
 )
 
-// Default resource caps applied to a spawned terminal session when cgroup
-// v2 delegation is available (see probeCgroupDelegation) — sane-but-
-// arbitrary defaults, not yet configurable. ponytail: add a flag once
-// someone actually needs to tune these rather than guessing at a default
-// that fits everyone.
-const (
-	cgroupMemoryMaxBytes = 2 << 30 // 2 GiB
-	cgroupPidsMax        = 512
-)
+// Resource caps applied to a spawned terminal session when cgroup v2
+// delegation is available (see probeCgroupDelegation) come from Limits
+// (runtime settings terminalMemoryMaxMB / terminalPidsMax) at spawn time.
 
 var (
 	cgroupProbeOnce sync.Once
@@ -104,11 +98,11 @@ func applyCgroupLimits(pid int) (cleanup func(), applied bool) {
 	parentSubtree := filepath.Join("/sys/fs/cgroup", ownPath, "cgroup.subtree_control")
 	_ = os.WriteFile(parentSubtree, []byte("+memory +pids"), 0o644)
 
-	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(strconv.Itoa(cgroupMemoryMaxBytes)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(strconv.FormatInt(CurrentLimits().TerminalMemoryBytes, 10)), 0o644); err != nil {
 		cleanupDir()
 		return noop, false
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pids.max"), []byte(strconv.Itoa(cgroupPidsMax)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "pids.max"), []byte(strconv.Itoa(CurrentLimits().TerminalPids)), 0o644); err != nil {
 		cleanupDir()
 		return noop, false
 	}

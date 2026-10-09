@@ -10,7 +10,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -41,7 +40,8 @@ func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv [
 		return nil, fmt.Errorf("empty command")
 	}
 
-	execCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	timeout := execTimeout(s.timeout)
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
@@ -53,9 +53,9 @@ func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv [
 		"PWD=" + s.projectRoot,
 	}, extraEnv...)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := newCapped(), newCapped()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 
@@ -63,7 +63,7 @@ func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv [
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("execution timed out after %v: %w", s.timeout, execCtx.Err())
+		return nil, fmt.Errorf("execution timed out after %v: %w", timeout, execCtx.Err())
 	}
 
 	exitCode := 0
