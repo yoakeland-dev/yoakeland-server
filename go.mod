@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	codeberg.org/readeck/go-readability v0.0.0-20260615104154-29522a0e224f
+	github.com/BurntSushi/toml v1.6.0
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/PuerkitoBio/goquery v1.13.0
 	github.com/UserExistsError/conpty v0.1.4

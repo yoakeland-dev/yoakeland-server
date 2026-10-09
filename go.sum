@@ -1,5 +1,7 @@
 codeberg.org/readeck/go-readability v0.0.0-20260615104154-29522a0e224f h1:mpQxf3AvUQcUtpPMAcpfL3fCxKYtAq08vZ7PsVyqibI=
 codeberg.org/readeck/go-readability v0.0.0-20260615104154-29522a0e224f/go.mod h1:j2ebxyRhpa95RJTFC9EYVUxtJwN851fcTscqJWxKJQU=
+github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
+github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/PuerkitoBio/goquery v1.13.0 h1:mqHbjD7Jmnul4DTR24LKTjo1uUmHUh072kteGV+xpFM=
