@@ -13,6 +13,9 @@ type UsageTotals struct {
 	InputTokens  int     `json:"inputTokens"`
 	OutputTokens int     `json:"outputTokens"`
 	CostUSD      float64 `json:"costUsd"`
+	// CostUnknown: some usage in the tally had no known price, so CostUSD
+	// is what could be priced, not everything spent.
+	CostUnknown bool `json:"costUnknown,omitempty"`
 }
 
 type usageModel struct {
@@ -56,6 +59,24 @@ func (s *UsageStore) SessionTotal(sessionID string) UsageTotals {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.model.Sessions[sessionID]
+}
+
+// ProjectTotal returns the project-wide running total.
+func (s *UsageStore) ProjectTotal() UsageTotals {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model.Project
+}
+
+// MarkCostUnknown notes that usage with no known price was (or is about to
+// be) recorded for sessionID, so its totals read as a lower bound.
+func (s *UsageStore) MarkCostUnknown(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.model.Sessions[sessionID]
+	sess.CostUnknown = true
+	s.model.Sessions[sessionID] = sess
+	s.model.Project.CostUnknown = true
 }
 
 // Record adds a turn's token usage and cost to both the session's running

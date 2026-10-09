@@ -32,9 +32,9 @@ func SetLivePricingSource(source func(model string, usage protocol.UsageData) (f
 // succeeded and the embedded snapshot doesn't have this exact model, or a
 // model string too far off LiteLLM's naming for PricingCache.Lookup's
 // candidates to match). Covers a handful of common models as of writing
-// (September 2026); an unlisted model prices at zero rather than guessing.
-// ponytail: static table, no live pricing fetch of its own — update entries
-// as needed, though livePricingSource should catch most drift first.
+// (September 2026); an unlisted model is reported unpriced rather than guessed.
+// The table has no live fetch of its own; livePricingSource catches most
+// drift first, so entries only need updating for models it can't match.
 var pricingTable = map[string]rate{
 	"claude-3-5-sonnet-20241022":  {InputPerMTok: 3, OutputPerMTok: 15},
 	"claude-3-5-haiku-20241022":   {InputPerMTok: 0.8, OutputPerMTok: 4},
@@ -59,30 +59,64 @@ var pricingTable = map[string]rate{
 	"meta-llama/llama-3.1-70b": {InputPerMTok: 0.4, OutputPerMTok: 0.4},
 }
 
-// EstimateCostUSD prices a turn's token usage for the given model: the live
+// EstimateCost prices a turn's token usage for the given model: the live
 // rate table first (see SetLivePricingSource), the static table if that has
-// nothing, $0 if neither does. Cost is informational, not load-bearing, so
-// an unpriced model never errors — it just reports zero.
-func EstimateCostUSD(model string, usage protocol.UsageData) float64 {
+// nothing. known is false when neither has a rate for model, in which case
+// usd is 0 and means "unpriced", not "free": callers flag it (CostUnknown)
+// instead of letting it read as a genuine $0.
+func EstimateCost(model string, usage protocol.UsageData) (usd float64, known bool) {
 	if livePricingSource != nil {
 		if usd, ok := livePricingSource(model, usage); ok {
-			return usd
+			return usd, true
 		}
 	}
 
 	r, ok := pricingTable[model]
 	if !ok {
-		return 0
+		return 0, false
 	}
-	// ponytail: Anthropic's cache multipliers (0.1× reads, 1.25× writes)
-	// for every model here; the live table carries each model's real rates.
+	// Anthropic's cache multipliers (0.1x reads, 1.25x writes) for every
+	// model here, wrong for the non-Anthropic entries; the live table
+	// carries each model's real rates, so add per-entry multipliers only if
+	// those models fall through to this table in practice.
 	plain := usage.InputTokens - usage.CachedInputTokens - usage.CacheWriteInputTokens
 	input := float64(plain) + 0.1*float64(usage.CachedInputTokens) + 1.25*float64(usage.CacheWriteInputTokens)
-	return input/1_000_000*r.InputPerMTok + float64(usage.OutputTokens)/1_000_000*r.OutputPerMTok
+	return input/1_000_000*r.InputPerMTok + float64(usage.OutputTokens)/1_000_000*r.OutputPerMTok, true
 }
 
-// addUsage adds u's token counts (not its cost) into dst.
+// EstimateCostUSD is EstimateCost without the known flag: an unpriced model
+// reads as $0.
+func EstimateCostUSD(model string, usage protocol.UsageData) float64 {
+	usd, _ := EstimateCost(model, usage)
+	return usd
+}
+
+// priceUsage settles u's cost unless it already is (a provider-reported
+// cost, or a price set earlier): CostUSD from the rate tables, or
+// CostUnknown when model has none. Usage with no tokens costs nothing
+// whatever the model.
+func priceUsage(model string, u *protocol.UsageData) {
+	if u.CostKnown || u.CostUnknown || u.InputTokens+u.OutputTokens == 0 {
+		return
+	}
+	if usd, ok := EstimateCost(model, *u); ok {
+		u.CostUSD, u.CostKnown = usd, true
+		return
+	}
+	u.CostUnknown = true
+}
+
+// addUsage adds u's token counts (not its cost) into dst. An unpriced part
+// makes the sum unpriced too; a request's context size and window are
+// snapshots, not sums, so the latest reported one wins.
 func addUsage(dst *protocol.UsageData, u protocol.UsageData) {
+	dst.CostUnknown = dst.CostUnknown || u.CostUnknown
+	if u.ContextTokens > 0 {
+		dst.ContextTokens = u.ContextTokens
+	}
+	if u.WindowTokens > 0 {
+		dst.WindowTokens = u.WindowTokens
+	}
 	dst.InputTokens += u.InputTokens
 	dst.OutputTokens += u.OutputTokens
 	dst.TotalTokens += u.TotalTokens

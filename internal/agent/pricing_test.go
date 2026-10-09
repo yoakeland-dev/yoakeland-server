@@ -20,6 +20,19 @@ func TestEstimateCostUSD(t *testing.T) {
 	}
 }
 
+func TestEstimateCost_KnownFlag(t *testing.T) {
+	usage := protocol.UsageData{InputTokens: 1_000_000, OutputTokens: 1_000_000}
+	if usd, known := agent.EstimateCost("claude-3-5-sonnet-20241022", usage); !known || usd != 18 {
+		t.Errorf("listed model: got %v, %v", usd, known)
+	}
+	if usd, known := agent.EstimateCost("some-unlisted-local-model", usage); known || usd != 0 {
+		t.Errorf("unlisted model must report known=false, got %v, %v", usd, known)
+	}
+	if _, known := agent.EstimateCost("", usage); known {
+		t.Error("no model must report known=false")
+	}
+}
+
 // TestEstimateCostUSD_PrefersLiveSourceOverStaticTable guards the wiring
 // SetLivePricingSource exists for: a live-fetched rate (internal/provider's
 // PricingCache, current as of the last daily refresh) must win over the

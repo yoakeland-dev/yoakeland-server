@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
@@ -133,6 +135,43 @@ type openAIRequest struct {
 
 const defaultMaxTokens = 8192
 
+// rateLimitBackoff is the wait before each retry of a 429; a var so tests
+// can shrink it. A Retry-After header from the provider wins over it.
+var rateLimitBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+const maxRetryAfter = 30 * time.Second
+
+// post sends body to the provider, retrying on 429 with backoff. Retrying is
+// safe because nothing has been streamed to the caller yet: a 429 comes back
+// as the response status, before any body.
+func (p *OpenAICompatibleProvider) post(ctx context.Context, body []byte) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range p.ExtraHeaders {
+			req.Header.Set(k, v)
+		}
+		resp, err := p.Client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusTooManyRequests || attempt >= len(rateLimitBackoff) {
+			return resp, err
+		}
+		wait := rateLimitBackoff[attempt]
+		if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs >= 0 {
+			wait = min(time.Duration(secs)*time.Second, maxRetryAfter)
+		}
+		resp.Body.Close()
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 // GenerateTitle implements agent.TitleGenerator with a small, non-streaming
 // request on the same model as the session, separate from any in-flight
 // StreamTurn call.
@@ -150,17 +189,7 @@ func (p *OpenAICompatibleProvider) GenerateTitle(ctx context.Context, prompt str
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	for k, v := range p.ExtraHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := p.Client.Do(req)
+	resp, err := p.post(ctx, jsonBytes)
 	if err != nil {
 		return "", err
 	}
@@ -291,19 +320,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			return
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(jsonBytes))
-		if err != nil {
-			eChan <- err
-			return
-		}
-
-		req.Header.Set("Authorization", "Bearer "+p.APIKey)
-		req.Header.Set("Content-Type", "application/json")
-		for k, v := range p.ExtraHeaders {
-			req.Header.Set(k, v)
-		}
-
-		resp, err := p.Client.Do(req)
+		resp, err := p.post(ctx, jsonBytes)
 		if err != nil {
 			eChan <- err
 			return

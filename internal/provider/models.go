@@ -7,8 +7,23 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
+
+// openRouterContext remembers each OpenRouter model's context_length from the
+// last catalog fetch (fetchModels), keyed by lowercased id: the agent asks
+// for a model's window long after the client listed it.
+var openRouterContext sync.Map
+
+// OpenRouterContextLength is model's context_length from the latest
+// OpenRouter catalog this process fetched, 0 if it hasn't fetched one or the
+// model isn't in it.
+func OpenRouterContextLength(model string) int {
+	n, _ := openRouterContext.Load(strings.ToLower(model))
+	v, _ := n.(int)
+	return v
+}
 
 // ModelInfo is one model available through a provider credential.
 type ModelInfo struct {
@@ -199,6 +214,9 @@ func fetchModels(url string, setHeaders func(*http.Request), nameField string, h
 				if v, ok := m[f]; ok {
 					caps[f] = v
 				}
+			}
+			if n, ok := caps["context_length"].(float64); ok && n > 0 {
+				openRouterContext.Store(key, int(n))
 			}
 			if len(caps) == 0 {
 				caps = nil

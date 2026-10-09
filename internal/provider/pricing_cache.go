@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,8 @@ type pricingRate struct {
 	// Prompt-cache rates; 0 when LiteLLM doesn't list one.
 	CacheReadPerToken  float64
 	CacheWritePerToken float64
+	// MaxInputTokens is the model's context window; 0 when not listed.
+	MaxInputTokens int
 }
 
 // pricingCacheFile mirrors manifestCacheFile: the raw upstream bytes plus
@@ -60,8 +63,14 @@ type PricingCache struct {
 	url        string // overridable by tests; defaults to pricingURL
 	httpClient *http.Client
 
+	refreshEvery atomic.Int64  // nanoseconds between background refreshes; 0 = daily at 00:00 UTC
+	wake         chan struct{} // nudges the refresh loop after the interval changes
+	lastMiss     atomic.Int64  // unix nanos of the last refresh an unpriced model triggered
+	started      atomic.Bool   // StartDailyRefresh ran: only then may a miss fetch
+
 	etag       string
 	rates      map[string]pricingRate
+	overrides  map[string]pricingRate // pricing-overrides.json; wins over rates
 	failStreak int
 }
 
@@ -69,7 +78,7 @@ type PricingCache struct {
 // back to the embedded snapshot otherwise (or on a corrupt cache file). It
 // never fetches over the network — call Refresh or StartDailyRefresh.
 func NewPricingCache(stateDir string) *PricingCache {
-	pc := &PricingCache{url: pricingURL, httpClient: &http.Client{Timeout: 20 * time.Second}}
+	pc := &PricingCache{url: pricingURL, httpClient: &http.Client{Timeout: 20 * time.Second}, wake: make(chan struct{}, 1)}
 	if stateDir != "" {
 		pc.cachePath = filepath.Join(stateDir, "pricing-cache.json")
 	}
@@ -90,7 +99,44 @@ func NewPricingCache(stateDir string) *PricingCache {
 		log.Printf("pricing table: embedded/cached fallback failed to parse: %v", err)
 	}
 	pc.rates, pc.etag = rates, etag
+	if stateDir != "" {
+		pc.overrides = loadPricingOverrides(filepath.Join(stateDir, "pricing-overrides.json"))
+	}
 	return pc
+}
+
+// loadPricingOverrides reads the user's own rates, for a model the table
+// misses or gets wrong:
+//
+//	{"my-model": {"inputPerMTok": 1, "outputPerMTok": 4, "cacheReadPerMTok": 0.1, "contextWindow": 128000}}
+//
+// Every field but the two prices is optional. A missing or malformed file
+// means no overrides.
+func loadPricingOverrides(path string) map[string]pricingRate {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var raw map[string]struct {
+		Input         float64 `json:"inputPerMTok"`
+		Output        float64 `json:"outputPerMTok"`
+		CacheRead     float64 `json:"cacheReadPerMTok"`
+		CacheWrite    float64 `json:"cacheWritePerMTok"`
+		ContextWindow int     `json:"contextWindow"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		log.Printf("pricing overrides: %s: %v (ignored)", path, err)
+		return nil
+	}
+	out := make(map[string]pricingRate, len(raw))
+	for model, o := range raw {
+		out[strings.ToLower(model)] = pricingRate{
+			InputPerToken: o.Input / 1e6, OutputPerToken: o.Output / 1e6,
+			CacheReadPerToken: o.CacheRead / 1e6, CacheWritePerToken: o.CacheWrite / 1e6,
+			MaxInputTokens: o.ContextWindow,
+		}
+	}
+	return out
 }
 
 // Lookup returns model's USD-per-token input/output rate. It tries, in
@@ -109,12 +155,21 @@ func (pc *PricingCache) Lookup(model string) (rate pricingRate, ok bool) {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
 
-	for _, candidate := range []string{key, "openrouter/" + key, bareModelName(key)} {
-		if r, found := pc.rates[candidate]; found {
-			return r, true
+	for _, table := range []map[string]pricingRate{pc.overrides, pc.rates} {
+		for _, candidate := range []string{key, "openrouter/" + key, bareModelName(key)} {
+			if r, found := table[candidate]; found {
+				return r, true
+			}
 		}
 	}
 	return pricingRate{}, false
+}
+
+// ContextWindow is model's context window (LiteLLM's max_input_tokens, or
+// an override's contextWindow), 0 when unknown.
+func (pc *PricingCache) ContextWindow(model string) int {
+	r, _ := pc.Lookup(model)
+	return r.MaxInputTokens
 }
 
 // CostUSD prices one request with prompt-cache reads and writes split out
@@ -123,6 +178,9 @@ func (pc *PricingCache) Lookup(model string) (rate pricingRate, ok bool) {
 func (pc *PricingCache) CostUSD(model string, input, cacheRead, cacheWrite, output int) (float64, bool) {
 	r, ok := pc.Lookup(model)
 	if !ok {
+		if pc != nil && model != "" {
+			pc.refreshOnMiss()
+		}
 		return 0, false
 	}
 	readRate, writeRate := r.CacheReadPerToken, r.CacheWritePerToken
@@ -143,22 +201,56 @@ func bareModelName(key string) string {
 	return key
 }
 
+// SetRefreshInterval makes the background refresh run every d (the runtime
+// setting pricingRefreshHours); 0 goes back to daily at 00:00 UTC.
+func (pc *PricingCache) SetRefreshInterval(d time.Duration) {
+	pc.refreshEvery.Store(int64(d))
+	select {
+	case pc.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (pc *PricingCache) nextRefresh() time.Duration {
+	if d := time.Duration(pc.refreshEvery.Load()); d > 0 {
+		return d
+	}
+	return time.Until(nextUTCMidnight(time.Now().UTC()))
+}
+
 // StartDailyRefresh fetches once immediately in the background (best-effort,
-// never blocking the caller) and then again at a fixed 00:00 UTC every day
-// after. Returns once ctx is done. See ManifestCache.StartDailyRefresh,
-// which this mirrors exactly.
+// never blocking the caller) and then again every refresh interval (daily at
+// 00:00 UTC unless SetRefreshInterval says otherwise). Returns once ctx is
+// done. See ManifestCache.StartDailyRefresh, which this mirrors.
 func (pc *PricingCache) StartDailyRefresh(ctx context.Context) {
+	pc.started.Store(true)
 	go func() {
 		_ = pc.Refresh()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Until(nextUTCMidnight(time.Now().UTC()))):
+			case <-pc.wake: // interval changed: re-arm the timer
+			case <-time.After(pc.nextRefresh()):
 				_ = pc.Refresh()
 			}
 		}
 	}()
+}
+
+// refreshOnMiss fetches fresh rates in the background when a model has no
+// price, at most once an hour: a model released since the last refresh is the
+// usual cause, and a model nobody prices must not hammer upstream.
+func (pc *PricingCache) refreshOnMiss() {
+	if !pc.started.Load() {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := pc.lastMiss.Load()
+	if now-last < int64(time.Hour) || !pc.lastMiss.CompareAndSwap(last, now) {
+		return
+	}
+	go func() { _ = pc.Refresh() }()
 }
 
 // Refresh does one conditional GET against pricingURL: If-None-Match with
@@ -252,6 +344,7 @@ type rawPricingEntry struct {
 	OutputCostPerToken     *float64 `json:"output_cost_per_token"`
 	CacheReadCostPerToken  float64  `json:"cache_read_input_token_cost"`
 	CacheWriteCostPerToken float64  `json:"cache_creation_input_token_cost"`
+	MaxInputTokens         any      `json:"max_input_tokens"` // a number; LiteLLM's sample_spec has prose here
 }
 
 // parsePricing projects LiteLLM's document into model -> rate. Entries
@@ -272,11 +365,13 @@ func parsePricing(raw []byte) (map[string]pricingRate, error) {
 		if entry.InputCostPerToken == nil || entry.OutputCostPerToken == nil {
 			continue
 		}
+		window, _ := entry.MaxInputTokens.(float64)
 		rates[strings.ToLower(name)] = pricingRate{
 			InputPerToken:      *entry.InputCostPerToken,
 			OutputPerToken:     *entry.OutputCostPerToken,
 			CacheReadPerToken:  entry.CacheReadCostPerToken,
 			CacheWritePerToken: entry.CacheWriteCostPerToken,
+			MaxInputTokens:     int(window),
 		}
 	}
 	if len(rates) == 0 {
