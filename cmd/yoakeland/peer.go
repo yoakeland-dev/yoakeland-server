@@ -34,6 +34,7 @@ type Peer struct {
 	TokenName   string
 	Email       string
 	DeviceID    string
+	Restricted  bool   // limited to remoteAllowed events; fixed for the connection
 	SessionID   string // last chat opened, see SetActivity
 	ProjectPath string
 	Network     string // "unix" or "tcp"
@@ -67,6 +68,7 @@ func NewPeerRegistry() *PeerRegistry {
 type peerIdentity struct {
 	Name, DeviceType, Avatar, DeviceID string
 	TokenName, Email                   string // set only for a named TCP token
+	Restricted                         bool   // a pairing (phone) credential: see remoteAllowed
 }
 
 // maxNameLen caps a display name; cleanName trims it and drops control characters, since a name
@@ -111,6 +113,7 @@ func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network stri
 		DeviceID:    who.DeviceID,
 		TokenName:   who.TokenName,
 		Email:       who.Email,
+		Restricted:  who.Restricted,
 		Network:     network,
 		conn:        conn,
 		ipc:         ipc,

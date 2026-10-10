@@ -830,7 +830,7 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 	// The token's name is only the initial name for a device that has none yet (it is what the
 	// person typed when pairing it); a device that already knows who it is keeps that identity.
 	// The credential's own name stays in TokenName for revocation and the audit log.
-	who.TokenName, who.Email = resolvedName, rec.Email
+	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, rec.Pairing
 	if who.Name == "" {
 		who.Name = resolvedName
 	}
@@ -1006,6 +1006,12 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 }
 
 func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
+	if remoteDenied(deps, network, peerID, env.Type) {
+		_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+			Message: fmt.Sprintf("%s isn't available from a paired device; do it on the computer running the server", env.Type),
+		})
+		return
+	}
 	if network == "tcp" {
 		if err := scopeRemoteProject(deps, env); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
