@@ -113,3 +113,27 @@ func TestSandbox_HidesStateDir(t *testing.T) {
 		t.Fatalf("state readable in the sandbox: %+v", res)
 	}
 }
+
+// .git is a mountpoint in the sandbox, so it can't be renamed away and
+// recreated without the read-only config/hooks binds; git still works.
+func TestSandbox_GitDirCannotBeRenamed(t *testing.T) {
+	root := t.TempDir()
+	if err := exec.Command("git", "-C", root, "init", "-q").Run(); err != nil {
+		t.Skipf("git unavailable: %v", err)
+	}
+	sb := sandbox.NewSandbox(root, 10*time.Second)
+	if sb.Mode() != sandbox.ModeBubblewrap {
+		t.Skip("needs bubblewrap")
+	}
+	res, err := sb.Execute(context.Background(), []string{"mv", ".git", ".git-old"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatal("mv .git succeeded in the sandbox")
+	}
+	res, err = sb.Execute(context.Background(), []string{"sh", "-c", "echo x > f && git add f"}, nil)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("git add failed: %v %+v", err, res)
+	}
+}

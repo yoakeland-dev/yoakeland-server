@@ -45,6 +45,7 @@ func (s *NonLinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv [
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
+	cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
 	cmd.Dir = s.projectRoot
 	cmd.Env = append([]string{
 		"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",

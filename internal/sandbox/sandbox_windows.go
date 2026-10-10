@@ -76,6 +76,7 @@ func (s *WindowsSandbox) Execute(ctx context.Context, argv []string, extraEnv []
 	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
 	cmd.Dir = s.projectRoot
 	cmd.Env = windowsBaseEnv(s.projectRoot, extraEnv)
+	cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
 
 	stdout, stderr := newCapped(), newCapped()
 	cmd.Stdout = stdout

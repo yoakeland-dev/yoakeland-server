@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,4 +86,23 @@ func TestManager_OpenStartsInRequestedCwd(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("shell didn't start in pkg/api: want %q in %q", want, seen)
+}
+
+// Opening past the cap is refused, so a paired peer can't exhaust pids/memory.
+func TestManager_OpenRefusesPastTerminalCap(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	sb := sandbox.NewSandbox(tempDir, 60*time.Second)
+	mgr := terminal.NewManager(sb, norm)
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{})
+	defer mgr.CloseSession("sess-cap")
+
+	for i := 0; i < 64; i++ {
+		if _, err := mgr.Open(context.Background(), ipc, "sess-cap", fmt.Sprintf("term-%d", i), "", 0, 0, nil); err != nil {
+			t.Fatalf("Open %d: %v", i, err)
+		}
+	}
+	if _, err := mgr.Open(context.Background(), ipc, "sess-cap", "term-over", "", 0, 0, nil); err == nil {
+		t.Fatal("65th terminal opened, want refusal")
+	}
 }

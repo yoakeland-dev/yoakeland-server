@@ -64,6 +64,7 @@ func (s *DarwinSandbox) Execute(ctx context.Context, argv []string, extraEnv []s
 	// command as the Linux tier's Execute — see buildCmd's doc comment.
 	cmd := s.buildCmd(execCtx, argv, false)
 	cmd.Env = s.baseEnv(extraEnv, false)
+	cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
 
 	stdout, stderr := newCapped(), newCapped()
 	cmd.Stdout = stdout

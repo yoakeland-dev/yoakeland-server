@@ -79,7 +79,7 @@ func applyCgroupLimits(pid int) (cleanup func(), applied bool) {
 	ownPath, ok := probeCgroupDelegation()
 	if !ok {
 		cgroupWarnOnce.Do(func() {
-			log.Printf("WARNING: no cgroup v2 delegation available — terminal sessions run with no memory/process-count limit beyond what bubblewrap/namespaces already isolate. A runaway or malicious interactive shell can still exhaust host memory or fork-bomb it. Run this daemon under a systemd user session (or grant it cgroup delegation another way) for enforced resource limits.")
+			log.Printf("WARNING: no cgroup v2 delegation. Terminals have no memory or process-count limit beyond what bubblewrap and namespaces isolate, so a runaway or malicious shell can exhaust host memory or fork-bomb it. Run this daemon under a systemd user session, or grant it cgroup delegation, to enforce limits.")
 		})
 		return noop, false
 	}

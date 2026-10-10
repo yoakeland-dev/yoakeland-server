@@ -48,6 +48,10 @@ const (
 	maxInputBytes  = 64 * 1024
 	maxEnvVars     = 128
 	maxEnvValueLen = 8192
+
+	// maxTerminals caps live terminals across all chats; each is a shell
+	// plus a sandbox process.
+	maxTerminals = 64
 )
 
 var (
@@ -404,6 +408,14 @@ func (m *Manager) open(ctx context.Context, stream *protocol.IPCStream, sessionI
 	if _, exists := m.terminals[sessionID][id]; exists {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("terminal %q is already open", id)
+	}
+	n := 0
+	for _, byID := range m.terminals {
+		n += len(byID)
+	}
+	if n >= maxTerminals {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("too many terminals open (max %d)", maxTerminals)
 	}
 	t := &Terminal{
 		sessionID: sessionID,

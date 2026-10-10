@@ -78,6 +78,7 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 	// neither.
 	cmd := s.buildCmd(execCtx, argv, "", true, false)
 	cmd.Env = s.baseEnv(extraEnv, false)
+	cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
 
 	stdout, stderr := newCapped(), newCapped()
 	cmd.Stdout = stdout
@@ -195,9 +196,17 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, 
 		// submodules named with a slash or nested (.git/modules/a/b/,
 		// .git/modules/a/modules/b/), stay writable; hostGit disables
 		// fsmonitor/hooks for those.
+		// Bind .git (and each module dir) onto itself first: a mountpoint
+		// can't be renamed, so the sandbox can't mv .git aside and recreate
+		// it without the read-only binds below. --bind-try skips a missing
+		// .git and binds a worktree/submodule .git file as a file.
+		g := filepath.Join(s.projectRoot, ".git")
+		bwrapArgs = append(bwrapArgs, "--bind-try", g, g)
 		gitPaths := []string{".git/config", ".git/hooks"}
-		if mods, err := os.ReadDir(filepath.Join(s.projectRoot, ".git", "modules")); err == nil {
+		if mods, err := os.ReadDir(filepath.Join(g, "modules")); err == nil {
 			for _, m := range mods {
+				md := filepath.Join(g, "modules", m.Name())
+				bwrapArgs = append(bwrapArgs, "--bind-try", md, md)
 				gitPaths = append(gitPaths, filepath.Join(".git", "modules", m.Name(), "config"), filepath.Join(".git", "modules", m.Name(), "hooks"))
 			}
 		}
@@ -404,7 +413,7 @@ func probeBubblewrap(testDir string) bool {
 func checkBubblewrapVersion() {
 	out, err := exec.Command("bwrap", "--version").Output()
 	if err != nil {
-		log.Printf("WARNING: could not determine bubblewrap version (%v) — if it predates 0.12.0 it may be vulnerable to known sandbox-escape CVEs (GHSA-pxhw-h44j-8pfx, GHSA-xq78-7hw4-5jvp). Consider upgrading bubblewrap.", err)
+		log.Printf("WARNING: could not determine bubblewrap version (%v). Versions before 0.12.0 have known sandbox-escape CVEs (GHSA-pxhw-h44j-8pfx, GHSA-xq78-7hw4-5jvp). Upgrade bubblewrap.", err)
 		return
 	}
 
@@ -417,7 +426,7 @@ func checkBubblewrapVersion() {
 		}
 	}
 	if version == "" || !bubblewrapVersionAtLeast(version, [3]int{0, 12, 0}) {
-		log.Printf("WARNING: bubblewrap version %q may be vulnerable to known sandbox-escape CVEs — GHSA-pxhw-h44j-8pfx (symlink-traversal escape, fixed in 0.12.0) and GHSA-xq78-7hw4-5jvp (ptrace privilege escalation in setuid installs, fixed in 0.11.2). Recommend upgrading bubblewrap.", strings.TrimSpace(string(out)))
+		log.Printf("WARNING: bubblewrap %q has known sandbox-escape CVEs: GHSA-pxhw-h44j-8pfx (symlink escape, fixed in 0.12.0) and GHSA-xq78-7hw4-5jvp (ptrace privilege escalation in setuid installs, fixed in 0.11.2). Upgrade bubblewrap.", strings.TrimSpace(string(out)))
 	}
 }
 
