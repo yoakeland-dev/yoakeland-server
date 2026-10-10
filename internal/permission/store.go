@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -154,7 +155,7 @@ func migrateV1(old map[string]legacyRule, root string) ([]Rule, []string) {
 		switch toolName {
 		case ToolBash:
 			sc, err := parseArgv(target)
-			if err != nil || len(sc.Argv) == 0 || (e.Allowed && (sc.HasChain || contains(sc.Argv, "*"))) {
+			if err != nil || len(sc.Argv) == 0 || (e.Allowed && (sc.HasChain || slices.Contains(sc.Argv, "*"))) {
 				notes = append(notes, "dropped bash entry that cannot be an exact argv rule: "+target)
 				continue
 			}

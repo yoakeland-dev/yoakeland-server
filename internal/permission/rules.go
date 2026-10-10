@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -78,7 +79,9 @@ func mcpSegment(s string) bool {
 // coversMCP: an MCP rule's tool applies to the named tool.
 func coversMCP(ruleTool, tool string) bool {
 	if server, name, ok := ParseMCPTool(ruleTool); ok && name == "*" {
-		return strings.HasPrefix(tool, ToolMCPPrefix+server+"__")
+		// A server named "foo_" also yields "mcp__foo___x"; that tool is not foo's.
+		p := ToolMCPPrefix + server + "__"
+		return strings.HasPrefix(tool, p) && !strings.HasPrefix(tool[len(p):], "_")
 	}
 	return ruleTool == tool
 }
@@ -151,7 +154,7 @@ func RatchetModes(mode string) []string {
 // caller did not say: deny/ask rules apply, allow rules only when unrestricted.
 func (r *Rule) appliesInMode(mode string) bool {
 	if r.Decision != DecisionAllow {
-		return len(r.Modes) == 0 || mode == "" || contains(r.Modes, mode)
+		return len(r.Modes) == 0 || mode == "" || slices.Contains(r.Modes, mode)
 	}
 	if rk, ok := modeRank[mode]; ok && rk < 1 {
 		return false // allow never widens read_only / plan
@@ -159,16 +162,7 @@ func (r *Rule) appliesInMode(mode string) bool {
 	if len(r.Modes) == 0 {
 		return true
 	}
-	return mode != "" && contains(r.Modes, mode)
-}
-
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
+	return mode != "" && slices.Contains(r.Modes, mode)
 }
 
 // Validate checks a rule is well formed and safe to store. It is the one
@@ -241,7 +235,7 @@ func validatePathPattern(p string, allow bool) error {
 		return fmt.Errorf("** is only allowed as a trailing /**")
 	}
 	if allow && (p == "**" || p == "*" || p == "." || p == "./**" || p == "") {
-		return fmt.Errorf("that covers the whole project — use Edit mode instead")
+		return fmt.Errorf("that covers the whole project; use Edit mode instead")
 	}
 	if _, err := path.Match(body, "x"); err != nil {
 		return fmt.Errorf("bad path pattern: %v", err)

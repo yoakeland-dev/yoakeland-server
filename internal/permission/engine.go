@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -180,12 +181,6 @@ type Result struct {
 	Rule        *Rule
 	CacheKey    string // legacy "tool:target", set when an exact suggestion exists
 	Suggestions []Suggestion
-}
-
-// Evaluate is Check without a mode, for callers that only need the verdict.
-func (e *Engine) Evaluate(toolName string, target string) (Decision, string) {
-	r := e.Check(Request{Tool: toolName, Target: target})
-	return r.Decision, r.CacheKey
 }
 
 func (e *Engine) sets() []*RuleSet {
@@ -369,7 +364,7 @@ func (e *Engine) suggest(req Request, subj *subject) []Suggestion {
 			}
 		}
 		exact := append([]string(nil), argv...)
-		if !contains(exact, "*") {
+		if !slices.Contains(exact, "*") {
 			out = append(out, Suggestion{ID: SuggestExact, Tool: ToolBash, Pattern: exact, Scope: ScopeProject,
 				Label: "Always allow this exact command"})
 		}
@@ -504,17 +499,10 @@ func (e *Engine) Problems() (errs, notes []string) {
 	for _, rs := range e.sets() {
 		rs.mu.RLock()
 		if rs.loadErr != nil {
-			errs = append(errs, fmt.Sprintf("%s rules: %v — every approval asks until it is fixed, and rules cannot be changed", rs.scope, rs.loadErr))
+			errs = append(errs, fmt.Sprintf("%s rules: %v. Every approval asks until it is fixed, and rules cannot be changed", rs.scope, rs.loadErr))
 		}
 		notes = append(notes, rs.notes...)
 		rs.mu.RUnlock()
 	}
 	return errs, notes
-}
-
-// ClearSessionCache drops the session-scope rules.
-func (e *Engine) ClearSessionCache() {
-	e.session.mu.Lock()
-	defer e.session.mu.Unlock()
-	e.session.rules = nil
 }

@@ -47,6 +47,22 @@ func TestMCPRuleCoversTheToolOrTheServer(t *testing.T) {
 	}
 }
 
+func TestMCPServerRuleIgnoresServersWhoseNameExtendsIt(t *testing.T) {
+	e, _ := newEngine(t)
+	mustAdd(t, e, permission.ScopeProject, mcpRule(permission.DecisionAllow, "mcp__foo__*"))
+	for _, c := range []struct {
+		tool string
+		want permission.Decision
+	}{
+		{"mcp__foo__search", permission.DecisionAllow},
+		{"mcp__foo___search", permission.DecisionAsk}, // server "foo_", tool "search"
+	} {
+		if got := check(e, c.tool, "{}", "read_write"); got != c.want {
+			t.Errorf("%s = %s, want %s", c.tool, got, c.want)
+		}
+	}
+}
+
 func TestMCPAllowNeverWidensReadOnlyOrPlan(t *testing.T) {
 	e, _ := newEngine(t)
 	mustAdd(t, e, permission.ScopeProject, mcpRule(permission.DecisionAllow, "mcp__docs__*"))
