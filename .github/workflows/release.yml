@@ -18,6 +18,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Nothing is released from a tree whose tests fail, race detector on.
+      - name: Test
+        run: go vet ./... && go test -race ./...
       - name: Build
         run: |
           mkdir out
