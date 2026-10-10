@@ -452,6 +452,7 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 		fmt.Sprintf("remote listener on %s (TLS) — pairing code: %s", ln.Addr(), code),
 		fmt.Sprintf("yoakeland remote listener on %s over TLS — paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
 	)
+	printPairQR(ln.Addr(), authToken, rtcFp)
 	return ln, authToken, nil
 }
 
