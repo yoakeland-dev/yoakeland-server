@@ -137,3 +137,36 @@ func TestSandbox_GitDirCannotBeRenamed(t *testing.T) {
 		t.Fatalf("git add failed: %v %+v", err, res)
 	}
 }
+
+// A peer-chosen LD_PRELOAD must reach the command inside the sandbox, not the bwrap process
+// on the host that sets the sandbox up.
+func TestSandbox_PreloadDoesNotRunOnHost(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	sb := sandbox.NewSandbox(root, 10*time.Second)
+	if sb.Mode() != sandbox.ModeBubblewrap {
+		t.Skip("needs bubblewrap")
+	}
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("needs gcc")
+	}
+	marker := filepath.Join(outside, "ran-on-host")
+	src := filepath.Join(root, "x.c")
+	code := "#include <stdio.h>\n__attribute__((constructor)) static void f(void){FILE*h=fopen(\"" + marker + "\",\"w\");if(h)fclose(h);}\n"
+	if err := os.WriteFile(src, []byte(code), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	so := filepath.Join(root, "x.so")
+	if out, err := exec.Command("gcc", "-shared", "-fPIC", "-o", so, src).CombinedOutput(); err != nil {
+		t.Skipf("gcc failed: %v %s", err, out)
+	}
+	res, err := sb.Execute(context.Background(), []string{"sh", "-c", "echo $FOO"}, []string{"LD_PRELOAD=" + so, "FOO=bar"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("LD_PRELOAD library ran on the host")
+	}
+	if strings.TrimSpace(res.Stdout) != "bar" {
+		t.Fatalf("env didn't reach the sandboxed command: %+v", res)
+	}
+}

@@ -77,7 +77,7 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 	// buildCmd's doc comment for why SpawnPTY's interactive terminal gets
 	// neither.
 	cmd := s.buildCmd(execCtx, argv, "", true, false)
-	cmd.Env = s.baseEnv(extraEnv, false)
+	s.setEnv(cmd, s.baseEnv(extraEnv, false))
 	cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
 
 	stdout, stderr := newCapped(), newCapped()
@@ -265,6 +265,23 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, 
 	return cmd
 }
 
+// setEnv gives the command inside the sandbox env. Under bwrap it goes in as --setenv, so a
+// peer-chosen LD_PRELOAD or the like applies to the sandboxed process; as bwrap's own
+// environment it would load a library into bwrap on the host, before the sandbox exists.
+func (s *LinuxSandbox) setEnv(cmd *exec.Cmd, env []string) {
+	if s.mode != ModeBubblewrap {
+		cmd.Env = env
+		return
+	}
+	args := []string{cmd.Args[0], "--clearenv"}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		args = append(args, "--setenv", k, v)
+	}
+	cmd.Args = append(args, cmd.Args[1:]...)
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"}
+}
+
 // baseEnv is the sandbox's fixed environment, plus extraEnv appended as-is.
 // interactive adds TERM, which a captured one-shot command has no use for
 // but an interactive shell (readline, ncurses tools) needs to behave sanely.
@@ -292,7 +309,7 @@ func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []s
 	}
 
 	cmd := s.buildCmd(ctx, argv, dir, false, allowNetwork)
-	cmd.Env = s.baseEnv(extraEnv, true)
+	s.setEnv(cmd, s.baseEnv(extraEnv, true))
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
 	if err != nil {

@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -720,6 +721,17 @@ func clampRows(v int) int {
 	return v
 }
 
+// loaderEnv names variables that make a process load or run attacker-chosen code before main
+// (the dynamic loader's, the shells' startup files, and the server's own). bwrap tiers keep them
+// off the host (sandbox.setEnv); this covers the tiers where the shell is the process itself.
+func loaderEnv(k string) bool {
+	switch k {
+	case "GCONV_PATH", "LOCPATH", "NLSPATH", "GLIBC_TUNABLES", "BASH_ENV", "ENV", "ZDOTDIR", "PATH", "HOME":
+		return true
+	}
+	return strings.HasPrefix(k, "LD_") || strings.HasPrefix(k, "DYLD_") || strings.HasPrefix(k, "MALLOC_") || strings.HasPrefix(k, "YOAKE")
+}
+
 // validateEnv turns a client-supplied env map into "KEY=value" pairs
 // appended on top of the sandbox's own base environment, with the same
 // restricted shape (name pattern, count, value size) node-pty-based tools
@@ -736,6 +748,9 @@ func validateEnv(env map[string]string) ([]string, error) {
 	for k, v := range env {
 		if !envKeyPattern.MatchString(k) {
 			return nil, fmt.Errorf("invalid env var name %q", k)
+		}
+		if loaderEnv(k) {
+			return nil, fmt.Errorf("env var %q can't be set from a client", k)
 		}
 		if len(v) > maxEnvValueLen {
 			return nil, fmt.Errorf("env var %q exceeds %d bytes", k, maxEnvValueLen)
