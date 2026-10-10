@@ -273,6 +273,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	shutdownServer = cancel
 
 	manifestCache.StartDailyRefresh(ctx)
 	pricingCache.StartDailyRefresh(ctx)
@@ -320,6 +321,10 @@ func main() {
 	drainTurns(deps.turnWG)
 	deps.projects.CloseMCP() // the MCP servers' processes don't outlive the daemon
 }
+
+// shutdownServer stops the daemon the way SIGTERM does (set once main has its context). A restart
+// is a shutdown: whatever started the daemon is what starts it again.
+var shutdownServer func()
 
 // turnDrainTimeout bounds how long a shutdown waits for in-flight turns.
 // ctx is already cancelled by the time this runs, so a turn's model stream and
@@ -2596,6 +2601,28 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		deps.record(ipc, peerID, audit.Event{Kind: audit.RemotePassword, Outcome: "ok"}) // the fact, never the password
 		_ = ipc.SendEvent(protocol.EventRemotePasswordSet, env.SessionID, env.TurnID, "", protocol.RemotePasswordSetData{})
+
+	case protocol.EventRestartServer:
+		if network != "unix" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "restart_server is local-socket-only",
+			})
+			return
+		}
+		var data protocol.RestartServerData
+		_ = json.Unmarshal(env.Data, &data) // no payload is fine: not forced
+		if active, _ := deps.projects.Stats(); active > 0 && !data.Force {
+			_ = ipc.SendEvent(protocol.EventServerRestart, env.SessionID, env.TurnID, "", protocol.ServerRestartData{Status: "busy", ActiveTurns: active})
+			return
+		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.ServerRestart, Outcome: "ok"})
+		_ = ipc.SendEvent(protocol.EventServerRestart, env.SessionID, env.TurnID, "", protocol.ServerRestartData{Status: "restarting"})
+		go func() {
+			time.Sleep(300 * time.Millisecond) // let the answer reach the client first
+			if shutdownServer != nil {
+				shutdownServer()
+			}
+		}()
 
 	case protocol.EventApprovePairing:
 		if network != "unix" {

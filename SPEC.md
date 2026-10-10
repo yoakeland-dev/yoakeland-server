@@ -829,6 +829,20 @@ Sets *this* connection's own avatar — same self-only shape as `set_peer_name`,
 - For a connection authenticated with a token (`register_token`/the legacy `"default"` one), this also persists the avatar against that token (`server.json`), so it's still there on the *next* reconnect rather than resetting to blank — the one piece of `set_peer_avatar` that outlives the connection. A unix-socket peer's avatar is still purely live/in-memory, same as before.
 - Response: no direct ack — every peer sees the change on the next `peer_list` push. `error` if this connection has no registered peer, or if `avatar` exceeds the size cap.
 
+#### `restart_server` *(v2.32)*
+Asks the daemon to shut down so that whatever started it can start it again — how a client applies a newly installed server binary. **Local-socket-only** — `error` over TCP. The daemon does not re-exec itself: it stops exactly as on `SIGTERM` (turns drained, sockets removed) and exits 0. The desktop app starts it again when its local connection drops; a headless install needs a supervisor (`systemd` `Restart=always`).
+```json
+{"type": "restart_server", "data": {"force": false}}
+```
+- Response: `server_restart` (§3.2). Without `force`, a server with turns running answers `{"status": "busy", "activeTurns": 2}` and keeps running; with it, or when idle, `{"status": "restarting"}` and then every connection drops. Terminals and coding-agent processes die with the daemon either way. Audited as `server_restart`.
+
+#### `restart_server` *(v2.32)*
+Asks the daemon to shut down so that whatever started it can start it again — how a client applies a newly installed server binary. **Local-socket-only** — `error` over TCP. The daemon does not re-exec itself: it stops exactly as on `SIGTERM` (turns drained, sockets removed) and exits 0. The desktop app starts it again when its local connection drops; a headless install needs a supervisor (`systemd` `Restart=always`).
+```json
+{"type": "restart_server", "data": {"force": false}}
+```
+- Response: `server_restart` (§3.2). Without `force`, a server with turns running answers `{"status": "busy", "activeTurns": 2}` and keeps running; with it, or when idle, `{"status": "restarting"}` and then every connection drops. Terminals and coding-agent processes die with the daemon either way. Audited as `server_restart`.
+
 #### `disconnect_peer`
 Force-closes another live connection. See "Peer registry & remote-access settings" (§2a) for the permission model.
 ```json

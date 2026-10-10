@@ -75,6 +75,7 @@ const (
 	EventSetDefaultProvider    EventType = "set_default_provider"
 	EventRegisterToken         EventType = "register_token"
 	EventApprovePairing        EventType = "approve_pairing"
+	EventRestartServer         EventType = "restart_server"
 	EventListTokens            EventType = "list_tokens"
 	EventRemoveToken           EventType = "remove_token"
 	EventListNotifications     EventType = "list_notifications"
@@ -183,6 +184,7 @@ const (
 	EventTokenRegistered          EventType = "token_registered"
 	EventPairingRequest           EventType = "pairing_request"
 	EventPairingPending           EventType = "pairing_pending"
+	EventServerRestart            EventType = "server_restart"
 	EventTokenList                EventType = "token_list"
 	EventTokenRemoved             EventType = "token_removed"
 	EventNotification             EventType = "notification"
@@ -1111,6 +1113,20 @@ type PairingRequestData struct {
 	Name       string `json:"name,omitempty"`
 	DeviceType string `json:"deviceType,omitempty"`
 	IP         string `json:"ip,omitempty"`
+}
+
+// RestartServerData asks the daemon to shut down so whatever started it can start it again (the
+// desktop app does; so does a supervisor with Restart=always). Local socket only.
+type RestartServerData struct {
+	// Force restarts even with turns running; without it a busy server refuses.
+	Force bool `json:"force,omitempty"`
+}
+
+// ServerRestartData is the answer: "restarting" (the daemon is about to exit and every connection
+// will drop) or "busy" (turns are running and Force wasn't set; ActiveTurns says how many).
+type ServerRestartData struct {
+	Status      string `json:"status"`
+	ActiveTurns int    `json:"activeTurns,omitempty"`
 }
 
 // ApprovePairingData answers a pairing_request (local socket only).

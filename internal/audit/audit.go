@@ -52,6 +52,7 @@ const (
 	ProjectRemove   = "project_remove"   // a project was forgotten
 	MCPServer       = "mcp_server"       // an MCP server was added, changed, removed, approved, signed in to
 	SkillChange     = "skill_change"     // a skill was switched on or off
+	ServerRestart   = "server_restart"   // the daemon was asked to restart
 )
 
 // Kinds lists every kind, in the order a UI shows them.
@@ -59,7 +60,7 @@ var Kinds = []string{
 	PermDecision, PermAuto, ToolExec, ModeChange, RuleAdd, RuleRemove, LimitPause,
 	ProviderAdd, ProviderRemove, SettingsChange, RemoteAccess, RemotePassword, TokenAdd, TokenRemove,
 	PeerJoin, PeerLeave, PeerKick, AuthFail, SnapshotRestore, TerminalOpen, FileWrite, FsOp, SessionDelete, ProjectRemove,
-	MCPServer, SkillChange,
+	MCPServer, SkillChange, ServerRestart,
 }
 
 // Event is one line of the log.
