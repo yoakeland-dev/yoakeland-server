@@ -212,7 +212,7 @@ func (mc *ManifestCache) recordFailure(err error) {
 	streak := mc.failStreak
 	mc.mu.Unlock()
 	if streak >= 2 {
-		log.Printf("WARNING: model manifest fetch has failed %d times in a row (%v) — still serving the last-good cache", streak, err)
+		log.Printf("WARNING: model manifest fetch failed %d times in a row (%v); serving the last-good cache", streak, err)
 	}
 }
 

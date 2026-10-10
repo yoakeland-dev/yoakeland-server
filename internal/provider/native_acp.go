@@ -268,6 +268,11 @@ func (p *CLISubprocessProvider) acpInit(ctx, procCtx context.Context, spec cliSp
 		"clientInfo":         map[string]string{"name": "yoakeland", "version": "1"},
 	})
 	if err != nil {
+		// The process is bound to procCtx, not ctx: stop it here or it outlives the failed start.
+		_ = proc.stdin.Close()
+		if proc.kill != nil {
+			proc.kill()
+		}
 		return nil, acpCaps{}, fmt.Errorf("%s: %w", spec.Binary, err)
 	}
 	var init struct {
@@ -293,7 +298,7 @@ type acpCaps struct {
 // acpErr makes the common "not logged in" failure actionable.
 func acpErr(binary string, err error) error {
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "auth") {
-		return fmt.Errorf("%s needs you to sign in first: run `%s` once in a terminal on the server (%v)", binary, binary, err)
+		return fmt.Errorf("%s: sign in first by running `%s` once in a terminal on the server (%v)", binary, binary, err)
 	}
 	return err
 }

@@ -185,12 +185,6 @@ func (s *claudeSession) setTurn(t *claudeTurn) {
 	s.mu.Unlock()
 }
 
-func (s *claudeSession) sessionID() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.id
-}
-
 // request sends a control_request and waits for its control_response.
 func (s *claudeSession) request(ctx context.Context, subtype string, extra map[string]any) (claudeLine, error) {
 	ch := make(chan claudeLine, 1)
@@ -832,8 +826,11 @@ func claudeProposedDiffs(name string, input json.RawMessage) []*diff.FileDiff {
 		return nil
 	}
 	before := ""
-	if b, err := os.ReadFile(in.FilePath); err == nil {
-		before = string(b)
+	// Stat first: a FIFO or device would block this reader, and a huge file would be read whole.
+	if fi, err := os.Stat(in.FilePath); err == nil && fi.Mode().IsRegular() && fi.Size() <= 4<<20 {
+		if b, err := os.ReadFile(in.FilePath); err == nil {
+			before = string(b)
+		}
 	}
 	after := before
 	replace := func(old, repl string, all bool) {

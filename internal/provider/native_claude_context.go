@@ -197,16 +197,9 @@ func splitClaudeMessages(row protocol.ContextCategory, shares map[string]int) []
 	if len(parts) == 0 {
 		return []protocol.ContextCategory{row}
 	}
-	agrees := sum > 0 && abs(sum-row.Tokens)*100 <= row.Tokens*3
+	agrees := sum > 0 && max(sum-row.Tokens, row.Tokens-sum)*100 <= row.Tokens*3
 	for i := range parts {
 		parts[i].Exact = row.Exact && agrees
 	}
 	return parts
-}
-
-func abs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 }

@@ -335,7 +335,7 @@ func (t *codexTurn) request(id json.RawMessage, method string, params json.RawMe
 			callID = r.CallID
 		}
 		if r.Reason != "" {
-			desc += " — " + r.Reason
+			desc += ": " + r.Reason
 		}
 		na := agent.NativeAsk{ToolCallID: callID, ToolName: toolName, Description: desc, Diff: d, Edit: edit}
 		if toolName == "shell" {

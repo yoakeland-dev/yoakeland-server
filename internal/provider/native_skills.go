@@ -50,12 +50,14 @@ func leadWith(prompt string, names []string, prefix string) string {
 		}
 		return prefix + n
 	})
-	rest = strings.Join(strings.Fields(strings.ReplaceAll(rest, "\x00", "")), " ")
+	rest = strings.TrimSpace(multiSpace.ReplaceAllString(strings.ReplaceAll(rest, "\x00", ""), " "))
 	if strings.TrimSpace(rest) == "" {
 		return prefix + last
 	}
 	return prefix + last + " " + rest
 }
+
+var multiSpace = regexp.MustCompile(`[ \t]{2,}`)
 
 var mentionRe = regexp.MustCompile(`(^|\s)\$([A-Za-z][A-Za-z0-9._:-]{0,63})($|[\s.,;:!?)])`)
 

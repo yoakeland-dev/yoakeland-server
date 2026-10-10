@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -649,7 +650,7 @@ func (m piModel) efforts(f piFlavor) []string {
 	for _, level := range piThinkingLevels {
 		if f.binary == "omp" {
 			// "off" bypasses provider mapping, so it is never listed but always accepted.
-			if level == "off" || contains(m.Thinking.Efforts, level) {
+			if level == "off" || slices.Contains(m.Thinking.Efforts, level) {
 				out = append(out, level)
 			}
 			continue

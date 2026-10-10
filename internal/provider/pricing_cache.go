@@ -326,7 +326,7 @@ func (pc *PricingCache) recordFailure(err error) {
 	streak := pc.failStreak
 	pc.mu.Unlock()
 	if streak >= 2 {
-		log.Printf("WARNING: pricing table fetch has failed %d times in a row (%v) — still serving the last-good cache", streak, err)
+		log.Printf("WARNING: pricing table fetch failed %d times in a row (%v); serving the last-good cache", streak, err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -121,7 +122,13 @@ func discoverClaudeModels(ctx context.Context, dir string) ([]ModelInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = proc.stdin.Close() }()
+	defer func() {
+		_ = proc.stdin.Close()
+		// Killed by ctx; reap it so it doesn't linger as a zombie.
+		if proc.wait != nil {
+			go func() { _ = proc.wait() }()
+		}
+	}()
 	var wmu sync.Mutex
 	if err := writeJSONLine(proc.stdin, &wmu, map[string]any{"type": "control_request", "request_id": "yk-models", "request": map[string]any{"subtype": "initialize"}}); err != nil {
 		return nil, err
@@ -241,8 +248,8 @@ func withManifest(models, manifest []ModelInfo) []ModelInfo {
 		for k, v := range m.Capabilities {
 			caps[k] = v
 		}
-		if efforts, ok := caps["reasoningEfforts"].([]string); ok && contains(efforts, "xhigh") {
-			if theirs, _ := best.Capabilities["reasoningEfforts"].([]string); contains(theirs, "ultracode") {
+		if efforts, ok := caps["reasoningEfforts"].([]string); ok && slices.Contains(efforts, "xhigh") {
+			if theirs, _ := best.Capabilities["reasoningEfforts"].([]string); slices.Contains(theirs, "ultracode") {
 				caps["reasoningEfforts"] = append(append([]string(nil), efforts...), "ultracode")
 			}
 		}
@@ -253,15 +260,6 @@ func withManifest(models, manifest []ModelInfo) []ModelInfo {
 		out[i].IsLegacy = best.IsLegacy // the picker's divider
 	}
 	return out
-}
-
-func contains(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
 }
 
 // ClaudeModelsDiscovered is Claude Code's own model list (cached), enriched

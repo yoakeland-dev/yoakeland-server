@@ -18,8 +18,8 @@ type SSEEvent struct {
 	Data  string
 }
 
-// ReadSSESteam decodes standard text/event-stream chunks line by line
-func ReadSSESteam(r io.Reader, handle func(ev SSEEvent) error) error {
+// ReadSSEStream decodes standard text/event-stream chunks line by line
+func ReadSSEStream(r io.Reader, handle func(ev SSEEvent) error) error {
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, 8*1024*1024)
@@ -49,8 +49,12 @@ func ReadSSESteam(r io.Reader, handle func(ev SSEEvent) error) error {
 		}
 	}
 
+	// A read error (or ErrTooLong) mid-event is an error, not a clean end.
+	if err := scanner.Err(); err != nil {
+		return err
+	}
 	if currentEvent.Data != "" || currentEvent.Event != "" {
 		return handle(currentEvent)
 	}
-	return scanner.Err()
+	return nil
 }

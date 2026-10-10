@@ -49,7 +49,13 @@ func probeClaudeUsage(ctx context.Context, start procStarter, dir string) (*prot
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = proc.stdin.Close() }()
+	defer func() {
+		_ = proc.stdin.Close()
+		// Killed by ctx; reap it so it doesn't linger as a zombie.
+		if proc.wait != nil {
+			go func() { _ = proc.wait() }()
+		}
+	}()
 	// Written while stdout is being read: initialize's answer (every slash
 	// command) can outgrow a pipe buffer before the CLI reads the next line.
 	go func() {

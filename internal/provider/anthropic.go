@@ -482,7 +482,7 @@ func (p *AnthropicProvider) StreamTurn(
 			}
 		}
 
-		if readErr := ReadSSESteam(resp.Body, func(ev SSEEvent) error {
+		if readErr := ReadSSEStream(resp.Body, func(ev SSEEvent) error {
 			switch ev.Event {
 			case "message_start":
 				var msg struct {

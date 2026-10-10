@@ -171,7 +171,7 @@ func fetchModels(url string, setHeaders func(*http.Request), nameField string, h
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("listing models (%d): %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("listing models: HTTP %d from %s", resp.StatusCode, url)
 	}
 
 	var body struct {

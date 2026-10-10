@@ -342,7 +342,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 		var usage protocol.UsageData
 		var finishReason string
 
-		if readErr := ReadSSESteam(resp.Body, func(ev SSEEvent) error {
+		if readErr := ReadSSEStream(resp.Body, func(ev SSEEvent) error {
 			if ev.Data == "[DONE]" {
 				return nil
 			}

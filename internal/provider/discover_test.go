@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 )
@@ -93,14 +94,14 @@ func TestManifestAddsWhatClaudeDoesNotReport(t *testing.T) {
 	if got[0].Capabilities["contextWindows"] == nil {
 		t.Fatal("context windows weren't carried over")
 	}
-	if e := got[2].Capabilities["reasoningEfforts"].([]string); contains(e, "ultracode") {
+	if e := got[2].Capabilities["reasoningEfforts"].([]string); slices.Contains(e, "ultracode") {
 		t.Fatalf("opus 4.6 got ultracode: %v", e)
 	}
 	if got[1].Capabilities["reasoningEfforts"] != nil {
 		t.Fatalf("haiku gained efforts: %v", got[1].Capabilities)
 	}
 	// What the agent reported is untouched.
-	if e := discoveredModels[0].Capabilities["reasoningEfforts"].([]string); contains(e, "ultracode") {
+	if e := discoveredModels[0].Capabilities["reasoningEfforts"].([]string); slices.Contains(e, "ultracode") {
 		t.Fatal("the input was modified")
 	}
 }
