@@ -818,7 +818,7 @@ Renames *this* connection's own peer entry — there's no target `peerId`, a pee
 {"type": "set_peer_name", "data": {"name": "aveline's phone"}}
 ```
 - Response: no direct ack — every peer (including the renamer) sees the change on the next `peer_list` push. `error` if this connection has no registered peer (only possible on a transport that skips peer registration, currently none of unix/TCP).
-- `error` also for a connection authenticated with a token (`register_token`): that identity's name is the credential's name, fixed at registration — rename by revoking (`remove_token`) and registering a new name instead, so "who is this" never has two conflicting answers (what the token says vs. what was last typed) mid-session.
+- A connection authenticated with a token (`register_token`) may rename itself too; the credential's own name (what `list_tokens` and the audit log show, and what `remove_token` takes) is unaffected.
 
 #### `set_peer_avatar`
 Sets *this* connection's own avatar — same self-only shape as `set_peer_name`, for updating the picture chosen at connect time (`auth`'s `avatar`, §2a) without reconnecting.
@@ -862,7 +862,7 @@ Mints a new **named**, per-person TCP auth credential — an alternative to shar
 ```
 - `name`: required, must not already be registered (including the implicit `"default"` token that `set_remote_password` manages) — `error` on a duplicate. Fixed for the life of the credential: there's no rename, by design — revoke it (`remove_token`) and register a new name instead, so "which person is this" never has two possible answers mid-flight.
 - `email`: optional, used only to seed `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` on a `bash` call this identity's turn makes (see `tool_call_requested`'s git-attribution note below) — a `<name>@yoake.local` placeholder is used if omitted.
-- Once this token authenticates a TCP `auth` handshake, its `name` becomes that connection's peer identity — overriding whatever `name`/`avatar` the client self-reports in the `auth` frame, since a named token is a real credential and a self-reported string isn't. Its avatar starts empty and is cached going forward via `set_peer_avatar` (§3.1) — see there for the persistence detail. A peer authenticated this way can't `set_peer_name` itself (that call errors for a token-backed identity); it can still `set_peer_avatar`.
+- Once this token authenticates a TCP `auth` handshake, its `name` is that connection's peer name *only if the client reports none*: it is the initial name for a device being set up, and a device that already has an identity (`name`/`avatar` in the `auth` frame) keeps it. The avatar likewise falls back to the one cached against the token via `set_peer_avatar` (§3.1) when the client sends none. The credential's name stays the token's handle for `list_tokens`, `remove_token` and the audit log, whatever the peer calls itself.
 - Response: `token_registered`, carrying the newly generated token — **shown only this once**, the same "reveal at creation, scrub afterward" pattern as any other bearer credential. Copy it somewhere before disconnecting; there's no way to retrieve it again short of `remove_token` + `register_token` a replacement.
 
 #### `list_tokens`

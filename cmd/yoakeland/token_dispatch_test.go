@@ -81,9 +81,9 @@ func TestServeConnection_TokenCommandsAreLocalSocketOnly(t *testing.T) {
 }
 
 // TestHandshake_ResolvesNamedTokenIdentity guards the actual point of
-// per-person tokens: a registered token's persisted name/avatar wins over
-// whatever the client self-reports in the auth frame, and an unrecognized
-// token is still rejected exactly as before.
+// per-person tokens: a registered token's name is the initial name for a
+// device that reports none, a device that reports its own identity keeps it,
+// and an unrecognized token is still rejected exactly as before.
 func TestHandshake_ResolvesNamedTokenIdentity(t *testing.T) {
 	deps := newTestDeps(t)
 	if err := deps.settings.AddToken("aveline", "tok-123", "aveline@example.com"); err != nil {
@@ -93,12 +93,16 @@ func TestHandshake_ResolvesNamedTokenIdentity(t *testing.T) {
 		t.Fatal("SetTokenAvatar should report the token existed")
 	}
 
-	line := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "tok-123", Name: "spoofed-name"})
-	ipc := protocol.NewIPCStream(bytes.NewBufferString(line+"\n"), &bytes.Buffer{})
-	who, _, ok := handshake(ipc, "tcp", deps.settings.LookupToken)
-	name, avatar, tokenName, email := who.Name, who.Avatar, who.TokenName, who.Email
-	if !ok || name != "aveline" || tokenName != "aveline" || email != "aveline@example.com" || avatar == "" {
-		t.Fatalf("handshake() = name=%q tokenName=%q email=%q avatar=%q ok=%v, want the persisted identity to win over the self-reported name", name, tokenName, email, avatar, ok)
+	line := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "tok-123"})
+	who, _, ok := handshake(protocol.NewIPCStream(bytes.NewBufferString(line+"\n"), &bytes.Buffer{}), "tcp", deps.settings.LookupToken)
+	if !ok || who.Name != "aveline" || who.TokenName != "aveline" || who.Email != "aveline@example.com" || who.Avatar == "" {
+		t.Fatalf("handshake() = %+v ok=%v, want the token's name and saved avatar for a device that sent none", who, ok)
+	}
+
+	own := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "tok-123", Name: "fish", Avatar: "data:image/png;base64,own"})
+	who, _, ok = handshake(protocol.NewIPCStream(bytes.NewBufferString(own+"\n"), &bytes.Buffer{}), "tcp", deps.settings.LookupToken)
+	if !ok || who.Name != "fish" || who.Avatar != "data:image/png;base64,own" || who.TokenName != "aveline" {
+		t.Fatalf("handshake() = %+v ok=%v, want the device's own name and avatar with the credential name kept", who, ok)
 	}
 
 	// A token with no saved avatar shows the one the device sent on connect.

@@ -809,14 +809,14 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 		})
 		return peerIdentity{}, nil, false
 	}
-	// The persisted, token-tied name/avatar always wins over whatever the
-	// client self-reported (SPEC.md §2a's per-person tokens) — a name is
-	// fixed at register_token time, and the avatar is cached via
-	// set_peer_avatar, not re-typed every connection.
-	who.Name, who.TokenName, who.Email = resolvedName, resolvedName, rec.Email
-	// Until a device has saved an avatar against its token (set_peer_avatar), the one it sends
-	// on connect stands in, so a freshly paired phone shows its own picture.
-	if rec.Avatar != "" {
+	// The token's name is only the initial name for a device that has none yet (it is what the
+	// person typed when pairing it); a device that already knows who it is keeps that identity.
+	// The credential's own name stays in TokenName for revocation and the audit log.
+	who.TokenName, who.Email = resolvedName, rec.Email
+	if who.Name == "" {
+		who.Name = resolvedName
+	}
+	if who.Avatar == "" {
 		who.Avatar = rec.Avatar
 	}
 	return who, nil, true
@@ -2431,12 +2431,6 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: "malformed set_peer_name payload (name is required)",
-			})
-			return
-		}
-		if p, ok := deps.peers.Get(peerID); ok && p.TokenName != "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "this connection's identity comes from a registered token and can't be renamed live — remove_token + register_token a new one instead",
 			})
 			return
 		}
