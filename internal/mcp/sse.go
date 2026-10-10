@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"strings"
 )
@@ -25,6 +26,7 @@ func readSSE(r io.Reader, fn func(sseEvent) bool) error {
 	sc.Buffer(make([]byte, 0, 64*1024), maxFrame)
 	var ev sseEvent
 	var data []string
+	size := 0 // bytes of data: lines in the current event; maxFrame bounds the whole event
 	flush := func() bool {
 		if len(data) == 0 {
 			ev = sseEvent{}
@@ -32,7 +34,7 @@ func readSSE(r io.Reader, fn func(sseEvent) bool) error {
 		}
 		ev.Data = strings.Join(data, "\n")
 		out := ev
-		ev, data = sseEvent{}, nil
+		ev, data, size = sseEvent{}, nil, 0
 		return fn(out)
 	}
 	for sc.Scan() {
@@ -50,6 +52,10 @@ func readSSE(r io.Reader, fn func(sseEvent) bool) error {
 			case "event":
 				ev.Event = value
 			case "data":
+				size += len(value)
+				if size > maxFrame {
+					return errors.New("the server sent an event larger than the frame limit")
+				}
 				data = append(data, value)
 			case "id":
 				ev.ID = value

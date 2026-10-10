@@ -442,12 +442,12 @@ func (f *Flow) discover(ctx context.Context, serverURL string, ch *errNeedsAuth)
 			ok = ok || m == "S256"
 		}
 		if !ok {
-			return nil, nil, errors.New("the authorization server doesn't support PKCE with S256, which is required")
+			return nil, nil, errors.New("the authorization server doesn't support PKCE with S256")
 		}
 	}
 	for _, e := range []string{md.AuthorizationEndpoint, md.TokenEndpoint} {
 		if !validEndpoint(serverURL, e) {
-			return nil, nil, fmt.Errorf("the authorization server named an endpoint I won't use: %s", e)
+			return nil, nil, fmt.Errorf("the authorization server named a refused endpoint: %s", e)
 		}
 	}
 	return &md, scopes, nil
@@ -488,10 +488,10 @@ func (f *Flow) Begin(ctx context.Context, cfg ServerConfig, ch *errNeedsAuth, re
 	}
 	if p.ClientID == "" {
 		if md.RegistrationEndpoint == "" {
-			return nil, "", errors.New("this server's sign-in has no dynamic client registration; register a client with it and give its clientId in the server's oauth settings")
+			return nil, "", errors.New("the server has no dynamic client registration: create a client on it and enter its clientId in the server's oauth settings")
 		}
 		if !validEndpoint(cfg.URL, md.RegistrationEndpoint) {
-			return nil, "", fmt.Errorf("the authorization server named a registration endpoint I won't use: %s", md.RegistrationEndpoint)
+			return nil, "", fmt.Errorf("the authorization server named a refused registration endpoint: %s", md.RegistrationEndpoint)
 		}
 		if p.ClientID, p.ClientSecret, err = f.register(ctx, cfg.URL, md.RegistrationEndpoint, redirect); err != nil {
 			return nil, "", err

@@ -104,6 +104,9 @@ func (t *sseTransport) read(body io.ReadCloser, ready chan<- error) {
 	err := readSSE(body, func(ev sseEvent) bool {
 		switch ev.Event {
 		case "endpoint":
+			if signalled {
+				return true
+			}
 			base, _ := url.Parse(t.url)
 			ref, err := url.Parse(strings.TrimSpace(ev.Data))
 			if err != nil || base == nil {

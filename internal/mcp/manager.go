@@ -323,7 +323,7 @@ func (m *Manager) connect(e *entry, raw ServerConfig, settled chan struct{}) {
 // superseded (the entry was replaced, or restarted, while it ran).
 func (m *Manager) finish(e *entry, settled chan struct{}, c *Client, err error, infos []ToolInfo, res []ResourceInfo) {
 	m.mu.Lock()
-	if m.closed || m.entries[e.name] != e || e.settled != settled {
+	if m.closed || m.entries[e.name] != e || e.settled != settled || e.state != StateConnecting {
 		m.mu.Unlock()
 		if c != nil {
 			c.Close()
@@ -339,7 +339,7 @@ func (m *Manager) finish(e *entry, settled chan struct{}, c *Client, err error, 
 		e.listedAt = time.Now()
 		go m.watch(e, c)
 	case errors.As(err, &auth):
-		e.state, e.err, e.challenge = StateNeedsAuth, "this server needs you to sign in", auth
+		e.state, e.err, e.challenge = StateNeedsAuth, "this server needs sign-in", auth
 		e.client, e.tools, e.resTool = nil, nil, nil
 	default:
 		e.state, e.err = StateFailed, err.Error()
@@ -494,7 +494,7 @@ func (m *Manager) ready(ctx context.Context, e *entry) (*Client, error) {
 			return c, nil
 		case StateNeedsAuth:
 			m.mu.Unlock()
-			return nil, fmt.Errorf("MCP server %s needs you to sign in: open Settings → MCP servers", e.name)
+			return nil, fmt.Errorf("MCP server %s needs sign-in: open Settings → MCP servers", e.name)
 		case StateDisabled, StatePending:
 			m.mu.Unlock()
 			return nil, fmt.Errorf("MCP server %s is not enabled", e.name)
@@ -536,12 +536,12 @@ func (m *Manager) callFailed(e *entry, c *Client, err error, turn, call context.
 	case errors.As(err, &auth):
 		m.mu.Lock()
 		if e.client == c {
-			e.state, e.err, e.challenge, e.client, e.tools, e.resTool = StateNeedsAuth, "this server needs you to sign in", auth, nil, nil, nil
+			e.state, e.err, e.challenge, e.client, e.tools, e.resTool = StateNeedsAuth, "this server needs sign-in", auth, nil, nil, nil
 		}
 		m.mu.Unlock()
 		m.notify()
 		c.Close()
-		return fmt.Errorf("MCP server %s needs you to sign in: open Settings → MCP servers", e.name)
+		return fmt.Errorf("MCP server %s needs sign-in: open Settings → MCP servers", e.name)
 	case errors.As(err, &rerr):
 		return fmt.Errorf("MCP server %s: %s", e.name, rerr.Message)
 	case errors.Is(err, errInputRequired):

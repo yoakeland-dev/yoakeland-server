@@ -118,7 +118,7 @@ type Client struct {
 	listenCt context.CancelFunc
 }
 
-var errInputRequired = errors.New("the server asked for more input, which yoakeland can't give it yet")
+var errInputRequired = errors.New("the server asked for input, which yoakeland doesn't support yet")
 
 // Dial connects and negotiates a protocol revision. Cancelling ctx abandons
 // the connect; the connected client does not depend on it.
@@ -228,7 +228,7 @@ func (c *Client) initialize(ctx context.Context) error {
 		return fmt.Errorf("the server's initialize answer is malformed: %w", err)
 	}
 	if !legacyVersions[res.ProtocolVersion] {
-		return fmt.Errorf("the server speaks protocol revision %q, which yoakeland doesn't", res.ProtocolVersion)
+		return fmt.Errorf("the server uses protocol revision %q, which yoakeland doesn't support", res.ProtocolVersion)
 	}
 	if err := c.t.notify(ictx, newNotification("notifications/initialized", nil)); err != nil {
 		return err

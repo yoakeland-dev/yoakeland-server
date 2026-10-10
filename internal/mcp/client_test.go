@@ -291,6 +291,26 @@ func TestLegacySSEEndpointMustStayOnTheServer(t *testing.T) {
 	}
 }
 
+func TestParseMessagesDropsNullEntries(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want int
+	}{
+		{`[null]`, 0},
+		{`[null, {"jsonrpc":"2.0","method":"ping"}]`, 1},
+		{`[{"jsonrpc":"2.0","method":"ping"}, null, {"jsonrpc":"2.0","method":"pong"}]`, 2},
+		{`{"jsonrpc":"2.0","method":"ping"}`, 1},
+	} {
+		msgs, err := parseMessages([]byte(c.in))
+		if err != nil {
+			t.Fatalf("parseMessages(%s): %v", c.in, err)
+		}
+		if len(msgs) != c.want {
+			t.Errorf("parseMessages(%s) = %d messages, want %d", c.in, len(msgs), c.want)
+		}
+	}
+}
+
 func TestReadSSE(t *testing.T) {
 	in := ": keep-alive\n\nevent: a\ndata: one\ndata: two\n\nid: 7\ndata: three\n\ndata: tail"
 	var got []sseEvent

@@ -84,7 +84,15 @@ func parseMessages(data []byte) ([]*message, error) {
 		if err := json.Unmarshal(data, &batch); err != nil {
 			return nil, err
 		}
-		return batch, nil
+		// A null entry is not a message; dropping it here keeps every reader
+		// from dereferencing it.
+		msgs := batch[:0]
+		for _, m := range batch {
+			if m != nil {
+				msgs = append(msgs, m)
+			}
+		}
+		return msgs, nil
 	}
 	var m message
 	if err := json.Unmarshal(data, &m); err != nil {

@@ -26,9 +26,9 @@ type errNeedsAuth struct {
 
 func (e *errNeedsAuth) Error() string {
 	if e.Detail != "" {
-		return "the server needs you to sign in (" + e.Detail + ")"
+		return "the server needs sign-in (" + e.Detail + ")"
 	}
-	return "the server needs you to sign in"
+	return "the server needs sign-in"
 }
 
 // errSessionExpired: the server forgot the session (HTTP 404 on a request that
@@ -92,7 +92,7 @@ func newHTTPClient(origin string) *http.Client {
 				return errors.New("too many redirects")
 			}
 			if start != nil && !sameOrigin(start, req.URL) {
-				return fmt.Errorf("the server redirected to another site (%s), which is refused", req.URL.Host)
+				return fmt.Errorf("refusing a redirect to another site (%s)", req.URL.Host)
 			}
 			return nil
 		},
