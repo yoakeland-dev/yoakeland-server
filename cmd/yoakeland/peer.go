@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"yoakeland/internal/protocol"
 )
 
@@ -67,12 +69,30 @@ type peerIdentity struct {
 	TokenName, Email                   string // set only for a named TCP token
 }
 
+// maxNameLen caps a display name; cleanName trims it and drops control characters, since a name
+// is shown in every peer's roster and chat.
+const maxNameLen = 64
+
+func cleanName(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(s))
+	if r := []rune(s); len(r) > maxNameLen {
+		s = string(r[:maxNameLen])
+	}
+	return s
+}
+
 // Add registers a freshly handshaken connection and broadcasts the updated
 // roster. An empty name gets a generated placeholder so the peer list never
 // shows a blank row; an oversized avatar — see maxAvatarLen — is dropped
 // rather than failing the connection over what's cosmetic.
 func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network string, who peerIdentity) *Peer {
 	id := randomID()
+	who.Name = cleanName(who.Name)
 	if who.Name == "" {
 		who.Name = who.DeviceType + "-" + id[:6]
 	}
@@ -121,9 +141,10 @@ func (r *PeerRegistry) Remove(id string) {
 // set_peer_name) and broadcasts the updated roster. Reports whether id was a
 // live peer.
 func (r *PeerRegistry) Rename(id, name string) bool {
+	name = cleanName(name)
 	r.mu.Lock()
 	p, ok := r.peers[id]
-	if ok {
+	if ok && name != "" {
 		p.Name = name
 	}
 	r.mu.Unlock()
@@ -187,9 +208,20 @@ func (r *PeerRegistry) DisconnectByToken(tokenName string) int {
 	return len(toClose)
 }
 
-// Get looks up a live peer by ID, for callers (like the user_prompt author
-// lookup, or set_peer_name's tokened-peer guard) that need one specific
-// peer's current identity rather than the whole roster.
+// Author is a peer's identity as attribution needs it, read under the lock because Name and
+// Avatar change live.
+func (r *PeerRegistry) Author(id string) (name, avatar, credential, email string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, found := r.peers[id]
+	if !found {
+		return "", "", "", "", false
+	}
+	return p.Name, p.Avatar, p.TokenName, p.Email, true
+}
+
+// Get looks up a live peer by ID, for callers that need one specific peer rather than the whole
+// roster. Name, Avatar and SessionID change live: read them through Author or Identify.
 func (r *PeerRegistry) Get(id string) (*Peer, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -322,6 +354,7 @@ func (r *PeerRegistry) Broadcast() {
 		list = append(list, protocol.PeerInfo{
 			PeerID:      p.ID,
 			Name:        p.Name,
+			Credential:  p.TokenName,
 			IP:          p.IP,
 			DeviceType:  p.DeviceType,
 			Avatar:      p.Avatar,

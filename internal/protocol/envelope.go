@@ -1000,8 +1000,11 @@ type SnapshotListData struct {
 // stable per-connection, not per-user — two tabs/devices from the same
 // person are two peers, each independently nameable/disconnectable.
 type PeerInfo struct {
-	PeerID      string    `json:"peerId"`
-	Name        string    `json:"name"`
+	PeerID string `json:"peerId"`
+	Name   string `json:"name"`
+	// Credential is the name of the token this connection signed in with
+	// ("" on the local socket). Unlike Name it is not chosen by the device.
+	Credential  string    `json:"credential,omitempty"`
 	IP          string    `json:"ip,omitempty"`
 	DeviceType  string    `json:"deviceType"`
 	Avatar      string    `json:"avatar,omitempty"` // data URL, see AuthData.Avatar
@@ -1759,8 +1762,9 @@ type UserPromptData struct {
 	// session_history still shows who wrote it (an avatar is not otherwise
 	// recoverable: it exists only in the sending client's settings).
 	//
-	// A token-authenticated TCP sender's name wins over AuthorName (SPEC.md
-	// §2a: a real credential isn't overridden by a self-report). For the unix
+	// A token-authenticated TCP sender is shown under the name its device
+	// reports and AuthorName is ignored for it; its commits use the credential's
+	// name (SPEC.md §2a). For the unix
 	// socket — the local case, where file permissions are the boundary and
 	// there's no credential to attribute to — this is the only source, which is
 	// why it's accepted rather than ignored as it was when only token-backed

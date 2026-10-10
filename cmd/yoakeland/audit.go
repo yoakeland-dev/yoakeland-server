@@ -16,6 +16,15 @@ import (
 // dispatcher and the agents reach it.
 
 // Identify names the device behind a live peer: its name and address now.
+// actorOf is who the audit log blames for a peer's actions: the credential it signed in with,
+// which the device can't choose, else (local socket) the name it gave itself.
+func actorOf(p *Peer) string {
+	if p.TokenName != "" {
+		return p.TokenName
+	}
+	return p.Name
+}
+
 func (r *PeerRegistry) Identify(id string) (name, ip, network string, ok bool) {
 	if r == nil {
 		return "", "", "", false
@@ -23,7 +32,7 @@ func (r *PeerRegistry) Identify(id string) (name, ip, network string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if p, found := r.peers[id]; found {
-		return p.Name, p.IP, p.Network, true
+		return actorOf(p), p.IP, p.Network, true
 	}
 	return "", "", "", false
 }
@@ -140,9 +149,9 @@ func (d connDeps) recordPeer(kind string, p *Peer) {
 	}
 	name, ip, network, _ := d.peers.Identify(p.ID)
 	if name == "" { // already removed from the roster when it leaves: use what the peer held
-		name, ip, network = p.Name, p.IP, p.Network
+		name, ip, network = actorOf(p), p.IP, p.Network
 	}
-	detail := map[string]any{"deviceType": p.DeviceType}
+	detail := map[string]any{"deviceType": p.DeviceType, "name": p.Name}
 	if p.TokenName != "" {
 		detail["credentialName"] = p.TokenName
 	}

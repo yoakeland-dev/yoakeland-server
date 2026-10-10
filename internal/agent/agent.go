@@ -106,6 +106,17 @@ type Author struct {
 	Name   string
 	Email  string
 	Avatar string
+	// Credential is the registered token's name when the sender signed in with
+	// one. Git commits use it rather than Name, which a device chooses itself.
+	Credential string
+}
+
+// GitName is what a commit made on this author's turn is signed with.
+func (a Author) GitName() string {
+	if a.Credential != "" {
+		return a.Credential
+	}
+	return a.Name
 }
 
 type authorContextKey struct{}
@@ -1898,7 +1909,7 @@ turn:
 				ToolCallID:     toolCallID,
 				SnapshotStore:  a.snapshotStore,
 				Stream:         a.getStream(),
-				AuthorName:     author.Name,
+				AuthorName:     author.GitName(),
 				AuthorEmail:    author.Email,
 				ExtraReadPaths: readable,
 				AskUsers: func(qs []tool.Question) ([]string, error) {

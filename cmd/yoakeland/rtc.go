@@ -157,10 +157,17 @@ func startRTCListener(ctx context.Context, addr string, cert webrtc.Certificate,
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	l := &rtcListener{ctx: ctx, cancel: cancel, udp: udp, cert: cert, accept: accept, active: map[string]struct{}{}}
+	// The muxer calls onUnhandled from its own goroutine as soon as it exists, so l.mux is only
+	// visible to it once assigned.
+	l.mu.Lock()
 	l.mux = ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: udp, OnUnhandledPacket: l.onUnhandled})
+	l.mu.Unlock()
 	go func() {
 		<-ctx.Done()
-		_ = l.mux.Close()
+		l.mu.Lock()
+		mux := l.mux
+		l.mu.Unlock()
+		_ = mux.Close()
 		_ = udp.Close()
 	}()
 	return l, nil
@@ -272,7 +279,10 @@ func (l *rtcListener) runPeer(ufrag string, from netip.AddrPort) {
 func (l *rtcListener) newPeerConnection(ufrag string) (*webrtc.PeerConnection, error) {
 	se := webrtc.SettingEngine{}
 	se.SetLite(true)
-	se.SetICEUDPMux(l.mux)
+	l.mu.Lock()
+	mux := l.mux
+	l.mu.Unlock()
+	se.SetICEUDPMux(mux)
 	se.SetICECredentials(ufrag, ufrag)
 	// The client's certificate is whatever its browser made up; the token is what authenticates it.
 	se.DisableCertificateFingerprintVerification(true)

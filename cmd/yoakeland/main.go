@@ -909,9 +909,10 @@ func sessionWriteError(sessionID, verb string, err error) string {
 }
 
 // resolveAuthor determines who to attribute a new user message (and any git
-// commits its tool calls make) to, in priority order. A token-backed
-// identity is a real credential, so it wins over anything the client says
-// about itself (SPEC.md §2a). Failing that, a client may self-report via
+// commits its tool calls make) to. A connection signed in with a token shows
+// the name and picture its device reports (falling back to the token's name),
+// but commits are signed with the credential's name and email, which the
+// device doesn't choose. Failing that, a client may self-report via
 // authorName/authorAvatar — the local unix socket has no credential to
 // attribute to (file permissions are its boundary), so this is the only way
 // a message from it is ever attributed, and without it the transcript has no
@@ -919,8 +920,8 @@ func sessionWriteError(sessionID, verb string, err error) string {
 // neither field) that declares nothing is stored unattributed rather than
 // rejected. Shared by user_prompt, edit_message, and retry_message.
 func resolveAuthor(deps connDeps, peerID, authorName, authorAvatar string) agent.Author {
-	if p, ok := deps.peers.Get(peerID); ok && p.TokenName != "" {
-		return agent.Author{Name: p.Name, Email: p.Email}
+	if name, avatar, credential, email, ok := deps.peers.Author(peerID); ok && credential != "" {
+		return agent.Author{Name: name, Avatar: avatar, Email: email, Credential: credential}
 	}
 	if authorName != "" || authorAvatar != "" {
 		avatar := authorAvatar
