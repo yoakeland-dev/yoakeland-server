@@ -176,7 +176,7 @@ func (m *Manager) reload() (stop []*Client) {
 				e.approval = "denied"
 			}
 		}
-		if _, err := w.cfg.Expanded(m.getenv); err != nil {
+		if _, err := w.cfg.Expanded(m.envFor(e)); err != nil {
 			e.expandErr = err.Error()
 		} else {
 			e.expandErr = ""
@@ -279,7 +279,7 @@ func (m *Manager) startLocked(e *entry) chan struct{} {
 
 func (m *Manager) connect(e *entry, raw ServerConfig, settled chan struct{}) {
 	defer close(settled)
-	cfg, err := raw.Expanded(m.getenv)
+	cfg, err := raw.Expanded(m.envFor(e))
 	if err != nil {
 		m.finish(e, settled, nil, err, nil, nil)
 		return
@@ -823,7 +823,7 @@ func (m *Manager) remote(name string) (*entry, ServerConfig, error) {
 	if e.cfg.EffectiveType() == TypeStdio {
 		return nil, ServerConfig{}, errors.New("a local server has nothing to sign in to")
 	}
-	cfg, err := e.cfg.Expanded(m.getenv)
+	cfg, err := e.cfg.Expanded(m.envFor(e))
 	return e, cfg, err
 }
 
@@ -865,7 +865,7 @@ func (m *Manager) CompleteAuth(ctx context.Context, id, code, state, iss string)
 	m.mu.Lock()
 	var names []string
 	for n, e := range m.entries {
-		if cfg, err := e.cfg.Expanded(m.getenv); err == nil && e.cfg.EffectiveType() != TypeStdio && authKey(cfg.URL) == authKey(p.ServerURL) {
+		if cfg, err := e.cfg.Expanded(m.envFor(e)); err == nil && e.cfg.EffectiveType() != TypeStdio && authKey(cfg.URL) == authKey(p.ServerURL) {
 			names = append(names, n)
 		}
 	}
@@ -936,7 +936,7 @@ func (m *Manager) Status() (servers []ServerStatus, problems []string) {
 		}
 		st.Resources = e.resTool != nil
 		if st.Remote && m.auth != nil {
-			if cfg, err := e.cfg.Expanded(m.getenv); err == nil {
+			if cfg, err := e.cfg.Expanded(m.envFor(e)); err == nil {
 				st.SignedIn = m.auth.SignedIn(cfg.URL)
 			}
 		}
@@ -1016,4 +1016,25 @@ func (m *Manager) AgentServers() []tool.AgentServer {
 		out = append(out, tool.AgentServer{Name: n, Type: c.EffectiveType(), Command: c.Command, Args: c.Args, Env: c.Env, URL: c.URL, Headers: c.Headers})
 	}
 	return out
+}
+
+// envFor is the environment ${VAR} in e's config may read. A project's .mcp.json is repository
+// content, so it can't name the daemon's own secrets: a server that gets approved shouldn't be
+// able to send the master key or a provider key to whoever wrote the file.
+// ponytail: a denylist of the daemon's known secrets; arbitrary variables (AWS_*, GITHUB_TOKEN)
+// still expand. A per-server allowlist in the approval UI would close that.
+func (m *Manager) envFor(e *entry) func(string) (string, bool) {
+	if e.scope != ScopeProject {
+		return m.getenv
+	}
+	return func(k string) (string, bool) {
+		switch k {
+		case "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_BASE_URL":
+			return "", false
+		}
+		if strings.HasPrefix(k, "YOAKELAND_") || strings.HasPrefix(k, "YOAKE_") {
+			return "", false
+		}
+		return m.getenv(k)
+	}
 }
