@@ -101,6 +101,16 @@ func TestHandshake_ResolvesNamedTokenIdentity(t *testing.T) {
 		t.Fatalf("handshake() = name=%q tokenName=%q email=%q avatar=%q ok=%v, want the persisted identity to win over the self-reported name", name, tokenName, email, avatar, ok)
 	}
 
+	// A token with no saved avatar shows the one the device sent on connect.
+	if err := deps.settings.AddToken("phone", "tok-456", ""); err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	fresh := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "tok-456", Avatar: "data:image/png;base64,mine"})
+	who, _, ok = handshake(protocol.NewIPCStream(bytes.NewBufferString(fresh+"\n"), &bytes.Buffer{}), "tcp", deps.settings.LookupToken)
+	if !ok || who.Avatar != "data:image/png;base64,mine" {
+		t.Fatalf("avatar = %q ok=%v, want the self-reported avatar for a token with none saved", who.Avatar, ok)
+	}
+
 	badLine := envelopeJSON(t, protocol.EventAuth, protocol.AuthData{Token: "wrong"})
 	badIPC := protocol.NewIPCStream(bytes.NewBufferString(badLine+"\n"), &bytes.Buffer{})
 	_, _, ok = handshake(badIPC, "tcp", deps.settings.LookupToken)

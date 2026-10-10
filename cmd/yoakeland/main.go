@@ -813,7 +813,12 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 	// client self-reported (SPEC.md §2a's per-person tokens) — a name is
 	// fixed at register_token time, and the avatar is cached via
 	// set_peer_avatar, not re-typed every connection.
-	who.Name, who.Avatar, who.TokenName, who.Email = resolvedName, rec.Avatar, resolvedName, rec.Email
+	who.Name, who.TokenName, who.Email = resolvedName, resolvedName, rec.Email
+	// Until a device has saved an avatar against its token (set_peer_avatar), the one it sends
+	// on connect stands in, so a freshly paired phone shows its own picture.
+	if rec.Avatar != "" {
+		who.Avatar = rec.Avatar
+	}
 	return who, nil, true
 }
 
