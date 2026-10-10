@@ -224,9 +224,18 @@ func seedFromFlags(f launchFlags, set map[string]bool, s *ServerSettings, store 
 		seeded := false
 		if s.DefaultProviderUnset() {
 			if http := providerFlagBackend(f.provider, f.baseURL); http != "" {
+				// A registered provider never reads the environment (BuildProvider), so
+				// what the flags left to it is copied in here, once.
+				key, base := f.apiKey, f.baseURL
+				if key == "" {
+					key = os.Getenv(map[string]string{"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY"}[http])
+				}
+				if base == "" && http == "openai" {
+					base = os.Getenv("OPENAI_BASE_URL")
+				}
 				err := store.Register(provider.ProviderConfig{
 					Name: "default", Kind: provider.ProviderKindAPIKey, HTTPProvider: http,
-					BaseURL: f.baseURL, APIKey: f.apiKey, AuthMethod: "manual",
+					BaseURL: base, APIKey: key, AuthMethod: "manual",
 				})
 				if err != nil {
 					logWarn("could not register the provider from the launch flags: %v", err)

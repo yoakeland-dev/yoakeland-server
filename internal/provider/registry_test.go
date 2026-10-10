@@ -156,3 +156,26 @@ func TestBuildProvider_CLIKinds(t *testing.T) {
 		t.Fatalf("unexpected CLISubprocessProvider fields: %+v", cli)
 	}
 }
+
+// A credential a client registered must not pick up the daemon's own keys or base URL.
+func TestBuildProvider_IgnoresDaemonEnv(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "host-key")
+	t.Setenv("OPENAI_API_KEY", "host-key")
+	t.Setenv("OPENAI_BASE_URL", "https://example.invalid/v1")
+	for _, cfg := range []provider.ProviderConfig{
+		{Name: "a", Kind: provider.ProviderKindAPIKey, HTTPProvider: "anthropic"},
+		{Name: "o", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai"},
+		{Name: "auto", Kind: provider.ProviderKindAPIKey},
+	} {
+		if p, err := provider.BuildProvider(cfg, "m", "/tmp"); err == nil {
+			t.Errorf("%s: built %T from the daemon's environment", cfg.Name, p)
+		}
+	}
+	p, err := provider.BuildProvider(provider.ProviderConfig{Name: "a", Kind: provider.ProviderKindAPIKey, HTTPProvider: "anthropic", APIKey: "own"}, "m", "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, ok := p.(*provider.AnthropicProvider); ok && a.BaseURL == "https://example.invalid/v1" {
+		t.Fatal("OPENAI_BASE_URL leaked into an Anthropic provider")
+	}
+}

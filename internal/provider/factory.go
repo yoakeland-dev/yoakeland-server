@@ -11,6 +11,9 @@ type Config struct {
 	Model        string
 	APIKey       string
 	BaseURL      string
+	// NoEnv builds from the fields alone: no API key or base URL comes from the daemon's
+	// environment and no backend is guessed from it. For credentials a client registered.
+	NoEnv bool
 }
 
 func normalizeOpenAIBaseURL(raw string) string {
@@ -26,11 +29,15 @@ func normalizeOpenAIBaseURL(raw string) string {
 
 func ResolveProvider(cfg Config) (Provider, error) {
 	name := cfg.ProviderName
+	getenv := os.Getenv
+	if cfg.NoEnv {
+		getenv = func(string) string { return "" }
+	}
 
 	// 1. If a custom BaseURL is passed (e.g. LM Studio, Ollama, vLLM), default to openai
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
-		baseURL = os.Getenv("OPENAI_BASE_URL")
+		baseURL = getenv("OPENAI_BASE_URL")
 	}
 
 	if (name == "" || name == "auto") && baseURL != "" {
@@ -39,11 +46,11 @@ func ResolveProvider(cfg Config) (Provider, error) {
 
 	// 2. Auto-detect based on env
 	if name == "" || name == "auto" {
-		if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		if getenv("ANTHROPIC_API_KEY") != "" {
 			name = "anthropic"
-		} else if os.Getenv("OPENROUTER_API_KEY") != "" {
+		} else if getenv("OPENROUTER_API_KEY") != "" {
 			name = "openrouter"
-		} else if os.Getenv("OPENAI_API_KEY") != "" {
+		} else if getenv("OPENAI_API_KEY") != "" {
 			name = "openai"
 		} else {
 			return nil, fmt.Errorf("no provider specified. Set -provider, -base-url, or an API key (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY)")
@@ -55,7 +62,7 @@ func ResolveProvider(cfg Config) (Provider, error) {
 	switch name {
 	case "anthropic":
 		if apiKey == "" {
-			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+			apiKey = getenv("ANTHROPIC_API_KEY")
 		}
 		if apiKey == "" {
 			return nil, fmt.Errorf("missing ANTHROPIC_API_KEY")
@@ -68,7 +75,7 @@ func ResolveProvider(cfg Config) (Provider, error) {
 
 	case "openai":
 		if apiKey == "" {
-			apiKey = os.Getenv("OPENAI_API_KEY")
+			apiKey = getenv("OPENAI_API_KEY")
 		}
 		// When targeting local servers (localhost / 127.0.0.1 / LM Studio), allow a dummy key
 		if apiKey == "" {
@@ -87,7 +94,7 @@ func ResolveProvider(cfg Config) (Provider, error) {
 
 	case "openrouter":
 		if apiKey == "" {
-			apiKey = os.Getenv("OPENROUTER_API_KEY")
+			apiKey = getenv("OPENROUTER_API_KEY")
 		}
 		if apiKey == "" {
 			return nil, fmt.Errorf("missing OPENROUTER_API_KEY")

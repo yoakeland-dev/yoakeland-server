@@ -269,6 +269,7 @@ func BuildProvider(cfg ProviderConfig, model string, projectRoot string) (Provid
 			Model:        model,
 			APIKey:       cfg.APIKey,
 			BaseURL:      cfg.BaseURL,
+			NoEnv:        true,
 		})
 	default:
 		if kind, ok := CLIKindOf(cfg.Kind); ok {
