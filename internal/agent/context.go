@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +34,57 @@ type ContextManager struct {
 	// directly rather than an atomic — this closes that race.
 	mu         sync.Mutex
 	userWindow int // set_model_options' contextWindow; 0 = not set
+
+	// compactAt and autoOff are this session's own say over when it
+	// compacts (set_model_options autoCompactTokens / autoCompact), in
+	// memory only: they last as long as the session's agent does. Guarded by
+	// mu. 0 / false = follow the server's setting.
+	compactAt int
+	autoOff   bool
+}
+
+// Server-wide compaction settings (runtime settings autoCompactTokens and
+// compactInstructions), set by SetCompactDefaults. 0 / "" = built-in budget
+// and no extra instructions.
+var (
+	defaultCompactTokens       atomic.Int64
+	defaultCompactInstructions atomic.Value // string
+)
+
+// SetCompactDefaults applies the server's compaction settings to every
+// session, live ones included.
+func SetCompactDefaults(tokens int, instructions string) {
+	defaultCompactTokens.Store(int64(tokens))
+	defaultCompactInstructions.Store(instructions)
+}
+
+// CompactTokensDefault is the server's autoCompactTokens setting (0 = not set),
+// for the providers whose agent compacts itself and is told when to.
+func CompactTokensDefault() int { return int(defaultCompactTokens.Load()) }
+
+func compactInstructions() string {
+	s, _ := defaultCompactInstructions.Load().(string)
+	return s
+}
+
+// SetAutoCompact applies a session's overrides: at > 0 compacts at that size
+// instead of the server's, at == 0 drops that override; auto false stops the
+// session compacting itself. nil leaves either as it is.
+func (cm *ContextManager) SetAutoCompact(at *int, auto *bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if at != nil {
+		cm.compactAt = max(*at, 0)
+	}
+	if auto != nil {
+		cm.autoOff = !*auto
+	}
+}
+
+func (cm *ContextManager) autoCompactOff() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.autoOff
 }
 
 // contextWindowLookup finds a model's window from a catalog (OpenRouter's,
@@ -106,7 +159,15 @@ func (cm *ContextManager) Window(model string, history []Message) int {
 // that there's no room to work in after the system prompt and tools, and
 // compacting would just repeat every round). window 0 = unknown.
 func (cm *ContextManager) compactionBudget(window int) int {
-	budget := cm.GetMaxHistoryTokens()
+	cm.mu.Lock()
+	budget, override := cm.MaxHistoryTokens, cm.compactAt
+	cm.mu.Unlock()
+	if d := int(defaultCompactTokens.Load()); d > 0 {
+		budget = d // the server's setting beats a budget that only came from a window
+	}
+	if override > 0 {
+		budget = override
+	}
 	if window > 0 {
 		budget = min(budget, window*9/10)
 	}
@@ -130,11 +191,16 @@ func (cm *ContextManager) Report(history []Message, model string, overhead int) 
 	used, source := cm.contextTokens(history, contextView(history, ""), overhead)
 	window := cm.Window(model, history)
 	budget := cm.compactionBudget(window)
+	off := cm.autoCompactOff()
+	if off {
+		budget = 0
+	}
 	return protocol.ContextData{
 		EstimatedTokens: used,
 		MaxTokens:       cmp.Or(window, budget),
 		WindowTokens:    window,
 		BudgetTokens:    budget,
+		AutoCompactOff:  off,
 		Source:          source,
 	}
 }
@@ -476,9 +542,24 @@ func fallbackSummary(view []Message) string {
 
 const minCompactionBudget = 8000
 
-const compactionSystemPrompt = `You summarize a coding agent's session so the work can continue from your summary alone — the agent will see nothing else from before it.
+const compactionBasePrompt = `You summarize a coding agent's session so the work can continue from your summary alone — the agent will see nothing else from before it.
 Keep: every request the user made and their constraints; decisions and why; files read or changed, with paths and what matters in them; commands run and their outcomes; errors hit and how they were resolved; and exactly what is still left to do, including the step in progress.
 Be specific and dense: exact names, paths and values, no preamble, no advice.`
+
+// withInstructions adds a user's own guidance to the summarizer's prompt. It
+// follows the base prompt and says it can't override it, so a careless
+// "keep it short" narrows the emphasis instead of dropping what the agent
+// needs to continue.
+func withInstructions(extra string) string {
+	if extra == "" {
+		return compactionBasePrompt
+	}
+	return compactionBasePrompt + "\n\nThe user added this guidance for the summary. Follow it for what to emphasize, but it does not replace anything above: still keep every request, decision, changed file and the remaining work.\n<guidance>\n" + extra + "\n</guidance>"
+}
+
+// minSummaryTokens is how short a summary of used tokens can get before it
+// can't be a summary of that much work: 1% of it, between 200 and 1500.
+func minSummaryTokens(used int) int { return min(max(used/100, 200), 1500) }
 
 // maybeCompact records a compaction before a round-trip when the context
 // has outgrown its budget (SPEC.md §4g): stubbing old tool results first
@@ -491,6 +572,9 @@ func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBindi
 	a.mu.Lock()
 	history := append([]Message(nil), a.history...)
 	a.mu.Unlock()
+	if cm.autoCompactOff() {
+		return protocol.UsageData{}
+	}
 	budget := cm.compactionBudget(cm.Window(bound.Model, history))
 	view := contextView(history, "")
 	if len(view) < 3 {
@@ -503,12 +587,20 @@ func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBindi
 	if clearBefore, saved, ok := cm.planClear(history, used, budget); ok && used-saved <= budget*3/4 {
 		a.recordCompaction(turnID, Message{Role: "compaction", Compaction: &Compaction{
 			Kind: CompactionClear, ClearBefore: clearBefore, TokensBefore: used, TokensAfter: used - saved,
-		}})
+		}}, false)
 		return protocol.UsageData{}
 	}
 
+	return a.compactBySummary(ctx, turnID, bound, view, used, overhead, "", false)
+}
+
+// compactBySummary records a summary compaction of view, which holds used
+// tokens, and returns the summarizer's usage. extra is the caller's one-off
+// guidance, added after the server's compactInstructions.
+func (a *Agent) compactBySummary(ctx context.Context, turnID string, bound RoleBinding, view []Message, used, overhead int, extra string, manual bool) protocol.UsageData {
 	summarizer := a.roleOr(RoleUtility, bound)
-	summary, usage := summarize(ctx, summarizer, view)
+	instructions := strings.TrimSpace(compactInstructions() + "\n" + extra)
+	summary, usage := summarize(ctx, summarizer, view, instructions, minSummaryTokens(used), a.contextManager)
 	a.recordCompaction(turnID, Message{
 		Role:     "compaction",
 		Content:  summary,
@@ -516,20 +608,81 @@ func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBindi
 		Model:    summarizer.Model,
 		Usage:    &usage,
 		Compaction: &Compaction{
-			Kind: CompactionSummary, TokensBefore: used, TokensAfter: overhead + cm.EstimateTokens(summaryOpening+summary),
+			Kind: CompactionSummary, TokensBefore: used, TokensAfter: overhead + a.contextManager.EstimateTokens(summaryOpening+summary),
 		},
-	})
+	}, manual)
 	return usage
+}
+
+// Compact summarizes the session's conversation now (compact_context).
+// Refused while a turn runs, since a turn owns the history, and for a native
+// agent, which compacts on its own terms. Persists the result and counts the
+// summarizer's cost towards the session's spend.
+func (a *Agent) Compact(ctx context.Context, sessionID, turnID, extra string) error {
+	select {
+	case a.turnSlot <- struct{}{}:
+		defer a.unlockTurn()
+	default:
+		return errors.New("a turn is running; compact once it finishes")
+	}
+	a.mu.Lock()
+	if a.sessionID == "" || a.sessionID != sessionID {
+		a.sessionID = sessionID
+	}
+	history := append([]Message(nil), a.history...)
+	a.mu.Unlock()
+
+	bound := a.turnBinding()
+	if bound.Provider == nil {
+		return errors.New("no provider configured for this session")
+	}
+	if _, native := bound.Provider.(NativeAgent); native {
+		return errors.New("this agent compacts its own context")
+	}
+	view := contextView(history, "")
+	if len(view) < 2 {
+		return errors.New("nothing to compact yet")
+	}
+	overhead := a.requestOverhead()
+	used, _ := a.contextManager.contextTokens(history, view, overhead)
+	usage := a.compactBySummary(ctx, turnID, bound, view, used, overhead, extra, true)
+	if a.usageStore != nil {
+		if usage.CostUnknown {
+			a.usageStore.MarkCostUnknown(sessionID)
+		}
+		a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
+	}
+	return a.persistCurrentState()
 }
 
 // summarize asks b's model for a summary of view, falling back to the
 // conversation's own words if that fails: compaction must never fail a turn.
-func summarize(ctx context.Context, b RoleBinding, view []Message) (string, protocol.UsageData) {
+// instructions are the user's own guidance; if they bring back a summary
+// shorter than minTokens it is thrown away and the base prompt runs alone, so
+// a careless instruction can't leave the agent with nothing to go on.
+func summarize(ctx context.Context, b RoleBinding, view []Message, instructions string, minTokens int, cm *ContextManager) (string, protocol.UsageData) {
 	var usage protocol.UsageData
 	if _, native := b.Provider.(NativeAgent); native || b.Provider == nil {
 		return fallbackSummary(view), usage
 	}
-	chunks, errs := b.Provider.StreamTurn(ctx, []Message{{Role: "user", Content: transcriptForSummary(view)}}, nil, compactionSystemPrompt)
+	summary, u, err := requestSummary(ctx, b, view, withInstructions(instructions))
+	usage = u
+	if err == nil && instructions != "" && cm.EstimateTokens(summary) < minTokens {
+		log.Printf("compaction summary with custom instructions was only %d tokens (< %d); redoing it without them", cm.EstimateTokens(summary), minTokens)
+		summary, u, err = requestSummary(ctx, b, view, withInstructions(""))
+		addUsage(&usage, u)
+		usage.CostUSD += u.CostUSD
+	}
+	if err == nil && summary != "" {
+		return summary, usage
+	}
+	log.Printf("compaction summary via %s failed (%v); using the conversation's own text", b.ProviderName, err)
+	return fallbackSummary(view), usage
+}
+
+func requestSummary(ctx context.Context, b RoleBinding, view []Message, system string) (string, protocol.UsageData, error) {
+	var usage protocol.UsageData
+	chunks, errs := b.Provider.StreamTurn(ctx, []Message{{Role: "user", Content: transcriptForSummary(view)}}, nil, system)
 	var sb strings.Builder
 	for c := range chunks {
 		switch c.Kind {
@@ -543,16 +696,12 @@ func summarize(ctx context.Context, b RoleBinding, view []Message) (string, prot
 	}
 	err := <-errs
 	priceUsage(b.Model, &usage)
-	if summary := strings.TrimSpace(sb.String()); err == nil && summary != "" {
-		return summary, usage
-	}
-	log.Printf("compaction summary via %s failed (%v); using the conversation's own text", b.ProviderName, err)
-	return fallbackSummary(view), usage
+	return strings.TrimSpace(sb.String()), usage, err
 }
 
 // recordCompaction appends a compaction message to history and tells the
 // session's clients.
-func (a *Agent) recordCompaction(turnID string, m Message) {
+func (a *Agent) recordCompaction(turnID string, m Message, manual bool) {
 	a.mu.Lock()
 	m.ID = a.nextMessageIDLocked()
 	m.CreatedAt = time.Now()
@@ -564,6 +713,8 @@ func (a *Agent) recordCompaction(turnID string, m Message) {
 		Kind:         m.Compaction.Kind,
 		TokensBefore: m.Compaction.TokensBefore,
 		TokensAfter:  m.Compaction.TokensAfter,
+		Summary:      m.Content,
+		Manual:       manual,
 	})
 }
 

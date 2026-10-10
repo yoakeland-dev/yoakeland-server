@@ -260,3 +260,47 @@ func TestAddUsage_CostUnknownAndSnapshots(t *testing.T) {
 		t.Fatalf("got %+v", total)
 	}
 }
+
+func TestReport_ServerSettingAndSessionOverrides(t *testing.T) {
+	t.Cleanup(func() { SetContextWindowLookup(nil); SetCompactDefaults(0, "") })
+	SetContextWindowLookup(func(string) int { return 1_000_000 })
+	history := []Message{{Role: "user", Content: "hi"}}
+	cm := NewContextManager(64000, 100)
+
+	SetCompactDefaults(400_000, "")
+	if r := cm.Report(history, "m", 0); r.BudgetTokens != 400_000 {
+		t.Fatalf("server setting: %+v", r)
+	}
+	cm.SetContextWindow(1_000_000) // a window the user declared must not undo the server setting
+	if r := cm.Report(history, "m", 0); r.BudgetTokens != 400_000 {
+		t.Fatalf("declared window: %+v", r)
+	}
+	at := 150_000
+	cm.SetAutoCompact(&at, nil)
+	if r := cm.Report(history, "m", 0); r.BudgetTokens != 150_000 {
+		t.Fatalf("session override: %+v", r)
+	}
+	zero := 0
+	cm.SetAutoCompact(&zero, nil)
+	if r := cm.Report(history, "m", 0); r.BudgetTokens != 400_000 {
+		t.Fatalf("override dropped: %+v", r)
+	}
+	SetContextWindowLookup(func(string) int { return 300_000 })
+	cm = NewContextManager(64000, 100)
+	if r := cm.Report(history, "m", 0); r.BudgetTokens != 270_000 {
+		t.Fatalf("still held under 90%% of the window: %+v", r)
+	}
+	off := false
+	cm.SetAutoCompact(nil, &off)
+	if r := cm.Report(history, "m", 0); r.BudgetTokens != 0 || !r.AutoCompactOff {
+		t.Fatalf("auto off: %+v", r)
+	}
+}
+
+func TestMinSummaryTokens(t *testing.T) {
+	for used, want := range map[int]int{1000: 200, 100_000: 1000, 400_000: 1500} {
+		if got := minSummaryTokens(used); got != want {
+			t.Errorf("minSummaryTokens(%d) = %d, want %d", used, got, want)
+		}
+	}
+}

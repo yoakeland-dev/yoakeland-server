@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,19 @@ type claudeBlock struct {
 	IsError   bool            `json:"is_error"`
 }
 
+// claudeContent is a message's content: blocks, or a bare string, which the
+// CLI uses for its own user messages (the summary it writes after a compaction).
+type claudeContent []claudeBlock
+
+func (c *claudeContent) UnmarshalJSON(b []byte) error {
+	var text string
+	if json.Unmarshal(b, &text) == nil {
+		*c = claudeContent{{Type: "text", Text: text}}
+		return nil
+	}
+	return json.Unmarshal(b, (*[]claudeBlock)(c))
+}
+
 type claudeLine struct {
 	Type            string  `json:"type"`
 	Subtype         string  `json:"subtype"`
@@ -84,7 +98,7 @@ type claudeLine struct {
 		} `json:"delta"`
 	} `json:"event"`
 	Message struct {
-		Content    []claudeBlock `json:"content"`
+		Content    claudeContent `json:"content"`
 		StopReason string        `json:"stop_reason"`
 		Usage      struct {
 			InputTokens              int `json:"input_tokens"`
@@ -100,6 +114,12 @@ type claudeLine struct {
 	Response      json.RawMessage `json:"response"`
 	UUID          string          `json:"uuid"`
 	RateLimitInfo json.RawMessage `json:"rate_limit_info"`
+	// compact_boundary: the CLI compacted its context, by /compact or on its own.
+	CompactMetadata struct {
+		Trigger    string `json:"trigger"`
+		PreTokens  int    `json:"pre_tokens"`
+		PostTokens int    `json:"post_tokens"`
+	} `json:"compact_metadata"`
 
 	// result
 	Result       string  `json:"result"`
@@ -247,6 +267,7 @@ type claudeTurn struct {
 	mu       sync.Mutex
 	names    map[string]string           // tool_use_id -> tool name
 	proposed map[string][]*diff.FileDiff // tool_use_id -> diff computed before it ran
+	compact  *agent.CompactionChunk      // a compact_boundary whose summary hasn't come yet
 }
 
 func (t *claudeTurn) handle(ln claudeLine) {
@@ -289,8 +310,17 @@ func (t *claudeTurn) handle(ln claudeLine) {
 			}
 			emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
 		}
+	case "system":
+		if ln.Subtype == "compact_boundary" {
+			t.mu.Lock()
+			t.compact = &agent.CompactionChunk{Manual: ln.CompactMetadata.Trigger == "manual", Before: ln.CompactMetadata.PreTokens, After: ln.CompactMetadata.PostTokens}
+			t.mu.Unlock()
+		}
 	case "user":
 		for _, b := range ln.Message.Content {
+			if b.Type == "text" && topLevel && strings.HasPrefix(b.Text, claudeSummaryOpening) {
+				t.flushCompaction(claudeSummaryOf(b.Text))
+			}
 			if b.Type != "tool_result" {
 				continue
 			}
@@ -317,11 +347,36 @@ func (t *claudeTurn) handle(ln claudeLine) {
 	case "rate_limit_event":
 		t.p.reportRateLimits(parseClaudeRateLimits(ln.RateLimitInfo))
 	case "result":
+		t.flushCompaction("") // a boundary that never got its summary is still where it happened
 		t.over.Store(true)
 		select {
 		case t.done <- ln:
 		default:
 		}
+	}
+}
+
+// claudeSummaryOpening starts the user message Claude Code writes after
+// compacting: the summary it continues from.
+const claudeSummaryOpening = "This session is being continued from a previous conversation"
+
+// claudeSummaryOf is the summary in that message, without its preamble.
+func claudeSummaryOf(text string) string {
+	if _, after, ok := strings.Cut(text, "Summary:\n"); ok {
+		text = after
+	}
+	return strings.TrimSpace(text)
+}
+
+// flushCompaction reports the pending compaction, if any, with its summary.
+func (t *claudeTurn) flushCompaction(summary string) {
+	t.mu.Lock()
+	c := t.compact
+	t.compact = nil
+	t.mu.Unlock()
+	if c != nil {
+		c.Summary = summary
+		t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkCompaction, Compaction: c})
 	}
 }
 
@@ -343,6 +398,14 @@ func (p *CLISubprocessProvider) claudeLaunch(nt *agent.NativeTurn) claudeLaunch 
 	}
 	if p.fast {
 		settings["fastMode"] = true
+	}
+	// When Claude Code compacts itself: its autoCompactWindow setting is the
+	// context size it works within, compacting a buffer (about 33k) below it.
+	if at := cmp.Or(p.compactAt, agent.CompactTokensDefault()); at > 0 {
+		settings["autoCompactWindow"] = at
+	}
+	if p.compactOff {
+		settings["autoCompactEnabled"] = false
 	}
 	if nt.Mode == agent.ModeAutonomous {
 		_ = json.Unmarshal([]byte(claudeAutonomousSandbox), &settings)

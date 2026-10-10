@@ -391,12 +391,14 @@ func generateAuthToken() (string, error) {
 // the exact {"t","ca"} JSON-then-base64 shape src/lib/pairing.ts decodes
 // client-side, so a code printed here pastes directly into a client's "Add a
 // server" pairing-code field: no separate CA file to hand over, whoever's
-// pairing just reads this one line off the server's own console.
-func pairingCode(token, caPem string) string {
+// pairing just reads this one line off the server's own console. rtcFp (the
+// DTLS fingerprint, rtc.go) lets a browser connect over WebRTC instead.
+func pairingCode(token, caPem, rtcFp string) string {
 	payload := struct {
 		Token string `json:"t"`
 		CA    string `json:"ca,omitempty"`
-	}{Token: token, CA: caPem}
+		FP    string `json:"fp,omitempty"`
+	}{Token: token, CA: caPem, FP: rtcFp}
 	b, _ := json.Marshal(payload) // an all-string struct — Marshal can't fail
 	return base64.StdEncoding.EncodeToString(b)
 }
@@ -441,7 +443,11 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 	if usingAutoCA {
 		carries = "the token and this server's CA"
 	}
-	code := pairingCode(authToken, caPEM)
+	var rtcFp string
+	if _, fp, err := loadRTCCert(stateDir); err == nil {
+		rtcFp = fp
+	}
+	code := pairingCode(authToken, caPEM, rtcFp)
 	logInfoDetail(
 		fmt.Sprintf("remote listener on %s (TLS) — pairing code: %s", ln.Addr(), code),
 		fmt.Sprintf("yoakeland remote listener on %s over TLS — paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
@@ -1334,13 +1340,15 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			ReasoningEffort: data.ReasoningEffort,
 			ThinkingBudget:  data.ThinkingBudget,
 			FastMode:        data.FastMode,
-		}, data.ContextWindow)
+		}, data.ContextWindow, data.AutoCompactTokens, data.AutoCompact)
 		modelOptsSet := protocol.ModelOptionsSetData{
-			SessionID:       sessID,
-			ReasoningEffort: data.ReasoningEffort,
-			ThinkingBudget:  data.ThinkingBudget,
-			ContextWindow:   data.ContextWindow,
-			FastMode:        data.FastMode,
+			SessionID:         sessID,
+			ReasoningEffort:   data.ReasoningEffort,
+			ThinkingBudget:    data.ThinkingBudget,
+			ContextWindow:     data.ContextWindow,
+			FastMode:          data.FastMode,
+			AutoCompactTokens: data.AutoCompactTokens,
+			AutoCompact:       data.AutoCompact,
 		}
 		_ = ipc.SendEvent(protocol.EventModelOptionsSet, sessID, env.TurnID, "", modelOptsSet)
 		deps.peers.BroadcastEvent(peerID, protocol.EventModelOptionsSet, sessID, modelOptsSet)
@@ -1707,6 +1715,33 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			out := pc.Registry.ContextBreakdown(ctx, data.SessionID, history)
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventContextBreakdown, data.SessionID, env.TurnID, "", out)
+		}()
+
+	case protocol.EventCompactContext:
+		var data protocol.CompactContextData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed compact_context payload (sessionId is required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		ag := pc.Registry.Get(ipc, data.SessionID)
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func() {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			defer recoverTurnPanic(ipc, data.SessionID, env.TurnID)
+			if err := ag.Compact(ctx, data.SessionID, env.TurnID, strings.TrimSpace(data.Instructions)); err != nil {
+				_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: "compact: " + err.Error()})
+			}
 		}()
 
 	case protocol.EventEditMessage:
@@ -2586,6 +2621,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Token: token,
 			Email: data.Email,
 			CaPem: caPem,
+
+			RTCFingerprint: deps.remote.RTCFingerprint(),
 		})
 
 	case protocol.EventListTokens:

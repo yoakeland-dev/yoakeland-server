@@ -57,6 +57,11 @@ func normalizeRuntimeSettings(rs protocol.RuntimeSettings) protocol.RuntimeSetti
 	rs.PoolIdleMinutes = clampInt(rs.PoolIdleMinutes, 30, 1, 10080)
 	rs.PoolMaxLive = min(max(rs.PoolMaxLive, 0), 1000)
 	rs.PricingRefreshHours = clampInt(rs.PricingRefreshHours, 24, 1, 720)
+	rs.AutoCompactTokens = min(max(rs.AutoCompactTokens, 0), 10_000_000)
+	rs.CompactInstructions = strings.TrimSpace(rs.CompactInstructions)
+	if len(rs.CompactInstructions) > 4000 {
+		rs.CompactInstructions = strings.ToValidUTF8(rs.CompactInstructions[:4000], "")
+	}
 	return rs
 }
 

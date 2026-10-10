@@ -26,6 +26,7 @@ const (
 	EventEditMessage           EventType = "edit_message"
 	EventRetryMessage          EventType = "retry_message"
 	EventSwitchBranch          EventType = "switch_branch"
+	EventCompactContext        EventType = "compact_context"
 	EventPermissionResponse    EventType = "permission_response"
 	EventCancelTurn            EventType = "cancel_turn"
 	EventSteerTurn             EventType = "steer_turn"
@@ -401,6 +402,14 @@ type SetModelOptionsData struct {
 	ContextWindow   int    `json:"contextWindow,omitempty"`
 	// FastMode turns a model's fast mode on or off; absent leaves it as is.
 	FastMode *bool `json:"fastMode,omitempty"`
+	// AutoCompactTokens overrides, for this session only, the size at which
+	// it compacts itself (SPEC.md §4g); 0 drops the override and goes back to
+	// the server's autoCompactTokens. Absent leaves it as is.
+	AutoCompactTokens *int `json:"autoCompactTokens,omitempty"`
+	// AutoCompact false turns automatic compaction off for this session until
+	// it is set true again (or the session's agent is dropped); absent leaves
+	// it as is.
+	AutoCompact *bool `json:"autoCompact,omitempty"`
 
 	// ProjectPath — see SetProviderData.ProjectPath; same reason, since a
 	// brand-new chat can have its model options tuned before its first
@@ -414,6 +423,21 @@ type ModelOptionsSetData struct {
 	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
 	ContextWindow   int    `json:"contextWindow,omitempty"`
 	FastMode        *bool  `json:"fastMode,omitempty"`
+
+	AutoCompactTokens *int  `json:"autoCompactTokens,omitempty"`
+	AutoCompact       *bool `json:"autoCompact,omitempty"`
+}
+
+// CompactContextData asks for a summary compaction of a session now, rather
+// than when it next outgrows its budget (SPEC.md §4g). Answered with
+// context_compacted, or error when the session is mid-turn, has nothing to
+// compact, or its agent compacts on its own terms.
+type CompactContextData struct {
+	SessionID string `json:"sessionId"`
+	// Instructions steer this summary (what to keep, what to drop); they are
+	// added to the server's compactInstructions.
+	Instructions string `json:"instructions,omitempty"`
+	ProjectPath  string `json:"projectPath,omitempty"`
 }
 
 // ModelRole assigns one model role (SPEC.md §4f) to a registered API
@@ -445,6 +469,12 @@ type ContextCompactedData struct {
 	Kind         string `json:"kind"`
 	TokensBefore int    `json:"tokensBefore"`
 	TokensAfter  int    `json:"tokensAfter"`
+	// Summary is what the model now sees in place of the conversation so
+	// far, for kind "summary".
+	Summary string `json:"summary,omitempty"`
+	// Manual is true for a compact_context request, false for the session
+	// compacting itself.
+	Manual bool `json:"manual,omitempty"`
 }
 
 // GetContextBreakdownData asks for a session's context split by category
@@ -1077,6 +1107,9 @@ type TokenRegisteredData struct {
 	Token string `json:"token"`
 	Email string `json:"email,omitempty"`
 	CaPem string `json:"caPem,omitempty"`
+	// RTCFingerprint is the DTLS certificate fingerprint a WebRTC client (a browser on any origin)
+	// pins in place of a CA: SDP form, uppercase colon-separated SHA-256 (SPEC.md §2a).
+	RTCFingerprint string `json:"rtcFp,omitempty"`
 }
 
 // TokenSummary is one row of a token_list response — no raw token value,
@@ -1171,6 +1204,15 @@ type RuntimeSettings struct {
 	PoolMaxLive             int  `json:"poolMaxLive"`             // 0 = unlimited
 	PricingRefreshHours     int  `json:"pricingRefreshHours"`     // default 24
 	BrowserBlockCrossOrigin bool `json:"browserBlockCrossOrigin"` // default true
+
+	// AutoCompactTokens is the context size at which sessions compact
+	// themselves (SPEC.md §4g); 0 = the built-in 64,000. Still held under 90%
+	// of the model's window, and a session can override it. API providers
+	// only: a CLI agent compacts on its own terms.
+	AutoCompactTokens int `json:"autoCompactTokens"`
+	// CompactInstructions is added to the summarizer's prompt for every
+	// summary compaction, automatic or manual.
+	CompactInstructions string `json:"compactInstructions"`
 }
 
 // SetRuntimeSettingsData is a partial update: a JSON object holding only the
@@ -1966,6 +2008,9 @@ type ContextData struct {
 	// BudgetTokens is the size at which the session compacts itself: the
 	// configured budget, clamped to the window and never below the minimum.
 	BudgetTokens int `json:"budgetTokens,omitempty"`
+	// AutoCompactOff is set when automatic compaction is turned off for the
+	// session (set_model_options autoCompact false); BudgetTokens is then 0.
+	AutoCompactOff bool `json:"autoCompactOff,omitempty"`
 	// Source is where EstimatedTokens came from: "provider" (a count the
 	// provider reported for its last request), "estimated" (a character
 	// heuristic), or "unknown" (nothing in the context yet to measure).

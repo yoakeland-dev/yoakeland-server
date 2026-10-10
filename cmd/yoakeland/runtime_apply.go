@@ -3,13 +3,15 @@ package main
 import (
 	"time"
 
+	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
 	"yoakeland/internal/sandbox"
 )
 
 // applyProcessLimits pushes the runtime settings that live in package-level
-// state (sandbox caps, the CLI process pool, the pricing refresh interval)
+// state (sandbox caps, the CLI process pool, the pricing refresh interval,
+// the compaction defaults)
 // into the packages that read them. It is a ServerSettings.OnRuntimeChange
 // hook: idempotent, run once at registration and after each change. Commands
 // and terminals already running keep the caps they started with.
@@ -24,6 +26,7 @@ func applyProcessLimits(pricing *provider.PricingCache) func(protocol.RuntimeSet
 			TerminalHistoryBytes: rs.TerminalHistoryKB << 10,
 		})
 		provider.SetPoolLimits(time.Duration(rs.PoolIdleMinutes)*time.Minute, rs.PoolMaxLive)
+		agent.SetCompactDefaults(rs.AutoCompactTokens, rs.CompactInstructions)
 		pricing.SetRefreshInterval(time.Duration(rs.PricingRefreshHours) * time.Hour)
 	}
 }

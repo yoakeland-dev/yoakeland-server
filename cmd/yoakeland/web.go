@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +23,21 @@ import (
 func serveWeb(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
 	mux := http.NewServeMux()
 	mux.Handle("/", spaHandler(deps.webRootDir()))
+	// The public half of the auto-managed CA, so a phone can install it before it trusts this
+	// server (the page itself can't load until it does). 404 when an operator certificate is used.
+	mux.HandleFunc("/ca.crt", func(w http.ResponseWriter, r *http.Request) {
+		var pem string
+		if deps.remote != nil {
+			pem, _ = deps.remote.CAPEM()
+		}
+		if pem == "" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+		w.Header().Set("Content-Disposition", `attachment; filename="yoakeland-ca.crt"`)
+		_, _ = io.WriteString(w, pem)
+	})
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// Default options reject cross-origin upgrades.
 		ws, err := websocket.Accept(w, r, nil)

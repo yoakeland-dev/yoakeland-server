@@ -95,6 +95,10 @@ type CLISubprocessProvider struct {
 
 	effort string
 	fast   bool
+	// compactAt and compactOff are the session's own say over when Claude Code
+	// compacts itself (agent.ModelOptions); 0 / false = the server's setting.
+	compactAt  int
+	compactOff bool
 }
 
 func (p *CLISubprocessProvider) ModelName() string { return p.Model }
@@ -120,6 +124,12 @@ func (p *CLISubprocessProvider) SetModelOptions(opts agent.ModelOptions) {
 	}
 	if opts.FastMode != nil {
 		p.fast = *opts.FastMode
+	}
+	if opts.AutoCompactTokens != nil {
+		p.compactAt = max(*opts.AutoCompactTokens, 0)
+	}
+	if opts.AutoCompact != nil {
+		p.compactOff = !*opts.AutoCompact
 	}
 }
 

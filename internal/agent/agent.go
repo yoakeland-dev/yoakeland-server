@@ -218,7 +218,20 @@ const (
 	// the provider's own shape (Message.RawContent), sent once at the end
 	// and only when replaying them matters.
 	StreamChunkRawContent StreamEventKind = "raw_content"
+
+	// StreamChunkCompaction is a NativeAgent reporting that it compacted its
+	// own context (ModelStreamChunk.Compaction); the turn records it as a
+	// compaction message so the chat shows where it happened.
+	StreamChunkCompaction StreamEventKind = "compaction"
 )
+
+// CompactionChunk is what a native agent says about a compaction it did.
+type CompactionChunk struct {
+	Summary string
+	Manual  bool
+	Before  int
+	After   int
+}
 
 type ModelStreamChunk struct {
 	Kind         StreamEventKind
@@ -227,7 +240,8 @@ type ModelStreamChunk struct {
 	ToolResult   *NativeToolResult // StreamChunkToolResult only
 	Usage        *protocol.UsageData
 	FinishReason string
-	Raw          json.RawMessage // StreamChunkRawContent only
+	Raw          json.RawMessage  // StreamChunkRawContent only
+	Compaction   *CompactionChunk // StreamChunkCompaction only
 }
 
 type ModelProvider interface {
@@ -250,6 +264,11 @@ type ModelOptions struct {
 	// FastMode is nil when the request doesn't say; only providers whose
 	// models have a fast mode look at it.
 	FastMode *bool
+	// AutoCompactTokens and AutoCompact are the session's own say over when a
+	// coding agent compacts itself (set_model_options); nil = not said.
+	// Providers that don't compact on their own terms ignore them.
+	AutoCompactTokens *int
+	AutoCompact       *bool
 }
 
 // ModelOptionsSetter is implemented by providers whose request shape can be
@@ -723,18 +742,22 @@ func (a *Agent) getModelName() string {
 // didApplyProviderOptions reports whether the current provider accepted the
 // reasoning/thinking fields, so a caller can tell the client when they were
 // silently ignored (e.g. a CLI-subprocess provider).
-func (a *Agent) SetModelOptions(opts ModelOptions, contextWindow int) (didApplyProviderOptions bool) {
+func (a *Agent) SetModelOptions(opts ModelOptions, contextWindow int, autoCompactTokens *int, autoCompact *bool) (didApplyProviderOptions bool) {
 	a.mu.Lock()
 	p := a.provider
 	cm := a.contextManager
 	a.mu.Unlock()
 
 	if setter, ok := p.(ModelOptionsSetter); ok {
+		opts.AutoCompactTokens, opts.AutoCompact = autoCompactTokens, autoCompact
 		setter.SetModelOptions(opts)
 		didApplyProviderOptions = true
 	}
 	if contextWindow > 0 && cm != nil {
 		cm.SetContextWindow(contextWindow)
+	}
+	if cm != nil {
+		cm.SetAutoCompact(autoCompactTokens, autoCompact)
 	}
 	return didApplyProviderOptions
 }
@@ -1644,6 +1667,13 @@ turn:
 							roundTripUsage.CostUSD += chunk.Usage.CostUSD
 							roundTripUsage.CostKnown = true
 						}
+					}
+				case StreamChunkCompaction:
+					if c := chunk.Compaction; c != nil {
+						flushSegment()
+						a.recordCompaction(turnID, Message{Role: "compaction", Content: c.Summary, Compaction: &Compaction{
+							Kind: CompactionSummary, TokensBefore: c.Before, TokensAfter: c.After,
+						}}, c.Manual)
 					}
 				case StreamChunkRawContent:
 					rawContent = chunk.Raw

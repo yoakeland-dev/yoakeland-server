@@ -40,7 +40,7 @@ func TestAgent_SetModelOptions_AppliesToProviderAndContextWindow(t *testing.T) {
 	ag := agent.NewAgent(ipc, tunable, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
 	t.Cleanup(ag.WaitBackground)
 
-	applied := ag.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high", ThinkingBudget: 4096}, 8000)
+	applied := ag.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high", ThinkingBudget: 4096}, 8000, nil, nil)
 	if !applied {
 		t.Fatal("expected SetModelOptions to report the provider accepted the options")
 	}
@@ -70,7 +70,7 @@ func TestAgent_SetModelOptions_IgnoredByPlainProvider(t *testing.T) {
 	ag := agent.NewAgent(ipc, plain, "test-provider", nil, engine, snapStore, sessStore, ctxMgr, nil)
 	t.Cleanup(ag.WaitBackground)
 
-	applied := ag.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high"}, 0)
+	applied := ag.SetModelOptions(agent.ModelOptions{ReasoningEffort: "high"}, 0, nil, nil)
 	if applied {
 		t.Error("expected SetModelOptions to report false for a provider without ModelOptionsSetter")
 	}

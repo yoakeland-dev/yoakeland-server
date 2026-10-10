@@ -97,7 +97,7 @@ func TestRegistry_ContextWindowIsPerSession(t *testing.T) {
 	agB := registry.Get(ipcB, "session-B")
 
 	// Session A picks a small-context model.
-	agA.SetModelOptions(agent.ModelOptions{}, 8000)
+	agA.SetModelOptions(agent.ModelOptions{}, 8000, nil, nil)
 
 	// Session B, untouched, must still report the project's original
 	// (large) context window — not A's.

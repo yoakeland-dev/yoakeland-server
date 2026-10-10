@@ -243,3 +243,44 @@ func TestLiveClaudeContextBreakdown(t *testing.T) {
 		}
 	}
 }
+
+// Live: /compact makes Claude Code compact, which comes back as a compaction chunk
+// carrying the summary, and an autoCompact override is a launch setting.
+func TestLiveClaudeCompact(t *testing.T) {
+	if os.Getenv("YK_LIVE") == "" {
+		t.Skip("YK_LIVE not set")
+	}
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	p := &CLISubprocessProvider{Kind: CLIKindClaude, Model: "haiku", Dir: t.TempDir()}
+	at := 400000
+	p.SetModelOptions(agent.ModelOptions{AutoCompactTokens: &at})
+	ask := func(resume, prompt string) (*agent.CompactionChunk, *agent.NativeTurn) {
+		rec := &turnRecorder{answer: agent.NativeAnswer{Allowed: true}}
+		nt := rec.turn(agent.ModeReadWrite)
+		nt.SessionKey, nt.ResumeID, nt.Prompt = key, resume, prompt
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer cancel()
+		chunks, errs := p.StreamTurn(agent.WithNativeTurn(ctx, nt), nil, nil, "")
+		var got *agent.CompactionChunk
+		for c := range chunks {
+			if c.Kind == agent.StreamChunkCompaction {
+				got = c.Compaction
+			}
+		}
+		if err := <-errs; err != nil {
+			t.Fatalf("turn: %v", err)
+		}
+		return got, nt
+	}
+	_, nt1 := ask("", "Remember the number 41. Reply OK.")
+	if l := p.claudeLaunch(nt1); !strings.Contains(l.settings, `"autoCompactWindow":400000`) {
+		t.Fatalf("override missing from launch settings: %q", l.settings)
+	}
+	_, nt2 := ask(nt1.SessionID, "Remember the number 42. Reply OK.")
+	c, _ := ask(nt2.SessionID, "/compact keep both numbers")
+	if c == nil || !c.Manual || c.Summary == "" || c.Before <= c.After || !strings.Contains(c.Summary, "41") {
+		t.Fatalf("expected a manual compaction with its summary, got %+v", c)
+	}
+	t.Logf("compaction: before=%d after=%d summary=%q", c.Before, c.After, c.Summary[:min(len(c.Summary), 120)])
+}

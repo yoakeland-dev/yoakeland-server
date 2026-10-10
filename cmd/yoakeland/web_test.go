@@ -38,6 +38,7 @@ func startWebTestServer(t *testing.T) (addr string, token string) {
 
 	deps := newTestDeps(t)
 	deps.webRoot = root
+	deps.remote = &remoteControl{stateDir: t.TempDir()}
 	token = "web-token"
 	lookup := func(tok string) (string, TokenRecord, bool) {
 		if tok == token {
@@ -148,5 +149,21 @@ func TestWeb_PlainTLSClientsStillWork(t *testing.T) {
 		if env.Type == protocol.EventPong {
 			return
 		}
+	}
+}
+
+func TestWeb_ServesCAForPairing(t *testing.T) {
+	addr, _ := startWebTestServer(t)
+	resp, err := insecureClient().Get("https://" + addr + "/ca.crt")
+	if err != nil {
+		t.Fatalf("GET /ca.crt: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.HasPrefix(string(body), "-----BEGIN CERTIFICATE-----") {
+		t.Fatalf("GET /ca.crt = %d %.40q, want a PEM certificate", resp.StatusCode, body)
+	}
+	if strings.Contains(string(body), "PRIVATE KEY") {
+		t.Fatal("/ca.crt must never include the CA key")
 	}
 }
