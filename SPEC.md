@@ -1,4 +1,4 @@
-# Yoakeland Backend IPC Specification (v2.28)
+# Yoakeland Backend IPC Specification (v2.32)
 
 This document is the complete, authoritative specification for the `yoakeland` backend daemon. It provides all information necessary to build a graphical frontend (e.g., Tauri, Flutter, Electron) that communicates with `yoakeland` over any of **three** transports: a local Unix domain socket (**always available**, one server process, many local clients), an optional TCP socket (remote/multi-device access), or standard input/output (a single spawned subprocess, opt-in via `-stdio`).
 
@@ -836,13 +836,6 @@ Asks the daemon to shut down so that whatever started it can start it again — 
 ```
 - Response: `server_restart` (§3.2). Without `force`, a server with turns running answers `{"status": "busy", "activeTurns": 2}` and keeps running; with it, or when idle, `{"status": "restarting"}` and then every connection drops. Terminals and coding-agent processes die with the daemon either way. Audited as `server_restart`.
 
-#### `restart_server` *(v2.32)*
-Asks the daemon to shut down so that whatever started it can start it again — how a client applies a newly installed server binary. **Local-socket-only** — `error` over TCP. The daemon does not re-exec itself: it stops exactly as on `SIGTERM` (turns drained, sockets removed) and exits 0. The desktop app starts it again when its local connection drops; a headless install needs a supervisor (`systemd` `Restart=always`).
-```json
-{"type": "restart_server", "data": {"force": false}}
-```
-- Response: `server_restart` (§3.2). Without `force`, a server with turns running answers `{"status": "busy", "activeTurns": 2}` and keeps running; with it, or when idle, `{"status": "restarting"}` and then every connection drops. Terminals and coding-agent processes die with the daemon either way. Audited as `server_restart`.
-
 #### `disconnect_peer`
 Force-closes another live connection. See "Peer registry & remote-access settings" (§2a) for the permission model.
 ```json
@@ -875,7 +868,6 @@ Mints a new **named**, per-person TCP auth credential — an alternative to shar
 {"type": "register_token", "data": {"name": "aveline", "email": "aveline@example.com"}}
 ```
 - `name`: required, must not already be registered (including the implicit `"default"` token that `set_remote_password` manages) — `error` on a duplicate. Fixed for the life of the credential: there's no rename, by design — revoke it (`remove_token`) and register a new name instead, so "which person is this" never has two possible answers mid-flight.
-- `pairing`: optional. Marks a one-device token for a phone about to scan a QR code (what "Pair a phone" and the terminal QR make). Unused, it expires after 10 minutes and is removed. The first device that signs in with it (its `auth` `deviceId` is required) is bound to it for good; any other device is refused as "already used". If a local-socket client is connected, that first sign-in also waits up to 60 seconds for it to approve: the server sends the connecting device `pairing_pending` and local peers `pairing_request` `{credential, name, deviceType, ip}`, and a local client answers with `approve_pairing` `{credential, allow}` (**local-socket-only**). Declined, or unanswered, the device is refused and the token removed.
 - `pairing`: optional. Marks a one-device token for a phone about to scan a QR code (what "Pair a phone" and the terminal QR make). Unused, it expires after 10 minutes and is removed. The first device that signs in with it (its `auth` `deviceId` is required) is bound to it for good; any other device is refused as "already used". If a local-socket client is connected, that first sign-in also waits up to 60 seconds for it to approve: the server sends the connecting device `pairing_pending` and local peers `pairing_request` `{credential, name, deviceType, ip}`, and a local client answers with `approve_pairing` `{credential, allow}` (**local-socket-only**). Declined, or unanswered, the device is refused and the token removed.
 - `email`: optional, used only to seed `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` on a `bash` call this identity's turn makes (see `tool_call_requested`'s git-attribution note below) — a `<name>@yoake.local` placeholder is used if omitted.
 - Once this token authenticates a TCP `auth` handshake, its `name` is that connection's peer name *only if the client reports none*: it is the initial name for a device being set up, and a device that already has an identity (`name`/`avatar` in the `auth` frame) keeps it. The avatar likewise falls back to the one cached against the token via `set_peer_avatar` (§3.1) when the client sends none. The credential's name stays the token's handle for `list_tokens`, `remove_token` and the audit log, whatever the peer calls itself.
@@ -1137,7 +1129,7 @@ The result of executing a tool (after approval or if pre-approved by policy).
   "toolCallId": "call_abc123",
   "data": {
     "toolName": "file_write",
-    "output": "Successfully wrote 32 bytes to lib/main.dart",
+    "output": "Wrote 32 bytes to lib/main.dart",
     "error": ""
   }
 }

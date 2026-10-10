@@ -77,11 +77,11 @@ func main() {
 	var token string
 	var caPath string
 	var name string
-	flag.StringVar(&backendCmdStr, "bin", "./yoakeland", "Path or command line for yoakeland backend binary (spawn mode — ignored if -connect is set)")
+	flag.StringVar(&backendCmdStr, "bin", "./yoakeland", "Path or command line of the yoakeland binary (spawn mode; ignored with -connect)")
 	flag.StringVar(&sessionID, "session", firstNonEmpty(saved.Session, "session-main"), "Session ID to join or resume")
-	flag.StringVar(&connect, "connect", saved.Connect, "Connect to an already-running yoakeland server instead of spawning one: 'local' for the standard local unix socket (<state-dir>/yoakeland.sock), an explicit unix socket path, or 'tcp://host:port' for the remote TLS+token listener (-token/-ca). Unset means spawn mode via -bin.")
+	flag.StringVar(&connect, "connect", saved.Connect, "Connect to a running yoakeland server instead of spawning one: 'local' for the local unix socket (<state-dir>/yoakeland.sock), a unix socket path, or 'tcp://host:port' for the remote TLS+token listener (-token/-ca). Unset means spawn mode via -bin.")
 	flag.StringVar(&token, "token", saved.Token, "Auth token for a tcp:// -connect target (SPEC.md §2a).")
-	flag.StringVar(&caPath, "ca", saved.CA, "Path to the server's tls/ca.pem for a tcp:// -connect target (copied over out-of-band). Omit to trust the system cert pool instead (operator-supplied real certificate).")
+	flag.StringVar(&caPath, "ca", saved.CA, "Path to the server's tls/ca.pem for a tcp:// -connect target, copied over out of band. Omit to trust the system cert pool (for a publicly trusted server certificate).")
 	flag.StringVar(&name, "name", saved.Name, "Self-reported peer name for a tcp:// -connect target. Defaults to the hostname.")
 	flag.Parse()
 
@@ -97,6 +97,7 @@ func main() {
 
 	var clientStream *protocol.IPCStream
 	var cmd *exec.Cmd
+	var childStdin io.WriteCloser
 
 	if strings.HasPrefix(connect, "tcp://") {
 		addr := strings.TrimPrefix(connect, "tcp://")
@@ -176,6 +177,7 @@ func main() {
 			os.Exit(1)
 		}
 
+		childStdin = stdinPipe
 		clientStream = protocol.NewIPCStream(stdoutPipe, stdinPipe)
 	}
 
@@ -238,7 +240,7 @@ func main() {
 				}
 				permMu.Unlock()
 
-				fmt.Printf("\n[PERMISSION REQUIRED] %s (%s)\nAllow? (y/n, append 'r' to remember forever, e.g. 'y' or 'yr'): ", d.ToolName, d.Description)
+				fmt.Printf("\n[PERMISSION REQUIRED] %s (%s)\nAllow? y/n, add r to remember forever (e.g. yr): ", d.ToolName, d.Description)
 
 			case protocol.EventToolResult:
 				var d protocol.ToolResultData
@@ -285,7 +287,7 @@ func main() {
 			permMu.Unlock()
 
 			if hasPerm {
-				fmt.Print("Please allow or deny: (y/n/yr/nr): ")
+				fmt.Print("Allow or deny? (y/n/yr/nr): ")
 			} else {
 				fmt.Print("> ")
 			}
@@ -345,6 +347,9 @@ func main() {
 	}
 
 	if cmd != nil {
+		// The child exits on stdin EOF, so close our end before Wait or
+		// both sides wait on each other.
+		_ = childStdin.Close()
 		_ = cmd.Wait()
 	}
 }

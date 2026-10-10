@@ -40,7 +40,7 @@ func setupLocalListener(path string, _ bool) (net.Listener, error) {
 	}
 	logInfoDetail(
 		fmt.Sprintf("local pipe listening at %s", path),
-		fmt.Sprintf("yoakeland local named pipe listening at %s (owner-only ACL — no auth token needed, the pipe's security descriptor is the auth boundary)", path),
+		fmt.Sprintf("yoakeland local named pipe listening at %s (owner-only ACL; no auth token needed, the ACL is the auth boundary)", path),
 	)
 	return ln, nil
 }

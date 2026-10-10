@@ -137,7 +137,7 @@ func getJSON(ctx context.Context, url, key string, v any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("provider answered %s", resp.Status)
+		return fmt.Errorf("provider returned %s", resp.Status)
 	}
 	return json.NewDecoder(resp.Body).Decode(v)
 }

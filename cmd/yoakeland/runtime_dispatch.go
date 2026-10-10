@@ -207,11 +207,11 @@ func seedFromFlags(f launchFlags, set map[string]bool, s *ServerSettings, store 
 	note := func(flagName, replacement string, seeded bool) {
 		result := "stored it as the setting"
 		if !seeded {
-			result = "ignored it because the server already has a stored value"
+			result = "left it alone because the server already has a stored value"
 		}
 		logWarnDetail(
 			fmt.Sprintf("%s is deprecated: use %s", flagName, replacement),
-			fmt.Sprintf("%s is deprecated. The first launch with it %s; it never overrides a value a client has set since. Change it at runtime with %s.", flagName, result, replacement),
+			fmt.Sprintf("%s is deprecated. On first launch it %s; it never overrides a value a client has set since. Change it at runtime with %s.", flagName, result, replacement),
 		)
 	}
 

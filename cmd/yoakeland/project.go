@@ -83,8 +83,8 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 	sb := sandbox.NewSandbox(norm.ProjectRoot, 60*time.Second)
 	if sb.Mode() == sandbox.ModeLocalRestr {
 		logWarnDetail(
-			fmt.Sprintf("no sandbox isolation for project %q — bash tool runs unconfined", norm.ProjectRoot),
-			fmt.Sprintf("no sandbox isolation available for project %q (bubblewrap and Linux namespaces both unavailable) — the bash tool runs with NO process/filesystem isolation beyond the project-root path check; a command can see and touch anything this OS user can. Install bubblewrap (bwrap) for real isolation.", norm.ProjectRoot),
+			fmt.Sprintf("no sandbox for project %q; bash tool runs unconfined", norm.ProjectRoot),
+			fmt.Sprintf("no sandbox available for project %q (bubblewrap and Linux namespaces both unavailable): the bash tool has no process or filesystem isolation beyond the project-root path check, so a command can see and touch anything this OS user can. Install bubblewrap (bwrap) for isolation.", norm.ProjectRoot),
 		)
 	}
 	// The read-only presets (ls, git status...) are only trusted where bash
@@ -847,7 +847,7 @@ func scopeRemoteProject(deps connDeps, env *protocol.Envelope) error {
 		}
 		key, err := projectKey(p)
 		if err != nil || !deps.projects.Known(key) {
-			return fmt.Errorf("project %q isn't open on this server; a remote connection can only use projects opened on the server itself", p)
+			return fmt.Errorf("project %q isn't open on this server; remote connections can only use projects opened here", p)
 		}
 		m[k], _ = json.Marshal(key)
 		changed = true

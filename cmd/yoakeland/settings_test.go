@@ -181,3 +181,21 @@ func TestServerSettings_LegacyTokenMigratesToDefault(t *testing.T) {
 		t.Fatalf("LookupToken(legacy-secret) = name=%q ok=%v, want %q/true", name, ok, defaultTokenName)
 	}
 }
+
+// TestClaimPairing_RemovedTokenIsRefused guards NET-10: a pairing token removed while its
+// device was waiting for approval must not be admitted by ClaimPairing.
+func TestClaimPairing_RemovedTokenIsRefused(t *testing.T) {
+	s, err := NewServerSettings(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewServerSettings: %v", err)
+	}
+	if err := s.AddPairingToken("phone", "tok-pair", ""); err != nil {
+		t.Fatalf("AddPairingToken: %v", err)
+	}
+	if _, err := s.RemoveToken("phone"); err != nil {
+		t.Fatalf("RemoveToken: %v", err)
+	}
+	if err := s.ClaimPairing("phone", "device-1"); err == nil {
+		t.Fatal("ClaimPairing on a removed token should fail")
+	}
+}

@@ -27,6 +27,7 @@ import (
 	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/audit"
+	"yoakeland/internal/mcp"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
@@ -62,20 +63,21 @@ func main() {
 	var stdioMode bool
 	var webRoot string
 
-	flag.StringVar(&projectDir, "project", "", "Default project root — pre-opened at startup and used as the fallback project for sessions/requests that don't specify their own projectPath. Kept for the -stdio spawn contract (yoake-client -bin \"yoakeland -project X\" sends no projectPath); a daemon's clients pass projectPath and open projects with open_project, so don't set it there.")
-	flag.StringVar(&stateDir, "state-dir", sockpath.DefaultStateDir(), "Directory for server-level state that isn't tied to any one project: providers.json, and the fallback unix socket path. Defaults to ~/.yoake (Linux), ~/Library/Application Support/yoake (macOS), or %AppData%\\yoake (Windows).")
+	flag.StringVar(&projectDir, "project", "", "Default project root, opened at startup and used for requests that don't name a projectPath. Kept for the -stdio spawn contract (yoake-client -bin \"yoakeland -project X\" sends no projectPath). A daemon's clients pass projectPath and use open_project, so don't set it there.")
+	flag.StringVar(&stateDir, "state-dir", sockpath.DefaultStateDir(), "Directory for server-level state not tied to one project: providers.json and the fallback unix socket path. Defaults to ~/.yoake (Linux), ~/Library/Application Support/yoake (macOS), or %AppData%\\yoake (Windows).")
 	flag.StringVar(&providerName, "provider", "auto", "DEPRECATED, seeds default_provider once (use register_provider + set_default_provider): 'anthropic', 'openai', 'openrouter', or 'auto'")
 	flag.StringVar(&modelName, "model", "", "DEPRECATED, seeds default_provider once (use set_default_provider): model name")
 	flag.StringVar(&apiKey, "api-key", "", "DEPRECATED, seeds default_provider once (use register_provider): API key. ANTHROPIC_API_KEY, OPENAI_API_KEY and OPENROUTER_API_KEY in the environment still pick a fallback default when none is configured")
 	flag.StringVar(&baseURL, "base-url", "", "DEPRECATED, seeds default_provider once (use register_provider): custom API base URL (e.g. http://localhost:1234/v1 for LM Studio)")
-	flag.BoolVar(&stdioMode, "stdio", false, "Speak the protocol directly over this process's own stdin/stdout and exit when stdin closes, instead of running as a daemon. This is the spawn-a-subprocess-per-client contract (what yoake-client's default -bin mode uses under the hood). Most local usage wants the default instead: a long-running process that always has a local unix socket open, exiting on SIGINT/SIGTERM rather than stdin EOF. Mutually exclusive with -listen.")
-	flag.StringVar(&listenAddr, "listen", "", "'unix:/path/to/socket' overrides where the always-on local socket lives (a named pipe on Windows; ignored if -stdio is set). A unix socket needs no auth token — the socket file's 0600 permissions (owner-only) are the auth boundary, same as Docker/Postgres/ssh-agent. A TCP address (e.g. ':7890') is DEPRECATED: it seeds remote access once; use set_remote_access.")
-	flag.StringVar(&tlsCert, "tls-cert", "", "DEPRECATED, seeds remote access once (use set_remote_access {tlsCert, tlsKey}): TLS certificate file for the TCP listener (requires -tls-key). Without both, yoakeland uses its own self-managed CA under -state-dir/tls/ — the listener is always TLS, never plaintext.")
+	flag.BoolVar(&stdioMode, "stdio", false, "Speak the protocol on this process's stdin/stdout and exit when stdin closes, instead of running as a daemon. This is the per-client subprocess contract yoake-client's default -bin mode uses. For normal local use, run the daemon: it keeps a local unix socket open and exits on SIGINT/SIGTERM. Mutually exclusive with -listen.")
+	flag.StringVar(&listenAddr, "listen", "", "'unix:/path/to/socket' overrides where the local socket lives (a named pipe on Windows; ignored with -stdio). A unix socket needs no auth token; its 0600 file permissions (owner only) are the auth boundary. A TCP address (e.g. ':7890') is DEPRECATED: it seeds remote access once; use set_remote_access.")
+	flag.StringVar(&tlsCert, "tls-cert", "", "DEPRECATED, seeds remote access once (use set_remote_access {tlsCert, tlsKey}): TLS certificate file for the TCP listener (requires -tls-key). Without both, a self-managed CA under -state-dir/tls/ is used. The listener is always TLS.")
 	flag.StringVar(&webRoot, "web-root", "", "DEPRECATED, seeds remote access once (use set_remote_access {webRoot}): directory holding the built web client (the GUI's build/), served to browsers on the remote TCP listener.")
 	flag.StringVar(&tlsKey, "tls-key", "", "DEPRECATED, seeds remote access once (use set_remote_access {tlsKey}): TLS private key file (requires -tls-cert)")
 	flag.Float64Var(&maxSessionCostUSD, "max-session-cost-usd", 0, "DEPRECATED, seeds maxSessionCostUsd once (use set_runtime_settings): pause a session's turns once it has spent this much (0 = unlimited)")
-	flag.StringVar(&masterKey, "master-key", "", "Passphrase encrypting providers.json at rest (AES-256-GCM, scrypt-derived key). Prefer the YOAKELAND_MASTER_KEY environment variable, which this falls back to: it has to be known before providers.json opens, so it can't be a runtime setting. Without either, providers.json is plaintext (0600 perms only).")
+	flag.StringVar(&masterKey, "master-key", "", "Passphrase that encrypts providers.json at rest (AES-256-GCM, scrypt key). Prefer the YOAKELAND_MASTER_KEY env var: it must be known before providers.json opens, so it can't be a runtime setting. Without either, providers.json is plaintext (0600 perms only).")
 	flag.Parse()
+	mcp.Version = version
 	setFlags := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
@@ -90,6 +92,9 @@ func main() {
 	if canon, err := normalizer.CanonicalRoot(stateDir); err == nil {
 		normalizer.Hidden = []string{canon}
 	}
+	// Tokens and project paths live here; an older build may have made it 0755.
+	_ = os.MkdirAll(stateDir, 0o700)
+	_ = os.Chmod(stateDir, 0o700)
 
 	initLogging(stateDir)
 
@@ -108,7 +113,7 @@ func main() {
 	if masterKey == "" {
 		logWarnDetail(
 			"no -master-key set; providers.json will be stored in plaintext",
-			"no -master-key/YOAKELAND_MASTER_KEY set — providers.json (API keys) will be stored in PLAINTEXT, protected only by 0600 file permissions.",
+			"neither -master-key nor YOAKELAND_MASTER_KEY is set: providers.json (API keys) is stored in plaintext, protected only by 0600 file permissions.",
 		)
 	}
 
@@ -128,7 +133,7 @@ func main() {
 	if err != nil {
 		logInfoDetail(
 			"no environment default provider; use set_default_provider or set_provider per session",
-			fmt.Sprintf("no provider could be picked from the environment (%v) — register one with register_provider, then set_default_provider (or set_provider per session) before the first user_prompt", err),
+			fmt.Sprintf("no provider could be picked from the environment (%v). Register one with register_provider, then set_default_provider (or set_provider per session) before the first user_prompt", err),
 		)
 	}
 
@@ -354,8 +359,8 @@ func drainTurns(wg *sync.WaitGroup) {
 	case <-done:
 	case <-time.After(turnDrainTimeout):
 		logWarnDetail(
-			fmt.Sprintf("shutting down with turns still running after %s — their sessions may be missing the last turn", turnDrainTimeout),
-			fmt.Sprintf("shutdown waited %s for in-flight turns to finish and save; at least one is still running, so its session on disk may be missing the turn in progress. This is expected only if a model request or tool call is ignoring cancellation.", turnDrainTimeout),
+			fmt.Sprintf("shutdown timed out after %s with turns still running; their sessions may be missing the last turn", turnDrainTimeout),
+			fmt.Sprintf("waited %s for in-flight turns to finish and save; at least one is still running, so its session on disk may be missing the turn in progress. Expected only if a model request or tool call ignores cancellation.", turnDrainTimeout),
 		)
 	}
 }
@@ -458,8 +463,8 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 	}
 	code := pairingCode(authToken, caPEM, rtcFp)
 	logInfoDetail(
-		fmt.Sprintf("remote listener on %s (TLS) — pairing code: %s", ln.Addr(), code),
-		fmt.Sprintf("yoakeland remote listener on %s over TLS — paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
+		fmt.Sprintf("remote listener on %s (TLS); pairing code: %s", ln.Addr(), code),
+		fmt.Sprintf("yoakeland remote listener on %s over TLS. Paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
 	)
 	return ln, authToken, nil
 }
@@ -1734,6 +1739,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if deps.turnWG != nil {
 				defer deps.turnWG.Done()
 			}
+			defer recoverTurnPanic(ipc, data.SessionID, env.TurnID)
 			ctx, cancel := context.WithTimeout(context.Background(), 19*time.Second)
 			defer cancel()
 			out := pc.Registry.ContextBreakdown(ctx, data.SessionID, history)
@@ -2033,6 +2039,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		// A cold scan reads every session file, so keep it off the read loop.
 		go func() {
+			defer recoverTurnPanic(ipc, "", env.TurnID)
 			var price usagePricer
 			if deps.pricing != nil {
 				price = func(model string, in, cr, cw, o int) float64 {
@@ -2144,6 +2151,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		go func() {
+			defer recoverTurnPanic(ipc, data.SessionID, env.TurnID)
 			dir, files, size, err := importChatFiles(chat.Root, target, data.SessionID)
 			out := protocol.ChatFilesImportedData{Target: target, Dir: dir, Files: files, Bytes: size}
 			outcome := "ok"
@@ -2599,7 +2607,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		deps.record(ipc, peerID, audit.Event{Kind: audit.RemotePassword, Outcome: "ok"}) // the fact, never the password
+		// The old shared token is gone, so connections authenticated with it must end too.
+		dropped := deps.peers.DisconnectByToken(defaultTokenName)
+		deps.record(ipc, peerID, audit.Event{Kind: audit.RemotePassword, Outcome: "ok", Detail: map[string]any{"disconnected": dropped}}) // the fact, never the password
 		_ = ipc.SendEvent(protocol.EventRemotePasswordSet, env.SessionID, env.TurnID, "", protocol.RemotePasswordSetData{})
 
 	case protocol.EventRestartServer:

@@ -85,7 +85,7 @@ func setupUnixListener(path string, ownDir bool) (net.Listener, error) {
 	}
 	logInfoDetail(
 		fmt.Sprintf("local socket listening at %s", path),
-		fmt.Sprintf("yoakeland local socket listening at %s (mode 0600 — no auth token needed, owner-only file permissions are the auth boundary)", path),
+		fmt.Sprintf("yoakeland local socket listening at %s (mode 0600; no auth token needed, file permissions are the auth boundary)", path),
 	)
 	return ln, nil
 }

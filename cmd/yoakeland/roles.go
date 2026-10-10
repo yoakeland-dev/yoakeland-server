@@ -71,7 +71,7 @@ func reloadRoles(roles *agent.Roles, store *provider.ProviderStore, settings *Se
 	for name, r := range table {
 		b, err := buildRoles(store, map[string]protocol.ModelRole{name: r})
 		if err != nil {
-			logWarn("model roles: %v — that role falls back to each session's own model", err)
+			logWarn("model roles: %v; that role falls back to each session's own model", err)
 			continue
 		}
 		for k, v := range b {

@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -181,12 +180,4 @@ func handleListAudit(ipc *protocol.IPCStream, deps connDeps, env *protocol.Envel
 		out.Events, out.More = events, more
 	}
 	_ = ipc.SendEvent(protocol.EventAuditList, env.SessionID, env.TurnID, "", out)
-}
-
-// firstLine is the first line of a multi-line string.
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
-	}
-	return s
 }

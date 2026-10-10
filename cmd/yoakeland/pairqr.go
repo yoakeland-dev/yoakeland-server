@@ -137,5 +137,5 @@ func printPairQR(addr net.Addr, newToken func() (string, error), rtcFp string) {
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nScan to open yoakeland on a phone and connect to %s:%d (good for %d minutes, one phone)\n%s\n", hosts[0], tcp.Port, int(PairingTTL.Minutes()), qrBlocks(q.Bitmap()))
+	fmt.Fprintf(os.Stderr, "\nScan with a phone to connect to %s:%d (valid for %d minutes, one phone)\n%s\n", hosts[0], tcp.Port, int(PairingTTL.Minutes()), qrBlocks(q.Bitmap()))
 }

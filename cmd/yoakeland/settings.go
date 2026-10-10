@@ -261,7 +261,7 @@ func (s *ServerSettings) ClaimPairing(name, deviceID string) error {
 	defer s.mu.Unlock()
 	rec, ok := s.Tokens[name]
 	if !ok || !rec.Pairing {
-		return nil
+		return fmt.Errorf("this pairing code is no longer valid")
 	}
 	if rec.DeviceID != "" {
 		if rec.DeviceID == deviceID {

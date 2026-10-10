@@ -41,7 +41,7 @@ type browserCall struct {
 // browserTimeout bounds one action, page load included.
 const browserTimeout = 60 * time.Second
 
-var errNoBrowserHost = errors.New("no browser is available: the browser tool needs the yoake desktop app connected to this server (and, from another machine, with this chat open)")
+var errNoBrowserHost = errors.New("no browser available: the browser tool needs the yoake desktop app connected to this server (and this chat open, from another machine)")
 
 func newBrowserBroker(peers *PeerRegistry) *browserBroker {
 	b := &browserBroker{peers: peers, pending: map[string]*browserCall{}, approved: map[string]map[string]bool{}}

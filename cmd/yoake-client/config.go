@@ -52,5 +52,10 @@ func saveClientConfig(cfg ClientConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	// WriteFile only applies the mode when it creates the file; chmod covers
+	// a client.json that already exists with looser permissions.
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
