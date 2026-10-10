@@ -73,7 +73,7 @@ func printPairQR(addr net.Addr, token, rtcFp string) {
 	if !ok || rtcFp == "" || host == "" || !term.IsTerminal(int(os.Stderr.Fd())) {
 		return
 	}
-	q, err := qrcode.New(pairingURL(host, tcp.Port, token, rtcFp), qrcode.Medium)
+	q, err := qrcode.New(pairingURL(host, tcp.Port, token, rtcFp), qrcode.Low)
 	if err != nil {
 		return
 	}

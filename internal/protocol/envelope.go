@@ -1152,6 +1152,12 @@ type ServerIdentityData struct {
 	// that predates this field should treat that connection as unknown/
 	// legacy rather than failing.
 	ServerID string `json:"serverId,omitempty"`
+
+	// Version is the release this binary was built from ("0.1.1"), or "dev"
+	// for a build outside the release workflow. Clients compare it with the
+	// latest release to flag an out-of-date server; a non-numeric value is
+	// never flagged.
+	Version string `json:"version,omitempty"`
 }
 
 // SetAutoGenerateTitleData sets the server-wide default applied to a first

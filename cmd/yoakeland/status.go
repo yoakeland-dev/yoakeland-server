@@ -27,6 +27,7 @@ func serverStatus(deps connDeps) *protocol.ServerStatus {
 		UptimeSec: int64(time.Since(processStart).Seconds()),
 		CPUs:      runtime.NumCPU(),
 		HeapBytes: mem.HeapAlloc,
+		Version:   version,
 	}
 	if deps.projects != nil {
 		st.ActiveTurns, st.OpenProjects = deps.projects.Stats()

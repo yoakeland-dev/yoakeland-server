@@ -44,6 +44,9 @@ const (
 	heartbeatTimeout  = 3 * heartbeatInterval
 )
 
+// version is set at release time (-ldflags "-X main.version=0.1.1"); "dev" otherwise.
+var version = "dev"
+
 func main() {
 	var projectDir string
 	var stateDir string
@@ -641,7 +644,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
 	onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
 
-	_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID()})
+	_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID(), Version: version})
 	_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
 	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
 	_ = ipc.SendEvent(protocol.EventNotifyPrefs, "", "", "", deps.settings.GetNotifyPrefs())
@@ -2503,7 +2506,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		for _, p := range deps.peers.All() {
-			_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: data.Name, ServerID: deps.settings.GetServerID()})
+			_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: data.Name, ServerID: deps.settings.GetServerID(), Version: version})
 		}
 
 	case protocol.EventSetAutoGenerateTitle:

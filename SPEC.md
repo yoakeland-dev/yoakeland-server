@@ -1655,8 +1655,9 @@ Pushed to **every** connected peer whenever the connection roster changes (conne
 #### `server_identity`
 Pushed to a peer right after it connects, and to every peer whenever `set_server_identity` changes it.
 ```json
-{"type": "server_identity", "data": {"identity": "aveline's living room", "serverId": "a1b2c3d4e5f6..."}}
+{"type": "server_identity", "data": {"identity": "aveline's living room", "serverId": "a1b2c3d4e5f6...", "version": "0.1.1"}}
 ```
+- `version`: the release this binary was built from, or `dev` for a local build. A client compares it with the latest release to flag an out-of-date server; a missing value (older server) counts as out of date, a non-numeric one never does.
 - `identity`: a mutable display name — *UI Action*: show this as the server's display name (e.g. in a connection list or title bar) rather than a raw address.
 - `serverId`: a stable identifier minted once, the first time this server's `-state-dir` is ever used, and never changed — there is no `set_server_id`. Unlike `identity`, its entire value is that it *doesn't* change: a client reaching this same daemon under two different addresses (a LAN IP one time, a VPN hostname another) sees the same `serverId` both times, and a client holding several simultaneous connections (to different servers) should key any per-server state it keeps by this, not by address. Omitted by a server that predates this field — treat that connection as unknown/legacy rather than erroring.
 

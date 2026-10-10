@@ -157,6 +157,9 @@ func TestServeConnection_SetServerIdentity(t *testing.T) {
 				if data.ServerID == "" {
 					t.Fatal("expected the server_identity push to also carry a non-empty serverId")
 				}
+				if data.Version != version {
+					t.Fatalf("pushed version %q, want %q", data.Version, version)
+				}
 				if data.ServerID != deps.settings.GetServerID() {
 					t.Fatalf("pushed serverId %q != deps.settings.GetServerID() %q", data.ServerID, deps.settings.GetServerID())
 				}
