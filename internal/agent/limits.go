@@ -60,7 +60,7 @@ func isShellTool(name string) bool {
 // allowed right now.
 func (a *Agent) toolUnavailableMessage(name string) string {
 	if a.ShellDisabled() && isShellTool(name) {
-		return fmt.Sprintf("tool %s is disabled: this project has no sandbox, and the server is set to withhold shell access without one", name)
+		return fmt.Sprintf("tool %s is disabled: this project has no sandbox, and the server withholds shell access without one", name)
 	}
 	return fmt.Sprintf("tool %s is unavailable in the current mode", name)
 }

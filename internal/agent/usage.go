@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -44,6 +45,12 @@ func NewUsageStore(dataDir string) (*UsageStore, error) {
 
 	if data, err := os.ReadFile(s.filePath); err == nil {
 		if json.Unmarshal(data, &s.model) != nil {
+			// Keep the unreadable file rather than let the next save destroy it.
+			if err := os.Rename(s.filePath, s.filePath+".corrupt"); err != nil {
+				log.Printf("usage: corrupt %s, could not set it aside: %v", s.filePath, err)
+			} else {
+				log.Printf("usage: corrupt %s moved to %s.corrupt; starting empty", s.filePath, s.filePath)
+			}
 			s.model = usageModel{Sessions: make(map[string]UsageTotals)}
 		}
 	}

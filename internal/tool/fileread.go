@@ -130,7 +130,7 @@ func numberedLines(content string, startLine, endLine int) (string, error) {
 	for i := start; i <= end; i++ {
 		line := lines[i-1]
 		if i > start && (i-start >= maxReadLines || b.Len()+len(line) > maxReadBytes) {
-			fmt.Fprintf(&b, "[showing lines %d-%d of %d — pass startLine: %d to read on]", start, i-1, total, i)
+			fmt.Fprintf(&b, "[showing lines %d-%d of %d; pass startLine: %d to read on]", start, i-1, total, i)
 			return b.String(), nil
 		}
 		if len(line) > maxReadBytes {

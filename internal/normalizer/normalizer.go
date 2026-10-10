@@ -187,6 +187,12 @@ func (n *Normalizer) ParseShellArgv(cmdStr string) (*ShellCommand, error) {
 		}
 
 		if r == '\\' && !inSingle {
+			// Inside double quotes a backslash is literal unless it escapes one of
+			// the characters POSIX allows there.
+			if inDouble && (i+1 >= len(runes) || !strings.ContainsRune("$`\"\\\n", runes[i+1])) {
+				curr.WriteRune(r)
+				continue
+			}
 			escaped = true
 			continue
 		}

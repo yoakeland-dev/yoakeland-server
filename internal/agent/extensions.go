@@ -219,11 +219,10 @@ func (a *Agent) preloadSkills(turnID string, bound RoleBinding) {
 	}
 	a.mu.Lock()
 	var text string
-	for i := len(a.history) - 1; i >= 0; i-- {
-		if a.history[i].Role == "user" {
-			text = a.history[i].Content
-			break
-		}
+	// Only right after a fresh user message: a retry keeps the earlier preload
+	// in history, which would otherwise be loaded a second time.
+	if n := len(a.history); n > 0 && a.history[n-1].Role == "user" {
+		text = a.history[n-1].Content
 	}
 	a.mu.Unlock()
 	names := mentionedSkills(text, have)

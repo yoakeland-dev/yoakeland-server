@@ -144,7 +144,7 @@ func TestFileReadTool_PagesLongFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if !strings.HasSuffix(out, "to read on]") || !strings.Contains(out, "of 2500 — pass startLine:") || strings.Contains(out, "  2500\t") {
+	if !strings.HasSuffix(out, "to read on]") || !strings.Contains(out, "of 2500; pass startLine:") || strings.Contains(out, "  2500\t") {
 		t.Fatalf("expected one page ending in a continuation note, got tail %q", out[len(out)-80:])
 	}
 }

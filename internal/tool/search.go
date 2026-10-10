@@ -107,7 +107,7 @@ func (t *SearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON [
 		return "no matches", nil
 	}
 	if more {
-		out = append(out, fmt.Sprintf("[stopped at %d results — narrow the search with path, glob or a more specific pattern]", maxSearchResults))
+		out = append(out, fmt.Sprintf("[stopped at %d results; narrow with path, glob or a more specific pattern]", maxSearchResults))
 	}
 	return strings.Join(out, "\n"), nil
 }

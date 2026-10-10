@@ -974,6 +974,9 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 	if webToolNames[name] && !webEnabled {
 		return false
 	}
+	if name == SubagentToolName && a.systemPrompt != "" {
+		return false // a subagent can't spawn subagents
+	}
 	if shellOff && isShellTool(name) {
 		return false
 	}
@@ -1168,6 +1171,9 @@ func (a *Agent) RunTurn(parentCtx context.Context, sessionID, turnID, prompt str
 // RunTurnWithTitleGeneration runs a turn and titles a newly-created chat in
 // parallel. Existing callers use RunTurn, whose default is enabled.
 func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID, turnID, prompt string, autoGenerateTitle bool) error {
+	if strings.TrimSpace(prompt) == "" && len(attachmentsFromContext(parentCtx)) == 0 {
+		return errors.New("empty prompt")
+	}
 	// Serialize turns within this session: see turnSlot's doc comment. This
 	// must wrap the budget check through the final usageStore.Record write
 	// (both happen below) so the check-then-record isn't itself racy. Also
@@ -1224,7 +1230,7 @@ func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (RoleBi
 	bound := a.turnBinding()
 	if bound.Provider == nil {
 		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("no_provider", protocol.UsageData{}, startTime, "", ""))
-		return RoleBinding{}, fmt.Errorf("session %s has no provider configured — call register_provider and set_provider first", sessionID)
+		return RoleBinding{}, fmt.Errorf("session %s has no provider; call register_provider and set_provider first", sessionID)
 	}
 
 	_, spendCap := a.getLimits().Get()
@@ -1271,7 +1277,7 @@ func (a *Agent) runTitleGeneration(parentCtx context.Context, sessID, turnID, pr
 			if generated, err := generator.GenerateTitle(parentCtx, prompt); err == nil {
 				title = normalizeTitle(generated)
 			} else {
-				log.Printf("title generation: %v — falling back to a title derived from the prompt", err)
+				log.Printf("title generation: %v; deriving a title from the prompt", err)
 			}
 		}
 	}
@@ -1417,7 +1423,7 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 		// still answering. The save below reports it properly if it's still
 		// failing by then.
 		_ = a.getStream().SendEvent(protocol.EventError, sessionID, "", "", protocol.ErrorData{
-			Message: fmt.Sprintf("session %s could not be saved yet (%v) — this turn may be lost if the server stops", sessionID, err),
+			Message: fmt.Sprintf("session %s not saved yet (%v); this turn may be lost if the server stops", sessionID, err),
 		})
 	}
 
@@ -1542,7 +1548,7 @@ turn:
 			a.mu.Lock()
 			activeContext = contextView(a.history, prefixKey)
 			a.mu.Unlock()
-			activeContext = withAttachmentNotes(flattenNativeTools(activeContext))
+			activeContext = withAttachmentNotes(dropEmptyAssistants(flattenNativeTools(activeContext)))
 			streamCtx = WithRequestHints(turnCtx, RequestHints{CacheKey: sessionID, AdvisorModel: a.advisorModel(bound)})
 		}
 
@@ -1788,6 +1794,10 @@ turn:
 			if _, ok := subs[tc.ID]; ok {
 				continue
 			}
+			if turnCtx.Err() != nil {
+				a.recordToolResult(turnID, tc, "", "cancelled before it ran")
+				continue
+			}
 			toolImpl, exists := a.lookupTool(tc.Name)
 			if !exists {
 				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s not recognized", tc.Name))
@@ -2006,7 +2016,7 @@ turn:
 	// can't be reloaded as an ordinary success.
 	if saveErr := a.persistCurrentState(); saveErr != nil {
 		_ = a.getStream().SendEvent(protocol.EventError, a.sessionID, turnID, "", protocol.ErrorData{
-			Message: fmt.Sprintf("session %s could not be saved (%v) — this turn will not survive a restart", a.sessionID, saveErr),
+			Message: fmt.Sprintf("session %s not saved (%v); this turn will not survive a restart", a.sessionID, saveErr),
 		})
 	}
 
@@ -2254,7 +2264,7 @@ func limitTitle(title string) string {
 func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.UsageData, startTime time.Time, userMessageID, messageID string) protocol.TurnCompletedData {
 	a.mu.Lock()
 	sessionID := a.sessionID
-	historySnapshot := a.history
+	historySnapshot := append([]Message(nil), a.history...)
 	a.mu.Unlock()
 
 	// Every part of usage was priced when it was recorded (a provider's own
@@ -2270,7 +2280,7 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 	if a.usageStore != nil {
 		if usage.CostUnknown {
 			a.usageStore.MarkCostUnknown(sessionID)
-			log.Printf("session %s: %s has no known price, so this turn's cost is unknown and not counted towards its spend total or cap", sessionID, a.getModelName())
+			log.Printf("session %s: %s has no known price; this turn's cost is unknown and not counted towards spend or the cap", sessionID, a.getModelName())
 		}
 		sessTotals, projTotals := a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
 		spend = &protocol.SpendData{
@@ -2320,4 +2330,17 @@ func (a *Agent) recordToolResultWith(turnID string, tc ToolCall, output, errText
 		Output:   output,
 		Error:    errText,
 	})
+}
+
+// dropEmptyAssistants removes assistant messages with neither text nor tool
+// calls (a native agent's reasoning-only segments), which API providers reject.
+func dropEmptyAssistants(msgs []Message) []Message {
+	out := msgs[:0:0]
+	for _, m := range msgs {
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }

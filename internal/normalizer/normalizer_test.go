@@ -3,6 +3,7 @@ package normalizer_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"yoakeland/internal/normalizer"
 )
@@ -135,6 +136,32 @@ func TestNormalizer_ParseShellArgv_Adversarial(t *testing.T) {
 				t.Errorf("isDestructive mismatch: got %v, want %v", norm.IsDestructiveBash(sc), tt.isDestruct)
 			}
 		})
+	}
+}
+
+func TestNormalizer_ParseShellArgv_BackslashInDoubleQuotes(t *testing.T) {
+	norm, _ := normalizer.New(t.TempDir())
+
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{`grep -E "\d+\.go" f`, []string{"grep", "-E", `\d+\.go`, "f"}},
+		{`echo "a\nb"`, []string{"echo", `a\nb`}},
+		{`echo 'a\nb'`, []string{"echo", `a\nb`}},
+		{`echo "say \"hi\""`, []string{"echo", `say "hi"`}},
+		{`echo "back\\slash"`, []string{"echo", `back\slash`}},
+		{`echo "cost \$5"`, []string{"echo", "cost $5"}},
+	}
+
+	for _, tt := range tests {
+		got, err := norm.ParseShellArgv(tt.input)
+		if err != nil {
+			t.Fatalf("ParseShellArgv(%q): %v", tt.input, err)
+		}
+		if !slices.Equal(got.Argv, tt.want) {
+			t.Errorf("ParseShellArgv(%q) = %q, want %q", tt.input, got.Argv, tt.want)
+		}
 	}
 }
 

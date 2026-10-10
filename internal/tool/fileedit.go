@@ -83,7 +83,7 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 		return "", fmt.Errorf("failed writing edit to disk: %w", err)
 	}
 
-	return fmt.Sprintf("Successfully replaced %d occurrence(s) in %s", occurrences, args.Path), nil
+	return fmt.Sprintf("Replaced %d occurrence(s) in %s", occurrences, args.Path), nil
 }
 
 func (t *FileEditTool) Definition() ToolDefinition {

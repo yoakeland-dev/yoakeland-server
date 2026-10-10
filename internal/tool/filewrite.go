@@ -60,7 +60,7 @@ func (t *FileWriteTool) Execute(_ context.Context, execCtx ExecutionContext, arg
 		return "", err
 	}
 
-	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(args.Content), args.Path), nil
+	return fmt.Sprintf("Wrote %d bytes to %s", len(args.Content), args.Path), nil
 }
 
 // WriteFileAtomic replaces path's content (path inside root, already
