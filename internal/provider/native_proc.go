@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ type procStarter func(ctx context.Context, name string, args []string, dir strin
 func startProc(ctx context.Context, name string, args []string, dir string) (*nativeProc, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	cmd.Env = cliEnv(os.Environ())
 	ownProcessGroup(cmd)
 	cmd.Cancel = func() error { return killTree(cmd) }
 	stdin, err := cmd.StdinPipe()
@@ -236,4 +238,41 @@ func parseUnifiedDiff(path, text string) *diff.FileDiff {
 		}
 	}
 	return fd
+}
+
+// cliEnvKeep is what a CLI agent inherits from the daemon, the rest is dropped: these agents run
+// model-driven shell commands, so anything left in their environment (API keys, the master key,
+// cloud credentials) is one prompt injection from leaving. The agents sign in with their own
+// stored login. Names in YOAKELAND_CLI_ENV (comma separated) are passed on too.
+var cliEnvKeep = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true, "LANG": true, "LANGUAGE": true,
+	"TERM": true, "TMPDIR": true, "TZ": true, "SSH_AUTH_SOCK": true, "COLORTERM": true,
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true, "ALL_PROXY": true,
+	"http_proxy": true, "https_proxy": true, "no_proxy": true, "all_proxy": true,
+	"SSL_CERT_FILE": true, "SSL_CERT_DIR": true, "NODE_EXTRA_CA_CERTS": true, "REQUESTS_CA_BUNDLE": true, "CURL_CA_BUNDLE": true,
+	// Windows
+	"SYSTEMROOT": true, "SystemRoot": true, "USERPROFILE": true, "APPDATA": true, "LOCALAPPDATA": true, "PATHEXT": true,
+	"COMSPEC": true, "TEMP": true, "TMP": true, "PROGRAMFILES": true, "PROGRAMDATA": true, "HOMEDRIVE": true, "HOMEPATH": true,
+}
+
+// cliEnvPrefixes are kept as families: locale, XDG dirs, and each agent's own settings.
+var cliEnvPrefixes = []string{"LC_", "XDG_", "CLAUDE_", "CODEX_", "AMP_", "PI_", "VOLTA_", "NVM_", "MISE_", "ASDF_"}
+
+func cliEnv(environ []string) []string {
+	extra := map[string]bool{}
+	for _, n := range strings.Split(os.Getenv("YOAKELAND_CLI_ENV"), ",") {
+		extra[strings.TrimSpace(n)] = true
+	}
+	var out []string
+	for _, kv := range environ {
+		k, _, _ := strings.Cut(kv, "=")
+		keep := cliEnvKeep[k] || extra[k]
+		for _, p := range cliEnvPrefixes {
+			keep = keep || strings.HasPrefix(k, p)
+		}
+		if keep {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
