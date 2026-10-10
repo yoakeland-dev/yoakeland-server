@@ -1,0 +1,44 @@
+# Cross-compiles the daemon and publishes one raw binary per platform as a GitHub prerelease.
+# Push a tag (git tag v0.1.0 && git push --tags) to release. The desktop app downloads these by
+# name (yoake-electron/electron/serverInstall.js: yoakeland_<os>_<arch>[.exe]), so keep the names.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          mkdir out
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${t%/*} arch=${t#*/}
+            ext=; [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" \
+              -o "out/yoakeland_${os}_${arch}${ext}" ./cmd/yoakeland
+          done
+      # Always a prerelease; the app reads the releases list because /releases/latest skips those.
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "$GITHUB_REF_NAME" \
+            --prerelease \
+            --generate-notes \
+            --notes "Pre-release. Linux is the primary platform; the macOS and Windows builds are experimental."
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoakeland-binaries
+          path: out/*
