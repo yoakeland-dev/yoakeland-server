@@ -21,6 +21,7 @@ const defaultRemoteAddr = ":7890"
 type remoteControl struct {
 	mu      sync.Mutex
 	ln      net.Listener
+	rtc     *rtcListener // WebRTC clients on the same port number over UDP (rtc.go); nil if it couldn't bind
 	stop    context.CancelFunc
 	tracker *connTracker
 
@@ -72,7 +73,33 @@ func (r *remoteControl) Start(ctx context.Context) error {
 	r.stop = cancel
 	r.tracker = tracker
 	go acceptLoop(lctx, ln, "tcp", r.deps, r.settings.LookupToken, tracker)
+	// Best-effort like the web client: TCP and WebSocket clients don't depend on it.
+	if cert, _, err := loadRTCCert(r.stateDir); err != nil {
+		logWarn("webrtc: no certificate, WebRTC clients are off: %v", err)
+	} else if rl, err := startRTCListener(lctx, addr, cert, func(c net.Conn) {
+		tracker.Add(c)
+		go func() {
+			defer tracker.Remove(c)
+			defer c.Close()
+			serveAccepted(lctx, c, "tcp", r.deps, r.settings.LookupToken)
+		}()
+	}); err != nil {
+		logWarn("webrtc: couldn't listen on UDP %s, WebRTC clients are off: %v", addr, err)
+	} else {
+		r.rtc = rl
+	}
 	return nil
+}
+
+// RTCFingerprint is the SHA-256 fingerprint of the DTLS certificate WebRTC clients pin, in the
+// form an SDP carries (rtc.go). It goes into pairing codes next to the token. "" if the
+// certificate can't be made.
+func (r *remoteControl) RTCFingerprint() string {
+	_, fp, err := loadRTCCert(r.stateDir)
+	if err != nil {
+		return ""
+	}
+	return fp
 }
 
 // CAPEM returns the auto-managed CA's PEM contents, for bundling into a
@@ -117,6 +144,10 @@ func (r *remoteControl) Stop() {
 		return
 	}
 	r.stop()
+	if r.rtc != nil {
+		r.rtc.Close()
+		r.rtc = nil
+	}
 	_ = r.ln.Close() // don't wait on acceptLoop's own async ctx-cancel watcher to do this
 	r.tracker.CloseAll()
 	r.ln = nil
