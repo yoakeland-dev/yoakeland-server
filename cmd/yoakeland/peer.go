@@ -345,6 +345,34 @@ func (r *PeerRegistry) BroadcastEvent(exceptPeerID string, eventType protocol.Ev
 	}
 }
 
+// HasLocal reports whether any client is connected over the local socket (one that could approve
+// a pairing).
+func (r *PeerRegistry) HasLocal() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.peers {
+		if p.Network == "unix" {
+			return true
+		}
+	}
+	return false
+}
+
+// BroadcastLocal sends an event to the local-socket peers only.
+func (r *PeerRegistry) BroadcastLocal(eventType protocol.EventType, data any) {
+	r.mu.Lock()
+	var peers []*Peer
+	for _, p := range r.peers {
+		if p.Network == "unix" {
+			peers = append(peers, p)
+		}
+	}
+	r.mu.Unlock()
+	for _, p := range peers {
+		_ = p.ipc.SendEvent(eventType, "", "", "", data)
+	}
+}
+
 // Broadcast pushes the current roster to every live peer.
 func (r *PeerRegistry) Broadcast() {
 	r.mu.Lock()

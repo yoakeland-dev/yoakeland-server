@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 	"yoakeland/internal/protocol"
 )
 
@@ -19,7 +20,16 @@ type TokenRecord struct {
 	Token  string `json:"token"`
 	Email  string `json:"email,omitempty"`
 	Avatar string `json:"avatar,omitempty"`
+
+	// Pairing tokens are made for one phone about to scan a QR code: unclaimed they stop working
+	// at ExpiresAt, and the first device to use one is the only device that ever can (DeviceID).
+	Pairing   bool   `json:"pairing,omitempty"`
+	ExpiresAt int64  `json:"expiresAt,omitempty"` // unix seconds; 0 once claimed
+	DeviceID  string `json:"deviceId,omitempty"`
 }
+
+// PairingTTL is how long a pairing QR code works before anyone uses it.
+const PairingTTL = 10 * time.Minute
 
 // ServerSettings persists the small set of runtime knobs a client can change
 // via set_server_identity/set_remote_password/register_token as
@@ -228,12 +238,68 @@ func (s *ServerSettings) AddToken(name, token, email string) error {
 	return s.save()
 }
 
+// AddPairingToken is AddToken for a one-device pairing token (see TokenRecord).
+func (s *ServerSettings) AddPairingToken(name, token, email string) error {
+	if name == "" {
+		return fmt.Errorf("token name is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpiredLocked()
+	if _, exists := s.Tokens[name]; exists {
+		return fmt.Errorf("a token named %q already exists", name)
+	}
+	s.Tokens[name] = TokenRecord{Token: token, Email: email, Pairing: true, ExpiresAt: time.Now().Add(PairingTTL).Unix()}
+	return s.save()
+}
+
+// ClaimPairing binds a pairing token to the first device that uses it. It fails for a token that
+// expired unclaimed (and removes it) or one another device already holds; the same device
+// presenting it again is fine.
+func (s *ServerSettings) ClaimPairing(name, deviceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.Tokens[name]
+	if !ok || !rec.Pairing {
+		return nil
+	}
+	if rec.DeviceID != "" {
+		if rec.DeviceID == deviceID {
+			return nil
+		}
+		return fmt.Errorf("this pairing code was already used")
+	}
+	if time.Now().Unix() > rec.ExpiresAt {
+		delete(s.Tokens, name)
+		_ = s.save()
+		return fmt.Errorf("this pairing code expired")
+	}
+	if deviceID == "" {
+		return fmt.Errorf("this app is too old to pair; update it")
+	}
+	rec.DeviceID, rec.ExpiresAt = deviceID, 0
+	s.Tokens[name] = rec
+	return s.save()
+}
+
+// purgeExpiredLocked drops pairing tokens nobody used in time, so a QR code that was never
+// scanned doesn't linger as a credential.
+func (s *ServerSettings) purgeExpiredLocked() {
+	now := time.Now().Unix()
+	for n, r := range s.Tokens {
+		if r.Pairing && r.DeviceID == "" && now > r.ExpiresAt {
+			delete(s.Tokens, n)
+		}
+	}
+}
+
 // ListTokenNames returns every registered token's name/email/whether it has
 // a cached avatar — never the raw token, same scrubbing precedent as
 // provider_list's apiKey.
 func (s *ServerSettings) ListTokenNames() []TokenSummaryInternal {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.purgeExpiredLocked()
 	out := make([]TokenSummaryInternal, 0, len(s.Tokens))
 	for n, r := range s.Tokens {
 		out = append(out, TokenSummaryInternal{Name: n, Email: r.Email, HasAvatar: r.Avatar != ""})

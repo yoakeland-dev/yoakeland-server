@@ -64,18 +64,22 @@ func qrBlocks(bitmap [][]bool) string {
 	return b.String()
 }
 
-// printPairQR shows the pairing QR code on stderr beside the log line, only when someone is
-// watching a terminal and the server can be reached over WebRTC. The token is the same one the
-// logged pairing code carries.
-func printPairQR(addr net.Addr, token, rtcFp string) {
+// printPairQR shows a pairing QR code on stderr beside the log line, only when someone is
+// watching a terminal and the server can be reached over WebRTC. Its token comes from newToken,
+// called only once it is certain to print: a one-device token that expires, not the shared one.
+func printPairQR(addr net.Addr, newToken func() (string, error), rtcFp string) {
 	tcp, ok := addr.(*net.TCPAddr)
 	host := lanIPv4()
 	if !ok || rtcFp == "" || host == "" || !term.IsTerminal(int(os.Stderr.Fd())) {
+		return
+	}
+	token, err := newToken()
+	if err != nil {
 		return
 	}
 	q, err := qrcode.New(pairingURL(host, tcp.Port, token, rtcFp), qrcode.Low)
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nScan to open yoakeland on a phone and connect to %s:%d\n%s\n", host, tcp.Port, qrBlocks(q.Bitmap()))
+	fmt.Fprintf(os.Stderr, "\nScan to open yoakeland on a phone and connect to %s:%d (good for %d minutes, one phone)\n%s\n", host, tcp.Port, int(PairingTTL.Minutes()), qrBlocks(q.Bitmap()))
 }

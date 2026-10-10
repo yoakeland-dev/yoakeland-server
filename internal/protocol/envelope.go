@@ -74,6 +74,7 @@ const (
 	EventSetRuntimeSettings    EventType = "set_runtime_settings"
 	EventSetDefaultProvider    EventType = "set_default_provider"
 	EventRegisterToken         EventType = "register_token"
+	EventApprovePairing        EventType = "approve_pairing"
 	EventListTokens            EventType = "list_tokens"
 	EventRemoveToken           EventType = "remove_token"
 	EventListNotifications     EventType = "list_notifications"
@@ -180,6 +181,8 @@ const (
 	EventRuntimeSettings          EventType = "runtime_settings"
 	EventDefaultProviderSet       EventType = "default_provider_set"
 	EventTokenRegistered          EventType = "token_registered"
+	EventPairingRequest           EventType = "pairing_request"
+	EventPairingPending           EventType = "pairing_pending"
 	EventTokenList                EventType = "token_list"
 	EventTokenRemoved             EventType = "token_removed"
 	EventNotification             EventType = "notification"
@@ -1094,6 +1097,26 @@ type RemotePasswordSetData struct{}
 type RegisterTokenData struct {
 	Name  string `json:"name"`
 	Email string `json:"email,omitempty"`
+	// Pairing makes this a one-device token for a phone about to scan a QR
+	// code: it expires unless used within PairingTTL, binds to the first
+	// device that uses it, and (with a local client connected to say yes)
+	// waits for approval before that first use.
+	Pairing bool `json:"pairing,omitempty"`
+}
+
+// PairingRequestData is pushed to local-socket peers when a device presents a
+// pairing token for the first time and is waiting to be let in.
+type PairingRequestData struct {
+	Credential string `json:"credential"`
+	Name       string `json:"name,omitempty"`
+	DeviceType string `json:"deviceType,omitempty"`
+	IP         string `json:"ip,omitempty"`
+}
+
+// ApprovePairingData answers a pairing_request (local socket only).
+type ApprovePairingData struct {
+	Credential string `json:"credential"`
+	Allow      bool   `json:"allow"`
 }
 
 // TokenRegisteredData carries the newly generated token — shown only once,

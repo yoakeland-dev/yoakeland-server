@@ -88,6 +88,17 @@ func (r *remoteControl) Start(ctx context.Context) error {
 	} else {
 		r.rtc = rl
 	}
+	printPairQR(ln.Addr(), func() (string, error) {
+		tok, err := generateAuthToken()
+		if err != nil {
+			return "", err
+		}
+		id, err := generateAuthToken()
+		if err != nil {
+			return "", err
+		}
+		return tok, r.settings.AddPairingToken("terminal-"+id[:6], tok, "")
+	}, r.RTCFingerprint())
 	return nil
 }
 

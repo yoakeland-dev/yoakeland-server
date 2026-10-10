@@ -260,6 +260,7 @@ func main() {
 		notify:             notify,
 		audit:              auditLog,
 		presence:           newPresenceNotes(notify),
+		pairings:           newPairingGate(),
 		uploads:            uploads,
 		settings:           settings,
 		remote:             rc,
@@ -455,7 +456,6 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 		fmt.Sprintf("remote listener on %s (TLS) — pairing code: %s", ln.Addr(), code),
 		fmt.Sprintf("yoakeland remote listener on %s over TLS — paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
 	)
-	printPairQR(ln.Addr(), authToken, rtcFp)
 	return ln, authToken, nil
 }
 
@@ -595,11 +595,13 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	// A stranger presenting a wrong credential is what the audit log wants;
 	// one that just connects and goes away is not.
 	badCredential := false
+	var tokenRec TokenRecord
 	if lookupToken != nil {
 		inner := lookupToken
 		lookupToken = func(token string) (string, TokenRecord, bool) {
 			name, rec, found := inner(token)
 			badCredential = badCredential || !found
+			tokenRec = rec
 			return name, rec, found
 		}
 	}
@@ -619,6 +621,12 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if who.DeviceType == "" {
 		who.DeviceType = "desktop"
+	}
+	if who.TokenName != "" {
+		if err := deps.admitPairing(ipc, who, tokenRec, remoteIP(conn, network)); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
+			return
+		}
 	}
 
 	peer := deps.peers.Add(ipc, conn, network, who)
@@ -838,6 +846,7 @@ type connDeps struct {
 	notify             *NotificationFeed
 	audit              *audit.Log
 	presence           *presenceNotes
+	pairings           *pairingGate
 	uploads            *UploadStore
 	settings           *ServerSettings
 	remote             *remoteControl
@@ -2588,6 +2597,22 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		deps.record(ipc, peerID, audit.Event{Kind: audit.RemotePassword, Outcome: "ok"}) // the fact, never the password
 		_ = ipc.SendEvent(protocol.EventRemotePasswordSet, env.SessionID, env.TurnID, "", protocol.RemotePasswordSetData{})
 
+	case protocol.EventApprovePairing:
+		if network != "unix" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "approve_pairing is local-socket-only",
+			})
+			return
+		}
+		var data protocol.ApprovePairingData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.Credential == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed approve_pairing payload (credential is required)",
+			})
+			return
+		}
+		deps.pairings.answer(data.Credential, data.Allow)
+
 	case protocol.EventRegisterToken:
 		if network != "unix" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -2609,7 +2634,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		if err := deps.settings.AddToken(data.Name, token, data.Email); err != nil {
+		add := deps.settings.AddToken
+		if data.Pairing {
+			add = deps.settings.AddPairingToken
+		}
+		if err := add(data.Name, token, data.Email); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: err.Error(),
 			})
