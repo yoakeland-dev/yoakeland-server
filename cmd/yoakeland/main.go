@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -400,23 +399,6 @@ func generateAuthToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// pairingCode bundles a token with a CA certificate (omitted if empty, the
-// operator-supplied-real-cert case) into one opaque, copy-pasteable string —
-// the exact {"t","ca"} JSON-then-base64 shape src/lib/pairing.ts decodes
-// client-side, so a code printed here pastes directly into a client's "Add a
-// server" pairing-code field: no separate CA file to hand over, whoever's
-// pairing just reads this one line off the server's own console. rtcFp (the
-// DTLS fingerprint, rtc.go) lets a browser connect over WebRTC instead.
-func pairingCode(token, caPem, rtcFp string) string {
-	payload := struct {
-		Token string `json:"t"`
-		CA    string `json:"ca,omitempty"`
-		FP    string `json:"fp,omitempty"`
-	}{Token: token, CA: caPem, FP: rtcFp}
-	b, _ := json.Marshal(payload) // an all-string struct — Marshal can't fail
-	return base64.StdEncoding.EncodeToString(b)
-}
-
 // setupTCPListener binds addr for the optional remote listener and
 // generates an auth token when one wasn't provided. Returns the token
 // actually in effect (generated or passed through) so the caller can gate
@@ -438,34 +420,17 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 		return nil, "", err
 	}
 
-	cert, usingAutoCA, caPEMPath, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
+	cert, _, _, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
 	if err != nil {
 		_ = ln.Close()
 		return nil, "", fmt.Errorf("resolving TLS certificate: %w", err)
 	}
 	ln = wrapTLS(ln, cert)
 
-	var caPEM string
-	if usingAutoCA {
-		// Best-effort: worst case the printed code just omits the CA (same as
-		// the operator-real-cert branch below), not a listener failure.
-		if b, err := os.ReadFile(caPEMPath); err == nil {
-			caPEM = string(b)
-		}
-	}
-	carries := "the token"
-	if usingAutoCA {
-		carries = "the token and this server's CA"
-	}
-	var rtcFp string
-	if _, fp, err := loadRTCCert(stateDir); err == nil {
-		rtcFp = fp
-	}
-	code := pairingCode(authToken, caPEM, rtcFp)
-	logInfoDetail(
-		fmt.Sprintf("remote listener on %s (TLS); pairing code: %s", ln.Addr(), code),
-		fmt.Sprintf("yoakeland remote listener on %s over TLS. Paste this pairing code into a client's \"Add a server\" (it carries %s): %s", ln.Addr(), carries, code),
-	)
+	// The shared token is deliberately not logged: a log or journal outlives the session and
+	// the token never expires. Devices pair with a fresh single-use code (printPairQR below
+	// on a terminal, or "Pair a phone" in the desktop app).
+	logInfo("remote listener on %s (TLS)", ln.Addr())
 	return ln, authToken, nil
 }
 
