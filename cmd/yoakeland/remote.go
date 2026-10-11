@@ -98,7 +98,7 @@ func (r *remoteControl) Start(ctx context.Context) error {
 			return "", err
 		}
 		return tok, r.settings.AddPairingToken("terminal-"+id[:6], tok, "")
-	}, r.RTCFingerprint())
+	}, r.RTCFingerprint(), r.caPEMLocked(), r.deps.pins)
 	return nil
 }
 
@@ -125,9 +125,19 @@ func (r *remoteControl) RTCFingerprint() string {
 // before remote access has ever been turned on.
 func (r *remoteControl) CAPEM() (string, error) {
 	r.mu.Lock()
-	operatorCert := r.tlsCert != "" || r.tlsKey != ""
-	r.mu.Unlock()
-	if operatorCert {
+	defer r.mu.Unlock()
+	return r.caPEM()
+}
+
+// caPEMLocked is CAPEM for a caller already holding r.mu (Start), where a failure just means no
+// CA in the code.
+func (r *remoteControl) caPEMLocked() string {
+	pem, _ := r.caPEM()
+	return pem
+}
+
+func (r *remoteControl) caPEM() (string, error) {
+	if r.tlsCert != "" || r.tlsKey != "" {
 		return "", nil
 	}
 	_, caPEMPath, _, err := tlsca.EnsureServerCert(r.stateDir, tlsca.DefaultSANs())

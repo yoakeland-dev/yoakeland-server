@@ -39,6 +39,14 @@ type Message struct {
 	// user, never sent back to the model.
 	Subagent []Message `json:"subagent,omitempty"`
 
+	// Images are pictures that travelled with this message, so the model can
+	// look at them: today a tool result's browser screenshot (see
+	// protocol.ImageData and tool.ImageTool). Sent to the provider on every
+	// request that includes this message, so they cost context each time
+	// (imageTokens) and are dropped when compaction stubs the message out
+	// (contextView). SPEC.md §4e.
+	Images []protocol.ImageData `json:"images,omitempty"`
+
 	// AuthorName is who actually sent this message, for a shared session
 	// with more than one connected peer — set only on the user message
 	// that starts a turn (see RunTurn), left empty for assistant/tool
@@ -288,6 +296,21 @@ type ModelOptions struct {
 // subprocesses, for instance — simply don't implement this interface.
 type ModelOptionsSetter interface {
 	SetModelOptions(ModelOptions)
+}
+
+// VisionProvider is implemented by providers whose current model can be sent a
+// picture alongside text: an API provider on a vision model. A CLI agent's
+// subprocess takes no image from us at all, so it doesn't implement this, and
+// neither does anything else that can't answer for its model.
+//
+// It gates the browser tool's `screenshot` action, which is only offered when
+// the answer is yes — a model that can't look at a picture shouldn't be told
+// about an action whose whole point it can't use (SPEC.md §4e). It also
+// decides whether a picture already in history is sent at all
+// (provider.withoutImages), so switching a session to a text-only model
+// doesn't leave it with a request that model rejects.
+type VisionProvider interface {
+	SupportsImages() bool
 }
 
 // Mode selects which tools the model is even given (SPEC.md §4c) and, for
@@ -913,7 +936,9 @@ var webToolNames = map[string]bool{
 }
 
 // activeToolDefs returns the tool definitions to hand the model this turn —
-// the mode-restricted subset, further filtered by the web-tools toggle.
+// the mode-restricted subset, further filtered by the web-tools toggle, and
+// with the picture-taking actions swapped out for a model that can't see a
+// picture.
 func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 	a.mu.Lock()
 	mode := a.mode
@@ -922,9 +947,13 @@ func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 	shellOff := a.shellDisabled
 	a.mu.Unlock()
 
+	// Whether the model can look at a picture decides whether screenshot is
+	// offered at all (SPEC.md §4e); ask once, for both filters below.
+	vision := a.providerSeesImages()
+
 	// The skill tool is only worth its definition when there is a skill to load.
 	hideSkill := a.tools[tool.SkillToolName] != nil && !a.skillsAvailable()
-	if webEnabled && !shellOff && !hideSkill {
+	if webEnabled && !shellOff && !hideSkill && vision {
 		return a.withSourceDefs(base, mode)
 	}
 	filtered := make([]tool.ToolDefinition, 0, len(base))
@@ -932,9 +961,33 @@ func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 		if (!webEnabled && webToolNames[def.Name]) || (shellOff && isShellTool(def.Name)) || (hideSkill && def.Name == tool.SkillToolName) {
 			continue
 		}
-		filtered = append(filtered, def)
+		filtered = append(filtered, a.defForVision(def, vision))
 	}
 	return a.withSourceDefs(filtered, mode)
+}
+
+// defForVision gives an image-capable tool the definition to offer a model
+// that can't see a picture — the browser tool without its screenshot action,
+// which would otherwise be an action whose result the model has no use for.
+func (a *Agent) defForVision(def tool.ToolDefinition, vision bool) tool.ToolDefinition {
+	if vision {
+		return def
+	}
+	if it, ok := a.tools[def.Name].(tool.ImageTool); ok {
+		return it.DefinitionWithoutImages()
+	}
+	return def
+}
+
+// providerSeesImages reports whether the session's current model can be sent a
+// picture. Providers that can't carry one — a CLI subprocess, most of all —
+// don't implement VisionProvider.
+func (a *Agent) providerSeesImages() bool {
+	a.mu.Lock()
+	p := a.provider
+	a.mu.Unlock()
+	vp, ok := p.(VisionProvider)
+	return ok && vp.SupportsImages()
 }
 
 // withSourceDefs adds the source's tools (MCP) after the fixed ones, in the
@@ -1205,6 +1258,10 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		CreatedAt:    startTime,
 	})
 	a.mu.Unlock()
+	_ = a.getStream().SendEvent(protocol.EventUserMessage, sessionID, turnID, "", protocol.UserMessageData{
+		MessageID: userMessageID, Content: prompt, Attachments: attachmentsFromContext(parentCtx),
+		Author: author.Name, AuthorAvatar: author.Avatar,
+	})
 
 	if isNewChat {
 		a.titleWG.Add(1)
@@ -1930,13 +1987,13 @@ turn:
 			if mutating {
 				a.auditExec(sessionID, tc.Name, target, mode, via)
 			}
-			output, execErr := toolImpl.Execute(turnCtx, execCtx, tc.Args)
+			output, images, execErr := runTool(turnCtx, toolImpl, execCtx, tc.Args)
 			truncatedOutput := a.contextManager.TruncateToolOutput(output)
 
 			if execErr != nil {
 				a.recordToolResult(turnID, tc, "", execErr.Error())
 			} else {
-				a.recordToolResult(turnID, tc, truncatedOutput, "")
+				a.recordToolResultAll(turnID, tc, truncatedOutput, "", nil, images)
 			}
 		}
 		for _, tc := range toolCalls {
@@ -2308,12 +2365,30 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 }
 
 func (a *Agent) recordToolResult(turnID string, tc ToolCall, output, errText string) {
-	a.recordToolResultWith(turnID, tc, output, errText, nil)
+	a.recordToolResultAll(turnID, tc, output, errText, nil, nil)
 }
 
 // recordToolResultWith is recordToolResult keeping a subagent call's
 // transcript (see Message.Subagent).
 func (a *Agent) recordToolResultWith(turnID string, tc ToolCall, output, errText string, transcript []Message) {
+	a.recordToolResultAll(turnID, tc, output, errText, transcript, nil)
+}
+
+// runTool dispatches one call, preferring ExecuteWithImages for a tool that can
+// produce pictures (the browser's screenshot): the image rides with the same
+// result rather than needing a second path through the turn.
+func runTool(ctx context.Context, t tool.Tool, execCtx tool.ExecutionContext, args []byte) (string, []protocol.ImageData, error) {
+	if it, ok := t.(tool.ImageTool); ok {
+		return it.ExecuteWithImages(ctx, execCtx, args)
+	}
+	out, err := t.Execute(ctx, execCtx, args)
+	return out, nil, err
+}
+
+// recordToolResultAll is where every finished tool call lands: the history
+// entry the model sees next round, the tool_result event clients render, and
+// whatever else the call produced — a subagent's transcript, a screenshot.
+func (a *Agent) recordToolResultAll(turnID string, tc ToolCall, output, errText string, transcript []Message, images []protocol.ImageData) {
 	a.mu.Lock()
 	a.history = append(a.history, Message{
 		ID:         a.nextMessageIDLocked(),
@@ -2321,6 +2396,7 @@ func (a *Agent) recordToolResultWith(turnID string, tc ToolCall, output, errText
 		Content:    output + errText,
 		ToolCallID: tc.ID,
 		Subagent:   transcript,
+		Images:     images,
 	})
 	sessID := a.sessionID
 	a.mu.Unlock()
@@ -2329,6 +2405,7 @@ func (a *Agent) recordToolResultWith(turnID string, tc ToolCall, output, errText
 		ToolName: tc.Name,
 		Output:   output,
 		Error:    errText,
+		Images:   images,
 	})
 }
 

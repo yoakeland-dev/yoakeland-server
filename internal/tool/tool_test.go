@@ -377,9 +377,9 @@ func TestBrowserTool_NavigatePermissionAndForwardedArgs(t *testing.T) {
 
 type recordingRelay struct{ args json.RawMessage }
 
-func (r *recordingRelay) Browse(_ context.Context, _, _ string, args json.RawMessage) (string, error) {
+func (r *recordingRelay) Browse(_ context.Context, _, _ string, args json.RawMessage) (tool.BrowserResult, error) {
 	r.args = args
-	return "ok", nil
+	return tool.BrowserResult{Output: "ok"}, nil
 }
 
 func TestWebFetchTool_RequiresPermission(t *testing.T) {

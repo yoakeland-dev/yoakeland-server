@@ -63,8 +63,8 @@ func TestBrowserBroker_HostChoiceAndSpoofing(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		b.Respond(local.ID, protocol.BrowserResponseData{RequestID: req.RequestID, Output: "real"})
 	}()
-	if out, err := b.Browse(ctx, "s1", "snapshot", nil); err != nil || out != "real" {
-		t.Fatalf("local host: %q, %v", out, err)
+	if out, err := b.Browse(ctx, "s1", "snapshot", nil); err != nil || out.Output != "real" {
+		t.Fatalf("local host: %+v, %v", out, err)
 	}
 
 	// A host with the chat open wins over the local fallback.

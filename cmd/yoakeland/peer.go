@@ -34,7 +34,7 @@ type Peer struct {
 	TokenName   string
 	Email       string
 	DeviceID    string
-	Restricted  bool   // limited to remoteAllowed events; fixed for the connection
+	Restricted  bool   // limited to remoteAllowed events; changes with set_peer_scope, read through IsRestricted
 	SessionID   string // last chat opened, see SetActivity
 	ProjectPath string
 	Network     string // "unix" or "tcp"
@@ -67,8 +67,9 @@ func NewPeerRegistry() *PeerRegistry {
 // against its token on TCP. See handshake.
 type peerIdentity struct {
 	Name, DeviceType, Avatar, DeviceID string
-	TokenName, Email                   string // set only for a named TCP token
-	Restricted                         bool   // a pairing (phone) credential: see remoteAllowed
+	TokenName, Email                   string              // set only for a named TCP token
+	Restricted                         bool                // a pairing (phone) credential: see remoteAllowed
+	pake                               *protocol.PakeStart // set when the first frame asked to pair with a PIN (pairpake.go); the connection never becomes a peer
 }
 
 // maxNameLen caps a display name; cleanName trims it and drops control characters, since a name
@@ -232,6 +233,32 @@ func (r *PeerRegistry) Get(id string) (*Peer, bool) {
 	return p, ok
 }
 
+// IsRestricted reports whether id is held to remoteAllowed. Unknown peers count as restricted.
+func (r *PeerRegistry) IsRestricted(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.peers[id]
+	return !ok || p.Restricted
+}
+
+// SetScope applies a tier change to every live connection on credential tokenName and broadcasts
+// the roster. Returns how many connections changed.
+func (r *PeerRegistry) SetScope(tokenName string, restricted bool) int {
+	r.mu.Lock()
+	n := 0
+	for _, p := range r.peers {
+		if p.TokenName == tokenName {
+			p.Restricted = restricted
+			n++
+		}
+	}
+	r.mu.Unlock()
+	if n > 0 {
+		r.Broadcast()
+	}
+	return n
+}
+
 // SetBrowserHost records whether id offers its browser panel to the agent.
 func (r *PeerRegistry) SetBrowserHost(id string, enabled bool) {
 	r.mu.Lock()
@@ -393,6 +420,7 @@ func (r *PeerRegistry) Broadcast() {
 			DeviceID:    p.DeviceID,
 			SessionID:   p.SessionID,
 			ProjectPath: p.ProjectPath,
+			Restricted:  p.Restricted,
 		})
 		peers = append(peers, p)
 	}

@@ -68,3 +68,44 @@ func TestHandshake_PairingCredentialIsRestricted(t *testing.T) {
 		}
 	}
 }
+
+func TestSetPeerScope(t *testing.T) {
+	deps := newTestDeps(t)
+	if err := deps.settings.AddPairingToken("phone", "t1", ""); err != nil {
+		t.Fatal(err)
+	}
+	phone := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", TokenName: "phone", Restricted: true})
+	laptop := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "laptop"})
+	send := func(from *Peer, network string, full bool) {
+		in := bytes.NewBufferString(`{"type":"set_peer_scope","data":{"peerId":"` + phone.ID + `","full":` + map[bool]string{true: "true", false: "false"}[full] + "}}\n")
+		serveConnection(context.Background(), protocol.NewIPCStream(in, &bytes.Buffer{}), deps, network, from.ID, nil)
+	}
+
+	send(phone, "tcp", true) // a restricted device can't promote itself
+	if !deps.peers.IsRestricted(phone.ID) {
+		t.Fatal("restricted device promoted itself")
+	}
+	send(laptop, "tcp", true)
+	if deps.peers.IsRestricted(phone.ID) || remoteDenied(deps, "tcp", phone.ID, protocol.EventSaveMCPServer) {
+		t.Fatal("promotion did not take effect live")
+	}
+	if rec := deps.settings.Tokens["phone"]; rec.Restricted() {
+		t.Fatal("promotion was not persisted")
+	}
+	send(laptop, "tcp", false)
+	if !deps.peers.IsRestricted(phone.ID) {
+		t.Fatal("demotion did not take effect")
+	}
+}
+
+func TestResolveAuthor_AvatarFallback(t *testing.T) {
+	deps := newTestDeps(t)
+	p := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", TokenName: "phone"})
+	if a := resolveAuthor(deps, p.ID, "x", "🦊"); a.Name != "phone" || a.Avatar != "🦊" {
+		t.Fatalf("no registered avatar: got %+v", a)
+	}
+	deps.peers.SetAvatar(p.ID, "data:image/png;base64,AA")
+	if a := resolveAuthor(deps, p.ID, "x", "🦊"); a.Avatar != "data:image/png;base64,AA" {
+		t.Fatalf("registered avatar should win: got %+v", a)
+	}
+}

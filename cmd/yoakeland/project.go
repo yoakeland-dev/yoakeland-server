@@ -187,6 +187,7 @@ func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Me
 			Reasoning:    m.Reasoning,
 			ToolCallID:   m.ToolCallID,
 			Diffs:        m.Diffs,
+			Images:       m.Images,
 			AlternateIDs: alternateIDs(branches[branchPoint]),
 			Author:       m.AuthorName,
 			AuthorAvatar: m.AuthorAvatar,

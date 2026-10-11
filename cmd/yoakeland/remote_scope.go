@@ -45,6 +45,5 @@ func remoteDenied(deps connDeps, network, peerID string, t protocol.EventType) b
 	if network != "tcp" || remoteAllowed[t] {
 		return false
 	}
-	p, ok := deps.peers.Get(peerID)
-	return !ok || p.Restricted
+	return deps.peers.IsRestricted(peerID)
 }

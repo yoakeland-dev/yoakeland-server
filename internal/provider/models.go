@@ -210,13 +210,20 @@ func fetchModels(url string, setHeaders func(*http.Request), nameField string, h
 		switch httpProvider {
 		case "openrouter":
 			caps = map[string]any{}
-			for _, f := range []string{"context_length", "pricing", "top_provider", "reasoning"} {
+			for _, f := range []string{"context_length", "pricing", "top_provider", "reasoning", "architecture"} {
 				if v, ok := m[f]; ok {
 					caps[f] = v
 				}
 			}
 			if n, ok := caps["context_length"].(float64); ok && n > 0 {
 				openRouterContext.Store(key, int(n))
+			}
+			// architecture.input_modalities is the one place a provider actually
+			// says which modalities a model takes; the vision gate reads it back
+			// (SupportsImages) instead of guessing from the id. A response
+			// without the member says nothing, so it isn't remembered.
+			if arch, ok := caps["architecture"]; ok {
+				rememberVision(key, takesImages(arch))
 			}
 			if len(caps) == 0 {
 				caps = nil

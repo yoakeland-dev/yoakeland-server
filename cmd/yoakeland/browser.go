@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/tool"
 )
 
 // browserBroker relays the agent's browser tool to a desktop client's browser
@@ -110,13 +111,13 @@ func (b *browserBroker) host(sessionID string) *Peer {
 }
 
 // Browse implements tool.BrowserRelay.
-func (b *browserBroker) Browse(ctx context.Context, sessionID, action string, args json.RawMessage) (string, error) {
+func (b *browserBroker) Browse(ctx context.Context, sessionID, action string, args json.RawMessage) (tool.BrowserResult, error) {
 	if b == nil {
-		return "", errNoBrowserHost
+		return tool.BrowserResult{}, errNoBrowserHost
 	}
 	p := b.host(sessionID)
 	if p == nil {
-		return "", errNoBrowserHost
+		return tool.BrowserResult{}, errNoBrowserHost
 	}
 	call := &browserCall{peerID: p.ID, done: make(chan protocol.BrowserResponseData, 1)}
 	reqID := "br-" + randomID()
@@ -138,18 +139,18 @@ func (b *browserBroker) Browse(ctx context.Context, sessionID, action string, ar
 	}
 	err := p.ipc.SendEvent(protocol.EventBrowserRequest, sessionID, "", "", req)
 	if err != nil {
-		return "", fmt.Errorf("reaching the browser: %w", err)
+		return tool.BrowserResult{}, fmt.Errorf("reaching the browser: %w", err)
 	}
 	select {
 	case r := <-call.done:
 		if r.Error != "" {
-			return "", errors.New(r.Error)
+			return tool.BrowserResult{}, errors.New(r.Error)
 		}
-		return r.Output, nil
+		return tool.BrowserResult{Output: r.Output, Image: r.Image}, nil
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return tool.BrowserResult{}, ctx.Err()
 	case <-time.After(browserTimeout):
-		return "", fmt.Errorf("the browser didn't answer within %s", browserTimeout)
+		return tool.BrowserResult{}, fmt.Errorf("the browser didn't answer within %s", browserTimeout)
 	}
 }
 

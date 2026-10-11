@@ -26,6 +26,18 @@ type TokenRecord struct {
 	Pairing   bool   `json:"pairing,omitempty"`
 	ExpiresAt int64  `json:"expiresAt,omitempty"` // unix seconds; 0 once claimed
 	DeviceID  string `json:"deviceId,omitempty"`
+
+	// Scope overrides the default tier: "full" or "limited". Empty means a pairing credential is
+	// limited (see remoteAllowed) and any other is full. Set with set_peer_scope or approve_pairing.
+	Scope string `json:"scope,omitempty"`
+}
+
+// Restricted reports whether devices on this credential are held to remoteAllowed.
+func (r TokenRecord) Restricted() bool {
+	if r.Scope != "" {
+		return r.Scope == "limited"
+	}
+	return r.Pairing
 }
 
 // PairingTTL is how long a pairing QR code works before anyone uses it.
@@ -343,6 +355,23 @@ func (s *ServerSettings) SetTokenAvatar(name, avatar string) bool {
 		return false
 	}
 	rec.Avatar = avatar
+	s.Tokens[name] = rec
+	_ = s.save()
+	return true
+}
+
+// SetTokenScope makes a credential full (unrestricted) or limited. False if no such credential.
+func (s *ServerSettings) SetTokenScope(name string, full bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.Tokens[name]
+	if !ok {
+		return false
+	}
+	rec.Scope = "limited"
+	if full {
+		rec.Scope = "full"
+	}
 	s.Tokens[name] = rec
 	_ = s.save()
 	return true

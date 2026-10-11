@@ -52,6 +52,11 @@ func (p *AnthropicProvider) getEffort() string {
 
 func (p *AnthropicProvider) ModelName() string { return p.Model }
 
+// SupportsImages implements agent.VisionProvider: whether this model gets a
+// picture inside a tool result, and so whether the browser tool offers its
+// `screenshot` action at all (SPEC.md §4e).
+func (p *AnthropicProvider) SupportsImages() bool { return SupportsImages(p.Model) }
+
 func NewAnthropic(apiKey, model string) *AnthropicProvider {
 	if model == "" {
 		model = "claude-sonnet-5"
@@ -116,13 +121,44 @@ type anthropicContentBlock struct {
 	Name         string                 `json:"name,omitempty"`
 	Input        map[string]any         `json:"input,omitempty"`
 	ToolUseID    string                 `json:"tool_use_id,omitempty"`
-	Content      string                 `json:"content,omitempty"`
+	Content      any                    `json:"content,omitempty"` // a string, or []any of *anthropicContentBlock for a tool result with pictures
+	Source       *anthropicImageSource  `json:"source,omitempty"`
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthropicMessage struct {
 	Role    string `json:"role"`
 	Content any    `json:"content"` // string, or []any of *anthropicContentBlock / json.RawMessage
+}
+
+// anthropicImageSource is the base64 half of an image block: a screenshot the
+// browser tool took, on its way to the model.
+type anthropicImageSource struct {
+	Type      string `json:"type"` // always "base64"
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+// toolResultContent is one tool result as Anthropic takes it: the plain string
+// for a text-only result (still the common case), or a block array when
+// pictures ride along — a tool_result's content takes text and image blocks,
+// which is how a screenshot reaches the model.
+func toolResultContent(m *agent.Message) any {
+	if len(m.Images) == 0 {
+		return m.Content
+	}
+	out := make([]any, 0, len(m.Images)+1)
+	if m.Content != "" {
+		out = append(out, &anthropicContentBlock{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		out = append(out, &anthropicContentBlock{Type: "image", Source: &anthropicImageSource{
+			Type:      "base64",
+			MediaType: img.MimeType,
+			Data:      img.Data,
+		}})
+	}
+	return out
 }
 
 type anthropicThinking struct {
@@ -243,7 +279,7 @@ func anthropicMessages(history []agent.Message) []anthropicMessage {
 			}
 			msgs = append(msgs, anthropicMessage{Role: "assistant", Content: blocks})
 		case "tool":
-			appendUser(&anthropicContentBlock{Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Content})
+			appendUser(&anthropicContentBlock{Type: "tool_result", ToolUseID: m.ToolCallID, Content: toolResultContent(&m)})
 		}
 	}
 	return msgs
@@ -351,7 +387,7 @@ func (p *AnthropicProvider) StreamTurn(
 		defer close(eChan)
 
 		hints := agent.RequestHintsFrom(ctx)
-		msgs := anthropicMessages(history)
+		msgs := anthropicMessages(withoutImages(history, p.SupportsImages()))
 		var betas []string
 
 		// Tools, then system, then messages is the order the API caches

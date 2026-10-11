@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -21,23 +22,32 @@ const hostedAppURL = "https://app.yoake.land"
 // maxPairHosts bounds the addresses in a QR code: each one makes it denser.
 const maxPairHosts = 3
 
-// pairingURL is the {t,h,p,fp} shape src/lib/pairing.ts decodes, same as the desktop's QR code.
-// hosts[0] is the address to try first; any others ride along as "hs" for a phone to race.
-func pairingURL(hosts []string, port int, token, rtcFp string) string {
+// pairingCode is the {t,ca,h,hs,p,fp} shape src/lib/pairing.ts decodes: what the QR code's URL
+// carries, and, with the CA added, the one string the desktop app takes pasted (it pins the CA
+// rather than the fingerprint). hosts[0] is the address to try first; any others ride along as
+// "hs" for a client to race.
+func pairingCode(hosts []string, port int, token, rtcFp, caPem string) string {
 	type payload struct {
 		T  string   `json:"t"`
+		CA string   `json:"ca,omitempty"`
 		H  string   `json:"h"`
 		HS []string `json:"hs,omitempty"`
 		P  int      `json:"p"`
-		FP string   `json:"fp"`
+		FP string   `json:"fp,omitempty"`
 	}
-	p := payload{T: token, P: port, FP: rtcFp}
+	p := payload{T: token, CA: caPem, P: port, FP: rtcFp}
 	if len(hosts) > 0 {
 		p.H = hosts[0]
 		p.HS = hosts[1:]
 	}
 	b, _ := json.Marshal(p)
-	return hostedAppURL + "/#pair=" + base64.StdEncoding.EncodeToString(b)
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// pairingURL is the hosted web client's link for a phone: the same code, without the CA (a
+// browser can't use one; it pins the fingerprint over WebRTC).
+func pairingURL(hosts []string, port int, token, rtcFp string) string {
+	return hostedAppURL + "/#pair=" + pairingCode(hosts, port, token, rtcFp, "")
 }
 
 // virtualIface is an interface that only the machine itself, or its containers, can reach: an
@@ -91,6 +101,33 @@ func lanIPv4s() []string {
 	return out
 }
 
+// sshServerIPv4 is the address the current ssh session reached this machine on (the third field
+// of SSH_CONNECTION), if it is a usable IPv4 one: the one address known to work from where the
+// operator is, including a public one lanIPv4s leaves out.
+func sshServerIPv4(sshConnection string) string {
+	f := strings.Fields(sshConnection)
+	if len(f) != 4 {
+		return ""
+	}
+	if ip := net.ParseIP(f[2]); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
+		return ip.String()
+	}
+	return ""
+}
+
+// pairHosts is lanIPv4s with the ssh session's own address first, so a server on a cloud box with
+// no private address still has one to offer.
+func pairHosts() []string {
+	hosts := lanIPv4s()
+	if ip := sshServerIPv4(os.Getenv("SSH_CONNECTION")); ip != "" {
+		hosts = append([]string{ip}, slices.DeleteFunc(hosts, func(h string) bool { return h == ip })...)
+		if len(hosts) > maxPairHosts {
+			hosts = hosts[:maxPairHosts]
+		}
+	}
+	return hosts
+}
+
 func isCGNAT(ip net.IP) bool {
 	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
 	return cgnat.Contains(ip)
@@ -120,22 +157,39 @@ func qrBlocks(bitmap [][]bool) string {
 	return b.String()
 }
 
-// printPairQR shows a pairing QR code on stderr beside the log line, only when someone is
-// watching a terminal and the server can be reached over WebRTC. Its token comes from newToken,
-// called only once it is certain to print: a one-device token that expires, not the shared one.
-func printPairQR(addr net.Addr, newToken func() (string, error), rtcFp string) {
+// printPairQR shows a pairing code on stderr beside the log line, only when someone is watching a
+// terminal: a QR code for a phone (when the server can be reached over WebRTC) and the same thing
+// as a string to paste into the desktop app, which is what you have over ssh, and a short PIN to
+// type there with the address (pairpake.go). Its token comes from newToken, called only once it is
+// certain to print: a one-device token that expires, not the shared one. The PIN is minted only
+// then too, and if it runs out of guesses a new one is printed in its place.
+func printPairQR(addr net.Addr, newToken func() (string, error), rtcFp, caPem string, pins *pinRegistry) {
 	tcp, ok := addr.(*net.TCPAddr)
-	hosts := lanIPv4s()
-	if !ok || rtcFp == "" || len(hosts) == 0 || !term.IsTerminal(int(os.Stderr.Fd())) {
+	hosts := pairHosts()
+	if !ok || len(hosts) == 0 || !term.IsTerminal(int(os.Stderr.Fd())) {
 		return
 	}
 	token, err := newToken()
 	if err != nil {
 		return
 	}
-	q, err := qrcode.New(pairingURL(hosts, tcp.Port, token, rtcFp), qrcode.Low)
-	if err != nil {
-		return
+	fmt.Fprintf(os.Stderr, "\nPair a device with %s:%d (valid for %d minutes, one device)\n", hosts[0], tcp.Port, int(PairingTTL.Minutes()))
+	if rtcFp != "" {
+		if q, err := qrcode.New(pairingURL(hosts, tcp.Port, token, rtcFp), qrcode.Low); err == nil {
+			fmt.Fprintf(os.Stderr, "Scan with a phone:\n%s\n", qrBlocks(q.Bitmap()))
+		}
 	}
-	fmt.Fprintf(os.Stderr, "\nScan with a phone to connect to %s:%d (valid for %d minutes, one phone)\n%s\n", hosts[0], tcp.Port, int(PairingTTL.Minutes()), qrBlocks(q.Bitmap()))
+	fmt.Fprintf(os.Stderr, "Or paste into the app's Pairing code field:\n%s\n", pairingCode(hosts, tcp.Port, token, rtcFp, caPem))
+	if pins != nil {
+		fmt.Fprint(os.Stderr, pinAnnouncement(hosts[0], tcp.Port, pins.Mint()))
+		pins.OnExhausted(func(pin string) {
+			fmt.Fprintf(os.Stderr, "\nThe pairing PIN was entered wrong too many times and is no longer valid.\n%s", pinAnnouncement(hosts[0], tcp.Port, pin))
+		})
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
+// pinAnnouncement is what to type into the app instead of scanning or pasting.
+func pinAnnouncement(host string, port int, pin string) string {
+	return fmt.Sprintf("Or type these into the app's Add remote form (the PIN works once, %d tries):\n  Address  %s:%d\n  PIN      %s\n", pinAttempts, host, port, formatPIN(pin))
 }

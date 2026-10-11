@@ -265,6 +265,7 @@ func main() {
 		audit:              auditLog,
 		presence:           newPresenceNotes(notify),
 		pairings:           newPairingGate(),
+		pins:               newPinRegistry(),
 		uploads:            uploads,
 		settings:           settings,
 		remote:             rc,
@@ -547,10 +548,12 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 // at most maxPreAuth such connections at once (the rest are dropped), and a
 // failed attempt holds its slot for authFailDelay — so a stranger can't pile
 // up idle or 10MB-frame connections, or guess passwords at line rate.
-const (
-	maxPreAuth    = 32
-	authFailDelay = time.Second
-)
+const maxPreAuth = 32
+
+var authFailDelay = time.Second // var for tests
+
+// pairLinger is how long a finished PIN pairing waits for the client to close the connection.
+const pairLinger = 5 * time.Second
 
 var preAuthTimeout = 10 * time.Second // var for tests
 
@@ -582,11 +585,23 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	who, pending, ok := handshake(ipc, network, lookupToken)
 	if network == "tcp" {
-		if !ok {
+		if !ok && who.pake == nil {
 			time.Sleep(authFailDelay)
 		}
 		<-preAuthSlots
 		_ = conn.SetReadDeadline(time.Time{})
+	}
+	if who.pake != nil {
+		if err := deps.pairWithPIN(ipc, conn, who); err != nil {
+			time.Sleep(authFailDelay) // after the slot is free, so it slows a guesser without holding one
+			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
+			deps.recordAuthFail(remoteIP(conn, network), network)
+		}
+		// Let the client hang up first: closing a WebRTC data channel right after a write can drop
+		// the write, and the write here is the credential.
+		_ = conn.SetReadDeadline(time.Now().Add(pairLinger))
+		_, _ = io.Copy(io.Discard, conn)
+		return
 	}
 	if !ok {
 		if badCredential {
@@ -780,6 +795,12 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 	if network == "unix" {
 		return who, nil, true
 	}
+	if data.Pake != nil {
+		// Pairing with a PIN: no token to look up. The caller runs the exchange, and this connection
+		// ends once it has (see pairWithPIN), so it is never "signed in".
+		who.pake = data.Pake
+		return who, nil, false
+	}
 
 	resolvedName, rec, found := "", TokenRecord{}, false
 	if lookupToken != nil {
@@ -795,7 +816,7 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 	// The token's name is only the initial name for a device that has none yet (it is what the
 	// person typed when pairing it); a device that already knows who it is keeps that identity.
 	// The credential's own name stays in TokenName for revocation and the audit log.
-	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, rec.Pairing
+	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, rec.Restricted()
 	if who.Name == "" {
 		who.Name = resolvedName
 	}
@@ -822,6 +843,7 @@ type connDeps struct {
 	audit              *audit.Log
 	presence           *presenceNotes
 	pairings           *pairingGate
+	pins               *pinRegistry // the PIN a new device types to pair (pairpake.go); nil turns that off
 	uploads            *UploadStore
 	settings           *ServerSettings
 	remote             *remoteControl
@@ -905,6 +927,11 @@ func sessionWriteError(sessionID, verb string, err error) string {
 // rejected. Shared by user_prompt, edit_message, and retry_message.
 func resolveAuthor(deps connDeps, peerID, authorName, authorAvatar string) agent.Author {
 	if name, avatar, credential, email, ok := deps.peers.Author(peerID); ok && credential != "" {
+		// A picture the device never managed to register (a lost set_peer_avatar) still shows if
+		// it sends one with the prompt; the name stays the credential's, which the device can't choose.
+		if avatar == "" && len(authorAvatar) <= maxAvatarLen {
+			avatar = authorAvatar
+		}
 		return agent.Author{Name: name, Avatar: avatar, Email: email, Credential: credential}
 	}
 	if authorName != "" || authorAvatar != "" {
@@ -1658,6 +1685,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		deps.peers.SetActivity(peerID, data.SessionID, pc.Root)
+		pc.Registry.Get(ipc, data.SessionID) // subscribe this device to the session's live events
 		state, err := pc.SessStore.Load(data.SessionID)
 		var history []agent.Message
 		var branches map[string][][]agent.Message
@@ -2484,6 +2512,30 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			deps.record(ipc, peerID, audit.Event{Kind: audit.PeerKick, Target: targetName, Outcome: "ok", Detail: map[string]any{"targetIp": targetIP}})
 		}
 
+	case protocol.EventSetPeerScope:
+		// Reaching here means the sender is on the local socket or a full-access credential:
+		// remoteDenied already refused a restricted device (set_peer_scope isn't in remoteAllowed).
+		var data protocol.SetPeerScopeData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.PeerID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed set_peer_scope payload (peerId is required)",
+			})
+			return
+		}
+		target, ok := deps.peers.Get(data.PeerID)
+		switch {
+		case !ok:
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: fmt.Sprintf("unknown peer %q", data.PeerID)})
+		case target.TokenName == "":
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: "a local-socket device always has full access"})
+		case !deps.settings.SetTokenScope(target.TokenName, data.Full):
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: "that credential no longer exists"})
+		default:
+			deps.peers.SetScope(target.TokenName, !data.Full)
+			deps.record(ipc, peerID, audit.Event{Kind: audit.PeerScope, Target: target.TokenName, Outcome: "ok", Detail: map[string]any{"full": data.Full}})
+		}
+		return
+
 	case protocol.EventSetServerIdentity:
 		var data protocol.SetServerIdentityData
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
@@ -2618,6 +2670,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				Message: "malformed approve_pairing payload (credential is required)",
 			})
 			return
+		}
+		if data.Allow {
+			deps.settings.SetTokenScope(data.Credential, data.Full)
 		}
 		deps.pairings.answer(data.Credential, data.Allow)
 

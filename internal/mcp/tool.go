@@ -135,8 +135,12 @@ func (t *mcpTool) Execute(ctx context.Context, _ tool.ExecutionContext, args []b
 	return tool.WrapUntrusted("the MCP server "+t.srv.name, text), nil
 }
 
-// renderResult turns a tool result into the text a model reads. Images and
-// audio can't ride in a text result, so they are named, not dropped silently.
+// renderResult turns a tool result into the text a model reads. An MCP
+// tool's pictures and audio have no home on a Tool.Execute result — a string,
+// unlike the browser tool's own tool.ImageTool — so they are named here, not
+// dropped silently. (An MCP server that wants its model to look at a picture
+// is out of reach either way: the image is the *server's* result content, not
+// a tool_result yoakeland built.)
 func renderResult(res *CallResult) string {
 	var parts []string
 	for _, b := range res.Content {

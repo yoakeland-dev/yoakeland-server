@@ -67,6 +67,8 @@ const (
 	EventSetPeerName           EventType = "set_peer_name"
 	EventSetPeerAvatar         EventType = "set_peer_avatar"
 	EventDisconnectPeer        EventType = "disconnect_peer"
+	EventSetPeerScope          EventType = "set_peer_scope"
+	EventUserMessage           EventType = "user_message"
 	EventSetRemoteAccess       EventType = "set_remote_access"
 	EventSetRemotePassword     EventType = "set_remote_password"
 	EventSetServerIdentity     EventType = "set_server_identity"
@@ -184,6 +186,9 @@ const (
 	EventTokenRegistered          EventType = "token_registered"
 	EventPairingRequest           EventType = "pairing_request"
 	EventPairingPending           EventType = "pairing_pending"
+	EventPakeReply                EventType = "pake_reply"   // server's CPace share, answering auth.pake (§2a)
+	EventPakeConfirm              EventType = "pake_confirm" // client's key confirmation
+	EventPakeResult               EventType = "pake_result"  // the sealed credential, once the PIN checked out
 	EventServerRestart            EventType = "server_restart"
 	EventTokenList                EventType = "token_list"
 	EventTokenRemoved             EventType = "token_removed"
@@ -296,6 +301,34 @@ type AuthData struct {
 	// DeviceID is a stable id the client generates once and keeps, so the
 	// same device is recognizable across reconnects and across servers.
 	DeviceID string `json:"deviceId,omitempty"`
+	// Pake *(v2.34)* starts a pairing with a PIN in place of a token (SPEC.md §2a): the client's
+	// half of a CPace exchange. Token is empty then.
+	Pake *PakeStart `json:"pake,omitempty"`
+}
+
+// PakeStart is the first message of a PIN pairing: a session id the client picked and its CPace
+// share, both base64 (std). SID is 16-64 bytes, Ya 32.
+type PakeStart struct {
+	SID string `json:"sid"`
+	Ya  string `json:"ya"`
+}
+
+// PakeReplyData is the server's CPace share (base64, 32 bytes).
+type PakeReplyData struct {
+	Yb string `json:"yb"`
+}
+
+// PakeConfirmData proves the client holds the same key: HMAC-SHA256 under a key derived from the
+// ISK (base64, 32 bytes).
+type PakeConfirmData struct {
+	Mac string `json:"mac"`
+}
+
+// PakeResultData carries the new credential, AES-256-GCM sealed under a key derived from the ISK
+// (base64 of nonce || ciphertext): a JSON {token, caPem?}. Opening it is the client's proof the
+// server knew the PIN.
+type PakeResultData struct {
+	Sealed string `json:"sealed"`
 }
 
 // RegisterProviderData registers (or updates) a named provider config: a
@@ -865,6 +898,11 @@ type HistoryMessage struct {
 	// Diffs: a native tool result's file changes (see ToolResultData.Diffs).
 	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
 
+	// Images *(v2.33)* are the pictures a tool result carried (see
+	// ToolResultData.Images) — re-sent on every repaint, so a client shows a
+	// screenshot where it happened rather than only in the live event.
+	Images []ImageData `json:"images,omitempty"`
+
 	// AlternateIDs lists the OTHER versions that exist at this point in the
 	// conversation — other edits of this same user message, or other
 	// retried responses to the same prompt — each individually addressable
@@ -1018,6 +1056,8 @@ type PeerInfo struct {
 	// The chat this connection last opened (get_session_history), if any.
 	SessionID   string `json:"sessionId,omitempty"`
 	ProjectPath string `json:"projectPath,omitempty"`
+	// Restricted: held to the paired-device allowlist (SPEC.md "Paired-device scope").
+	Restricted bool `json:"restricted,omitempty"`
 }
 
 // PeerListData is pushed to every connected peer whenever the connection
@@ -1133,6 +1173,14 @@ type ServerRestartData struct {
 type ApprovePairingData struct {
 	Credential string `json:"credential"`
 	Allow      bool   `json:"allow"`
+	Full       bool   `json:"full,omitempty"` // approve with full access instead of the paired-device scope
+}
+
+// SetPeerScopeData promotes (Full) or demotes the device behind PeerID. It applies to the
+// credential, so every connection on it changes. Local socket and full-access devices only.
+type SetPeerScopeData struct {
+	PeerID string `json:"peerId"`
+	Full   bool   `json:"full"`
 }
 
 // TokenRegisteredData carries the newly generated token — shown only once,
@@ -1885,6 +1933,17 @@ type SteerResultData struct {
 // TurnStartedData is empty: the envelope's turnId is the whole message.
 type TurnStartedData struct{}
 
+// UserMessageData is a user turn's prompt, sent to every device watching the session right after
+// the server records it, so a device that didn't send it can show it (the sender already has it,
+// matched by turnId or messageId). Followed by the turn's model_delta stream as usual.
+type UserMessageData struct {
+	MessageID    string   `json:"messageId"`
+	Content      string   `json:"content"`
+	Attachments  []string `json:"attachments,omitempty"`
+	Author       string   `json:"author,omitempty"`
+	AuthorAvatar string   `json:"authorAvatar,omitempty"`
+}
+
 type ModelDeltaData struct {
 	Content string `json:"content,omitempty"`
 
@@ -2003,6 +2062,18 @@ type PermissionRulesData struct {
 	Error string `json:"error,omitempty"`
 }
 
+// ImageData is one picture riding with a message, so the model can look at it
+// and a repainted transcript can show it again: a screenshot the browser
+// tool's `screenshot` action took (SPEC.md §4e). Data is base64 with no
+// `data:` prefix; MimeType is one the providers take — image/png, image/jpeg,
+// image/webp or image/gif.
+type ImageData struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
+}
+
 type ToolResultData struct {
 	ToolName string `json:"toolName"`
 	Output   string `json:"output,omitempty"`
@@ -2010,6 +2081,11 @@ type ToolResultData struct {
 	// Diffs are the file changes a native tool call made, when the agent
 	// reported them (SPEC.md §6b).
 	Diffs []*diff.FileDiff `json:"diffs,omitempty"`
+	// Images *(v2.33)* are pictures this tool result carries, sent to the
+	// model with the result and kept on the `tool` entry in
+	// get_session_history. Today only the browser tool's screenshot action
+	// produces them.
+	Images []ImageData `json:"images,omitempty"`
 }
 
 type UsageData struct {
@@ -2415,9 +2491,12 @@ type BrowserRequestData struct {
 }
 
 // BrowserResponseData answers one browser_request: Output is the text the
-// agent gets back (a page snapshot, an evaluate result), or Error.
+// agent gets back (a page snapshot, an evaluate result), or Error. Image
+// *(v2.33)* carries a `screenshot` action's capture, base64 inside
+// ImageData.
 type BrowserResponseData struct {
-	RequestID string `json:"requestId"`
-	Output    string `json:"output,omitempty"`
-	Error     string `json:"error,omitempty"`
+	RequestID string     `json:"requestId"`
+	Output    string     `json:"output,omitempty"`
+	Image     *ImageData `json:"image,omitempty"`
+	Error     string     `json:"error,omitempty"`
 }

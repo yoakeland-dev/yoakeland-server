@@ -63,6 +63,22 @@ type Tool interface {
 	Execute(ctx context.Context, execCtx ExecutionContext, argsJSON []byte) (string, error)
 }
 
+// ImageTool is a Tool whose Execute can also hand back a picture for the
+// model to look at (the browser tool's screenshot action). The agent calls
+// ExecuteWithImages instead of Execute for these, and the pictures ride with
+// the same tool result (see agent.Message.Images, SPEC.md §4e). Tools without
+// this interface behave exactly as before — a plain text Tool result.
+//
+// DefinitionWithoutImages is how that same tool describes itself to a model
+// that can't see a picture: the browser tool leaves its screenshot action out
+// of the description and the schema, rather than offering an action that
+// produces something the model has no use for. The agent picks between the two
+// by asking its provider (agent.VisionProvider).
+type ImageTool interface {
+	ExecuteWithImages(ctx context.Context, execCtx ExecutionContext, argsJSON []byte) (string, []protocol.ImageData, error)
+	DefinitionWithoutImages() ToolDefinition
+}
+
 // DiffableTool allows tools like file_write and file_edit to generate a diff before applying changes
 type DiffableTool interface {
 	PreviewDiff(argsJSON []byte) (*diff.FileDiff, error)

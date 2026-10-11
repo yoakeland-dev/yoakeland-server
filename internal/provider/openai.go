@@ -56,6 +56,11 @@ func (p *OpenAICompatibleProvider) getReasoningEffort() string {
 
 func (p *OpenAICompatibleProvider) ModelName() string { return p.Model }
 
+// SupportsImages implements agent.VisionProvider: whether this model gets a
+// picture inside a tool result, and so whether the browser tool offers its
+// `screenshot` action at all (SPEC.md §4e).
+func (p *OpenAICompatibleProvider) SupportsImages() bool { return SupportsImages(p.Model) }
+
 func NewOpenAI(apiKey, model string) *OpenAICompatibleProvider {
 	if model == "" {
 		model = "gpt-4o"
@@ -96,8 +101,10 @@ type openAIToolCall struct {
 }
 
 type openAIMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content"`
+	Role string `json:"role"`
+	// Content is a string, or a []any of content parts ({type:"text"} /
+	// {type:"image_url"}) when pictures ride with the message.
+	Content    any              `json:"content"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
@@ -205,7 +212,9 @@ func (p *OpenAICompatibleProvider) GenerateTitle(ctx context.Context, prompt str
 
 	var out struct {
 		Choices []struct {
-			Message openAIMessage `json:"message"`
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -235,7 +244,32 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			{Role: "system", Content: systemPrompt},
 		}
 
-		for _, m := range history {
+		// A tool result's pictures have no home in a `tool` message — the Chat
+		// Completions shape keeps those text-only — so they follow their result
+		// as one user message of image parts. Buffered, and flushed before the
+		// next non-tool message (or at the end), so the run of tool messages
+		// stays contiguous as servers expect.
+		var pendingImages []protocol.ImageData
+		flushImages := func() {
+			if len(pendingImages) == 0 {
+				return
+			}
+			parts := make([]any, 0, len(pendingImages)+1)
+			parts = append(parts, map[string]any{"type": "text", "text": "Screenshot from the browser tool:"})
+			for _, img := range pendingImages {
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": "data:" + img.MimeType + ";base64," + img.Data},
+				})
+			}
+			msgs = append(msgs, openAIMessage{Role: "user", Content: parts})
+			pendingImages = nil
+		}
+
+		for _, m := range withoutImages(history, p.SupportsImages()) {
+			if m.Role != "tool" {
+				flushImages()
+			}
 			switch m.Role {
 			case "user":
 				msgs = append(msgs, openAIMessage{Role: "user", Content: m.Content})
@@ -262,8 +296,10 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 					Content:    m.Content,
 					ToolCallID: m.ToolCallID,
 				})
+				pendingImages = append(pendingImages, m.Images...)
 			}
 		}
+		flushImages()
 
 		// 2. Convert tools
 		var openAITools []any

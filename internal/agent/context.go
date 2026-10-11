@@ -226,6 +226,20 @@ const imageTokens = 1500
 
 var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
 
+// imageSummary describes attached pictures in words — a type and a size are
+// all a text-only reader (the summarizer) can be told about one.
+func imageSummary(images []protocol.ImageData) string {
+	parts := make([]string, 0, len(images))
+	for _, img := range images {
+		dim := "size not reported"
+		if img.Width > 0 && img.Height > 0 {
+			dim = fmt.Sprintf("%dx%d", img.Width, img.Height)
+		}
+		parts = append(parts, img.MimeType+" "+dim)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // EstimateHistoryTokens sums the token estimate across an entire message
 // history: content, reasoning (or the raw provider blocks that carry it),
 // tool call arguments, and attachments. Used to report context-window
@@ -250,6 +264,10 @@ func (cm *ContextManager) EstimateHistoryTokens(history []Message) int {
 				total += imageTokens
 			}
 		}
+		// An attached picture (a browser screenshot) is priced like an image
+		// attachment: a flat allowance, since the provider decides the real
+		// cost from the pixels.
+		total += imageTokens * len(m.Images)
 	}
 	return total
 }
@@ -385,6 +403,10 @@ func stubbed(m Message) Message {
 			m.Content = fmt.Sprintf("[cleared to save context: this result was %d lines — run the tool again if you need it]",
 				strings.Count(m.Content, "\n")+1)
 		}
+		// A picture (browser screenshot) is the most expensive thing a tool
+		// result can carry, so it goes with the text: keeping it would leave
+		// the thing compaction was trying to shrink.
+		m.Images = nil
 	case "assistant":
 		if len(m.ToolCalls) == 0 {
 			break
@@ -523,6 +545,11 @@ func transcriptForSummary(view []Message) string {
 			}
 		case "tool":
 			fmt.Fprintf(&sb, "Tool result: %s\n\n", truncateRunes(m.Content, 2000))
+			if len(m.Images) > 0 {
+				// The summarizer sees text only, so say the picture was there
+				// and what it was of, or the summary loses it entirely.
+				fmt.Fprintf(&sb, "[%d image(s) attached to that result: %s]\n\n", len(m.Images), imageSummary(m.Images))
+			}
 		}
 	}
 	return sb.String()
