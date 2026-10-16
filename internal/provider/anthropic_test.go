@@ -42,6 +42,8 @@ data: {"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"
 data: {"index":1}`,
 			`event: message_delta
 data: {"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}`,
+			`event: message_stop
+data: {"type":"message_stop"}`,
 		} {
 			fmt.Fprintf(w, "%s\n\n", ev)
 		}

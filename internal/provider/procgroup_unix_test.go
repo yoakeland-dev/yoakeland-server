@@ -1,4 +1,4 @@
-//go:build linux
+//go:build unix
 
 package provider
 
@@ -35,4 +35,26 @@ func TestKillTakesGrandchildren(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("grandchild %d survived the kill", pid)
+}
+
+// A line longer than the frame limit stops the reader while the CLI is still
+// writing. wait must kill the CLI, or it blocks on the full pipe forever.
+func TestWaitKillsCLIWhenStdoutOverflows(t *testing.T) {
+	p, err := startProc(context.Background(), "sh", []string{"-c", "head -c 12000000 /dev/zero | tr '\\0' x; sleep 60"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.lines.Scan() {
+		t.Fatal("expected the over-long line to stop the scanner")
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = p.wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("wait blocked: the CLI was never killed")
+	}
 }

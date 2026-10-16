@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -86,6 +87,7 @@ func TestPricingCacheRefreshConditionalGET(t *testing.T) {
 	pc := NewPricingCache(dir)
 	pc.httpClient = srv.Client()
 	pc.url = srv.URL
+	pc.rates = nil // the embedded table would make this one-model body a mass drop
 
 	if err := pc.Refresh(); err != nil {
 		t.Fatalf("first refresh: %v", err)
@@ -133,5 +135,53 @@ func TestPricingCacheKeepsLastGoodOnMalformedFetch(t *testing.T) {
 	after, ok := pc.Lookup("gpt-4o")
 	if !ok || after != before {
 		t.Fatalf("expected last-good rate to survive a malformed fetch: before=%+v after=%+v ok=%v", before, after, ok)
+	}
+}
+
+// A table that drops most models, or reprices one tenfold, is refused and the
+// last good rates kept; the same body served again and again is taken as real.
+func TestPricingCacheRefusesImplausibleTable(t *testing.T) {
+	pc := &PricingCache{}
+	pc.rates = map[string]pricingRate{}
+	for i := 0; i < 10; i++ {
+		pc.rates[fmt.Sprintf("m%d", i)] = pricingRate{InputPerToken: 1e-6, OutputPerToken: 2e-6}
+	}
+
+	zeroed := `{"m0": {"input_cost_per_token": 0, "output_cost_per_token": 0}}`
+	dropped := `{"m0": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}}`
+	for _, body := range []string{zeroed, dropped} {
+		next, err := parsePricing([]byte(body))
+		if err != nil {
+			t.Fatalf("parsePricing: %v", err)
+		}
+		if why := pricingShift(pc.rates, next); why == "" {
+			t.Fatalf("pricingShift accepted %s", body)
+		}
+	}
+
+	// Sustained: the same implausible body eventually counts as real.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(zeroed))
+	}))
+	defer srv.Close()
+	pc.httpClient, pc.url = srv.Client(), srv.URL
+	for i := 0; i < pricingRefusalsToAccept; i++ {
+		if err := pc.Refresh(); err == nil {
+			t.Fatalf("refresh %d accepted a zeroed table", i+1)
+		}
+	}
+	if err := pc.Refresh(); err != nil {
+		t.Fatalf("repeated table still refused: %v", err)
+	}
+}
+
+// A negative rate is garbage: the entry is dropped rather than priced.
+func TestParsePricingDropsNegativeRates(t *testing.T) {
+	rates, err := parsePricing([]byte(`{"neg": {"input_cost_per_token": -1, "output_cost_per_token": 1}, "ok": {"input_cost_per_token": 1, "output_cost_per_token": 1}}`))
+	if err != nil {
+		t.Fatalf("parsePricing: %v", err)
+	}
+	if _, ok := rates["neg"]; ok || len(rates) != 1 {
+		t.Fatalf("rates = %+v, want only \"ok\"", rates)
 	}
 }

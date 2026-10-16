@@ -79,3 +79,44 @@ func TestFetchModels_OpenAIReasoningEffortTable(t *testing.T) {
 		t.Errorf("expected gpt-4o (non-reasoning) to carry no capabilities, got %+v", caps)
 	}
 }
+
+// Anthropic returns 20 models a page and says when more follow: every page
+// must be read, and the listing must go to the configured endpoint.
+func TestListModels_AnthropicFollowsPagesOnConfiguredEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		page := map[string]any{"data": []map[string]any{{"id": "claude-a", "display_name": "A"}}, "has_more": false}
+		if r.URL.Query().Get("after_id") == "" {
+			page = map[string]any{"data": []map[string]any{{"id": "claude-a", "display_name": "A"}}, "has_more": true, "last_id": "claude-a"}
+		} else {
+			page["data"] = []map[string]any{{"id": "claude-b", "display_name": "B"}}
+		}
+		_ = json.NewEncoder(w).Encode(page)
+	}))
+	defer srv.Close()
+
+	models, err := ListModels(ProviderConfig{Kind: ProviderKindAPIKey, HTTPProvider: "anthropic", APIKey: "k", BaseURL: srv.URL + "/v1/messages"}, nil)
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, m := range models {
+		seen[m.ID] = true
+	}
+	if !seen["claude-a"] || !seen["claude-b"] {
+		t.Fatalf("models = %v, want both pages", seen)
+	}
+}
+
+// A bare host gets the same /v1 that chat completions get.
+func TestOpenAIModelsURL_BareHostGetsV1(t *testing.T) {
+	if got, want := openAIModelsURL("http://localhost:1234"), "http://localhost:1234/v1/models"; got != want {
+		t.Fatalf("openAIModelsURL = %q, want %q", got, want)
+	}
+	if got, want := openAIModelsURL("http://localhost:1234/v1/chat/completions"), "http://localhost:1234/v1/models"; got != want {
+		t.Fatalf("openAIModelsURL = %q, want %q", got, want)
+	}
+}

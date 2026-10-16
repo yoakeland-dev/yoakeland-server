@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,9 +68,19 @@ func usageAccounts(store *provider.ProviderStore) []protocol.UsageAccount {
 }
 
 func accountFetcher(cfg provider.ProviderConfig) func(context.Context) protocol.UsageAccount {
-	base := strings.ToLower(cfg.BaseURL)
+	// The key is sent to the vendor's own account API, so only a provider that
+	// talks to that vendor gets one: its default endpoint or the vendor's host
+	// itself. A proxy or local endpoint would receive the key otherwise.
+	host := ""
+	if cfg.BaseURL != "" {
+		u, err := url.Parse(cfg.BaseURL)
+		if err != nil {
+			return nil
+		}
+		host = strings.ToLower(u.Hostname())
+	}
 	switch {
-	case cfg.HTTPProvider == "openrouter" || strings.Contains(base, "openrouter.ai"):
+	case host == "openrouter.ai" || (host == "" && cfg.HTTPProvider == "openrouter"):
 		return func(ctx context.Context) protocol.UsageAccount {
 			a := protocol.UsageAccount{Currency: "USD"}
 			var key struct {
@@ -101,7 +112,7 @@ func accountFetcher(cfg provider.ProviderConfig) func(context.Context) protocol.
 			}
 			return a
 		}
-	case strings.Contains(base, "api.deepseek.com"):
+	case host == "api.deepseek.com":
 		return func(ctx context.Context) protocol.UsageAccount {
 			a := protocol.UsageAccount{}
 			var bal struct {

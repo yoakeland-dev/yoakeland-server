@@ -2108,6 +2108,9 @@ type UsageData struct {
 	// charge for writes).
 	CachedInputTokens     int `json:"cachedInputTokens,omitempty"`
 	CacheWriteInputTokens int `json:"cacheWriteInputTokens,omitempty"`
+	// WebSearches counts the server-side web searches a provider billed for
+	// the request (Anthropic's web search tool), priced on top of the tokens.
+	WebSearches int `json:"webSearches,omitempty"`
 
 	// ContextTokens is how many tokens the context held after the last
 	// model request this usage covers (that request's input plus its

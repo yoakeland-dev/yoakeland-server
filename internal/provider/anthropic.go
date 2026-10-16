@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -182,6 +183,24 @@ type anthropicRequest struct {
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 }
 
+// post sends a Messages API request, retrying transient failures (see
+// doWithRetry). betas is the anthropic-beta header, when there is one.
+func (p *AnthropicProvider) post(ctx context.Context, body []byte, betas []string) (*http.Response, error) {
+	return doWithRetry(ctx, p.Client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("x-api-key", p.APIKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("content-type", "application/json")
+		if len(betas) > 0 {
+			req.Header.Set("anthropic-beta", strings.Join(betas, ","))
+		}
+		return req, nil
+	})
+}
+
 const titleSystemPrompt = "Summarize the user's message as a short chat title (plain text, no quotes, at most 8 words)."
 
 // GenerateTitle implements agent.TitleGenerator with a small, non-streaming
@@ -206,26 +225,14 @@ func (p *AnthropicProvider) GenerateTitle(ctx context.Context, prompt string) (s
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("x-api-key", p.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
-
-	resp, err := p.Client.Do(req)
+	resp, err := p.post(ctx, jsonBytes, nil)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error struct{ Message string } `json:"error"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		return "", fmt.Errorf("anthropic error (%d): %s", resp.StatusCode, errResp.Error.Message)
+		return "", httpError(resp, "anthropic")
 	}
 
 	var out struct {
@@ -462,32 +469,16 @@ func (p *AnthropicProvider) StreamTurn(
 			return
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(jsonBytes))
+		resp, err := p.post(ctx, jsonBytes, betas)
 		if err != nil {
 			eChan <- err
 			return
 		}
-
-		req.Header.Set("x-api-key", p.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-		req.Header.Set("content-type", "application/json")
-		if len(betas) > 0 {
-			req.Header.Set("anthropic-beta", strings.Join(betas, ","))
-		}
-
-		resp, err := p.Client.Do(req)
-		if err != nil {
-			eChan <- err
-			return
-		}
-		defer resp.Body.Close()
+		body := newStallReader(resp.Body, streamIdleTimeout)
+		defer body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			var errResp struct {
-				Error struct{ Message string } `json:"error"`
-			}
-			_ = json.NewDecoder(resp.Body).Decode(&errResp)
-			eChan <- fmt.Errorf("anthropic error (%d): %s", resp.StatusCode, errResp.Error.Message)
+			eChan <- httpError(resp, "anthropic")
 			return
 		}
 
@@ -498,6 +489,17 @@ func (p *AnthropicProvider) StreamTurn(
 
 		var usage protocol.UsageData
 		var stopReason string
+		var sawEvent, sawStop bool
+		// send hands a chunk on, or gives up once the turn is cancelled: the
+		// consumer may have stopped reading.
+		send := func(c agent.ModelStreamChunk) error {
+			select {
+			case cChan <- c:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 
 		// Input usage arrives in message_start and, when server tools ran,
 		// again (updated) in message_delta. input_tokens is only the
@@ -508,6 +510,9 @@ func (p *AnthropicProvider) StreamTurn(
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
+			ServerToolUse            struct {
+				WebSearchRequests int `json:"web_search_requests"`
+			} `json:"server_tool_use"`
 		}
 		applyUsage := func(u anthropicUsage) {
 			if in := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens; in > 0 {
@@ -518,10 +523,19 @@ func (p *AnthropicProvider) StreamTurn(
 			if u.OutputTokens > 0 {
 				usage.OutputTokens = u.OutputTokens
 			}
+			// Server tools are billed per use, and the count is cumulative like
+			// the output tokens.
+			if n := u.ServerToolUse.WebSearchRequests; n > 0 {
+				usage.WebSearches = n
+			}
 		}
 
-		if readErr := ReadSSEStream(resp.Body, func(ev SSEEvent) error {
+		if readErr := ReadSSEStream(body, func(ev SSEEvent) error {
+			sawEvent = true
 			switch ev.Event {
+			case "message_stop":
+				sawStop = true
+
 			case "message_start":
 				var msg struct {
 					Message struct {
@@ -546,6 +560,11 @@ func (p *AnthropicProvider) StreamTurn(
 						stopReason = "length"
 					case "refusal":
 						stopReason = "refusal"
+					case "pause_turn":
+						// The server-side tool loop hit its limit and wants the
+						// turn resent to continue it. Not done yet, so an answer
+						// cut here must not pass for a finished one.
+						return fmt.Errorf("anthropic paused the reply (pause_turn) before it finished")
 					}
 				}
 
@@ -596,15 +615,15 @@ func (p *AnthropicProvider) StreamTurn(
 					blocks.delta(delta.Index, delta.Delta)
 					switch delta.Delta["type"] {
 					case "text_delta":
-						cChan <- agent.ModelStreamChunk{
+						return send(agent.ModelStreamChunk{
 							Kind:  agent.StreamChunkDelta,
 							Delta: fmt.Sprint(delta.Delta["text"]),
-						}
+						})
 					case "thinking_delta":
-						cChan <- agent.ModelStreamChunk{
+						return send(agent.ModelStreamChunk{
 							Kind:  agent.StreamChunkReasoning,
 							Delta: fmt.Sprint(delta.Delta["thinking"]),
-						}
+						})
 					case "input_json_delta":
 						currentArgsBuffer.WriteString(fmt.Sprint(delta.Delta["partial_json"]))
 					}
@@ -622,11 +641,12 @@ func (p *AnthropicProvider) StreamTurn(
 						args = []byte("{}")
 					}
 					currentToolCall.Args = json.RawMessage(append([]byte(nil), args...))
-					cChan <- agent.ModelStreamChunk{
-						Kind:     agent.StreamChunkToolCall,
-						ToolCall: currentToolCall,
-					}
+					call := currentToolCall
 					currentToolCall = nil
+					return send(agent.ModelStreamChunk{
+						Kind:     agent.StreamChunkToolCall,
+						ToolCall: call,
+					})
 				}
 			}
 			return nil
@@ -641,15 +661,30 @@ func (p *AnthropicProvider) StreamTurn(
 			return
 		}
 
+		// Anthropic always ends a reply with message_stop. Without it the
+		// connection closed partway through, and the answer is not whole.
+		if sawEvent && !sawStop {
+			eChan <- fmt.Errorf("anthropic stream ended before the reply finished: %w", io.ErrUnexpectedEOF)
+			return
+		}
+
 		if raw := blocks.raw(); raw != nil {
-			cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkRawContent, Raw: raw}
+			if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkRawContent, Raw: raw}); err != nil {
+				eChan <- err
+				return
+			}
 		}
 		if stopReason != "" {
-			cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkFinish, FinishReason: stopReason}
+			if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkFinish, FinishReason: stopReason}); err != nil {
+				eChan <- err
+				return
+			}
 		}
 
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-		cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &usage}
+		if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &usage}); err != nil {
+			eChan <- err
+		}
 	}()
 
 	return cChan, eChan

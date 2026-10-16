@@ -49,7 +49,15 @@ func startProc(ctx context.Context, name string, args []string, dir string) (*na
 	}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 64*1024), protocol.MaxFrameSize)
-	return &nativeProc{stdin: stdin, lines: sc, stderr: errBuf.String, wait: cmd.Wait, kill: func() { _ = killTree(cmd) }}, nil
+	// A reader that stopped on an over-long line leaves the CLI writing into a
+	// pipe nobody drains: kill it, or Wait never returns.
+	wait := func() error {
+		if sc.Err() != nil {
+			_ = killTree(cmd)
+		}
+		return cmd.Wait()
+	}
+	return &nativeProc{stdin: stdin, lines: sc, stderr: errBuf.String, wait: wait, kill: func() { _ = killTree(cmd) }}, nil
 }
 
 // tailBuffer keeps the last 4 KiB written to it.

@@ -60,6 +60,7 @@ func TestAnthropicProvider_StreamTurn_ReportsMaxTokensAsLength(t *testing.T) {
 		fmt.Fprint(w, "event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"this got cut off\"}}\n\n")
 		fmt.Fprint(w, "event: content_block_stop\ndata: {}\n\n")
 		fmt.Fprint(w, "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":8192}}\n\n")
+		fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
 	defer srv.Close()
 

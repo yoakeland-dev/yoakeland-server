@@ -91,6 +91,10 @@ func EstimateCostUSD(model string, usage protocol.UsageData) float64 {
 	return usd
 }
 
+// webSearchUSD is what Anthropic bills per server-side web search ($10 per
+// 1,000). It is a flat rate, not a per-model one.
+const webSearchUSD = 0.01
+
 // priceUsage settles u's cost unless it already is (a provider-reported
 // cost, or a price set earlier): CostUSD from the rate tables, or
 // CostUnknown when model has none. Usage with no tokens costs nothing
@@ -100,7 +104,7 @@ func priceUsage(model string, u *protocol.UsageData) {
 		return
 	}
 	if usd, ok := EstimateCost(model, *u); ok {
-		u.CostUSD, u.CostKnown = usd, true
+		u.CostUSD, u.CostKnown = usd+float64(u.WebSearches)*webSearchUSD, true
 		return
 	}
 	u.CostUnknown = true
@@ -118,6 +122,7 @@ func addUsage(dst *protocol.UsageData, u protocol.UsageData) {
 		dst.WindowTokens = u.WindowTokens
 	}
 	dst.InputTokens += u.InputTokens
+	dst.WebSearches += u.WebSearches
 	dst.OutputTokens += u.OutputTokens
 	dst.TotalTokens += u.TotalTokens
 	dst.CachedInputTokens += u.CachedInputTokens

@@ -3,13 +3,19 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 )
+
+// modelsClient bounds a /models listing. It runs on the request path, so a
+// hung endpoint must not hold a turn, or a shutdown, open.
+var modelsClient = &http.Client{Timeout: 15 * time.Second}
 
 // openRouterContext remembers each OpenRouter model's context_length from the
 // last catalog fetch (fetchModels), keyed by lowercased id: the agent asks
@@ -141,18 +147,19 @@ func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 
 	switch cfg.HTTPProvider {
 	case "anthropic":
-		return fetchModels("https://api.anthropic.com/v1/models", func(req *http.Request) {
-			req.Header.Set("x-api-key", cfg.APIKey)
-			req.Header.Set("anthropic-version", "2023-06-01")
-		}, "display_name", cfg.HTTPProvider)
+		return anthropicModels(cfg)
 	case "openai":
 		return fetchModels(openAIModelsURL(cfg.BaseURL), func(req *http.Request) {
 			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 		}, "", cfg.HTTPProvider)
 	case "openrouter":
 		// Public catalog, same for every key; the key isn't required but
-		// doesn't hurt to send.
-		return fetchModels("https://openrouter.ai/api/v1/models", func(req *http.Request) {
+		// doesn't hurt to send. A custom endpoint serves its own list, as chat does.
+		listURL := "https://openrouter.ai/api/v1/models"
+		if cfg.BaseURL != "" {
+			listURL = openAIModelsURL(cfg.BaseURL)
+		}
+		return fetchModels(listURL, func(req *http.Request) {
 			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 		}, "name", cfg.HTTPProvider)
 	default:
@@ -161,41 +168,85 @@ func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 }
 
 // openAIModelsURL derives the /v1/models endpoint from a chat-completions
-// BaseURL (as stored/normalized for OpenAICompatibleProvider), so this works
-// for the default OpenAI API and for OpenAI-compatible local servers alike.
+// BaseURL, so this works for the default OpenAI API and for OpenAI-compatible
+// local servers alike. A bare host gets the same /v1 that chat gets.
 func openAIModelsURL(baseURL string) string {
 	if baseURL == "" {
 		return "https://api.openai.com/v1/models"
 	}
-	root := strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/chat/completions")
+	root := strings.TrimSuffix(normalizeOpenAIBaseURL(baseURL), "/chat/completions")
 	return root + "/models"
 }
 
-func fetchModels(url string, setHeaders func(*http.Request), nameField string, httpProvider string) ([]ModelInfo, error) {
-	req, err := http.NewRequest("GET", url, nil)
+// anthropicModels lists /v1/models a page at a time: the API returns 20
+// models unless asked for more, and says when more follow.
+func anthropicModels(cfg ProviderConfig) ([]ModelInfo, error) {
+	root := "https://api.anthropic.com"
+	if cfg.BaseURL != "" {
+		root = strings.TrimSuffix(strings.TrimRight(cfg.BaseURL, "/"), "/v1/messages")
+	}
+	setHeaders := func(req *http.Request) {
+		req.Header.Set("x-api-key", cfg.APIKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	var all []ModelInfo
+	after := ""
+	for range 20 { // a cap: a provider that never says it's done can't loop us forever
+		pageURL := root + "/v1/models?limit=1000"
+		if after != "" {
+			pageURL += "&after_id=" + url.QueryEscape(after)
+		}
+		models, hasMore, last, err := fetchModelPage(pageURL, setHeaders, "display_name", cfg.HTTPProvider)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, models...)
+		if !hasMore || last == "" || last == after {
+			break
+		}
+		after = last
+	}
+	return all, nil
+}
+
+func fetchModels(listURL string, setHeaders func(*http.Request), nameField string, httpProvider string) ([]ModelInfo, error) {
+	models, _, _, err := fetchModelPage(listURL, setHeaders, nameField, httpProvider)
+	return models, err
+}
+
+// fetchModelPage is one GET of a models listing, with the paging fields
+// (has_more, last_id) when the provider sends them.
+func fetchModelPage(listURL string, setHeaders func(*http.Request), nameField string, httpProvider string) (models []ModelInfo, hasMore bool, lastID string, err error) {
+	req, err := http.NewRequest("GET", listURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	setHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := modelsClient.Do(req)
 	if err != nil {
-		return nil, err
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			ue.URL = withoutQuery(ue.URL)
+		}
+		return nil, false, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("listing models: HTTP %d from %s", resp.StatusCode, url)
+		return nil, false, "", fmt.Errorf("listing models: HTTP %d from %s", resp.StatusCode, withoutQuery(listURL))
 	}
 
 	var body struct {
-		Data []map[string]any `json:"data"`
+		Data    []map[string]any `json:"data"`
+		HasMore bool             `json:"has_more"`
+		LastID  string           `json:"last_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 
-	models := make([]ModelInfo, 0, len(body.Data))
+	models = make([]ModelInfo, 0, len(body.Data))
 	seen := make(map[string]bool, len(body.Data)) // dedupe case-insensitively, see casing-dupe note below
 	for _, m := range body.Data {
 		id, _ := m["id"].(string)
@@ -247,5 +298,11 @@ func fetchModels(url string, setHeaders func(*http.Request), nameField string, h
 		}
 		models = append(models, ModelInfo{ID: id, DisplayName: display, Capabilities: caps})
 	}
-	return models, nil
+	return models, body.HasMore, body.LastID, nil
+}
+
+// withoutQuery drops a URL's query string from an error message.
+func withoutQuery(u string) string {
+	before, _, _ := strings.Cut(u, "?")
+	return before
 }

@@ -1,10 +1,10 @@
-//go:build !linux
+//go:build !unix
 
 package provider
 
 import "os/exec"
 
-// ponytail: no process-group kill off Linux; grandchildren can outlive a kill.
+// Windows has no process groups here: a kill reaches only the CLI itself.
 func ownProcessGroup(*exec.Cmd) {}
 
 func killTree(cmd *exec.Cmd) error {

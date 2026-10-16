@@ -112,3 +112,27 @@ func TestOAuthSessionStore_TakeUnknownRequestID(t *testing.T) {
 		t.Fatal("expected Take to fail for an unknown request ID")
 	}
 }
+
+// Logins that are never finished must not pile up: the store keeps at most
+// maxPendingOAuth, evicting the oldest.
+func TestOAuthSessionStore_BoundsPendingLogins(t *testing.T) {
+	store := provider.NewOAuthSessionStore()
+	var first string
+	var last string
+	for i := 0; i < 100; i++ {
+		id, _, err := store.Begin("p")
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		if i == 0 {
+			first = id
+		}
+		last = id
+	}
+	if _, ok := store.Take(first); ok {
+		t.Fatal("the oldest login survived past the cap")
+	}
+	if _, ok := store.Take(last); !ok {
+		t.Fatal("the newest login was evicted")
+	}
+}
