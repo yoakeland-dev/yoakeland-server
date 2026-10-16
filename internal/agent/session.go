@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 	"yoakeland/internal/protocol"
 )
 
@@ -116,34 +117,11 @@ func (s *DiskSessionStore) saveLocked(session *SessionState) error {
 	if err != nil {
 		return err
 	}
-	tmp := target + ".tmp"
 	// The folder may have been deleted since startup.
 	if err := os.MkdirAll(s.baseDir, 0755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(bytes); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		return err
-	}
-	if dir, err := os.Open(s.baseDir); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	return fsutil.WriteFileAtomic(target, bytes, 0644)
 }
 
 func (s *DiskSessionStore) Load(sessionID string) (*SessionState, error) {

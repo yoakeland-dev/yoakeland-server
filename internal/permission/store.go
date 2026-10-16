@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 )
 
 // FilePermissionsModel is the permissions.json shape. Version 2 stores an
@@ -119,14 +120,10 @@ func (s *PersistentStore) save(rules []Rule) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.filePath + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(tmp), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.filePath), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.filePath)
+	return fsutil.WriteFileAtomic(s.filePath, b, 0o600)
 }
 
 // migrateV1 turns exact "tool:target" entries into v2 rules that mean

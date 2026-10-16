@@ -17,6 +17,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 )
 
 // DataDir holds a project's state, outside the project. The id hashes the
@@ -80,11 +81,7 @@ func (s *Store) save(model fileModel) error {
 	if err != nil {
 		return err
 	}
-	tmpFile := s.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, bytes, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpFile, s.filePath)
+	return fsutil.WriteFileAtomic(s.filePath, bytes, 0644)
 }
 
 // List returns every known project, most-recently-opened first.

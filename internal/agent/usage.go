@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"yoakeland/internal/fsutil"
 )
 
 // UsageTotals is a running tally of token spend, either for one session or
@@ -112,12 +113,8 @@ func (s *UsageStore) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.filePath + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(tmp), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.filePath), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.filePath)
+	return fsutil.WriteFileAtomic(s.filePath, data, 0644)
 }

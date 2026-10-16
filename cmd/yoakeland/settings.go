@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 	"yoakeland/internal/protocol"
 )
 
@@ -110,7 +111,13 @@ func NewServerSettings(dir string) (*ServerSettings, error) {
 	s := &ServerSettings{filePath: filepath.Join(dir, "server.json"), Tokens: map[string]TokenRecord{}}
 	if data, err := os.ReadFile(s.filePath); err == nil {
 		if err := json.Unmarshal(data, s); err != nil {
-			logWarn("server settings: server.json failed to parse, resetting to empty: %v", err)
+			// PRV-12/NET-16: set the unreadable file aside rather than let the
+			// next save overwrite it, so its tokens stay recoverable by hand.
+			aside := fmt.Sprintf("%s.corrupt-%d", s.filePath, time.Now().Unix())
+			if rerr := os.Rename(s.filePath, aside); rerr != nil {
+				return nil, fmt.Errorf("server.json failed to parse and could not be set aside: %w", rerr)
+			}
+			logWarn("server settings: server.json failed to parse, moved to %s; starting empty: %v", aside, err)
 			s.Identity, s.Token, s.Tokens = "", "", map[string]TokenRecord{}
 			s.RuntimeState, s.RemoteState, s.DefaultProviderState = nil, nil, nil
 		}
@@ -382,9 +389,5 @@ func (s *ServerSettings) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.filePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.filePath)
+	return fsutil.WriteFileAtomic(s.filePath, data, 0600)
 }

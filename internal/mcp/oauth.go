@@ -18,6 +18,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"yoakeland/internal/fsutil"
 )
 
 // Sign-in to a remote server follows the MCP authorization spec: OAuth 2.1
@@ -77,7 +78,7 @@ func (a *AuthStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(a.path, b)
+	return fsutil.WriteFileAtomic(a.path, b, 0o600)
 }
 
 // key is the canonical form of a server URL.

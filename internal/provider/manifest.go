@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 )
 
 // modelManifestURL is T3 Code's own model list (MIT-licensed, public repo, no
@@ -193,10 +194,7 @@ func (mc *ManifestCache) Refresh() error {
 	if mc.cachePath != "" {
 		data, err := json.Marshal(manifestCacheFile{ETag: newETag, FetchedAt: time.Now().UTC(), Raw: body})
 		if err == nil {
-			tmp := mc.cachePath + ".tmp"
-			if err := os.WriteFile(tmp, data, 0644); err == nil {
-				_ = os.Rename(tmp, mc.cachePath)
-			}
+			_ = fsutil.WriteFileAtomic(mc.cachePath, data, 0644)
 		}
 	}
 	return nil

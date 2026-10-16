@@ -522,7 +522,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 			if tlsConn, ok := conn.(*tls.Conn); ok {
 				_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 				if err := tlsConn.Handshake(); err != nil {
-					logWarn("TLS handshake failed from %s: %v", conn.RemoteAddr(), err)
+					logWarn("TLS handshake failed from %s: %s", conn.RemoteAddr(), logSafe(err.Error()))
 					return
 				}
 				// Clients open with a JSON auth frame; anything else is a browser.

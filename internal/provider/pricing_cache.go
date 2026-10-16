@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"yoakeland/internal/fsutil"
 )
 
 // pricingURL is LiteLLM's community-maintained per-model rate table (MIT
@@ -308,10 +309,7 @@ func (pc *PricingCache) Refresh() error {
 	if pc.cachePath != "" {
 		data, err := json.Marshal(pricingCacheFile{ETag: newETag, FetchedAt: time.Now().UTC(), Raw: body})
 		if err == nil {
-			tmp := pc.cachePath + ".tmp"
-			if err := os.WriteFile(tmp, data, 0644); err == nil {
-				_ = os.Rename(tmp, pc.cachePath)
-			}
+			_ = fsutil.WriteFileAtomic(pc.cachePath, data, 0644)
 		}
 	}
 	return nil

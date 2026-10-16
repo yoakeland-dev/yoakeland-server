@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 )
 
 // Catalog finds skills and remembers which the user switched off. The switch is
@@ -143,19 +144,7 @@ func (c *Catalog) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(c.path), "skills.json.tmp*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), c.path)
+	return fsutil.WriteFileAtomic(c.path, b, 0600)
 }
 
 // ForAgent is the skills an agent can use in this project: switched on, not

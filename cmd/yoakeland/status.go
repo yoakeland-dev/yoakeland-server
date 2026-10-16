@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/fsutil"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
 )
@@ -352,9 +353,7 @@ func (l *spendLedger) Record(now time.Time, usd float64) {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(l.path+".tmp", b, 0644); err == nil {
-		_ = os.Rename(l.path+".tmp", l.path)
-	}
+	_ = fsutil.WriteFileAtomic(l.path, b, 0644)
 }
 
 func (l *spendLedger) Totals(now time.Time) *protocol.ServerSpend {
