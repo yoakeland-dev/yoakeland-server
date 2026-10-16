@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -105,4 +107,62 @@ func TestManager_OpenRefusesPastTerminalCap(t *testing.T) {
 	if _, err := mgr.Open(context.Background(), ipc, "sess-cap", "term-over", "", 0, 0, nil); err == nil {
 		t.Fatal("65th terminal opened, want refusal")
 	}
+}
+
+// countingSandbox counts the shells a Manager spawns.
+type countingSandbox struct {
+	sandbox.Sandbox
+	spawns atomic.Int32
+}
+
+func (c *countingSandbox) SpawnPTY(ctx context.Context, argv []string, env []string, dir string, cols, rows int, allowNetwork bool) (sandbox.PTYSession, error) {
+	c.spawns.Add(1)
+	return c.Sandbox.SpawnPTY(ctx, argv, env, dir, cols, rows, allowNetwork)
+}
+
+// TestManager_ConcurrentRestartSpawnsOneShell: several peers attaching to an
+// exited terminal with restartIfExited must bring up one shell between them,
+// not one each (the second would be overwritten and leak).
+func TestManager_ConcurrentRestartSpawnsOneShell(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	sb := &countingSandbox{Sandbox: sandbox.NewSandbox(tempDir, 60*time.Second)}
+	mgr := terminal.NewManager(sb, norm)
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{})
+
+	if _, err := mgr.Open(context.Background(), ipc, "sess-1", "term-1", "", 0, 0, nil); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := mgr.Write("sess-1", "term-1", []byte("exit\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := mgr.State("sess-1", "term-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Status == protocol.TerminalStatusExited {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shell did not exit")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			peer := protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{})
+			_, _ = mgr.Attach(context.Background(), peer, "sess-1", "term-1", 0, 0, true)
+		}()
+	}
+	wg.Wait()
+	if got := sb.spawns.Load(); got != 2 {
+		t.Fatalf("spawns = %d, want 2 (the original shell and one restart)", got)
+	}
+	mgr.CloseSession("sess-1")
 }
