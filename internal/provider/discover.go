@@ -96,6 +96,23 @@ func (c *discoveryCache) get(kind CLIKind, fetch func(context.Context) ([]ModelI
 	return fallback()
 }
 
+// degraded: kind has no real answer from its agent, so lists served for it are the manifest's.
+func (c *discoveryCache) degraded(kind CLIKind) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := c.entries[kind]
+	return e == nil || len(e.models) == 0
+}
+
+// retry forgets a failure so the next get asks the agent again, e.g. after it was logged in.
+func (c *discoveryCache) retry(kind CLIKind) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e := c.entries[kind]; e != nil && len(e.models) == 0 {
+		e.failedAt = time.Time{}
+	}
+}
+
 // discoverProc starts a throwaway CLI process for one question.
 func discoverProc(ctx context.Context, name string, args []string, dir string) (*nativeProc, error) {
 	// The process is bound to ctx, so it dies with the timeout however the call ends.

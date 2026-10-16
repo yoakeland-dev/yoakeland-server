@@ -947,15 +947,23 @@ func (r *ProjectRegistry) ListChats() []protocol.SessionSummary {
 		}
 		store, err := agent.NewDiskSessionStore(projectstore.DataDir(r.stateDir, filepath.Join(r.chatsDir, e.Name())))
 		if err != nil {
+			logWarn("list chats: skipping %s: %v", e.Name(), err)
 			continue
 		}
-		ids, _ := store.List()
+		ids, err := store.List()
+		if err != nil {
+			logWarn("list chats: cannot list %s: %v", e.Name(), err)
+		}
 		for _, id := range ids {
-			if st, err := store.Load(id); err == nil {
-				sum := sessionSummaryFrom(filepath.Join(r.chatsDir, e.Name()), st)
-				sum.WorkspaceBytes = dirSize(sum.ProjectPath)
-				out = append(out, sum)
+			st, err := store.Load(id)
+			if err != nil {
+				// Left out of the list, so the chat vanishes from every client: say why.
+				logWarn("list chats: skipping unreadable session %s in %s: %v", id, e.Name(), err)
+				continue
 			}
+			sum := sessionSummaryFrom(filepath.Join(r.chatsDir, e.Name()), st)
+			sum.WorkspaceBytes = dirSize(sum.ProjectPath)
+			out = append(out, sum)
 		}
 	}
 	return out

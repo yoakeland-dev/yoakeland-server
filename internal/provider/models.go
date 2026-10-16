@@ -94,6 +94,20 @@ func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 	return models, nil // the ACP agents attach their own, from what they advertise
 }
 
+// ModelsFallback reports that ListModels for k answered from the built-in manifest because the
+// agent itself couldn't be asked (logged out, failed). Only Claude and Codex are discovered this way.
+func ModelsFallback(k ProviderKind) bool {
+	kind, ok := CLIKindOf(k)
+	return ok && (kind == CLIKindClaude || kind == CLIKindCodex) && discovered.degraded(kind)
+}
+
+// RetryModels lifts the backoff after a failed discovery so the next ListModels asks the agent again.
+func RetryModels(k ProviderKind) {
+	if kind, ok := CLIKindOf(k); ok {
+		discovered.retry(kind)
+	}
+}
+
 func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error) {
 	switch cfg.Kind {
 	case ProviderKindCLIClaude:

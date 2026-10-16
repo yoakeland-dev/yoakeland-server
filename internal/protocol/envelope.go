@@ -368,6 +368,9 @@ type ProviderRegisteredData struct {
 // list since there's no key to query an API with.
 type ListModelsData struct {
 	ProviderName string `json:"providerName"`
+	// Refresh asks a CLI agent again even if its last attempt failed (e.g. it was
+	// logged out and the user has since signed in), instead of waiting out the backoff.
+	Refresh bool `json:"refresh,omitempty"`
 }
 
 // ModelSummary is one model available through a provider's credential.
@@ -387,6 +390,9 @@ type ModelSummary struct {
 type ModelListData struct {
 	ProviderName string         `json:"providerName"`
 	Models       []ModelSummary `json:"models"`
+	// Fallback: the agent couldn't be asked (logged out, failed), so this is the
+	// built-in list and lacks what only the agent reports (e.g. Auto mode). Ask again later.
+	Fallback bool `json:"fallback,omitempty"`
 }
 
 // SetFavoriteModelsData replaces the favorite-model list for a provider.

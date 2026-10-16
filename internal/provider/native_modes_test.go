@@ -194,3 +194,19 @@ func TestAutoModeOnlyWhereTheAgentHasAReviewer(t *testing.T) {
 		t.Fatalf("haiku modes = %d", n)
 	}
 }
+
+// Auto is sandboxed on Codex (workspace-write) and not on Claude.
+func TestAutoSandboxFlag(t *testing.T) {
+	auto := func(specs []ModeSpec) ModeSpec {
+		for _, s := range specs {
+			if s.Mode == "auto" {
+				return s
+			}
+		}
+		t.Fatal("no auto spec")
+		return ModeSpec{}
+	}
+	if !auto(codexModes()).Sandbox || auto(claudeModes(true)).Sandbox {
+		t.Fatal("codex auto should be sandboxed, claude auto not")
+	}
+}

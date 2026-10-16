@@ -208,3 +208,28 @@ func TestCodexDisplayName(t *testing.T) {
 		}
 	}
 }
+
+// A failed discovery (logged out) is degraded and backed off; retry lifts the backoff, and a
+// real answer ends the degradation.
+func TestDiscoveryRetryAfterLogin(t *testing.T) {
+	c := &discoveryCache{entries: map[CLIKind]*discoveryEntry{}}
+	loggedIn := false
+	fetch := func(context.Context) ([]ModelInfo, error) {
+		if !loggedIn {
+			return nil, errClaudeLoggedOut
+		}
+		return []ModelInfo{{ID: "m", Capabilities: map[string]any{"autoMode": true}}}, nil
+	}
+	fb := func() []ModelInfo { return []ModelInfo{{ID: "fallback"}} }
+	if got := c.get(CLIKindClaude, fetch, fb); got[0].ID != "fallback" || !c.degraded(CLIKindClaude) {
+		t.Fatalf("logged out: %v", got)
+	}
+	loggedIn = true
+	if got := c.get(CLIKindClaude, fetch, fb); got[0].ID != "fallback" { // still backed off
+		t.Fatalf("backoff: %v", got)
+	}
+	c.retry(CLIKindClaude)
+	if got := c.get(CLIKindClaude, fetch, fb); got[0].ID != "m" || c.degraded(CLIKindClaude) {
+		t.Fatalf("after retry: %v", got)
+	}
+}

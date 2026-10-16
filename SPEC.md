@@ -436,6 +436,7 @@ Requests the models available through one registered provider's own credential �
 ```
 - For `api_key` providers this calls that HTTP backend's own models endpoint live (Anthropic/OpenAI/OpenRouter each expose one, keyed by the same credential used for chat completions) — so newly released models show up with no server-side changes. `cli_claude`/`cli_codex` have no key to query, so their list instead comes from a cached copy of [T3 Code's](https://github.com/pingdotgg/t3code) `model-manifest.json` (MIT-licensed, public, no auth) — see §6c. The ACP `cli_*` kinds ask the agent itself (a throwaway ACP session, so this call can take several seconds) — see §6b.
 - For OpenRouter, any entry whose upstream record carries a populated `alias_target` (a floating alias for another, pinned model — e.g. `anthropic/claude-3.7-sonnet` aliasing `anthropic/claude-3-7-sonnet`) is filtered out server-side, rather than left for the frontend to recognize by convention (the `~` prefix is only how you'd *reference* a floating alias when calling chat completions, not how the `/models` listing marks one). Entries whose `id` collides case-insensitively with one already returned are also deduped, keeping the first.
+- `refresh` *(optional bool)*: for `cli_claude`/`cli_codex`, ask the agent again even if its last attempt failed and is still in the 2-minute backoff. A client sets it when the list it holds has `fallback: true` (or is missing), e.g. the agent was logged out when first asked and the user has signed in since.
 - Response: `model_list` on success, `error` if `providerName` isn't registered or the upstream call fails (e.g. a revoked key). Each returned model carries `isFavorite`, set from that provider's server-persisted favorites (see `set_favorite_models` below), and an optional `capabilities` object — see `model_list` (§3.2) for its shape.
 
 #### `set_favorite_models`
@@ -1335,6 +1336,7 @@ Response to `list_providers`. Credentials are never included, and note there's n
 
 #### `model_list`
 Response to `list_models`.
+`fallback` *(optional bool)*: the agent itself couldn't be asked (logged out, or failed), so `models` is the built-in manifest list and lacks what only the agent reports, such as which models support Auto. Ask again later with `list_models.refresh`.
 ```json
 {
   "type": "model_list",

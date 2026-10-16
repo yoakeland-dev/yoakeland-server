@@ -88,12 +88,19 @@ func codexModes() []ModeSpec {
 		agent.ModeAcceptEdits: "workspace-write · untrusted", agent.ModeAutonomous: "workspace-write · never", agent.ModePlan: "read-only",
 		agent.ModeAuto: "workspace-write · on-request · auto review",
 	}
-	return modeSpecs(func(m agent.Mode) (string, string) {
+	specs := modeSpecs(func(m agent.Mode) (string, string) {
 		if m == agent.ModeAcceptEdits {
 			return "yoakeland", native[m]
 		}
 		return "agent", native[m]
 	}, "emulated", true, true)
+	// Auto stays in Codex's workspace-write sandbox; Claude's auto has none.
+	for i := range specs {
+		if specs[i].Mode == string(agent.ModeAuto) {
+			specs[i].Sandbox = true
+		}
+	}
+	return specs
 }
 
 // acpModes maps what an ACP agent advertised: a mode it has a match for is

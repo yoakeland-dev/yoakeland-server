@@ -1248,6 +1248,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				defer deps.turnWG.Done()
 			}
 			defer recoverTurnPanic(ipc, env.SessionID, env.TurnID)
+			if data.Refresh {
+				provider.RetryModels(cfg.Kind)
+			}
 			models, err := provider.ListModels(cfg, deps.manifestCache)
 			if err != nil {
 				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -1266,6 +1269,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventModelList, env.SessionID, env.TurnID, "", protocol.ModelListData{
 				ProviderName: data.ProviderName,
 				Models:       summaries,
+				Fallback:     provider.ModelsFallback(cfg.Kind),
 			})
 		}()
 
@@ -1662,6 +1666,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		for _, id := range ids {
 			state, err := pc.SessStore.Load(id)
 			if err != nil {
+				// Left out of the list, so the chat vanishes from every client: say why.
+				logWarn("list_sessions: skipping unreadable session %s in %s: %v", id, pc.Root, err)
 				continue
 			}
 			summaries = append(summaries, sessionSummaryFrom(pc.Root, state))
