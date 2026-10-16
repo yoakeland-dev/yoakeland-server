@@ -71,6 +71,7 @@ func toolServer(command string) *httptest.Server {
 				`event: content_block_delta` + "\n" + `data: {"index":0,"delta":{"type":"input_json_delta","partial_json":` + string(partial) + `}}`,
 				`event: content_block_stop` + "\n" + `data: {"index":0}`,
 				`event: message_delta` + "\n" + `data: {"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}`,
+				`event: message_stop` + "\n" + `data: {}`,
 			} {
 				_, _ = w.Write([]byte(ev + "\n\n"))
 			}

@@ -415,6 +415,7 @@ func TestNotifications_AskRaisedThenRetractedWhenAnswered(t *testing.T) {
 				"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}",
 				"event: content_block_stop\ndata: {\"index\":0}",
 				"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}",
+				"event: message_stop\ndata: {}",
 			} {
 				_, _ = w.Write([]byte(ev + "\n\n"))
 			}
