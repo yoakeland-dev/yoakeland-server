@@ -91,31 +91,12 @@ func (b *browserBroker) allowedHosts(sessionID string) []string {
 	return hosts
 }
 
-// host picks who runs sessionID's browser: a host that has this chat open,
-// else a local (unix socket) one. A remote peer never gets another chat's
-// browser traffic just by offering to host.
-func (b *browserBroker) host(sessionID string) *Peer {
-	var local *Peer
-	for _, p := range b.peers.All() {
-		if !p.BrowserHost {
-			continue
-		}
-		if p.SessionID == sessionID {
-			return p
-		}
-		if p.Network == "unix" && (local == nil || p.ConnectedAt.After(local.ConnectedAt)) {
-			local = p
-		}
-	}
-	return local
-}
-
 // Browse implements tool.BrowserRelay.
 func (b *browserBroker) Browse(ctx context.Context, sessionID, action string, args json.RawMessage) (tool.BrowserResult, error) {
 	if b == nil {
 		return tool.BrowserResult{}, errNoBrowserHost
 	}
-	p := b.host(sessionID)
+	p, projectPath := b.peers.BrowserHostFor(sessionID)
 	if p == nil {
 		return tool.BrowserResult{}, errNoBrowserHost
 	}
@@ -132,7 +113,7 @@ func (b *browserBroker) Browse(ctx context.Context, sessionID, action string, ar
 
 	b.approve(sessionID, action, args)
 	req := protocol.BrowserRequestData{
-		RequestID: reqID, SessionID: sessionID, ProjectPath: p.ProjectPath, Action: action, Args: args,
+		RequestID: reqID, SessionID: sessionID, ProjectPath: projectPath, Action: action, Args: args,
 	}
 	if b.blockCrossOrigin.Load() {
 		req.BlockCrossOrigin, req.AllowedHosts = true, b.allowedHosts(sessionID)

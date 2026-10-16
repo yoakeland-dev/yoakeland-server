@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -180,5 +181,29 @@ func TestBrowserBroker_SendsApprovedHosts(t *testing.T) {
 	b.SetBlockCrossOrigin(false)
 	if r := do("s1", "click", `{"ref":"3"}`); r.BlockCrossOrigin || len(r.AllowedHosts) != 0 {
 		t.Fatalf("setting off but still enforcing: %+v", r)
+	}
+}
+
+// The browser goes to a host that has the chat open, else to the newest local host, never to a
+// remote host that merely has it open in its own view.
+func TestBrowserHostFor(t *testing.T) {
+	reg := NewPeerRegistry()
+	add := func(network string) *Peer {
+		return reg.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, network, peerIdentity{Name: network})
+	}
+	remote := add("tcp")
+	reg.SetBrowserHost(remote.ID, true)
+	reg.SetActivity(remote.ID, "chat", "/remote/proj")
+	if p, _ := reg.BrowserHostFor("chat"); p != remote {
+		t.Fatal("the host with the chat open was not chosen")
+	}
+	local := add("unix")
+	reg.SetBrowserHost(local.ID, true)
+	reg.SetActivity(local.ID, "", "/local/proj")
+	if p, project := reg.BrowserHostFor("other"); p != local || project != "/local/proj" {
+		t.Fatalf("got %v %q, want the local host", p, project)
+	}
+	if p, _ := reg.BrowserHostFor("unknown"); p == remote {
+		t.Fatal("a remote host without the chat was chosen")
 	}
 }

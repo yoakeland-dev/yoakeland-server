@@ -291,6 +291,31 @@ func (r *PeerRegistry) SetBrowserHost(id string, enabled bool) {
 	}
 }
 
+// BrowserHostFor picks the peer that runs sessionID's browser: a host that has this chat open,
+// else the newest local (unix socket) one. A remote peer never gets another chat's browser traffic
+// just by offering to host. It also returns the project that peer last opened, read under the
+// lock, since SetActivity writes it there.
+func (r *PeerRegistry) BrowserHostFor(sessionID string) (*Peer, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var local *Peer
+	for _, p := range r.peers {
+		if !p.BrowserHost {
+			continue
+		}
+		if p.SessionID == sessionID {
+			return p, p.ProjectPath
+		}
+		if p.Network == "unix" && (local == nil || p.ConnectedAt.After(local.ConnectedAt)) {
+			local = p
+		}
+	}
+	if local == nil {
+		return nil, ""
+	}
+	return local, local.ProjectPath
+}
+
 // SetActivity records the chat id last opened, broadcasting only on a
 // change. Reports whether id was a live peer.
 func (r *PeerRegistry) SetActivity(id, sessionID, projectPath string) bool {
