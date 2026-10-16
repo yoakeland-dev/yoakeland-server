@@ -13,12 +13,21 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 )
 
 const (
 	openRouterAuthURL     = "https://openrouter.ai/auth"
 	openRouterKeyExchange = "https://openrouter.ai/api/v1/auth/keys"
+
+	// A login the user never finishes is dropped after pendingOAuthTTL, and at
+	// most maxPendingOAuth are held at once: the store lives as long as the daemon.
+	pendingOAuthTTL = 10 * time.Minute
+	maxPendingOAuth = 32
 )
+
+// oauthClient bounds the key exchange, which the user's login waits on.
+var oauthClient = &http.Client{Timeout: 15 * time.Second}
 
 // OpenRouterPKCE is one PKCE challenge/verifier pair for OpenRouter's OAuth
 // flow (https://openrouter.ai/docs/use-cases/oauth-pkce): no client secret,
@@ -73,18 +82,26 @@ func ExchangeOpenRouterCode(ctx context.Context, baseURL, code, verifier string)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("openrouter key exchange failed (%d): %s", resp.StatusCode, string(respBody))
+		// Only the message goes out, not the body: it can echo what was just approved.
+		var e struct {
+			Error json.RawMessage `json:"error"`
+		}
+		msg := ""
+		if json.Unmarshal(respBody, &e) == nil {
+			msg = errorMessage(e.Error)
+		}
+		return "", fmt.Errorf("openrouter key exchange failed (%d): %s", resp.StatusCode, msg)
 	}
 
 	var result struct {
@@ -104,6 +121,7 @@ func ExchangeOpenRouterCode(ctx context.Context, baseURL, code, verifier string)
 type PendingOAuth struct {
 	Verifier string
 	Name     string
+	begun    time.Time
 }
 
 // OAuthSessionStore tracks in-flight OAuth logins between the `start` and
@@ -133,7 +151,22 @@ func (s *OAuthSessionStore) Begin(name string) (requestID string, pkce *OpenRout
 	requestID = hex.EncodeToString(idBytes)
 
 	s.mu.Lock()
-	s.pending[requestID] = PendingOAuth{Verifier: pkce.Verifier, Name: name}
+	now := time.Now()
+	for id, p := range s.pending {
+		if now.Sub(p.begun) > pendingOAuthTTL {
+			delete(s.pending, id)
+		}
+	}
+	for len(s.pending) >= maxPendingOAuth {
+		oldest := ""
+		for id, p := range s.pending {
+			if oldest == "" || p.begun.Before(s.pending[oldest].begun) {
+				oldest = id
+			}
+		}
+		delete(s.pending, oldest)
+	}
+	s.pending[requestID] = PendingOAuth{Verifier: pkce.Verifier, Name: name, begun: now}
 	s.mu.Unlock()
 	return requestID, pkce, nil
 }
