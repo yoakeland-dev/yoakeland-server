@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 )
 
-// Resource caps applied to a spawned terminal session when cgroup v2
-// delegation is available (see probeCgroupDelegation) come from Limits
+// Resource caps applied to a spawned command or terminal session when cgroup
+// v2 delegation is available (see probeCgroupDelegation) come from Limits
 // (runtime settings terminalMemoryMaxMB / terminalPidsMax) at spawn time.
 
 var (
@@ -62,54 +65,88 @@ func probeCgroupDelegation() (string, bool) {
 	return cgroupOwnPath, cgroupUsable
 }
 
-// applyCgroupLimits best-effort confines pid to a fresh cgroup v2 leaf with
-// memory/pids caps — the upgrade path buildCmd's own doc comment points to
-// for the "no seccomp filter, no cgroup limits" gap. Every step's error is
-// checked and any failure tears down what was created and reports
-// applied=false rather than silently leaving pid in an unconfined cgroup
-// while claiming success: an unenforced cap that looks enforced is worse
-// than an honest "no limit" (same insecure-by-omission-is-visible rule the
-// bubblewrap-version and sandbox-tier warnings already follow elsewhere in
-// this package). Logs a warning at most once per process when delegation
-// itself isn't available — the expected case on a bare daemon — rather than
-// once per terminal.
-func applyCgroupLimits(pid int) (cleanup func(), applied bool) {
-	noop := func() {}
+// cgroupLeaf is a fresh cgroup v2 leaf with memory and pids caps, made before
+// its command starts. The command is born inside it (clone3's
+// CLONE_INTO_CGROUP, via SysProcAttr.CgroupFD): moving an already-running pid
+// in left a window in which its first children ran uncapped.
+type cgroupLeaf struct {
+	dir string
+	fd  *os.File // the leaf's directory, open until the command has started
+}
 
+var cgroupLeafSeq atomic.Uint64
+
+// newCgroupLeaf returns nil when there is no delegation or the leaf can't be
+// configured, so the command runs without the caps rather than not at all.
+// Every step's error is checked and a partial leaf is torn down, so nothing is
+// left looking capped when it isn't. Logs a warning at most once per process
+// when delegation itself isn't available (the expected case on a bare daemon).
+func newCgroupLeaf() *cgroupLeaf {
 	ownPath, ok := probeCgroupDelegation()
 	if !ok {
 		cgroupWarnOnce.Do(func() {
-			log.Printf("WARNING: no cgroup v2 delegation. Terminals have no memory or process-count limit beyond what bubblewrap and namespaces isolate, so a runaway or malicious shell can exhaust host memory or fork-bomb it. Run this daemon under a systemd user session, or grant it cgroup delegation, to enforce limits.")
+			log.Printf("WARNING: no cgroup v2 delegation. Terminals and one-shot commands have no memory or process-count limit beyond what bubblewrap and namespaces isolate, so a runaway or malicious command can exhaust host memory or fork-bomb it. Run this daemon under a systemd user session, or grant it cgroup delegation, to enforce limits.")
 		})
-		return noop, false
+		return nil
 	}
 
-	dir := filepath.Join("/sys/fs/cgroup", ownPath, fmt.Sprintf("yoakeland-term-%d", pid))
+	dir := filepath.Join("/sys/fs/cgroup", ownPath, fmt.Sprintf("yoakeland-%d-%d", os.Getpid(), cgroupLeafSeq.Add(1)))
 	if err := os.Mkdir(dir, 0o755); err != nil {
-		return noop, false
+		return nil
 	}
-	cleanupDir := func() { _ = os.Remove(dir) }
+	l := &cgroupLeaf{dir: dir}
 
 	// A cgroup only exposes memory.max/pids.max to a child once the parent
 	// delegates those controllers via its own subtree_control — best-effort,
 	// since a parent that already has member processes of its own can hit
 	// cgroup v2's "no internal process" constraint here and refuse it, which
 	// the write-and-verify below catches rather than assumes away.
-	parentSubtree := filepath.Join("/sys/fs/cgroup", ownPath, "cgroup.subtree_control")
-	_ = os.WriteFile(parentSubtree, []byte("+memory +pids"), 0o644)
+	_ = os.WriteFile(filepath.Join("/sys/fs/cgroup", ownPath, "cgroup.subtree_control"), []byte("+memory +pids"), 0o644)
 
-	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(strconv.FormatInt(CurrentLimits().TerminalMemoryBytes, 10)), 0o644); err != nil {
-		cleanupDir()
-		return noop, false
+	caps := CurrentLimits()
+	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(strconv.FormatInt(caps.TerminalMemoryBytes, 10)), 0o644); err != nil {
+		l.remove()
+		return nil
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pids.max"), []byte(strconv.Itoa(CurrentLimits().TerminalPids)), 0o644); err != nil {
-		cleanupDir()
-		return noop, false
+	if err := os.WriteFile(filepath.Join(dir, "pids.max"), []byte(strconv.Itoa(caps.TerminalPids)), 0o644); err != nil {
+		l.remove()
+		return nil
 	}
-	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		cleanupDir()
-		return noop, false
+	fd, err := os.Open(dir)
+	if err != nil {
+		l.remove()
+		return nil
 	}
+	l.fd = fd
+	return l
+}
 
-	return cleanupDir, true
+// place makes cmd start inside the leaf. A nil leaf leaves cmd as it is.
+func (l *cgroupLeaf) place(cmd *exec.Cmd) {
+	if l == nil {
+		return
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.UseCgroupFD = true
+	cmd.SysProcAttr.CgroupFD = int(l.fd.Fd())
+}
+
+// release closes the leaf's directory handle, which only placing needs.
+func (l *cgroupLeaf) release() {
+	if l != nil && l.fd != nil {
+		_ = l.fd.Close()
+		l.fd = nil
+	}
+}
+
+// remove deletes the leaf once its command has exited. It fails harmlessly
+// while processes are still in it.
+func (l *cgroupLeaf) remove() {
+	if l == nil {
+		return
+	}
+	l.release()
+	_ = os.Remove(l.dir)
 }

@@ -94,6 +94,10 @@ type Terminal struct {
 	busy     bool
 	finished int
 	lastExit *int
+	// markNonce stamps this shell's marks; scanMarks ignores any mark that
+	// doesn't carry it, so a program printing an escape sequence can't pass
+	// for the shell. Set per spawn.
+	markNonce string
 
 	session sandbox.PTYSession
 
@@ -255,9 +259,10 @@ func (t *Terminal) snapshotLocked(sandboxTier string) *protocol.TerminalSnapshot
 // calling Wait more than once, or concurrently with the read loop still
 // running, is undefined).
 func (t *Terminal) pump() {
+	session := t.session
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := t.session.Read(buf)
+		n, err := session.Read(buf)
 		if n > 0 {
 			t.appendOutput(buf[:n])
 		}
@@ -266,7 +271,10 @@ func (t *Terminal) pump() {
 		}
 	}
 
-	exitCode, _ := t.session.Wait()
+	exitCode, _ := session.Wait()
+	// Release the pty master now the shell is gone; without this every exited
+	// terminal, and every restart of one, leaked a file descriptor.
+	_ = session.Close()
 
 	t.mu.Lock()
 	t.status = protocol.TerminalStatusExited
@@ -459,7 +467,12 @@ func (m *Manager) Attach(ctx context.Context, stream *protocol.IPCStream, sessio
 	}
 
 	t.mu.Lock()
+	// Claimed under the lock: a second attacher finds the shell Starting and
+	// doesn't spawn another one over it.
 	needsRestart := restartIfExited && t.status != protocol.TerminalStatusRunning && t.status != protocol.TerminalStatusStarting
+	if needsRestart {
+		t.status = protocol.TerminalStatusStarting
+	}
 	if cols > 0 {
 		t.cols = clampCols(cols)
 	}
@@ -487,7 +500,8 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	t.mu.Unlock()
 	network := !agent || m.agentNetwork.Load()
 
-	argv, env = applyShellIntegration(argv, env)
+	nonce := newMarkNonce()
+	argv, env = applyShellIntegration(argv, env, nonce)
 	// Later entries win, so this overrides the sandbox's PWD (the project root).
 	env = append(env, "PWD="+cwd)
 
@@ -501,7 +515,8 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	}
 
 	t.mu.Lock()
-	t.session = session
+	t.session = &onceClose{PTYSession: session}
+	t.markNonce = nonce
 	t.pid = session.Pid()
 	t.status = protocol.TerminalStatusRunning
 	t.exitCode = nil
@@ -599,6 +614,20 @@ func (m *Manager) CloseSession(sessionID string) {
 	if len(byID) > 0 {
 		m.changed()
 	}
+}
+
+// onceClose makes Close idempotent: a terminal's session is closed both by
+// closeTerminal and by pump once the shell exits, and closing a pty twice
+// isn't safe on every platform.
+type onceClose struct {
+	sandbox.PTYSession
+	once sync.Once
+	err  error
+}
+
+func (o *onceClose) Close() error {
+	o.once.Do(func() { o.err = o.PTYSession.Close() })
+	return o.err
 }
 
 // closeTerminal does the actual teardown shared by Close and CloseSession —

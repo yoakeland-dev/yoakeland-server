@@ -41,6 +41,7 @@ const (
 	ToolFileWrite = "file_write"
 	ToolFileEdit  = "file_edit"
 	ToolWebFetch  = "web_fetch"
+	ToolWebSearch = "web_search"
 	ToolBrowser   = "browser"
 	// ToolRead covers file_read and search: a path rule that can deny or ask,
 	// never allow (reads need no allow rule).
@@ -97,6 +98,7 @@ func coversMCP(ruleTool, tool string) bool {
 //   - edit/file_write/file_edit: one project-relative slash path: an exact
 //     file, a single-segment glob (`docs/*.md`), or a subtree (`internal/**`).
 //   - web_fetch/browser: one host (or, for browser evaluate, the exact script).
+//   - web_search: "*", every query (the query is the tool's argument, not the rule's).
 //
 // Modes lists the modes an allow rule applies in (the ratchet: an allow
 // granted in Edit also applies in Auto, not in Ask). Empty means every mode
@@ -219,6 +221,10 @@ func (r *Rule) Validate(scope Scope) error {
 	case ToolWebFetch, ToolBrowser:
 		if len(r.Pattern) != 1 {
 			return fmt.Errorf("a %s rule takes exactly one host", r.Tool)
+		}
+	case ToolWebSearch:
+		if len(r.Pattern) != 1 || r.Pattern[0] != "*" {
+			return fmt.Errorf("a web_search rule covers every query: its pattern is *")
 		}
 	default:
 		if _, _, ok := ParseMCPTool(r.Tool); !ok {

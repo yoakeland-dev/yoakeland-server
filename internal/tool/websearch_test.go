@@ -83,3 +83,14 @@ func TestWebSearchTool_Execute_DDGBlocked(t *testing.T) {
 		t.Fatal("expected error when DuckDuckGo returns a bot-check page")
 	}
 }
+
+func TestWebSearchTool_AsksAndRejectsLongQuery(t *testing.T) {
+	wt := NewWebSearchTool("test-key")
+	if !wt.RequiresPermission(nil) {
+		t.Fatal("web_search must ask: its query leaves the machine")
+	}
+	long := strings.Repeat("a", MaxWebSearchQueryRunes+1)
+	if _, err := wt.Execute(context.Background(), ExecutionContext{}, []byte(`{"query":"`+long+`"}`)); err == nil {
+		t.Fatal("expected error for a query over the cap")
+	}
+}

@@ -33,3 +33,6 @@ func (a *Agent) AskNative(ctx context.Context, sessionID, turnID string, req Nat
 func (a *Agent) AskQuestions(ctx context.Context, sessionID, turnID string, qs []NativeQuestion) ([]string, error) {
 	return a.askUserQuestions(ctx, sessionID, turnID, qs)
 }
+
+// ServerWebSearchAllowed exposes serverWebSearchAllowed to the external test package.
+func (a *Agent) ServerWebSearchAllowed() bool { return a.serverWebSearchAllowed() }

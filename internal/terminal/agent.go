@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"yoakeland/internal/protocol"
@@ -16,46 +17,48 @@ import (
 // long-lived process like a dev server keeps running after the tool call
 // that started it returns.
 
-var (
-	oscPrompt = []byte("\x1b]633;A")
-	oscStart  = []byte("\x1b]633;C")
-	oscDone   = []byte("\x1b]633;D")
-)
+var oscPrefix = []byte("\x1b]633;")
 
 // scanMarks updates ready/busy/finished/lastExit from one output chunk's
-// OSC 633 marks, in order. Callers hold t.mu.
+// OSC 633 marks, in order. Callers hold t.mu. A mark counts only when its last
+// field is this shell's nonce (integration.bash): A and C are "A;<nonce>" and
+// "C;<nonce>", D is "D;<exit code>;<nonce>". Output from a program carries no
+// nonce, so it can't fake a prompt, a command start or a finish.
 // ponytail: a mark split across two pty reads is missed; the agent then just
 // waits out its timeout instead of returning early; carry a partial-mark tail
 // between reads if that timeout is ever seen in practice.
 func (t *Terminal) scanMarks(data []byte) {
 	for {
-		i := bytes.Index(data, []byte("\x1b]633;"))
+		i := bytes.Index(data, oscPrefix)
 		if i < 0 {
 			return
 		}
-		rest := data[i:]
-		switch {
-		case bytes.HasPrefix(rest, oscPrompt):
+		rest := data[i+len(oscPrefix):]
+		body := rest
+		if end := bytes.IndexAny(rest, "\x07\x1b"); end >= 0 {
+			body = rest[:end]
+		}
+		data = rest
+		fields := strings.Split(string(body), ";")
+		if t.markNonce == "" || len(fields) < 2 || fields[len(fields)-1] != t.markNonce {
+			continue
+		}
+		switch fields[0] {
+		case "A":
 			t.ready = true
-		case bytes.HasPrefix(rest, oscStart):
+		case "C":
 			t.busy = true
-		case bytes.HasPrefix(rest, oscDone):
+		case "D":
 			if t.busy {
 				t.busy = false
 				t.finished++
-				code := rest[len(oscDone):]
-				if len(code) > 0 && code[0] == ';' {
-					code = code[1:]
-				}
-				if end := bytes.IndexAny(code, "\x07\x1b"); end >= 0 {
-					code = code[:end]
-				}
-				if n, err := strconv.Atoi(string(code)); err == nil {
-					t.lastExit = &n
+				if len(fields) == 3 {
+					if n, err := strconv.Atoi(fields[1]); err == nil {
+						t.lastExit = &n
+					}
 				}
 			}
 		}
-		data = rest[len("\x1b]633;"):]
 	}
 }
 

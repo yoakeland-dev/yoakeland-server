@@ -62,6 +62,9 @@ type RequestHints struct {
 	CacheKey string
 	// AdvisorModel is the model for Anthropic's advisor tool; "" for none.
 	AdvisorModel string
+	// ServerWebSearch lets a provider attach its own server-side web search
+	// (Anthropic's, OpenRouter's). Set only when the web_search rule allows it.
+	ServerWebSearch bool
 }
 
 type requestHintsKey struct{}

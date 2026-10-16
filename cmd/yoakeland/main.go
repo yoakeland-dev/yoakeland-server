@@ -2288,6 +2288,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				Description: snap.Description,
 				CreatedAt:   snap.CreatedAt,
 				Files:       files,
+				SessionID:   snap.SessionID,
 			})
 		}
 		_ = ipc.SendEvent(protocol.EventSnapshotList, env.SessionID, env.TurnID, "", protocol.SnapshotListData{

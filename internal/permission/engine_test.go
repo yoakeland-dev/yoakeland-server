@@ -449,3 +449,24 @@ func TestReadRules(t *testing.T) {
 		t.Error("an allow read rule was accepted")
 	}
 }
+
+// A web_search rule covers every query; without one, each query asks.
+func TestWebSearchRuleCoversEveryQuery(t *testing.T) {
+	e, _ := newEngine(t)
+	if got := check(e, "web_search", "go generics", "read_write"); got != permission.DecisionAsk {
+		t.Fatalf("web_search without a rule = %s, want ask", got)
+	}
+	res := e.Check(permission.Request{Tool: "web_search", Target: "go generics", Mode: "read_write"})
+	if len(res.Suggestions) != 1 {
+		t.Fatalf("suggestions = %+v, want one always-allow", res.Suggestions)
+	}
+	if _, err := e.Remember(res.Suggestions[0], true, "", "read_write"); err != nil {
+		t.Fatal(err)
+	}
+	if got := check(e, "web_search", "anything else", "read_write"); got != permission.DecisionAllow {
+		t.Fatalf("web_search after always-allow = %s, want allow", got)
+	}
+	if _, err := e.AddRule(permission.ScopeProject, permission.Rule{Tool: "web_search", Pattern: []string{"x"}, Decision: permission.DecisionAllow}); err == nil {
+		t.Fatal("a web_search rule with a non-* pattern must be rejected")
+	}
+}

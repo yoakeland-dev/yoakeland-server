@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -76,15 +77,35 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 	// isolation both apply to the agent-issued one-shot command — see
 	// buildCmd's doc comment for why SpawnPTY's interactive terminal gets
 	// neither.
-	cmd := s.buildCmd(execCtx, argv, "", true, false)
-	s.setEnv(cmd, s.baseEnv(extraEnv, false))
-	cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
-
 	stdout, stderr := newCapped(), newCapped()
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	build := func() *exec.Cmd {
+		cmd := s.buildCmd(execCtx, argv, "", true, false)
+		s.setEnv(cmd, s.baseEnv(extraEnv, false))
+		cmd.WaitDelay = 2 * time.Second // a descendant holding the pipes can't hang us past the timeout
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		return cmd
+	}
 
-	err := cmd.Run()
+	// The same memory/pids caps as a terminal, applied from the start.
+	leaf := newCgroupLeaf()
+	cmd := build()
+	leaf.place(cmd)
+	err := cmd.Start()
+	leaf.release()
+	if err != nil && leaf != nil {
+		// A start refused inside the leaf runs the command without caps,
+		// rather than not at all.
+		log.Printf("WARNING: could not start a command in its cgroup (%v); running it without memory and process caps", err)
+		leaf.remove()
+		leaf = nil
+		cmd = build()
+		err = cmd.Start()
+	}
+	if err == nil {
+		err = cmd.Wait()
+	}
+	leaf.remove()
 
 	// Prioritize context deadline / cancellation errors
 	if execCtx.Err() != nil {
@@ -107,7 +128,7 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
 		ExitCode: exitCode,
-		ModeUsed: s.mode,
+		ModeUsed: s.Mode(),
 	}, nil
 }
 
@@ -227,15 +248,12 @@ func (s *LinuxSandbox) buildCmd(ctx context.Context, argv []string, dir string, 
 			"--die-with-parent",
 			// ponytail: namespace/mount isolation only — no seccomp filter;
 			// add one if agents start running untrusted code.
-			// SpawnPTY additionally applies memory/pids cgroup v2 limits
-			// when this process has delegation for one (applyCgroupLimits,
-			// cgroup_linux.go) — Execute doesn't bother, since its
-			// wall-clock timeout (s.timeout) already bounds a one-shot
-			// command's blast radius, where an interactive terminal has no
-			// such bound by design. Delegation is often unavailable on a
-			// bare daemon with no session manager above it (logged once,
-			// not silent) — upgrade path there is running under a systemd
-			// user session, or granting cgroup delegation another way.
+			// Execute and SpawnPTY both apply memory/pids cgroup v2 limits
+			// when this process has delegation for one (newCgroupLeaf,
+			// cgroup_linux.go). Delegation is often unavailable on a bare
+			// daemon with no session manager above it (logged once, not
+			// silent) — upgrade path there is running under a systemd user
+			// session, or granting cgroup delegation another way.
 		)
 		if newSession {
 			bwrapArgs = append(bwrapArgs, "--new-session")
@@ -308,24 +326,35 @@ func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []s
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmd := s.buildCmd(ctx, argv, dir, false, allowNetwork)
-	s.setEnv(cmd, s.baseEnv(extraEnv, true))
-
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
-	if err != nil {
-		return nil, fmt.Errorf("pty spawn error: %w", err)
+	ws := &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}
+	build := func() *exec.Cmd {
+		cmd := s.buildCmd(ctx, argv, dir, false, allowNetwork)
+		s.setEnv(cmd, s.baseEnv(extraEnv, true))
+		return cmd
 	}
 
 	// Confines the whole spawned tree (bwrap and everything inside its pid
 	// namespace, or the shell directly in namespace/local mode — cgroup
 	// membership is inherited by descendants regardless of pid-namespace
-	// boundaries, so the immediate child's pid is enough in every tier) to a
-	// memory/pids-capped cgroup when this process has delegation for one —
-	// see applyCgroupLimits's doc comment for why this is best-effort rather
-	// than a hard requirement.
-	cgroupCleanup, _ := applyCgroupLimits(cmd.Process.Pid)
+	// boundaries) to a memory/pids-capped cgroup when this process has
+	// delegation for one. Placed before the start, see cgroupLeaf.
+	leaf := newCgroupLeaf()
+	cmd := build()
+	leaf.place(cmd)
+	ptmx, err := pty.StartWithSize(cmd, ws)
+	leaf.release()
+	if err != nil && leaf != nil {
+		log.Printf("WARNING: could not start a terminal in its cgroup (%v); running it without memory and process caps", err)
+		leaf.remove()
+		leaf = nil
+		cmd = build()
+		ptmx, err = pty.StartWithSize(cmd, ws)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("pty spawn error: %w", err)
+	}
 
-	return &linuxPTYSession{cmd: cmd, ptmx: ptmx, cgroupCleanup: cgroupCleanup}, nil
+	return &linuxPTYSession{cmd: cmd, ptmx: ptmx, cgroupCleanup: leaf.remove}, nil
 }
 
 // linuxPTYSession implements PTYSession over creack/pty's master file —
@@ -413,11 +442,24 @@ func probeBubblewrap(testDir string) bool {
 		targetBin,
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "bwrap", args...)
-	return cmd.Run() == nil
+	// A second attempt with a longer deadline: a cold cache or a loaded host
+	// can push one run past a second, and a false "no bubblewrap" leaves the
+	// project unisolated until the daemon restarts. The failure is logged,
+	// since the reason (no userns permission, say) is what the user needs.
+	for _, timeout := range []time.Duration{time.Second, 5 * time.Second} {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		var out bytes.Buffer
+		cmd := exec.CommandContext(ctx, "bwrap", args...)
+		cmd.Stdout, cmd.Stderr = &out, &out
+		cmd.WaitDelay = 500 * time.Millisecond // a child holding the pipe can't stall past the deadline
+		err := cmd.Run()
+		cancel()
+		if err == nil {
+			return true
+		}
+		log.Printf("bubblewrap probe failed: %v: %s", err, strings.TrimSpace(out.String()))
+	}
+	return false
 }
 
 // checkBubblewrapVersion warns (but never fails) if the installed bwrap is

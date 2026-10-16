@@ -170,5 +170,5 @@ func (t *FileWriteTool) PreviewDiff(argsJSON []byte) (*diff.FileDiff, error) {
 		beforeContent = string(existingBytes)
 	}
 
-	return diff.ComputeDiff(args.Path, beforeContent, args.Content), nil
+	return diff.ComputePreview(args.Path, beforeContent, args.Content), nil
 }

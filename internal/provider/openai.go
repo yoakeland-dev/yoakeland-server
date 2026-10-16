@@ -303,7 +303,10 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 
 		// 2. Convert tools
 		var openAITools []any
-		if p.IsOpenRouter && os.Getenv("OPENROUTER_DISABLE_WEB_SEARCH") == "" {
+		// Only agent turns with tools, and only when the web_search rule allows
+		// it (agent.RequestHints.ServerWebSearch): a compaction request sends
+		// no tools and must not search.
+		if p.IsOpenRouter && len(tools) > 0 && agent.RequestHintsFrom(ctx).ServerWebSearch && os.Getenv("OPENROUTER_DISABLE_WEB_SEARCH") == "" {
 			// OpenRouter's server-side web_search tool: resolved entirely
 			// on OpenRouter's side (like Anthropic's native tool below),
 			// billed to the same OPENROUTER_API_KEY already in use.

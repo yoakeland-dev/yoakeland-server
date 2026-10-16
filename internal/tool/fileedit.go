@@ -142,5 +142,5 @@ func (t *FileEditTool) PreviewDiff(argsJSON []byte) (*diff.FileDiff, error) {
 		afterContent = strings.Replace(beforeContent, args.OldString, args.NewString, 1)
 	}
 
-	return diff.ComputeDiff(args.Path, beforeContent, afterContent), nil
+	return diff.ComputePreview(args.Path, beforeContent, afterContent), nil
 }

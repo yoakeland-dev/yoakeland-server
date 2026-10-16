@@ -339,3 +339,36 @@ func TestPermissionTarget_UsesToolsOwnField(t *testing.T) {
 		t.Fatalf("unknown tool target = %q", got)
 	}
 }
+
+// The provider-side web search follows the web_search rule: off until an
+// allow rule exists, and never in read-only mode, where web_search is withheld.
+func TestAgent_ServerWebSearchNeedsAnAllowRule(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	ctxMgr := agent.NewContextManager(100, 20)
+	tools := []tool.Tool{tool.NewWebSearchTool("")}
+
+	ag := agent.NewAgent(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), &capturingProvider{}, "test-provider", tools, engine, snapStore, sessStore, ctxMgr, nil)
+	t.Cleanup(ag.WaitBackground)
+	ag.SetMode(agent.ModeReadWrite)
+
+	if ag.ServerWebSearchAllowed() {
+		t.Fatal("server web search must be off with no allow rule")
+	}
+	if _, err := engine.AddRule(permission.ScopeSession, permission.Rule{Tool: "web_search", Pattern: []string{"*"}, Decision: permission.DecisionAllow}); err != nil {
+		t.Fatal(err)
+	}
+	if !ag.ServerWebSearchAllowed() {
+		t.Fatal("server web search must follow an allow rule")
+	}
+	ag.SetMode(agent.ModeReadOnly)
+	if ag.ServerWebSearchAllowed() {
+		t.Fatal("server web search must be off in read-only mode")
+	}
+	if got := agent.PermissionTarget("web_search", json.RawMessage(`{"query":"go generics"}`)); got != "go generics" {
+		t.Fatalf("web_search target = %q", got)
+	}
+}

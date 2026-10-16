@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"yoakeland/internal/normalizer"
 )
@@ -55,6 +57,7 @@ type FileState struct {
 
 type Snapshot struct {
 	ID          string               `json:"id"`
+	SessionID   string               `json:"sessionId,omitempty"` // the session whose turn this is; "" for snapshots made before it was recorded
 	Description string               `json:"description"`
 	CreatedAt   time.Time            `json:"createdAt"`
 	Files       map[string]FileState `json:"files"` // RelPath -> FileState
@@ -83,15 +86,17 @@ type SnapshotStore interface {
 	// bool, which reports whether anything new was actually captured this
 	// call (a caller can use it to decide whether a "snapshot created/
 	// updated" notification is warranted).
-	CapturePreMutation(turnID, description string, projectRoot string, absFilePaths ...string) (snap *Snapshot, captured bool, err error)
+	CapturePreMutation(sessionID, turnID, description string, projectRoot string, absFilePaths ...string) (snap *Snapshot, captured bool, err error)
 	// CloseTurn stops tracking turnID as "still open" for grouping purposes.
 	// Purely an in-memory bookkeeping eviction (no on-disk effect) — call it
 	// once a turn has finished, cancelled or not, so the tracking map
 	// doesn't grow for the life of the process.
 	CloseTurn(turnID string)
 	// RestoreSnapshot returns every file captured by id or any later
-	// snapshot to its state right before id's turn, first capturing their
-	// current state as a new snapshot so the restore can itself be undone.
+	// snapshot of id's session to its state right before id's turn, first
+	// capturing their current state as a new snapshot so the restore can
+	// itself be undone. It refuses when a file it would revert was also
+	// changed by a later snapshot of another session.
 	RestoreSnapshot(id string, projectRoot string) error
 	// ListSnapshots returns every snapshot, oldest first.
 	ListSnapshots() ([]*Snapshot, error)
@@ -102,9 +107,8 @@ type SnapshotStore interface {
 }
 
 type DiskSnapshotStore struct {
-	mu          sync.RWMutex
-	baseDir     string
-	manifestDir string
+	mu      sync.RWMutex
+	baseDir string
 
 	// openByTurn maps a still-in-progress turnID to the snapshot ID
 	// CapturePreMutation calls for that turn should keep extending, rather
@@ -118,20 +122,19 @@ func NewDiskSnapshotStore(dataDir string) (*DiskSnapshotStore, error) {
 		return nil, fmt.Errorf("creating snapshot dir: %w", err)
 	}
 	return &DiskSnapshotStore{
-		baseDir:     baseDir,
-		manifestDir: baseDir,
-		openByTurn:  make(map[string]string),
+		baseDir:    baseDir,
+		openByTurn: make(map[string]string),
 	}, nil
 }
 
-func (s *DiskSnapshotStore) CapturePreMutation(turnID, description string, projectRoot string, absFilePaths ...string) (*Snapshot, bool, error) {
+func (s *DiskSnapshotStore) CapturePreMutation(sessionID, turnID, description string, projectRoot string, absFilePaths ...string) (*Snapshot, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.captureLocked(turnID, description, projectRoot, absFilePaths...)
+	return s.captureLocked(sessionID, turnID, description, projectRoot, absFilePaths...)
 }
 
-func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoot string, absFilePaths ...string) (*Snapshot, bool, error) {
-	snap, snapDir, isNewSnapshot, err := s.openOrCreateTurnSnapshot(turnID, description)
+func (s *DiskSnapshotStore) captureLocked(sessionID, turnID, description string, projectRoot string, absFilePaths ...string) (*Snapshot, bool, error) {
+	snap, snapDir, isNewSnapshot, err := s.openOrCreateTurnSnapshot(sessionID, turnID, description)
 	if err != nil {
 		return nil, false, err
 	}
@@ -165,15 +168,34 @@ func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoo
 		// Through an os.Root (normalizer.InRoot): a directory swapped for a
 		// symlink since the tool validated absPath can't pull an outside
 		// file into the backup, which a restore would then write back in.
+		// Opened O_NONBLOCK and checked on the open file: a FIFO planted at
+		// the path would otherwise block here, with s.mu held, until a
+		// writer shows up. Copied rather than read whole, so a large file
+		// isn't held in memory.
+		backupName := fmt.Sprintf("file_%d.bak", snap.NextBackupIndex)
+		backupPath := filepath.Join(dataDir, backupName)
 		var info os.FileInfo
-		var content []byte
 		err = normalizer.InRoot(projectRoot, absPath, func(r *os.Root, rel string) error {
-			var err error
-			if info, err = r.Stat(rel); err != nil {
+			src, err := r.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+			if err != nil {
 				return err
 			}
-			content, err = r.ReadFile(rel)
-			return err
+			defer src.Close()
+			if info, err = src.Stat(); err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("%s is not a regular file", rel)
+			}
+			dst, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+			if err != nil {
+				return fmt.Errorf("saving backup copy: %w", err)
+			}
+			if _, err := io.Copy(dst, src); err != nil {
+				dst.Close()
+				return fmt.Errorf("saving backup copy: %w", err)
+			}
+			return dst.Close()
 		})
 		if os.IsNotExist(err) {
 			// File does not exist yet; rollback means removing it
@@ -184,15 +206,9 @@ func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoo
 			captured = true
 			continue
 		} else if err != nil {
-			return nil, false, fmt.Errorf("stat failed on %s: %w", absPath, err)
+			return nil, false, fmt.Errorf("capturing %s: %w", absPath, err)
 		}
-
-		backupName := fmt.Sprintf("file_%d.bak", snap.NextBackupIndex)
 		snap.NextBackupIndex++
-		backupPath := filepath.Join(dataDir, backupName)
-		if err := os.WriteFile(backupPath, content, info.Mode()); err != nil {
-			return nil, false, fmt.Errorf("saving backup copy: %w", err)
-		}
 
 		snap.Files[relPath] = FileState{
 			RelPath:      relPath,
@@ -214,7 +230,7 @@ func (s *DiskSnapshotStore) captureLocked(turnID, description string, projectRoo
 // creating a fresh one (and registering it in openByTurn) if this is the
 // first call for that turn — along with whether it was just created. Caller
 // must hold s.mu.
-func (s *DiskSnapshotStore) openOrCreateTurnSnapshot(turnID, description string) (*Snapshot, string, bool, error) {
+func (s *DiskSnapshotStore) openOrCreateTurnSnapshot(sessionID, turnID, description string) (*Snapshot, string, bool, error) {
 	if existingID, ok := s.openByTurn[turnID]; ok {
 		snapDir := filepath.Join(s.baseDir, existingID)
 		data, err := os.ReadFile(filepath.Join(snapDir, "manifest.json"))
@@ -237,6 +253,7 @@ func (s *DiskSnapshotStore) openOrCreateTurnSnapshot(turnID, description string)
 
 	snap := &Snapshot{
 		ID:          snapID,
+		SessionID:   sessionID,
 		Description: description,
 		CreatedAt:   time.Now().UTC(),
 		Files:       make(map[string]FileState),
@@ -279,17 +296,31 @@ func (s *DiskSnapshotStore) RestoreSnapshot(id string, projectRoot string) error
 		return err
 	}
 	// Newest first, down to target: each file ends at the copy taken by the
-	// oldest snapshot (at or after target) that touched it, which is its
-	// state right before target's turn.
+	// oldest snapshot of target's session (at or after target) that touched
+	// it, which is its state right before target's turn. Another session's
+	// snapshots are not reverted, so a file one of them changed later can't
+	// be restored without undoing that work.
 	var apply []*Snapshot
 	affected := map[string]bool{}
+	laterOther := map[string]string{} // file -> another session's later snapshot that touched it
 	for i := len(all) - 1; i >= 0; i-- {
 		if all[i].CreatedAt.Before(target.CreatedAt) {
 			break
 		}
+		if all[i].SessionID != target.SessionID {
+			for rel := range all[i].Files {
+				laterOther[rel] = all[i].ID
+			}
+			continue
+		}
 		apply = append(apply, all[i])
 		for rel := range all[i].Files {
 			affected[rel] = true
+		}
+	}
+	for rel := range affected {
+		if other, ok := laterOther[rel]; ok {
+			return fmt.Errorf("cannot restore %s: another session changed it after this turn (snapshot %s); restore that snapshot first", filepath.ToSlash(rel), other)
 		}
 	}
 
@@ -306,7 +337,7 @@ func (s *DiskSnapshotStore) RestoreSnapshot(id string, projectRoot string) error
 		paths = append(paths, p)
 	}
 	undoTurn := fmt.Sprintf("restore:%s:%d", id, time.Now().UnixNano())
-	_, _, err = s.captureLocked(undoTurn, "Before restoring to "+target.CreatedAt.Local().Format("Jan 2 15:04:05"), norm.ProjectRoot, paths...)
+	_, _, err = s.captureLocked(target.SessionID, undoTurn, "Before restoring to "+target.CreatedAt.Local().Format("Jan 2 15:04:05"), norm.ProjectRoot, paths...)
 	delete(s.openByTurn, undoTurn)
 	if err != nil {
 		return fmt.Errorf("saving an undo snapshot: %w", err)

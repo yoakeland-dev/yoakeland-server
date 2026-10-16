@@ -1035,6 +1035,9 @@ type SnapshotSummary struct {
 	SnapshotID  string    `json:"snapshotId"`
 	Description string    `json:"description"`
 	CreatedAt   time.Time `json:"createdAt"`
+	// SessionID is the session whose turn this snapshot holds; a restore
+	// reverts only that session's later turns. Empty for older snapshots.
+	SessionID string `json:"sessionId,omitempty"`
 	// Files are the project-relative paths this snapshot holds a pre-turn
 	// copy (or recorded absence) of, forward-slash separated.
 	Files []string `json:"files"`
