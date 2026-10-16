@@ -366,6 +366,8 @@ func contextView(history []Message, prefixKey string) []Message {
 		out = append(out, m)
 	}
 
+	out = pairToolCalls(out)
+
 	replay := true
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i].Role != "assistant" {
@@ -377,6 +379,41 @@ func contextView(history []Message, prefixKey string) []Message {
 		if !replay {
 			out[i].RawContent = nil
 		}
+	}
+	return out
+}
+
+// pairToolCalls gives every API tool call in view a tool result. A turn that
+// was cancelled, failed or panicked mid-round leaves calls with no result,
+// and providers reject the whole request for an unanswered tool_use. The
+// synthetic result goes after the call's own results, in the view only;
+// history keeps what really happened. Native calls are flattened to text for
+// API providers, so they are left alone.
+func pairToolCalls(view []Message) []Message {
+	answered := map[string]bool{}
+	for _, m := range view {
+		if m.Role == "tool" {
+			answered[m.ToolCallID] = true
+		}
+	}
+	out := make([]Message, 0, len(view))
+	for i := 0; i < len(view); i++ {
+		m := view[i]
+		out = append(out, m)
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		j := i + 1
+		for ; j < len(view) && view[j].Role == "tool"; j++ {
+			out = append(out, view[j])
+		}
+		for _, tc := range m.ToolCalls {
+			if !tc.Native && !answered[tc.ID] {
+				out = append(out, Message{Role: "tool", ToolCallID: tc.ID, Content: "no result: the turn ended before this tool ran"})
+				answered[tc.ID] = true
+			}
+		}
+		i = j - 1
 	}
 	return out
 }
