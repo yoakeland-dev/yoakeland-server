@@ -131,7 +131,7 @@ func TestServeConnection_RestoreSnapshotBroadcastsToOtherPeers(t *testing.T) {
 	if err := os.WriteFile(target, []byte("package main\n"), 0644); err != nil {
 		t.Fatalf("seeding file: %v", err)
 	}
-	snap, captured, err := pc.SnapStore.CapturePreMutation("turn-1", "test turn", pc.Root, target)
+	snap, captured, err := pc.SnapStore.CapturePreMutation("s1", "turn-1", "test turn", pc.Root, target)
 	if err != nil || !captured {
 		t.Fatalf("CapturePreMutation: captured=%v err=%v", captured, err)
 	}

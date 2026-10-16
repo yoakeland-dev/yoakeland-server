@@ -23,7 +23,7 @@ func capturePreMutationSnapshot(execCtx ExecutionContext, description, projectRo
 		})
 	}
 
-	snap, captured, err := execCtx.SnapshotStore.CapturePreMutation(execCtx.TurnID, description, projectRoot, absFilePaths...)
+	snap, captured, err := execCtx.SnapshotStore.CapturePreMutation(execCtx.SessionID, execCtx.TurnID, description, projectRoot, absFilePaths...)
 	if err != nil {
 		if execCtx.Stream != nil {
 			_ = execCtx.Stream.SendEvent(protocol.EventError, execCtx.SessionID, execCtx.TurnID, execCtx.ToolCallID, protocol.ErrorData{

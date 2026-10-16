@@ -1296,7 +1296,7 @@ Response to `list_snapshots`.
   }
 }
 ```
-*UI Action*: Populate a restore-snapshot picker for the project you asked about. Snapshots come oldest first *(v2.17)*. `files` *(v2.17)* are the project-relative paths the snapshot holds a pre-turn copy of; `get_file_diff` with `snapshotId` shows what restoring would revert in each. Pass the chosen `snapshotId` to `restore_snapshot` (§3.1).
+*UI Action*: Populate a restore-snapshot picker for the project you asked about. Snapshots come oldest first *(v2.17)*. `files` *(v2.17)* are the project-relative paths the snapshot holds a pre-turn copy of; `get_file_diff` with `snapshotId` shows what restoring would revert in each. `sessionId` is the session whose turn it is: `restore_snapshot` reverts only that session's turns from that point on, and refuses if another session changed one of those files later. Pass the chosen `snapshotId` to `restore_snapshot` (§3.1).
 
 #### `error`
 Reports operational or fatal backend errors.

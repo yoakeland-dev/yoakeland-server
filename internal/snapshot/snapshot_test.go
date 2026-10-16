@@ -22,7 +22,7 @@ func TestDiskSnapshotStore_CaptureAndRestore(t *testing.T) {
 	newFile := filepath.Join(projectRoot, "newfile.txt")
 
 	// Capture snapshot covering existing and non-existing file
-	snap, captured, err := store.CapturePreMutation("turn-1", "test write", projectRoot, existingFile, newFile)
+	snap, captured, err := store.CapturePreMutation("s1", "turn-1", "test write", projectRoot, existingFile, newFile)
 	if err != nil {
 		t.Fatalf("capture failed: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestDiskSnapshotStore_CapturePreMutation_GroupsByTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap1, captured1, err := store.CapturePreMutation("turn-x", "file_write: a.txt", projectRoot, fileA)
+	snap1, captured1, err := store.CapturePreMutation("s1", "turn-x", "file_write: a.txt", projectRoot, fileA)
 	if err != nil {
 		t.Fatalf("first capture: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestDiskSnapshotStore_CapturePreMutation_GroupsByTurn(t *testing.T) {
 	}
 	_ = os.WriteFile(fileA, []byte("a-mutated"), 0644)
 
-	snap2, captured2, err := store.CapturePreMutation("turn-x", "file_write: b.txt", projectRoot, fileB)
+	snap2, captured2, err := store.CapturePreMutation("s1", "turn-x", "file_write: b.txt", projectRoot, fileB)
 	if err != nil {
 		t.Fatalf("second capture: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestDiskSnapshotStore_CapturePreMutation_GroupsByTurn(t *testing.T) {
 	// A later, unrelated turn must not extend the closed one.
 	fileC := filepath.Join(projectRoot, "c.txt")
 	_ = os.WriteFile(fileC, []byte("c-original"), 0644)
-	snap3, _, err := store.CapturePreMutation("turn-y", "file_write: c.txt", projectRoot, fileC)
+	snap3, _, err := store.CapturePreMutation("s1", "turn-y", "file_write: c.txt", projectRoot, fileC)
 	if err != nil {
 		t.Fatalf("third capture: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestDiskSnapshotStore_CapturePreMutation_SecondCaptureOfSameFileIsNoop(t *t
 		t.Fatal(err)
 	}
 
-	snap1, captured1, err := store.CapturePreMutation("turn-z", "first edit", projectRoot, file)
+	snap1, captured1, err := store.CapturePreMutation("s1", "turn-z", "first edit", projectRoot, file)
 	if err != nil {
 		t.Fatalf("first capture: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestDiskSnapshotStore_CapturePreMutation_SecondCaptureOfSameFileIsNoop(t *t
 	_ = os.WriteFile(file, []byte("after-first-edit"), 0644)
 
 	// Second mutation of the SAME file, same turn — must not re-capture.
-	snap2, captured2, err := store.CapturePreMutation("turn-z", "second edit", projectRoot, file)
+	snap2, captured2, err := store.CapturePreMutation("s1", "turn-z", "second edit", projectRoot, file)
 	if err != nil {
 		t.Fatalf("second capture: %v", err)
 	}
@@ -278,13 +278,13 @@ func TestDiskSnapshotStore_RestoreIsPointInTimeAndUndoable(t *testing.T) {
 	}
 
 	write(a, "a0")
-	first, _, err := store.CapturePreMutation("t1", "turn 1", root, a)
+	first, _, err := store.CapturePreMutation("s1", "t1", "turn 1", root, a)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store.CloseTurn("t1")
 	write(a, "a1")
-	if _, _, err := store.CapturePreMutation("t2", "turn 2", root, a, b); err != nil {
+	if _, _, err := store.CapturePreMutation("s1", "t2", "turn 2", root, a, b); err != nil {
 		t.Fatal(err)
 	}
 	store.CloseTurn("t2")
@@ -305,5 +305,61 @@ func TestDiskSnapshotStore_RestoreIsPointInTimeAndUndoable(t *testing.T) {
 	}
 	if read(a) != "a2" || read(b) != "b2" {
 		t.Fatalf("after undo: a=%q b=%q, want a2 and b2", read(a), read(b))
+	}
+}
+
+// A restore reverts only its own session's later turns: another session's
+// edit to a different file survives, and a file another session changed
+// later is refused rather than rolled back under it.
+func TestDiskSnapshotStore_RestoreStaysInItsSession(t *testing.T) {
+	root := t.TempDir()
+	store, err := snapshot.NewDiskSnapshotStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(p string) string {
+		data, _ := os.ReadFile(p)
+		return string(data)
+	}
+
+	write(a, "a0")
+	write(b, "b0")
+	snapA, _, err := store.CapturePreMutation("sessA", "turnA", "turn A", root, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.CloseTurn("turnA")
+	write(a, "a1")
+	if _, _, err := store.CapturePreMutation("sessB", "turnB", "turn B", root, b); err != nil {
+		t.Fatal(err)
+	}
+	store.CloseTurn("turnB")
+	write(b, "b1")
+
+	if err := store.RestoreSnapshot(snapA.ID, root); err != nil {
+		t.Fatal(err)
+	}
+	if read(a) != "a0" || read(b) != "b1" {
+		t.Fatalf("restoring session A's turn: a=%q b=%q, want a0 and b1 (session B's edit kept)", read(a), read(b))
+	}
+
+	// Session B now edits a, so restoring A's turn would undo B's work on a.
+	write(a, "a2")
+	if _, _, err := store.CapturePreMutation("sessB", "turnB2", "turn B again", root, a); err != nil {
+		t.Fatal(err)
+	}
+	store.CloseTurn("turnB2")
+	write(a, "a3")
+	if err := store.RestoreSnapshot(snapA.ID, root); err == nil {
+		t.Fatal("expected a refusal when another session changed the file later")
+	}
+	if read(a) != "a3" {
+		t.Fatalf("refused restore still changed a: %q", read(a))
 	}
 }
