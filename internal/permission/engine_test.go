@@ -439,6 +439,7 @@ func TestReadRules(t *testing.T) {
 		{"file_read", "sub/.npmrc", permission.DecisionAsk},
 		{"file_read", "sub/.git/config", permission.DecisionAsk},
 		{"file_read", ".git/HEAD", permission.DecisionAllow},
+		{"file_read", ".env.example", permission.DecisionAllow},
 	} {
 		if got := check(e, c.tool, c.target, "read_write"); got != c.want {
 			t.Errorf("%s %q = %s, want %s", c.tool, c.target, got, c.want)

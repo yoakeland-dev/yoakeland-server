@@ -394,6 +394,12 @@ func relSlash(root, target string) string {
 func secretPath(p string) bool {
 	segs := strings.Split(strings.ToLower(filepath.ToSlash(filepath.Clean(p))), "/")
 	last := segs[len(segs)-1]
+	// Templates committed for others to copy hold no secrets; asking about them is noise.
+	for _, ext := range []string{".example", ".sample", ".template", ".dist"} {
+		if strings.HasSuffix(last, ext) {
+			return false
+		}
+	}
 	switch {
 	case strings.HasPrefix(last, ".env"), strings.HasPrefix(last, "id_rsa"), last == ".npmrc", last == ".netrc",
 		strings.HasSuffix(last, ".pem"), strings.HasSuffix(last, ".key"):
