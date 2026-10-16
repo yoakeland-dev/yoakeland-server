@@ -107,9 +107,8 @@ type SnapshotStore interface {
 }
 
 type DiskSnapshotStore struct {
-	mu          sync.RWMutex
-	baseDir     string
-	manifestDir string
+	mu      sync.RWMutex
+	baseDir string
 
 	// openByTurn maps a still-in-progress turnID to the snapshot ID
 	// CapturePreMutation calls for that turn should keep extending, rather
@@ -123,9 +122,8 @@ func NewDiskSnapshotStore(dataDir string) (*DiskSnapshotStore, error) {
 		return nil, fmt.Errorf("creating snapshot dir: %w", err)
 	}
 	return &DiskSnapshotStore{
-		baseDir:     baseDir,
-		manifestDir: baseDir,
-		openByTurn:  make(map[string]string),
+		baseDir:    baseDir,
+		openByTurn: make(map[string]string),
 	}, nil
 }
 

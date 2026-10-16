@@ -10,8 +10,7 @@ import (
 )
 
 var (
-	ErrEscapesRoot     = errors.New("path escapes project root")
-	ErrDisallowedChain = errors.New("command chaining or piping is prohibited without explicit permission")
+	ErrEscapesRoot = errors.New("path escapes project root")
 )
 
 // Hidden lists directories no project may reach even when one contains

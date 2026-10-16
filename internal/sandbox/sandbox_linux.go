@@ -128,7 +128,7 @@ func (s *LinuxSandbox) Execute(ctx context.Context, argv []string, extraEnv []st
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
 		ExitCode: exitCode,
-		ModeUsed: s.mode,
+		ModeUsed: s.Mode(),
 	}, nil
 }
 
