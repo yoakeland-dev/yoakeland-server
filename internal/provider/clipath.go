@@ -75,7 +75,7 @@ func wellKnownBinDirs() []string {
 }
 
 // cliPath is the PATH CLIs are found and run with: the login shell's, then the
-// daemon's own, then the well-known folders that exist, without repeats.
+// daemon's own, then the well-known folders, without repeats.
 // YOAKELAND_STRICT_PATH set keeps it to the daemon's own PATH.
 func cliPath() string {
 	base := os.Getenv("PATH")
@@ -99,11 +99,9 @@ func cliPath() string {
 	}
 	add(filepath.SplitList(shellPath())...)
 	add(filepath.SplitList(base)...)
-	for _, d := range wellKnownBinDirs() {
-		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
-			add(d)
-		}
-	}
+	// Listed even before they exist: each lookup checks the folders afresh, so an
+	// installer that creates ~/.local/bin is seen at once, not on the next rebuild.
+	add(wellKnownBinDirs()...)
 	cliPathVal, cliPathTime, cliPathBase = strings.Join(dirs, string(os.PathListSeparator)), time.Now(), base
 	return cliPathVal
 }
