@@ -11,8 +11,10 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // message is one JSON-RPC 2.0 message of any kind.
@@ -109,6 +111,33 @@ func trimSpace(b []byte) []byte {
 		b = b[:len(b)-1]
 	}
 	return b
+}
+
+// A server's own requests are answered off the read loop, since a handler may
+// block, but only maxReplies at a time, each reply given replyTimeout to send.
+// A request that finds every slot busy is dropped; the server times it out.
+const (
+	maxReplies   = 8
+	replyTimeout = 10 * time.Second
+)
+
+// answerRequest runs h on a request the server sent and sends its reply.
+func answerRequest(slots chan struct{}, h handler, send func(context.Context, *message) error, m *message) {
+	select {
+	case slots <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-slots }()
+		reply := h(m)
+		if reply == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), replyTimeout)
+		defer cancel()
+		_ = send(ctx, reply)
+	}()
 }
 
 // idKey is the map key for a message id (numbers and strings both occur).

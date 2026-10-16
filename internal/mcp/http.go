@@ -64,12 +64,13 @@ type httpTransport struct {
 	session string // Mcp-Session-Id, legacy servers only
 	version string // MCP-Protocol-Version to send once negotiated
 	modern  bool   // add the per-request headers the 2026-07-28 revision requires
+	replies chan struct{}
 	closed  chan struct{}
 	once    sync.Once
 }
 
 func newHTTP(rawURL string, headers map[string]string, bearer bearerFunc, h handler) *httpTransport {
-	return &httpTransport{url: rawURL, hc: newHTTPClient(rawURL), headers: headers, bearer: bearer, h: h, closed: make(chan struct{})}
+	return &httpTransport{url: rawURL, hc: newHTTPClient(rawURL), headers: headers, bearer: bearer, h: h, replies: make(chan struct{}, maxReplies), closed: make(chan struct{})}
 }
 
 // newHTTPClient is a client with no overall timeout (a response may stream for
@@ -231,9 +232,7 @@ func (t *httpTransport) call(ctx context.Context, req *message) (*message, error
 				return false
 			}
 		case m.isRequest():
-			if reply := t.h(m); reply != nil {
-				go t.post(context.WithoutCancel(ctx), reply)
-			}
+			answerRequest(t.replies, t.h, t.post, m)
 		default:
 			t.h(m)
 		}
@@ -399,9 +398,7 @@ func (t *httpTransport) listen(ctx context.Context) {
 			for _, m := range msgs {
 				switch {
 				case m.isRequest():
-					if reply := t.h(m); reply != nil {
-						go t.post(context.WithoutCancel(ctx), reply)
-					}
+					answerRequest(t.replies, t.h, t.post, m)
 				case m.isNotify():
 					t.h(m)
 				}

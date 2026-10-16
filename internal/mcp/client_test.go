@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -138,6 +140,52 @@ func TestStdioCloseKillsTheProcess(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the process outlived Close")
 	}
+}
+
+// A server that never reads its stdin fills the pipe; the call must give up at
+// its deadline and the stuck process must go, not hold every later call.
+func TestStdioWriteToAServerThatStopsReadingGivesUp(t *testing.T) {
+	tr, err := startStdio("sh", []string{"-c", "sleep 30"}, t.TempDir(), os.Environ(), func(*message) *message { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	big := json.RawMessage(`"` + strings.Repeat("x", 1<<20) + `"`)
+	start := time.Now()
+	if _, err := tr.call(ctx, &message{JSONRPC: "2.0", ID: json.RawMessage("1"), Method: "tools/list", Params: big}); err == nil {
+		t.Fatal("a call into a full pipe must fail")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the call waited %v on a server that stopped reading", time.Since(start))
+	}
+	select {
+	case <-tr.done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stuck server was not killed")
+	}
+}
+
+// Server-initiated requests run on at most maxReplies goroutines at once.
+func TestServerRequestsAreBounded(t *testing.T) {
+	slots := make(chan struct{}, maxReplies)
+	release := make(chan struct{})
+	var running atomic.Int32
+	h := func(*message) *message { running.Add(1); <-release; return nil }
+	req := &message{JSONRPC: "2.0", ID: json.RawMessage("1"), Method: "ping"}
+	for i := 0; i < 3*maxReplies; i++ {
+		answerRequest(slots, h, nil, req)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for running.Load() < maxReplies && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := running.Load(); n != maxReplies {
+		t.Fatalf("%d handlers running, want %d", n, maxReplies)
+	}
+	close(release)
 }
 
 func TestHTTPLegacyWithSessionAndSSE(t *testing.T) {
