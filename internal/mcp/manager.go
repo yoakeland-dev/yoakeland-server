@@ -955,7 +955,7 @@ func (m *Manager) Status() (servers []ServerStatus, problems []string) {
 			wires[t.raw] = t.wire
 		}
 		for _, ti := range e.toolInfos {
-			ts := ToolStatus{Name: wires[ti.Name], Raw: ti.Name, Title: ti.Title, Description: shorten(ti.Description, 240), Enabled: !off[ti.Name]}
+			ts := ToolStatus{Name: wires[ti.Name], Raw: ti.Name, Title: shorten(ti.Title, 200), Description: shorten(ti.Description, 240), Enabled: !off[ti.Name]}
 			if a := ti.Annotations; a != nil {
 				ts.ReadOnly = a.ReadOnlyHint != nil && *a.ReadOnlyHint
 				ts.Destructive = a.DestructiveHint != nil && *a.DestructiveHint

@@ -44,6 +44,16 @@ type ServerInfo struct {
 	Prompts   bool `json:"prompts,omitempty"`
 }
 
+// limitInfo caps what a server says about itself. It goes to every peer on each
+// status push, so a server can't make that push arbitrarily large.
+func limitInfo(info ServerInfo) ServerInfo {
+	info.Name, info.Title, info.Version = shorten(info.Name, 200), shorten(info.Title, 200), shorten(info.Version, 200)
+	if len(info.Instructions) > 2048 {
+		info.Instructions = strings.ToValidUTF8(info.Instructions[:2048], "") + "…"
+	}
+	return info
+}
+
 type ToolAnnotations struct {
 	Title           string `json:"title,omitempty"`
 	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
@@ -241,7 +251,7 @@ func (c *Client) initialize(ctx context.Context) error {
 	info.Resources = len(res.Capabilities.Resources) > 0
 	info.Prompts = len(res.Capabilities.Prompts) > 0
 	c.mu.Lock()
-	c.era, c.version, c.info = "legacy", res.ProtocolVersion, info
+	c.era, c.version, c.info = "legacy", res.ProtocolVersion, limitInfo(info)
 	c.mu.Unlock()
 	if ht, ok := c.t.(*httpTransport); ok {
 		ht.setVersion(res.ProtocolVersion, false)
@@ -299,7 +309,7 @@ func (c *Client) discover(ctx context.Context) error {
 	_, info.Resources = res.Capabilities["resources"]
 	_, info.Prompts = res.Capabilities["prompts"]
 	c.mu.Lock()
-	c.info = info
+	c.info = limitInfo(info)
 	c.mu.Unlock()
 	return nil
 }

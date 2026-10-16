@@ -372,6 +372,13 @@ func TestLegacySSEEndpointMustStayOnTheServer(t *testing.T) {
 	}
 }
 
+func TestServerInfoIsCapped(t *testing.T) {
+	got := limitInfo(ServerInfo{Name: strings.Repeat("n", 5000), Instructions: strings.Repeat("i", 9000)})
+	if len(got.Name) > 210 || len(got.Instructions) > 2060 {
+		t.Fatalf("name %d bytes, instructions %d bytes: not capped", len(got.Name), len(got.Instructions))
+	}
+}
+
 func TestParseMessagesDropsNullEntries(t *testing.T) {
 	for _, c := range []struct {
 		in   string
