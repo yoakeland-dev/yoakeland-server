@@ -1,6 +1,34 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// NET-16: an unparseable server.json is set aside, not overwritten by the
+// save that mints a fresh ServerID.
+func TestServerSettings_CorruptFileSetAside(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServerSettings(dir); err != nil {
+		t.Fatalf("NewServerSettings: %v", err)
+	}
+	matches, _ := filepath.Glob(path + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("expected one set-aside copy, got %v", matches)
+	}
+	if b, _ := os.ReadFile(matches[0]); string(b) != "{not json" {
+		t.Fatalf("set-aside copy = %q, want the original bytes", b)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "serverId") {
+		t.Fatalf("server.json was not rewritten with a fresh ServerID: %q", b)
+	}
+}
 
 // TestServerSettings_DefaultsIdentityToHostname guards that a fresh server
 // (no server.json yet) still has a non-empty display name to show peers.

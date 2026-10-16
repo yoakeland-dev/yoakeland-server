@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"yoakeland/internal/fsutil"
 )
 
 type ProjectSettings struct {
@@ -58,12 +59,8 @@ func (s *Store) Save(settings ProjectSettings) error {
 		return err
 	}
 
-	tmpFile := s.filePath + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(tmpFile), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.filePath), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmpFile, bytes, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpFile, s.filePath)
+	return fsutil.WriteFileAtomic(s.filePath, bytes, 0644)
 }

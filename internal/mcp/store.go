@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"yoakeland/internal/fsutil"
 )
 
 // Approval records what the user decided about one project server. It is for
@@ -69,29 +70,7 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.path, b)
-}
-
-// writeFileAtomic replaces path through a temp file in the same directory, so
-// a crash leaves the old file or the new one, never half of one.
-func writeFileAtomic(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return fsutil.WriteFileAtomic(s.path, b, 0o600)
 }
 
 // Servers is a copy of the user's servers.

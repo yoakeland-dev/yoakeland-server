@@ -179,3 +179,27 @@ func TestBuildProvider_IgnoresDaemonEnv(t *testing.T) {
 		t.Fatal("OPENAI_BASE_URL leaked into an Anthropic provider")
 	}
 }
+
+// ARC-5/PRV-12: an unparseable providers.json is set aside before the next
+// save can overwrite it, so the API keys in it stay recoverable.
+func TestProviderStore_CorruptFileSetAside(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := provider.NewProviderStore(dir, "")
+	if err != nil {
+		t.Fatalf("NewProviderStore: %v", err)
+	}
+	if err := store.Register(provider.ProviderConfig{Name: "p", Kind: provider.ProviderKindAPIKey, APIKey: "k"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	matches, _ := filepath.Glob(path + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("expected one set-aside copy, got %v", matches)
+	}
+	if b, _ := os.ReadFile(matches[0]); string(b) != "{not json" {
+		t.Fatalf("set-aside copy = %q, want the original bytes", b)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/fsutil"
 	"yoakeland/internal/protocol"
 )
 
@@ -353,7 +354,7 @@ func (f *NotificationFeed) saveLocked(rewrite bool, added protocol.Notification)
 			buf.Write(append(line, '\n'))
 		}
 	}
-	if err := writeFileAtomic(f.path, buf.Bytes()); err != nil {
+	if err := fsutil.WriteFileAtomic(f.path, buf.Bytes(), 0o600); err != nil {
 		logWarn("notifications: rewrite %s: %v", f.path, err)
 	}
 }
@@ -399,28 +400,6 @@ func appendFile(path string, b []byte) error {
 		err = cerr
 	}
 	return err
-}
-
-// writeFileAtomic replaces path via a synced temp file and a rename, so a
-// crash leaves the old file or the new one, never half of either.
-func writeFileAtomic(path string, b []byte) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(b)
-	if err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 // sessionTap turns a project's session events into notifications — the

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+	"yoakeland/internal/fsutil"
 )
 
 type ProviderKind string
@@ -148,10 +150,14 @@ func (s *ProviderStore) load(data []byte) error {
 		return json.Unmarshal(plaintext, &s.model)
 	}
 
-	// Legacy/plaintext format: tolerate corruption same as before rather
-	// than failing startup over it.
+	// Legacy/plaintext format. An unparseable file is set aside, not
+	// overwritten by the next save: it may hold API keys still worth recovering.
 	if err := json.Unmarshal(data, &s.model); err != nil {
-		log.Printf("provider store: providers.json failed to parse, resetting to empty: %v", err)
+		aside := fmt.Sprintf("%s.corrupt-%d", s.filePath, time.Now().Unix())
+		if rerr := os.Rename(s.filePath, aside); rerr != nil {
+			return fmt.Errorf("providers.json failed to parse and could not be set aside: %w", rerr)
+		}
+		log.Printf("provider store: providers.json failed to parse, moved to %s; starting empty: %v", aside, err)
 		s.model = providerFileModel{Providers: make(map[string]ProviderConfig)}
 	}
 	return nil
@@ -249,11 +255,7 @@ func (s *ProviderStore) save() error {
 		}
 	}
 
-	tmp := s.filePath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.filePath)
+	return fsutil.WriteFileAtomic(s.filePath, out, 0600)
 }
 
 // BuildProvider constructs a live Provider from a stored credential plus the
