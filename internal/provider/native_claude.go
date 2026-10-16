@@ -855,7 +855,11 @@ func claudeProposedDiffs(name string, input json.RawMessage) []*diff.FileDiff {
 	if before == after {
 		return nil
 	}
-	return []*diff.FileDiff{diff.ComputeDiff(in.FilePath, before, after)}
+	d := diff.ComputePreview(in.FilePath, before, after)
+	if d == nil {
+		return nil
+	}
+	return []*diff.FileDiff{d}
 }
 
 // claudeResultDiffs reads the (undocumented) tool_use_result a file tool's

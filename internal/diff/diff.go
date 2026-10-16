@@ -49,6 +49,23 @@ func ComputeDiff(filePath, before, after string) *FileDiff {
 	}
 }
 
+// MaxPreviewBytes caps each side of a permission preview. A larger change is
+// approved without one: its diff, which carries every changed line twice (as
+// hunks and as unified text), can exceed the IPC frame limit, and the client
+// then drops the connection while the turn waits on an answer it can't see.
+// At this size, even control characters (escaped to six bytes in JSON) keep
+// the frame under protocol.MaxFrameSize.
+const MaxPreviewBytes = 256 << 10
+
+// ComputePreview is ComputeDiff for a permission prompt: nil when either side
+// is over MaxPreviewBytes.
+func ComputePreview(filePath, before, after string) *FileDiff {
+	if len(before) > MaxPreviewBytes || len(after) > MaxPreviewBytes {
+		return nil
+	}
+	return ComputeDiff(filePath, before, after)
+}
+
 func splitLines(text string) []string {
 	if text == "" {
 		return []string{}
