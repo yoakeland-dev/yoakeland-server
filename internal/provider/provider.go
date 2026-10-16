@@ -72,8 +72,9 @@ var rateLimitBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Se
 const maxRetryAfter = 30 * time.Second
 
 // streamIdleTimeout is how long an HTTP stream may go without a byte before
-// it counts as dead. A var so tests can shrink it.
-var streamIdleTimeout = 90 * time.Second
+// it counts as dead. Generous: a reasoning model can think silently for minutes,
+// and a local server may still be loading the model. A var so tests can shrink it.
+var streamIdleTimeout = 5 * time.Minute
 
 // retryableStatus is whether a response is worth another try: a rate limit,
 // a server error, or Anthropic's 529 "overloaded".
