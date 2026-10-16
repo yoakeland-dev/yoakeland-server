@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -38,7 +39,11 @@ const (
 const (
 	// maxToolsPerServer bounds what one server can add to every request.
 	maxToolsPerServer = 200
-	connectTimeout    = 60 * time.Second
+	// Tool definitions ride along on every model request: a byte budget per
+	// server, and one for all of them together, so a count cap isn't the only limit.
+	maxToolBytes    = 32 << 10
+	maxToolBytesAll = 128 << 10
+	connectTimeout  = 60 * time.Second
 )
 
 // entry is one server of one project.
@@ -380,9 +385,24 @@ func (m *Manager) setTools(e *entry, infos []ToolInfo, res []ResourceInfo) {
 			desc = strings.ToValidUTF8(desc[:maxDescription], "") + "…"
 		}
 		wire := wireName(e.name, info.Name, taken)
-		e.tools = append(e.tools, &mcpTool{srv: e, wire: wire, raw: info.Name, info: info, def: tool.ToolDefinition{
+		size := len(desc)
+		if b, err := json.Marshal(schema); err == nil {
+			size += len(b)
+		}
+		e.tools = append(e.tools, &mcpTool{srv: e, wire: wire, raw: info.Name, info: info, size: size, def: tool.ToolDefinition{
 			Name: wire, Description: "[MCP server " + e.name + "] " + desc, Parameters: schema,
 		}})
+	}
+	// Over budget, the largest tools go first, and the count of those dropped is shown.
+	var total int
+	for _, t := range e.tools {
+		total += t.size
+	}
+	sort.Slice(e.tools, func(i, j int) bool { return e.tools[i].size > e.tools[j].size })
+	for total > maxToolBytes && len(e.tools) > 0 {
+		total -= e.tools[0].size
+		e.tools = e.tools[1:]
+		e.truncated++
 	}
 	sort.Slice(e.tools, func(i, j int) bool { return e.tools[i].wire < e.tools[j].wire })
 	if e.info.Resources {
@@ -392,7 +412,7 @@ func (m *Manager) setTools(e *entry, infos []ToolInfo, res []ResourceInfo) {
 				fmt.Fprintf(&list, "\n… and %d more", len(res)-i)
 				break
 			}
-			fmt.Fprintf(&list, "\n- %s (%s)", r.URI, r.Name)
+			fmt.Fprintf(&list, "\n- %s (%s)", shorten(r.URI, 200), shorten(r.Name, 200))
 		}
 		desc := "[MCP server " + e.name + "] Read a resource this server offers by its URI."
 		if list.Len() > 0 {
@@ -467,9 +487,14 @@ func (m *Manager) Tools() []tool.Tool {
 	}
 	sort.Strings(names)
 	var out []tool.Tool
+	var used int
 	for _, n := range names {
 		e := m.entries[n]
 		for _, t := range e.tools {
+			if used+t.size > maxToolBytesAll {
+				continue
+			}
+			used += t.size
 			out = append(out, t)
 		}
 		if e.resTool != nil {

@@ -407,6 +407,11 @@ func TestSchemaNormalization(t *testing.T) {
 	if _, err := normalizeSchema(json.RawMessage(`{"type":"object","x":"` + strings.Repeat("a", maxSchemaBytes) + `"}`)); err == nil {
 		t.Error("a huge schema must be refused")
 	}
+	// Schema descriptions reach the model, so they are capped like the tool's own.
+	clipped, err := normalizeSchema(json.RawMessage(`{"type":"object","properties":{"a":{"description":"` + strings.Repeat("d", 5000) + `"}}}`))
+	if d := clipped["properties"].(map[string]any)["a"].(map[string]any)["description"].(string); err != nil || len(d) > maxSchemaText+10 {
+		t.Errorf("schema description not clipped: %d bytes, %v", len(d), err)
+	}
 }
 
 func TestConfigExpansionAndHash(t *testing.T) {
@@ -447,5 +452,31 @@ func TestProjectServerCannotReadDaemonSecrets(t *testing.T) {
 	st, _ := m.Status()
 	if len(st) != 1 || !strings.Contains(st[0].Error, "YOAKELAND_MASTER_KEY") || !strings.Contains(st[0].Error, "is not set") {
 		t.Fatalf("status = %+v", st)
+	}
+}
+
+// A server's tools are held to a byte budget; the largest go first and are counted.
+func TestToolBudgetDropsTheLargest(t *testing.T) {
+	big := strings.Repeat("x", 9<<10)
+	var infos []ToolInfo
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		// examples is not clipped, so the bulk survives into the budget.
+		schema := json.RawMessage(`{"type":"object","properties":{"s":{"type":"string","examples":["` + big + `"]}}}`)
+		infos = append(infos, ToolInfo{Name: n, InputSchema: schema})
+	}
+	infos = append(infos, ToolInfo{Name: "small", InputSchema: json.RawMessage(`{}`)})
+	e := &entry{name: "srv"}
+	(&Manager{}).setTools(e, infos, nil)
+	var total int
+	kept := map[string]bool{}
+	for _, x := range e.tools {
+		total += x.size
+		kept[x.wire] = true
+	}
+	if e.truncated == 0 || total > maxToolBytes || e.truncated+len(e.tools) != len(infos) {
+		t.Fatalf("total %d, kept %d, dropped %d of %d", total, len(e.tools), e.truncated, len(infos))
+	}
+	if !kept["mcp__srv__small"] {
+		t.Fatal("the small tool must survive the budget")
 	}
 }
