@@ -502,15 +502,25 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 		_ = ln.Close()
 	}()
 
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
+			// Accept keeps failing while the cause lasts (EMFILE, say): back off rather than
+			// spin and log on every attempt.
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
 			logWarn("accept error on %s: %v", ln.Addr(), err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			continue
 		}
+		backoff = 0
 
 		tracker.Add(conn)
 
@@ -520,8 +530,17 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 
 			var c net.Conn = conn
 			if tlsConn, ok := conn.(*tls.Conn); ok {
+				// Nothing else bounds connections before they authenticate, and each
+				// handshake costs an ECDSA signature: cap how many run at once (NET-8).
+				select {
+				case handshakeSlots <- struct{}{}:
+				default:
+					logWarn("too many TLS handshakes in progress, dropping %s", conn.RemoteAddr())
+					return
+				}
 				_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 				if err := tlsConn.Handshake(); err != nil {
+					<-handshakeSlots
 					logWarn("TLS handshake failed from %s: %v", conn.RemoteAddr(), err)
 					return
 				}
@@ -529,6 +548,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 				br := bufio.NewReader(conn)
 				first, err := br.Peek(1)
 				_ = tlsConn.SetDeadline(time.Time{})
+				<-handshakeSlots
 				if err != nil {
 					return
 				}
@@ -559,8 +579,14 @@ var preAuthTimeout = 10 * time.Second // var for tests
 
 var preAuthSlots = make(chan struct{}, maxPreAuth)
 
+// maxHandshakes caps TLS handshakes in progress across all clients (see acceptLoop).
+const maxHandshakes = 64
+
+var handshakeSlots = make(chan struct{}, maxHandshakes)
+
 // Shared by socket clients and browser WebSockets (web.go).
 func serveAccepted(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
+	conn = deadlineConn{conn} // a peer that stops reading must not stall everyone else (NET-1)
 	ipc := protocol.NewIPCStream(conn, conn)
 	if network == "tcp" {
 		select {

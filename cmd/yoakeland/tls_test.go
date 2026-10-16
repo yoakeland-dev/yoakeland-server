@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,10 +11,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 	"yoakeland/internal/protocol"
@@ -183,5 +186,64 @@ func TestResolveServerCert_DefaultsToAutoCA(t *testing.T) {
 	}
 	if _, err := os.Stat(caPEMPath); err != nil {
 		t.Errorf("expected the CA PEM file to exist at %s: %v", caPEMPath, err)
+	}
+}
+
+// acceptFailer fails every Accept, the way a process out of file descriptors does.
+type acceptFailer struct{ calls atomic.Int64 }
+
+func (a *acceptFailer) Accept() (net.Conn, error) {
+	a.calls.Add(1)
+	return nil, errors.New("accept tcp: too many open files")
+}
+func (a *acceptFailer) Close() error   { return nil }
+func (a *acceptFailer) Addr() net.Addr { return &net.TCPAddr{} }
+
+// A listener whose Accept keeps failing must be retried with backoff, not in a
+// busy loop that logs on every attempt (NET-8).
+func TestAcceptLoop_BacksOffOnAcceptErrors(t *testing.T) {
+	ln := &acceptFailer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	acceptLoop(ctx, ln, "unix", connDeps{}, nil, nil) // returns once ctx expires
+	if n := ln.calls.Load(); n > 20 {
+		t.Fatalf("%d Accept calls in 200ms: a busy retry loop, not backoff", n)
+	}
+}
+
+// With every TLS handshake slot taken (maxHandshakes connections already mid-handshake),
+// a new connection is dropped before it costs a handshake (NET-8).
+func TestAcceptLoop_DropsTLSConnsOverHandshakeCap(t *testing.T) {
+	certPath, keyPath := writeSelfSignedCert(t, t.TempDir())
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	plainLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go acceptLoop(ctx, wrapTLS(plainLn, cert), "tcp", newTestDeps(t), nil, newConnTracker())
+
+	for i := 0; i < maxHandshakes; i++ {
+		handshakeSlots <- struct{}{}
+	}
+	defer func() {
+		for len(handshakeSlots) > 0 {
+			<-handshakeSlots
+		}
+	}()
+
+	raw, err := net.DialTimeout("tcp", plainLn.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(2 * time.Second))
+	client := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
+	if err := client.Handshake(); err == nil {
+		t.Fatal("handshake succeeded with every handshake slot taken")
 	}
 }

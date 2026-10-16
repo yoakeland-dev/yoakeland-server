@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -215,4 +218,59 @@ func kinds(f *NotificationFeed) string {
 		ks = append(ks, n.Kind)
 	}
 	return strings.Join(ks, ",")
+}
+
+// A peer that never reads must not hold up a broadcast to everyone else (NET-1):
+// its writes time out, its connection is dropped, and the healthy peer still
+// gets the event.
+func TestBroadcast_StuckPeerDoesNotBlockOthers(t *testing.T) {
+	old := peerWriteTimeout.Load()
+	peerWriteTimeout.Store(int64(20 * time.Millisecond))
+	defer peerWriteTimeout.Store(old)
+
+	deps := newTestDeps(t)
+
+	// The stuck client sends one frame, then never reads again.
+	stuckSrv, stuckCli := net.Pipe()
+	defer stuckCli.Close()
+	stuckDone := make(chan struct{})
+	go func() {
+		serveAccepted(context.Background(), stuckSrv, "unix", deps, nil)
+		close(stuckDone)
+	}()
+	_, _ = stuckCli.Write([]byte(`{"type":"ping","data":{}}` + "\n"))
+
+	healthySrv, healthyCli := net.Pipe()
+	defer healthyCli.Close()
+	go serveAccepted(context.Background(), healthySrv, "unix", deps, nil)
+	_, _ = healthyCli.Write([]byte(`{"type":"ping","data":{}}` + "\n"))
+	lines := make(chan string, 1000)
+	go func() {
+		sc := bufio.NewScanner(healthyCli)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+	}()
+
+	waitUntil(t, "both peers connected", func() bool { return deps.peers.Count() == 2 })
+	deps.peers.BroadcastEvent("", protocol.EventSessionUpdated, "", map[string]string{"note": "fan-out"})
+
+	timeout := time.After(5 * time.Second)
+	for got := false; !got; {
+		select {
+		case l := <-lines:
+			got = strings.Contains(l, `"note":"fan-out"`)
+		case <-timeout:
+			t.Fatal("healthy peer never got the broadcast: a stuck peer blocked it")
+		}
+	}
+
+	select {
+	case <-stuckDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stuck peer was never dropped")
+	}
+	if n := deps.peers.Count(); n != 1 {
+		t.Fatalf("expected only the healthy peer left, got %d", n)
+	}
 }
