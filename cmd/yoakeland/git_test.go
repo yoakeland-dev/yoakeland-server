@@ -114,3 +114,40 @@ func TestHostGitIgnoresFsmonitor(t *testing.T) {
 		t.Fatal("core.fsmonitor ran on the host")
 	}
 }
+
+// A project inside a larger repo reads its own HEAD copies, and a path that
+// climbs out of it is refused instead of read from a sibling directory.
+func TestGitShowHead_SubProjectStaysInside(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		full := append([]string{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"}, args...)
+		if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	for p, s := range map[string]string{"a/s.txt": "mine", "b/s.txt": "sibling"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, p), []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("add", "-A")
+	run("commit", "-qm", "init")
+
+	sub := filepath.Join(repo, "a")
+	if got, _, err := gitShowHead(sub, "s.txt"); err != nil || string(got) != "mine" {
+		t.Fatalf("own file at HEAD: %q, %v", got, err)
+	}
+	for _, rel := range []string{"../b/s.txt", "x/../../b/s.txt", "/etc/passwd"} {
+		if got, _, err := gitShowHead(sub, rel); err == nil {
+			t.Fatalf("%s read %q", rel, got)
+		}
+	}
+}

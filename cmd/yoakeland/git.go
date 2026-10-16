@@ -272,9 +272,15 @@ func gitChanges(root string) (files []protocol.GitChange, truncated bool, err er
 }
 
 // gitShowHead returns rel's content at HEAD; missing is true when HEAD has
-// no such file (new, untracked, or no commits yet).
+// no such file (new, untracked, or no commits yet). rel is project-relative:
+// HEAD:./rel resolves from root rather than the repo's top, so a project
+// inside a larger repo gets its own files, and a `..` is refused so it can't
+// reach a sibling.
 func gitShowHead(root, rel string) (content []byte, missing bool, err error) {
-	out, err := hostGit("-C", root, "show", "HEAD:"+rel).Output()
+	if filepath.IsAbs(rel) || slices.Contains(strings.Split(filepath.ToSlash(rel), "/"), "..") {
+		return nil, false, fmt.Errorf("%s is not inside the project", rel)
+	}
+	out, err := hostGit("-C", root, "show", "HEAD:./"+filepath.ToSlash(filepath.Clean(rel))).Output()
 	if err != nil {
 		if _, isExit := err.(*exec.ExitError); isExit {
 			return nil, true, nil

@@ -3,6 +3,7 @@ package tool_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -204,5 +205,88 @@ func TestSearch_SkipsHiddenStateDir(t *testing.T) {
 	}
 	if strings.Contains(out, "server.json") || !strings.Contains(out, "main.go:1:") {
 		t.Fatalf("search output:\n%s", out)
+	}
+}
+
+// Yoakeland's state dir can't be read through an attached folder, the way
+// file_read refuses it inside the project; the upload store under it can.
+func TestFileReadTool_AttachedStateDirRefused(t *testing.T) {
+	root, _ := normalizer.CanonicalRoot(t.TempDir())
+	state := filepath.Join(root, ".yoake")
+	uploads := filepath.Join(state, "uploads")
+	if err := os.MkdirAll(uploads, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(state, "server.json"), []byte("token"), 0o600)
+	_ = os.WriteFile(filepath.Join(uploads, "u.txt"), []byte("U"), 0o600)
+	oldHidden, oldUploads := normalizer.Hidden, normalizer.Uploads
+	normalizer.Hidden, normalizer.Uploads = []string{state}, uploads
+	t.Cleanup(func() { normalizer.Hidden, normalizer.Uploads = oldHidden, oldUploads })
+	norm, _ := normalizer.New(root)
+	rt := tool.NewFileReadTool(norm)
+
+	ctx := tool.ExecutionContext{ExtraReadPaths: []string{state}}
+	read := func(p string) (string, error) {
+		args, _ := json.Marshal(tool.FileReadArgs{Path: p})
+		return rt.Execute(context.Background(), ctx, args)
+	}
+	if _, err := read(filepath.Join(state, "server.json")); err == nil {
+		t.Fatal("state file read through an attached folder")
+	}
+	if out, err := read(filepath.Join(uploads, "u.txt")); err != nil || out != "     1\tU" {
+		t.Fatalf("upload: %q, %v", out, err)
+	}
+}
+
+// A search walk leaves out the files ReadAllowed refuses, by name or by
+// listing, so searching a folder above a secret can't surface it.
+func TestSearch_SkipsRefusedFiles(t *testing.T) {
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, ".env"), []byte("KEY=SECRET\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(root, "app.txt"), []byte("KEY=public\n"), 0o644)
+	norm, _ := normalizer.New(root)
+	ctx := tool.ExecutionContext{ReadAllowed: func(abs string) bool { return filepath.Base(abs) != ".env" }}
+	out, err := tool.NewSearchTool(norm).Execute(context.Background(), ctx, []byte(`{"pattern":"KEY"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, ".env") || !strings.Contains(out, "app.txt:1:") {
+		t.Fatalf("search output:\n%s", out)
+	}
+	// Named outright, the file is searched: the approval was for that path.
+	if out, err = tool.NewSearchTool(norm).Execute(context.Background(), ctx, []byte(`{"pattern":"KEY","path":".env"}`)); err != nil || !strings.Contains(out, ".env:1:") {
+		t.Fatalf("named file: %q, %v", out, err)
+	}
+}
+
+// A symlink repointed between the permission check and the write (a sandboxed
+// process did it while the user was asked) must not redirect the write.
+func TestFileWriteTool_RefusesRepointedSymlink(t *testing.T) {
+	root, _ := normalizer.CanonicalRoot(t.TempDir())
+	_ = os.MkdirAll(filepath.Join(root, "docs"), 0o755)
+	target := filepath.Join(root, "docs", "a.txt")
+	env := filepath.Join(root, ".env")
+	_ = os.WriteFile(target, []byte("a"), 0o644)
+	_ = os.WriteFile(env, []byte("SECRET"), 0o600)
+	link := filepath.Join(root, "docs", "x")
+	_ = os.Symlink(target, link)
+	norm, _ := normalizer.New(root)
+	wt := tool.NewFileWriteTool(norm)
+	write := func(approved string) error {
+		args, _ := json.Marshal(tool.FileWriteArgs{Path: "docs/x", Content: "new"})
+		_, err := wt.Execute(context.Background(), tool.ExecutionContext{ApprovedPath: approved}, args)
+		return err
+	}
+
+	if err := write(target); err != nil {
+		t.Fatalf("approved write: %v", err)
+	}
+	_ = os.Remove(link)
+	_ = os.Symlink(env, link)
+	if err := write(target); !errors.Is(err, tool.ErrPathChanged) {
+		t.Fatalf("repointed write: %v, want ErrPathChanged", err)
+	}
+	if b, _ := os.ReadFile(env); string(b) != "SECRET" {
+		t.Fatalf(".env was written: %q", b)
 	}
 }

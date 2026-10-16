@@ -181,6 +181,9 @@ type Result struct {
 	Rule        *Rule
 	CacheKey    string // legacy "tool:target", set when an exact suggestion exists
 	Suggestions []Suggestion
+	// Resolved is the path a file call's target resolved to (ResolveAndValidatePath)
+	// when it was decided. The tool must still resolve to it when it runs.
+	Resolved string
 }
 
 func (e *Engine) sets() []*RuleSet {
@@ -204,21 +207,30 @@ func (e *Engine) allRules() (rules []Rule, corrupt bool) {
 	return rules, corrupt
 }
 
+// ReadTool reports whether a tool only reads project files. Its calls are
+// checked against read rules and the secret set, not asked about by default.
+func ReadTool(name string) bool { return name == "file_read" || name == "search" }
+
 func ruleCoversTool(r *Rule, tool string) bool {
 	switch r.Tool {
 	case ToolBash:
 		return tool == "bash" || tool == "terminal_start" || tool == "terminal_output"
 	case ToolEdit:
 		return tool == "file_write" || tool == "file_edit"
+	case ToolRead:
+		return ReadTool(tool)
 	default:
 		return coversMCP(r.Tool, tool)
 	}
 }
 
 // Check decides one tool call.
-func (e *Engine) Check(req Request) Result {
+func (e *Engine) Check(req Request) (res Result) {
 	rules, corrupt := e.allRules()
 	subj := e.newSubject(req)
+	if subj.resolveErr == nil {
+		defer func() { res.Resolved = subj.resolved }()
+	}
 
 	var ask, allow *Rule
 	for i := range rules {
@@ -243,7 +255,13 @@ func (e *Engine) Check(req Request) Result {
 		}
 	}
 
-	if req.Tool == "file_read" {
+	if ReadTool(req.Tool) {
+		if ask != nil {
+			return Result{Decision: DecisionAsk, Rule: ask}
+		}
+		if subj.secret {
+			return Result{Decision: DecisionAsk}
+		}
 		return Result{Decision: DecisionAllow}
 	}
 	if req.Tool == "bash" && subj.parseErr != nil {
@@ -255,7 +273,7 @@ func (e *Engine) Check(req Request) Result {
 	if allow != nil && !corrupt {
 		return Result{Decision: DecisionAllow, Rule: allow}
 	}
-	res := Result{Decision: DecisionAsk, Suggestions: e.suggest(req, subj)}
+	res = Result{Decision: DecisionAsk, Suggestions: e.suggest(req, subj)}
 	for _, s := range res.Suggestions {
 		if s.ID == SuggestExact {
 			res.CacheKey = req.Tool + ":" + req.Target
@@ -276,6 +294,7 @@ type subject struct {
 	resolvedRel string
 	resolved    string
 	resolveErr  error
+	secret      bool // a read of a secret-shaped path (see secretPath)
 }
 
 func (e *Engine) newSubject(req Request) *subject {
@@ -286,12 +305,14 @@ func (e *Engine) newSubject(req Request) *subject {
 		s.cands = commandCandidates(req.Target)
 	case "terminal_start", "terminal_output":
 		s.cands = commandCandidates(req.Target)
-	case "file_write", "file_edit":
+	case "file_write", "file_edit", "file_read", "search":
 		s.reqRel = relSlash(e.normalizer.ProjectRoot, req.Target)
 		s.resolved, s.resolveErr = e.normalizer.ResolveAndValidatePath(req.Target)
 		if s.resolveErr == nil {
 			s.resolvedRel = relSlash(e.normalizer.ProjectRoot, s.resolved)
 		}
+		// A symlink to a secret counts too: the resolved path is what gets read.
+		s.secret = secretPath(req.Target) || (s.resolveErr == nil && secretPath(s.resolved))
 	}
 	return s
 }
@@ -311,7 +332,7 @@ func (s *subject) matches(e *Engine, r *Rule) bool {
 			}
 		}
 		return false
-	case ToolEdit, ToolFileWrite, ToolFileEdit:
+	case ToolEdit, ToolFileWrite, ToolFileEdit, ToolRead:
 		pat := r.Pattern[0]
 		if allow {
 			return s.resolveErr == nil && s.reqRel != "" && !neverAllow(e.normalizer, s.resolved) &&

@@ -21,6 +21,11 @@ var (
 // sandbox also mounts an empty tmpfs over each (sandbox_linux.go).
 var Hidden []string
 
+// Uploads is the store clients' attachments are copied into. It sits under a
+// Hidden dir, and is the one part of one that an attachment may point at.
+// Set once at startup, next to Hidden.
+var Uploads string
+
 // HiddenIn returns the Hidden dirs strictly inside root.
 func HiddenIn(root string) []string {
 	var out []string
@@ -30,6 +35,26 @@ func HiddenIn(root string) []string {
 		}
 	}
 	return out
+}
+
+// InHidden reports whether abs (symlink-resolved) is inside a Hidden dir,
+// other than the upload store. Attachments are refused here exactly as
+// ResolveAndValidatePath refuses the same path for a project file.
+func InHidden(abs string) bool {
+	if Uploads != "" && within(Uploads, abs) {
+		return false
+	}
+	for _, h := range Hidden {
+		if within(h, abs) {
+			return true
+		}
+	}
+	return false
+}
+
+func within(dir, abs string) bool {
+	rel, err := filepath.Rel(dir, abs)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 type Normalizer struct {
@@ -132,20 +157,20 @@ func InRoot(root, abs string, fn func(r *os.Root, rel string) error) error {
 	return fn(r, rel)
 }
 
-// ErrGitExecPath refuses a write git would later run as code on the host.
-var ErrGitExecPath = errors.New("refusing to write .git/config or .git/hooks: git runs them as code outside the sandbox")
+// ErrGitExecPath refuses a write into .git: git runs its config and hooks as
+// code on the host, and the rest of it (objects, refs, index) must stay intact.
+var ErrGitExecPath = errors.New("refusing to change .git: git runs its config and hooks as code outside the sandbox")
 
-// IsGitExecPath reports whether resolved (a ResolveAndValidatePath result)
-// is a .git entry itself, its config, or its hooks — anything that, once
-// written, git executes the next time it runs on the host.
+// IsGitExecPath reports whether resolved (a ResolveAndValidatePath result) is
+// inside any .git, including a submodule's or worktree's (.git/modules/*,
+// .git/worktrees/*): no write, rename or delete may touch one.
 func (n *Normalizer) IsGitExecPath(resolved string) bool {
 	rel, err := filepath.Rel(n.ProjectRoot, resolved)
 	if err != nil {
 		return false
 	}
-	parts := strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/")
-	for i, p := range parts {
-		if p == ".git" && (i == len(parts)-1 || parts[i+1] == "config" || parts[i+1] == "hooks") {
+	for _, p := range strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/") {
+		if p == ".git" {
 			return true
 		}
 	}

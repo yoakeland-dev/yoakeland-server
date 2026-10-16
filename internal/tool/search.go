@@ -59,7 +59,7 @@ func (t *SearchTool) Definition() ToolDefinition {
 	}}
 }
 
-func (t *SearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON []byte) (string, error) {
+func (t *SearchTool) Execute(ctx context.Context, execCtx ExecutionContext, argsJSON []byte) (string, error) {
 	var args searchArgs
 	if err := json.Unmarshal(argsJSON, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -97,7 +97,7 @@ func (t *SearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON [
 				return ctx.Err()
 			}
 			abs := filepath.Join(t.normalizer.ProjectRoot, filepath.FromSlash(p))
-			return t.visit(fsys, abs, p, d, start, hidden, re, args.Glob, &out, &more)
+			return t.visit(fsys, abs, p, d, start, hidden, re, args.Glob, execCtx.ReadAllowed, &out, &more)
 		})
 	})
 	if walkErr != nil {
@@ -114,7 +114,7 @@ func (t *SearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSON [
 
 // visit handles one walk entry: p is its slash path inside the root fsys,
 // abs its host path, start the host path the walk began at.
-func (t *SearchTool) visit(fsys fs.FS, abs, p string, d fs.DirEntry, start string, hidden []string, re *regexp.Regexp, glob string, out *[]string, more *bool) error {
+func (t *SearchTool) visit(fsys fs.FS, abs, p string, d fs.DirEntry, start string, hidden []string, re *regexp.Regexp, glob string, readAllowed func(string) bool, out *[]string, more *bool) error {
 	if d.IsDir() {
 		// hidden: yoakeland's own state (normalizer.Hidden), which isn't
 		// always dot-named (~/Library/Application Support/yoake, %AppData%).
@@ -132,6 +132,11 @@ func (t *SearchTool) visit(fsys fs.FS, abs, p string, d fs.DirEntry, start strin
 		if ok, _ := filepath.Match(glob, d.Name()); !ok {
 			return nil
 		}
+	}
+	// The start path was asked for (and approved, if it needed that) as it
+	// is; only files the walk turns up are filtered.
+	if abs != start && readAllowed != nil && !readAllowed(abs) {
+		return nil
 	}
 	rel := filepath.FromSlash(p)
 	if re == nil {

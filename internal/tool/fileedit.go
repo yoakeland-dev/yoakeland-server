@@ -49,6 +49,9 @@ func (t *FileEditTool) Execute(_ context.Context, execCtx ExecutionContext, args
 	if err != nil {
 		return "", fmt.Errorf("path error: %w", err)
 	}
+	if execCtx.ApprovedPath != "" && safePath != execCtx.ApprovedPath {
+		return "", ErrPathChanged
+	}
 	if t.normalizer.IsGitExecPath(safePath) {
 		return "", normalizer.ErrGitExecPath
 	}

@@ -239,6 +239,10 @@ func main() {
 	if err != nil {
 		logFatal("failed to initialize upload store: %v", err)
 	}
+	// Canonical like Hidden: attachments are compared with symlinks resolved.
+	if canon, err := normalizer.CanonicalRoot(uploads.dir); err == nil {
+		normalizer.Uploads = canon
+	}
 
 	// Pre-opened (failing fast on a bad path) only after everything a
 	// project's sessions read at creation exists.

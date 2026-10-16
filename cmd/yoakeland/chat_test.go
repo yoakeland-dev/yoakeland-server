@@ -102,3 +102,26 @@ func TestImportChatFiles(t *testing.T) {
 		t.Fatal("an empty workspace should be refused")
 	}
 }
+
+// copyFile never follows a symlink out of the chat, even one that replaced a
+// file the walk had listed as regular.
+func TestCopyFileRefusesEscapingSymlink(t *testing.T) {
+	chat, dst := t.TempDir(), t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("S"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(chat, "f")); err != nil {
+		t.Fatal(err)
+	}
+	from, _ := os.OpenRoot(chat)
+	defer from.Close()
+	to, _ := os.OpenRoot(dst)
+	defer to.Close()
+	if err := copyFile(from, "f", to, "f", 0o644); err == nil {
+		t.Fatal("copied through a symlink out of the chat")
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "f")); err == nil {
+		t.Fatal("a file was created for the refused copy")
+	}
+}

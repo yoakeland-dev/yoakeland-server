@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,5 +119,18 @@ func TestFsOpRefusesStateDir(t *testing.T) {
 	}
 	if _, err := os.Stat(state); err != nil {
 		t.Fatalf("state dir touched: %v", err)
+	}
+}
+
+// A git dir inside a submodule is refused by every explorer write, though
+// reads of it stay open.
+func TestWriteProjectFileRefusesSubmoduleGit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git", "modules", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := writeProjectFile(root, protocol.WriteFileData{Path: ".git/modules/sub/config", Content: "[filter \"x\"]", Force: true})
+	if !errors.Is(err, normalizer.ErrGitExecPath) {
+		t.Fatalf("err = %v, want ErrGitExecPath", err)
 	}
 }

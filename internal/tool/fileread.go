@@ -78,7 +78,7 @@ func resolveAttached(rawPath string, attached []string, rootErr error) (string, 
 		return "", rootErr
 	}
 	real, err := filepath.EvalSymlinks(rawPath)
-	if err != nil {
+	if err != nil || normalizer.InHidden(real) {
 		return "", rootErr
 	}
 	for _, a := range attached {

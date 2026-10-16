@@ -82,32 +82,50 @@ func importChatFiles(chatRoot, targetRoot, sessionID string) (dir string, files 
 		_ = os.RemoveAll(dst)
 		return "", 0, 0, err
 	}
-	for _, e := range list {
-		to := filepath.Join(dst, e.rel)
-		if e.dir {
-			if err := os.MkdirAll(to, 0o755); err != nil {
-				return fail(err)
+	// Both sides go through an os.Root: the chat's files are copied while
+	// the sandboxed agent may still be running, so one swapped for a symlink
+	// after the walk must not lead the copy out of the chat.
+	copyAll := func() error {
+		from, err := os.OpenRoot(chatRoot)
+		if err != nil {
+			return err
+		}
+		defer from.Close()
+		to, err := os.OpenRoot(dst)
+		if err != nil {
+			return err
+		}
+		defer to.Close()
+		for _, e := range list {
+			if e.dir {
+				if err := to.MkdirAll(e.rel, 0o755); err != nil {
+					return err
+				}
+				continue
 			}
-			continue
+			perm := fs.FileMode(0o644)
+			if e.mode&0o111 != 0 {
+				perm = 0o755
+			}
+			if err := copyFile(from, e.rel, to, e.rel, perm); err != nil {
+				return err
+			}
 		}
-		perm := fs.FileMode(0o644)
-		if e.mode&0o111 != 0 {
-			perm = 0o755
-		}
-		if err := copyFile(filepath.Join(chatRoot, e.rel), to, perm); err != nil {
-			return fail(err)
-		}
+		return nil
+	}
+	if err := copyAll(); err != nil {
+		return fail(err)
 	}
 	return name, files, bytes, nil
 }
 
-func copyFile(from, to string, perm fs.FileMode) error {
-	in, err := os.Open(from)
+func copyFile(from *os.Root, fromRel string, to *os.Root, toRel string, perm fs.FileMode) error {
+	in, err := from.Open(fromRel)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(to, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	out, err := to.OpenFile(toRel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 	if err != nil {
 		return err
 	}

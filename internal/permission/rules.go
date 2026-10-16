@@ -42,6 +42,9 @@ const (
 	ToolFileEdit  = "file_edit"
 	ToolWebFetch  = "web_fetch"
 	ToolBrowser   = "browser"
+	// ToolRead covers file_read and search: a path rule that can deny or ask,
+	// never allow (reads need no allow rule).
+	ToolRead = "read"
 )
 
 // ToolMCPPrefix starts the name of a tool an MCP server provides
@@ -203,6 +206,16 @@ func (r *Rule) Validate(scope Scope) error {
 		if err := validatePathPattern(r.Pattern[0], allow); err != nil {
 			return err
 		}
+	case ToolRead:
+		if len(r.Pattern) != 1 {
+			return fmt.Errorf("a read rule takes exactly one path pattern")
+		}
+		if allow {
+			return fmt.Errorf("a read rule can deny or ask, not allow: reading needs no allow rule")
+		}
+		if err := validatePathPattern(r.Pattern[0], false); err != nil {
+			return err
+		}
 	case ToolWebFetch, ToolBrowser:
 		if len(r.Pattern) != 1 {
 			return fmt.Errorf("a %s rule takes exactly one host", r.Tool)
@@ -263,7 +276,7 @@ func (r *Rule) exampleMatches(ex string) bool {
 	switch r.Tool {
 	case ToolBash:
 		return matchBashRule(r, ex)
-	case ToolEdit, ToolFileWrite, ToolFileEdit:
+	case ToolEdit, ToolFileWrite, ToolFileEdit, ToolRead:
 		return matchPathPattern(r.Pattern[0], filepath.ToSlash(filepath.Clean(ex)), r.Decision != DecisionAllow)
 	default:
 		if _, _, ok := ParseMCPTool(r.Tool); ok {
