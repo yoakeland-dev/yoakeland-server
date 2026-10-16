@@ -389,6 +389,19 @@ func relSlash(root, target string) string {
 	return filepath.ToSlash(target)
 }
 
+// secretPath: files that usually hold credentials. A read of one asks
+// whatever rules say, and a search skips them unless asked for by name.
+func secretPath(p string) bool {
+	segs := strings.Split(strings.ToLower(filepath.ToSlash(filepath.Clean(p))), "/")
+	last := segs[len(segs)-1]
+	switch {
+	case strings.HasPrefix(last, ".env"), strings.HasPrefix(last, "id_rsa"), last == ".npmrc", last == ".netrc",
+		strings.HasSuffix(last, ".pem"), strings.HasSuffix(last, ".key"):
+		return true
+	}
+	return len(segs) >= 2 && segs[len(segs)-2] == ".git" && last == "config"
+}
+
 // neverAllow: paths no allow rule may ever cover — git's own directory (its
 // config and hooks are code git runs later), and .env* files (secrets).
 func neverAllow(norm *normalizer.Normalizer, resolved string) bool {

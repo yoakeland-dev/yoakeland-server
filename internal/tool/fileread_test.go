@@ -236,3 +236,20 @@ func TestFileReadTool_AttachedStateDirRefused(t *testing.T) {
 		t.Fatalf("upload: %q, %v", out, err)
 	}
 }
+
+// A search walk leaves out the files ReadAllowed refuses, by name or by
+// listing, so searching a folder above a secret can't surface it.
+func TestSearch_SkipsRefusedFiles(t *testing.T) {
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, ".env"), []byte("KEY=SECRET\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(root, "app.txt"), []byte("KEY=public\n"), 0o644)
+	norm, _ := normalizer.New(root)
+	ctx := tool.ExecutionContext{ReadAllowed: func(abs string) bool { return filepath.Base(abs) != ".env" }}
+	out, err := tool.NewSearchTool(norm).Execute(context.Background(), ctx, []byte(`{"pattern":"KEY"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, ".env") || !strings.Contains(out, "app.txt:1:") {
+		t.Fatalf("search output:\n%s", out)
+	}
+}

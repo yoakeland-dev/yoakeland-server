@@ -53,6 +53,11 @@ type ExecutionContext struct {
 	// (agent.Message.Attachments): file_read may read these, and anything
 	// under them, even though they're outside the project root.
 	ExtraReadPaths []string
+
+	// ReadAllowed, if non-nil, says whether a file a directory walk reached
+	// may be read. search leaves out the files it refuses, so searching a
+	// folder above a denied or secret file can't surface it.
+	ReadAllowed func(abs string) bool
 }
 
 type Tool interface {

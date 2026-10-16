@@ -417,3 +417,34 @@ func TestEngineWithoutGlobalStillWorks(t *testing.T) {
 		t.Error("global add with no global store succeeded")
 	}
 }
+
+// Reads need no allow rule. A read rule can deny or ask, and secret-shaped
+// files ask on their own; ordinary files are allowed.
+func TestReadRules(t *testing.T) {
+	e, _ := newEngine(t)
+	mustAdd(t, e, permission.ScopeProject, permission.Rule{Tool: permission.ToolRead, Pattern: []string{"private/**"}, Decision: permission.DecisionDeny})
+	mustAdd(t, e, permission.ScopeProject, permission.Rule{Tool: permission.ToolRead, Pattern: []string{"docs/*.md"}, Decision: permission.DecisionAsk})
+	for _, c := range []struct {
+		tool, target string
+		want         permission.Decision
+	}{
+		{"file_read", "src/a.go", permission.DecisionAllow},
+		{"file_read", "private/key.txt", permission.DecisionDeny},
+		{"search", "private", permission.DecisionDeny},
+		{"search", ".", permission.DecisionAllow},
+		{"file_read", "docs/x.md", permission.DecisionAsk},
+		{"file_read", ".env", permission.DecisionAsk},
+		{"file_read", "config/.ENV.local", permission.DecisionAsk},
+		{"file_read", "ssh/id_rsa.pub", permission.DecisionAsk},
+		{"file_read", "sub/.npmrc", permission.DecisionAsk},
+		{"file_read", "sub/.git/config", permission.DecisionAsk},
+		{"file_read", ".git/HEAD", permission.DecisionAllow},
+	} {
+		if got := check(e, c.tool, c.target, "read_write"); got != c.want {
+			t.Errorf("%s %q = %s, want %s", c.tool, c.target, got, c.want)
+		}
+	}
+	if _, err := e.AddRule(permission.ScopeProject, permission.Rule{Tool: permission.ToolRead, Pattern: []string{"src/**"}, Decision: permission.DecisionAllow}); err == nil {
+		t.Error("an allow read rule was accepted")
+	}
+}

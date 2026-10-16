@@ -909,7 +909,7 @@ func permissionTarget(toolName string, args json.RawMessage) string {
 		return a.Expression
 	case "web_fetch":
 		return urlHost(a.URL, args)
-	case "file_write", "file_edit":
+	case "file_write", "file_edit", "file_read", "search":
 		return filepath.Clean(a.Path)
 	}
 	if isMCPTool(toolName) { // a rule covers the tool, not its arguments; the target is for the audit log
@@ -1869,8 +1869,12 @@ turn:
 			allowed := true
 			var denyFeedback, ruleDenied string
 			mutating := toolImpl.RequiresPermission(tc.Args)
+			// Reads aren't mutating, but read rules and the secret set still
+			// get their say (permission.ReadTool); an ordinary read is allowed
+			// and not logged.
+			gated := mutating || permission.ReadTool(tc.Name)
 			target := ""
-			if mutating {
+			if gated {
 				target = permissionTarget(tc.Name, tc.Args)
 			}
 			via := "" // how a call that goes ahead got through, for the audit log
@@ -1881,7 +1885,7 @@ turn:
 					via = "autonomous"
 					a.auditAuto(sessionID, tc.Name, target, "allow", mode, nil, via)
 				}
-			} else if mutating {
+			} else if gated {
 
 				// Rules answer first, shell tools included: a bash call asks
 				// unless a rule (or a read-only preset) allows that argv.
@@ -1945,7 +1949,7 @@ turn:
 					if via == "" {
 						via = viaRule(res.Rule)
 					}
-					if !isPreset(res.Rule) {
+					if mutating && !isPreset(res.Rule) {
 						a.auditAuto(sessionID, tc.Name, target, "allow", mode, res.Rule, via)
 					}
 				}
@@ -1979,6 +1983,9 @@ turn:
 				AuthorName:     author.GitName(),
 				AuthorEmail:    author.Email,
 				ExtraReadPaths: readable,
+				ReadAllowed: func(abs string) bool {
+					return mode == ModeAutonomous || a.permEngine.Check(permission.Request{Tool: "file_read", Target: abs, Mode: string(mode)}).Decision == permission.DecisionAllow
+				},
 				AskUsers: func(qs []tool.Question) ([]string, error) {
 					return a.askUserQuestion(turnCtx, sessionID, turnID, toolCallID, qs)
 				},
