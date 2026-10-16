@@ -1,7 +1,9 @@
 package terminal
 
 import (
+	"crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -64,6 +66,15 @@ func integrationDir() (string, error) {
 	return integrationScriptDir, integrationScriptErr
 }
 
+// newMarkNonce is the secret each terminal's marks are stamped with (see
+// scanMarks). It travels to the shell in YOAKE_MARK_NONCE, which the scripts
+// unset at once so the commands they run don't inherit it.
+func newMarkNonce() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
 // applyShellIntegration extends argv/env to inject OSC 633 shell
 // integration for the shells we know how to do it for, keyed off the
 // shell's own basename (argv[0], as shellArgv chose it) — bash gets
@@ -77,8 +88,8 @@ func integrationDir() (string, error) {
 // A failure to write the scripts to disk (integrationDir) degrades to "no
 // shell integration" rather than failing the spawn — a terminal a human is
 // about to type into is far more valuable than the OSC 633 decorations
-// riding on top of it.
-func applyShellIntegration(argv []string, env []string) ([]string, []string) {
+// riding on top of it. nonce stamps the marks (see newMarkNonce).
+func applyShellIntegration(argv []string, env []string, nonce string) ([]string, []string) {
 	if len(argv) == 0 {
 		return argv, env
 	}
@@ -90,9 +101,10 @@ func applyShellIntegration(argv []string, env []string) ([]string, []string) {
 	switch filepath.Base(argv[0]) {
 	case "bash":
 		argv = append(append([]string{}, argv...), "--rcfile", filepath.Join(dir, "integration.bash"))
+		env = append(append([]string{}, env...), "YOAKE_MARK_NONCE="+nonce)
 	case "zsh":
 		origZdotdir := os.Getenv("ZDOTDIR")
-		env = append(append([]string{}, env...), "ZDOTDIR="+dir, "YOAKE_ORIG_ZDOTDIR="+origZdotdir)
+		env = append(append([]string{}, env...), "ZDOTDIR="+dir, "YOAKE_ORIG_ZDOTDIR="+origZdotdir, "YOAKE_MARK_NONCE="+nonce)
 	}
 	return argv, env
 }

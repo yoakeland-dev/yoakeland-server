@@ -94,6 +94,10 @@ type Terminal struct {
 	busy     bool
 	finished int
 	lastExit *int
+	// markNonce stamps this shell's marks; scanMarks ignores any mark that
+	// doesn't carry it, so a program printing an escape sequence can't pass
+	// for the shell. Set per spawn.
+	markNonce string
 
 	session sandbox.PTYSession
 
@@ -487,7 +491,8 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	t.mu.Unlock()
 	network := !agent || m.agentNetwork.Load()
 
-	argv, env = applyShellIntegration(argv, env)
+	nonce := newMarkNonce()
+	argv, env = applyShellIntegration(argv, env, nonce)
 	// Later entries win, so this overrides the sandbox's PWD (the project root).
 	env = append(env, "PWD="+cwd)
 
@@ -502,6 +507,7 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 
 	t.mu.Lock()
 	t.session = session
+	t.markNonce = nonce
 	t.pid = session.Pid()
 	t.status = protocol.TerminalStatusRunning
 	t.exitCode = nil
