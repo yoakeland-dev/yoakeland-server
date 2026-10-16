@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/snapshot"
@@ -58,7 +59,16 @@ type ExecutionContext struct {
 	// may be read. search leaves out the files it refuses, so searching a
 	// folder above a denied or secret file can't surface it.
 	ReadAllowed func(abs string) bool
+
+	// ApprovedPath is the path a file tool's permission check resolved its
+	// target to. If the target resolves elsewhere by the time the tool runs
+	// (a symlink repointed while the user was asked), the tool refuses.
+	ApprovedPath string
 }
+
+// ErrPathChanged: a file tool's target no longer resolves to the path that
+// was approved, so nothing was written.
+var ErrPathChanged = errors.New("the path now resolves somewhere else than when it was approved; nothing was written")
 
 type Tool interface {
 	Name() string

@@ -3,6 +3,7 @@ package tool_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,5 +252,37 @@ func TestSearch_SkipsRefusedFiles(t *testing.T) {
 	}
 	if strings.Contains(out, ".env") || !strings.Contains(out, "app.txt:1:") {
 		t.Fatalf("search output:\n%s", out)
+	}
+}
+
+// A symlink repointed between the permission check and the write (a sandboxed
+// process did it while the user was asked) must not redirect the write.
+func TestFileWriteTool_RefusesRepointedSymlink(t *testing.T) {
+	root, _ := normalizer.CanonicalRoot(t.TempDir())
+	_ = os.MkdirAll(filepath.Join(root, "docs"), 0o755)
+	target := filepath.Join(root, "docs", "a.txt")
+	env := filepath.Join(root, ".env")
+	_ = os.WriteFile(target, []byte("a"), 0o644)
+	_ = os.WriteFile(env, []byte("SECRET"), 0o600)
+	link := filepath.Join(root, "docs", "x")
+	_ = os.Symlink(target, link)
+	norm, _ := normalizer.New(root)
+	wt := tool.NewFileWriteTool(norm)
+	write := func(approved string) error {
+		args, _ := json.Marshal(tool.FileWriteArgs{Path: "docs/x", Content: "new"})
+		_, err := wt.Execute(context.Background(), tool.ExecutionContext{ApprovedPath: approved}, args)
+		return err
+	}
+
+	if err := write(target); err != nil {
+		t.Fatalf("approved write: %v", err)
+	}
+	_ = os.Remove(link)
+	_ = os.Symlink(env, link)
+	if err := write(target); !errors.Is(err, tool.ErrPathChanged) {
+		t.Fatalf("repointed write: %v, want ErrPathChanged", err)
+	}
+	if b, _ := os.ReadFile(env); string(b) != "SECRET" {
+		t.Fatalf(".env was written: %q", b)
 	}
 }

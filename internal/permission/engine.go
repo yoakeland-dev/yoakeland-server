@@ -181,6 +181,9 @@ type Result struct {
 	Rule        *Rule
 	CacheKey    string // legacy "tool:target", set when an exact suggestion exists
 	Suggestions []Suggestion
+	// Resolved is the path a file call's target resolved to (ResolveAndValidatePath)
+	// when it was decided. The tool must still resolve to it when it runs.
+	Resolved string
 }
 
 func (e *Engine) sets() []*RuleSet {
@@ -222,9 +225,12 @@ func ruleCoversTool(r *Rule, tool string) bool {
 }
 
 // Check decides one tool call.
-func (e *Engine) Check(req Request) Result {
+func (e *Engine) Check(req Request) (res Result) {
 	rules, corrupt := e.allRules()
 	subj := e.newSubject(req)
+	if subj.resolveErr == nil {
+		defer func() { res.Resolved = subj.resolved }()
+	}
 
 	var ask, allow *Rule
 	for i := range rules {
@@ -267,7 +273,7 @@ func (e *Engine) Check(req Request) Result {
 	if allow != nil && !corrupt {
 		return Result{Decision: DecisionAllow, Rule: allow}
 	}
-	res := Result{Decision: DecisionAsk, Suggestions: e.suggest(req, subj)}
+	res = Result{Decision: DecisionAsk, Suggestions: e.suggest(req, subj)}
 	for _, s := range res.Suggestions {
 		if s.ID == SuggestExact {
 			res.CacheKey = req.Tool + ":" + req.Target

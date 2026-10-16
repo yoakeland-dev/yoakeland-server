@@ -1877,7 +1877,8 @@ turn:
 			if gated {
 				target = permissionTarget(tc.Name, tc.Args)
 			}
-			via := "" // how a call that goes ahead got through, for the audit log
+			via := ""      // how a call that goes ahead got through, for the audit log
+			approved := "" // the path a file call's check resolved its target to (EXE-13)
 			if mode == ModeAutonomous {
 				// Autonomous: every permission check is bypassed outright,
 				// permission.Engine is never consulted (SPEC.md §4c).
@@ -1891,6 +1892,7 @@ turn:
 				// unless a rule (or a read-only preset) allows that argv.
 				res := a.permEngine.Check(permission.Request{Tool: tc.Name, Target: target, Mode: string(mode)})
 				decision, cacheKey := res.Decision, res.CacheKey
+				approved = res.Resolved
 				// Accept Edits: project edits go through; a deny rule still wins,
 				// and so does an explicit ask rule.
 				if mode == ModeAcceptEdits && editTools[tc.Name] && decision == permission.DecisionAsk && res.Rule == nil {
@@ -1983,6 +1985,7 @@ turn:
 				AuthorName:     author.GitName(),
 				AuthorEmail:    author.Email,
 				ExtraReadPaths: readable,
+				ApprovedPath:   approved,
 				ReadAllowed: func(abs string) bool {
 					return mode == ModeAutonomous || a.permEngine.Check(permission.Request{Tool: "file_read", Target: abs, Mode: string(mode)}).Decision == permission.DecisionAllow
 				},
