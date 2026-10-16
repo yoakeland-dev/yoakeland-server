@@ -54,7 +54,7 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 	}
 	if rec.DeviceID == "" { // first use
 		if time.Now().Unix() > rec.ExpiresAt {
-			_, _ = d.settings.RemoveToken(who.TokenName)
+			d.settings.RemoveUnclaimedPairing(who.TokenName)
 			return errors.New("this pairing code expired")
 		}
 		if who.DeviceID == "" {
@@ -63,6 +63,12 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 		if d.pairings != nil && d.peers.HasLocal() {
 			ch := make(chan bool, 1)
 			d.pairings.mu.Lock()
+			// One waiter per code. A second device holding the same code is refused instead of
+			// replacing the first, so each prompt on the desktop is for the device that asked for it.
+			if _, busy := d.pairings.waiting[who.TokenName]; busy {
+				d.pairings.mu.Unlock()
+				return errors.New("another device is already waiting to pair with this code")
+			}
 			d.pairings.waiting[who.TokenName] = ch
 			d.pairings.mu.Unlock()
 			defer func() {
@@ -77,11 +83,11 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 			select {
 			case allow := <-ch:
 				if !allow {
-					_, _ = d.settings.RemoveToken(who.TokenName)
+					d.settings.RemoveUnclaimedPairing(who.TokenName)
 					return errors.New("pairing was declined")
 				}
 			case <-time.After(pairingApprovalWait):
-				_, _ = d.settings.RemoveToken(who.TokenName)
+				d.settings.RemoveUnclaimedPairing(who.TokenName)
 				return errors.New("nobody approved the pairing in time")
 			}
 		}

@@ -85,7 +85,8 @@ const maxNameLen = 64
 
 func cleanName(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		// Format characters (bidi overrides, zero-width joiners) can make a name read as someone else's.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r

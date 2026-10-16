@@ -342,6 +342,17 @@ func (s *ServerSettings) RemoveToken(name string) (existed bool, err error) {
 	return true, s.save()
 }
 
+// RemoveUnclaimedPairing deletes a pairing credential only while no device holds it. A device that
+// waited for approval must not take down a code another device has since claimed.
+func (s *ServerSettings) RemoveUnclaimedPairing(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.Tokens[name]; ok && rec.Pairing && rec.DeviceID == "" {
+		delete(s.Tokens, name)
+		_ = s.save()
+	}
+}
+
 // SetTokenAvatar persists an avatar against a named token so it survives
 // reconnects — the "cache avatars" half of set_peer_avatar for a tokened
 // (TCP, per-person) peer. No-op success if the name is unknown, mirroring

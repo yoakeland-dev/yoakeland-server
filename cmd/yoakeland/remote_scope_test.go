@@ -146,6 +146,10 @@ func TestPeerIdentity_Capped(t *testing.T) {
 	if utf8.RuneCountInString(p.Name) > maxNameLen {
 		t.Fatalf("fallback name is %d runes, want at most %d", utf8.RuneCountInString(p.Name), maxNameLen)
 	}
+	// A bidi override can't make a name read as another one.
+	if got := cleanName("pay\u202Ealice"); got != "payalice" {
+		t.Fatalf("cleanName kept a format character: %q", got)
+	}
 }
 
 // One credential may hold only maxConnsPerToken live connections.
