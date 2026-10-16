@@ -132,20 +132,20 @@ func InRoot(root, abs string, fn func(r *os.Root, rel string) error) error {
 	return fn(r, rel)
 }
 
-// ErrGitExecPath refuses a write git would later run as code on the host.
-var ErrGitExecPath = errors.New("refusing to write .git/config or .git/hooks: git runs them as code outside the sandbox")
+// ErrGitExecPath refuses a write into .git: git runs its config and hooks as
+// code on the host, and the rest of it (objects, refs, index) must stay intact.
+var ErrGitExecPath = errors.New("refusing to change .git: git runs its config and hooks as code outside the sandbox")
 
-// IsGitExecPath reports whether resolved (a ResolveAndValidatePath result)
-// is a .git entry itself, its config, or its hooks — anything that, once
-// written, git executes the next time it runs on the host.
+// IsGitExecPath reports whether resolved (a ResolveAndValidatePath result) is
+// inside any .git, including a submodule's or worktree's (.git/modules/*,
+// .git/worktrees/*): no write, rename or delete may touch one.
 func (n *Normalizer) IsGitExecPath(resolved string) bool {
 	rel, err := filepath.Rel(n.ProjectRoot, resolved)
 	if err != nil {
 		return false
 	}
-	parts := strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/")
-	for i, p := range parts {
-		if p == ".git" && (i == len(parts)-1 || parts[i+1] == "config" || parts[i+1] == "hooks") {
+	for _, p := range strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/") {
+		if p == ".git" {
 			return true
 		}
 	}

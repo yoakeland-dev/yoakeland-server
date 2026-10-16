@@ -174,7 +174,10 @@ func TestIsGitExecPath(t *testing.T) {
 	for rel, want := range map[string]bool{
 		".git": true, ".git/config": true, ".git/hooks": true, ".git/hooks/pre-commit": true,
 		"sub/.git/config": true, ".GIT/Config": true,
-		".git/HEAD": false, ".git/objects/ab": false, "config": false, ".gitignore": false, "src/hooks/a.go": false,
+		// Submodule and worktree config run as code too, and the rest of .git is not for writing.
+		".git/modules/sub/config": true, ".git/worktrees/w/config.worktree": true,
+		".git/HEAD": true, ".git/objects/ab": true, ".git/refs/heads/main": true,
+		"config": false, ".gitignore": false, "src/hooks/a.go": false, "src/.gitkeep": false,
 	} {
 		p, err := n.ResolveAndValidatePath(rel)
 		if err != nil {
