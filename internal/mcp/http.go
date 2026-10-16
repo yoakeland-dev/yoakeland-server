@@ -35,6 +35,23 @@ func (e *errNeedsAuth) Error() string {
 // carried an Mcp-Session-Id), so the client must start a new one.
 var errSessionExpired = errors.New("the server's session expired")
 
+var errCleartext = errors.New("won't send headers or a token over plain http to a host other than this machine; use https")
+
+// cleartextRemote reports whether rawURL sends requests in the clear to a host
+// other than this machine, where headers and tokens must not go.
+func cleartextRemote(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "https" {
+		return err != nil
+	}
+	h := strings.ToLower(u.Hostname())
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return false
+	}
+	ip := net.ParseIP(h)
+	return ip == nil || !ip.IsLoopback()
+}
+
 // httpError is a status the transport has no meaning for.
 type httpError struct {
 	Status int
@@ -132,6 +149,9 @@ func (t *httpTransport) newRequest(ctx context.Context, method string, body []by
 	if err != nil {
 		return nil, err
 	}
+	if len(t.headers) > 0 && cleartextRemote(t.url) {
+		return nil, errCleartext
+	}
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -160,6 +180,9 @@ func (t *httpTransport) newRequest(ctx context.Context, method string, body []by
 			return nil, err
 		}
 		if tok != "" {
+			if cleartextRemote(t.url) {
+				return nil, errCleartext
+			}
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 	}

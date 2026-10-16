@@ -84,6 +84,9 @@ func connectSSE(ctx context.Context, rawURL string, headers map[string]string, b
 }
 
 func (t *sseTransport) decorate(ctx context.Context, req *http.Request) error {
+	if len(t.headers) > 0 && cleartextRemote(t.url) {
+		return errCleartext
+	}
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -93,6 +96,9 @@ func (t *sseTransport) decorate(ctx context.Context, req *http.Request) error {
 			return err
 		}
 		if tok != "" {
+			if cleartextRemote(t.url) {
+				return errCleartext
+			}
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 	}

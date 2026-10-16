@@ -409,3 +409,23 @@ func TestReadSSE(t *testing.T) {
 		t.Fatalf("events = %+v", got)
 	}
 }
+
+// Headers and tokens never go over plain http to another host, but do to this machine.
+func TestCleartextRemoteRefusesSecrets(t *testing.T) {
+	for raw, bad := range map[string]bool{
+		"https://example.com/mcp":     false,
+		"http://127.0.0.1:9/mcp":      false,
+		"http://localhost:9/mcp":      false,
+		"http://[::1]:9/mcp":          false,
+		"http://intranet.example/mcp": true,
+		"http://10.0.0.5/mcp":         true,
+	} {
+		if cleartextRemote(raw) != bad {
+			t.Errorf("cleartextRemote(%q) = %v", raw, !bad)
+		}
+	}
+	_, err := Dial(ctx5(t), Options{Config: ServerConfig{URL: "http://intranet.example/mcp", Headers: map[string]string{"X-Key": "k"}}, Dir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "plain http") {
+		t.Fatalf("err = %v, want a refusal to send headers over plain http", err)
+	}
+}
