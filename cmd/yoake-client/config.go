@@ -14,6 +14,9 @@ type ClientConfig struct {
 	CA      string `json:"ca,omitempty"`
 	Name    string `json:"name,omitempty"`
 	Session string `json:"session,omitempty"`
+	// DeviceID is generated once and kept, so the server knows this device
+	// across reconnects (SPEC.md §2a).
+	DeviceID string `json:"deviceId,omitempty"`
 }
 
 func clientConfigPath() (string, error) {

@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,12 +21,73 @@ import (
 	"yoakeland/internal/sockpath"
 )
 
-type pendingPerm struct {
+// pendingAsk is something the backend is blocked on: a permission request
+// (allow/deny) or an ask_user_question. They are answered oldest first.
+type pendingAsk struct {
 	SessionID  string
 	TurnID     string
 	ToolCallID string
-	ToolName   string
-	Desc       string
+	Perm       bool     // a permission request rather than a question
+	Options    []string // a question's options, if it has any
+}
+
+// sanitize drops control characters from text the backend or the model
+// produced, so a repo's files can't clear the screen, hide the permission
+// prompt or write the clipboard through escape sequences. Newlines and tabs
+// are kept.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// parsePermissionAnswer accepts only the answers the prompt names. A loose
+// match would let a stray word allow a tool, or save a rule that lasts forever.
+func parsePermissionAnswer(line string) (allowed, remember, ok bool) {
+	switch strings.ToLower(line) {
+	case "y", "yes":
+		return true, false, true
+	case "yr", "always":
+		return true, true, true
+	case "n", "no":
+		return false, false, true
+	case "nr":
+		return false, true, true
+	}
+	return false, false, false
+}
+
+// backendPath resolves a bare binary name from PATH, then from beside this
+// client, never from the working directory: a repo could ship its own
+// yoakeland there. An explicit path is returned as is.
+func backendPath(name string) string {
+	if strings.ContainsRune(name, filepath.Separator) {
+		return name
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), name)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return name
+}
+
+// newDeviceID makes the stable id this client presents on every TCP connect,
+// so the server recognises the device across reconnects (SPEC.md §2a).
+func newDeviceID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func parseCommandArgs(cmdStr string) []string {
@@ -77,7 +142,7 @@ func main() {
 	var token string
 	var caPath string
 	var name string
-	flag.StringVar(&backendCmdStr, "bin", "./yoakeland", "Path or command line of the yoakeland binary (spawn mode; ignored with -connect)")
+	flag.StringVar(&backendCmdStr, "bin", "yoakeland", "Command line of the yoakeland binary (spawn mode; ignored with -connect). A bare name is found on PATH, then beside this client; a path such as ./yoakeland runs that file.")
 	flag.StringVar(&sessionID, "session", firstNonEmpty(saved.Session, "session-main"), "Session ID to join or resume")
 	flag.StringVar(&connect, "connect", saved.Connect, "Connect to a running yoakeland server instead of spawning one: 'local' for the local unix socket (<state-dir>/yoakeland.sock), a unix socket path, or 'tcp://host:port' for the remote TLS+token listener (-token/-ca). Unset means spawn mode via -bin.")
 	flag.StringVar(&token, "token", saved.Token, "Auth token for a tcp:// -connect target (SPEC.md §2a).")
@@ -91,9 +156,14 @@ func main() {
 		}
 	}
 
+	deviceID := saved.DeviceID
+	if deviceID == "" {
+		deviceID = newDeviceID()
+	}
+
 	// Remember this run's settings so the next invocation on this device
 	// doesn't need to repeat them.
-	_ = saveClientConfig(ClientConfig{Connect: connect, Token: token, CA: caPath, Name: name, Session: sessionID})
+	_ = saveClientConfig(ClientConfig{Connect: connect, Token: token, CA: caPath, Name: name, Session: sessionID, DeviceID: deviceID})
 
 	var clientStream *protocol.IPCStream
 	var cmd *exec.Cmd
@@ -128,6 +198,7 @@ func main() {
 			Token:      token,
 			Name:       name,
 			DeviceType: "cli",
+			DeviceID:   deviceID,
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to send auth: %v\n", err)
 			os.Exit(1)
@@ -152,6 +223,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "no backend binary specified\n")
 			os.Exit(1)
 		}
+		cmdParts[0] = backendPath(cmdParts[0])
 		// yoakeland defaults to daemon mode (always-on local socket, exits
 		// only on SIGINT/SIGTERM) — this spawn-and-pipe path needs the
 		// opposite contract (speak stdio directly, exit on stdin EOF), so
@@ -183,34 +255,61 @@ func main() {
 
 	var turnCounter uint64
 
+	// quitting is set once the user has asked to leave, so the backend closing
+	// its end after that is expected rather than a failure.
+	var quitting atomic.Bool
+
 	var permMu sync.Mutex
-	var activePermReq *pendingPerm
+	var pending []pendingAsk // oldest first; the next answer goes to pending[0]
+
+	// check reports a send that failed, so the user knows an answer or prompt
+	// never reached the backend.
+	check := func(err error) {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[client] send failed: %v\n", err)
+		}
+	}
 
 	// Background listener for events from backend
 	go func() {
 		for {
 			env, err := clientStream.ReadEnvelope()
 			if err != nil {
-				if err == io.EOF {
-					fmt.Println("\n[client] Backend closed.")
-					os.Exit(0)
+				if quitting.Load() {
+					return
 				}
-				return
+				// The backend went away underneath us. Say so and fail, rather
+				// than leaving the user typing into a dead stream.
+				if err == io.EOF {
+					fmt.Fprintln(os.Stderr, "\n[client] Backend closed.")
+				} else {
+					fmt.Fprintf(os.Stderr, "\n[client] Read from backend failed: %v\n", err)
+				}
+				os.Exit(1)
 			}
 
 			switch env.Type {
+			case protocol.EventPing:
+				// Idle connections are dropped if they never answer a ping (SPEC.md §2a).
+				var d protocol.PingData
+				_ = json.Unmarshal(env.Data, &d)
+				check(clientStream.SendEvent(protocol.EventPong, "", "", "", protocol.PongData{Nonce: d.Nonce}))
+
+			case protocol.EventPairingPending:
+				fmt.Printf("\n[client] Waiting for someone at the desktop to approve this device...\n")
+
 			case protocol.EventSessionHistory:
 				var d protocol.SessionHistoryData
 				_ = json.Unmarshal(env.Data, &d)
 				if len(d.Messages) > 0 {
-					fmt.Printf("[client] Resuming session %s (%d prior messages):\n", d.SessionID, len(d.Messages))
+					fmt.Printf("[client] Resuming session %s (%d prior messages):\n", sanitize(d.SessionID), len(d.Messages))
 					for _, m := range d.Messages {
 						if m.Content != "" {
-							role := m.Role
+							role := sanitize(m.Role)
 							if m.Author != "" {
-								role = fmt.Sprintf("%s (%s)", m.Role, m.Author)
+								role = fmt.Sprintf("%s (%s)", role, sanitize(m.Author))
 							}
-							fmt.Printf("  %s: %s\n", role, m.Content)
+							fmt.Printf("  %s: %s\n", role, sanitize(m.Content))
 						}
 					}
 				}
@@ -219,129 +318,169 @@ func main() {
 			case protocol.EventModelDelta:
 				var d protocol.ModelDeltaData
 				_ = json.Unmarshal(env.Data, &d)
-				fmt.Print(d.Content)
+				fmt.Print(sanitize(d.Content))
 
 			case protocol.EventToolCallRequested:
 				var d protocol.ToolCallData
 				_ = json.Unmarshal(env.Data, &d)
-				fmt.Printf("\n[TOOL CALL] %s -> %s\n", d.Name, string(d.Args))
+				fmt.Printf("\n[TOOL CALL] %s -> %s\n", sanitize(d.Name), sanitize(string(d.Args)))
 
 			case protocol.EventPermissionRequest:
 				var d protocol.PermissionRequestData
 				_ = json.Unmarshal(env.Data, &d)
 
 				permMu.Lock()
-				activePermReq = &pendingPerm{
-					SessionID:  env.SessionID,
-					TurnID:     env.TurnID,
-					ToolCallID: env.ToolCallID,
-					ToolName:   d.ToolName,
-					Desc:       d.Description,
-				}
+				pending = append(pending, pendingAsk{SessionID: env.SessionID, TurnID: env.TurnID, ToolCallID: env.ToolCallID, Perm: true})
 				permMu.Unlock()
 
-				fmt.Printf("\n[PERMISSION REQUIRED] %s (%s)\nAllow? y/n, add r to remember forever (e.g. yr): ", d.ToolName, d.Description)
+				// A plan ask is the agent leaving plan mode. This client has no
+				// plan view, so it is answered as an ordinary allow or deny.
+				label := "PERMISSION REQUIRED"
+				if d.Plan {
+					label = "PLAN APPROVAL REQUIRED"
+				}
+				fmt.Printf("\n[%s] %s (%s)\nAllow? y/n, add r to remember forever (e.g. yr): ", label, sanitize(d.ToolName), sanitize(d.Description))
+
+			case protocol.EventAskUserQuestionRequested:
+				var d protocol.AskUserQuestionRequestedData
+				_ = json.Unmarshal(env.Data, &d)
+
+				permMu.Lock()
+				pending = append(pending, pendingAsk{SessionID: env.SessionID, TurnID: env.TurnID, ToolCallID: env.ToolCallID, Options: d.Options})
+				permMu.Unlock()
+
+				label := "QUESTION"
+				if d.Total > 1 {
+					label = fmt.Sprintf("QUESTION %d of %d", d.Index, d.Total)
+				}
+				fmt.Printf("\n[%s] %s\n", label, sanitize(d.Question))
+				for i, o := range d.Options {
+					fmt.Printf("  %d) %s\n", i+1, sanitize(o))
+				}
+				fmt.Print("Answer: ")
 
 			case protocol.EventToolResult:
 				var d protocol.ToolResultData
 				_ = json.Unmarshal(env.Data, &d)
 				if d.Error != "" {
-					fmt.Printf("[TOOL ERR] %s: %s\n", d.ToolName, d.Error)
+					fmt.Printf("[TOOL ERR] %s: %s\n", sanitize(d.ToolName), sanitize(d.Error))
 				} else {
-					fmt.Printf("[TOOL OUT] %s:\n%s\n", d.ToolName, d.Output)
+					fmt.Printf("[TOOL OUT] %s:\n%s\n", sanitize(d.ToolName), sanitize(d.Output))
 				}
 
 			case protocol.EventTurnCompleted:
-				fmt.Printf("\n--- [Turn completed (Session: %s)] ---\n> ", env.SessionID)
+				fmt.Printf("\n--- [Turn completed (Session: %s)] ---\n> ", sanitize(env.SessionID))
 
 			case protocol.EventSnapshotRestored:
 				var d protocol.SnapshotEventData
 				_ = json.Unmarshal(env.Data, &d)
-				fmt.Printf("\n[SNAPSHOT RESTORED] Snapshot ID: %s\n> ", d.SnapshotID)
+				fmt.Printf("\n[SNAPSHOT RESTORED] Snapshot ID: %s\n> ", sanitize(d.SnapshotID))
 
 			case protocol.EventError:
 				var d protocol.ErrorData
 				_ = json.Unmarshal(env.Data, &d)
-				fmt.Printf("\n[BACKEND ERROR] %s\n> ", d.Message)
+				fmt.Printf("\n[BACKEND ERROR] %s\n> ", sanitize(d.Message))
 			}
 		}
 	}()
 
 	// Single Stdin Scanner Loop (Sole Owner of os.Stdin)
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("yoakeland client connected [Session: %s]\nType a prompt or 'exit':\n", sessionID)
+	scanner.Buffer(make([]byte, 0, 64*1024), protocol.MaxFrameSize)
+	fmt.Printf("yoakeland client connected [Session: %s]\nType a prompt or 'exit':\n", sanitize(sessionID))
 
 	// Ask the backend to replay this session's persisted history (if any) —
 	// the server is the source of truth for a session's transcript (see
 	// SPEC.md §6, get_session_history), not this client. The background
 	// listener above prints it (and the next "> " prompt) once it arrives.
-	_ = clientStream.SendEvent(protocol.EventGetSessionHistory, sessionID, "", "", protocol.GetSessionHistoryData{
+	check(clientStream.SendEvent(protocol.EventGetSessionHistory, sessionID, "", "", protocol.GetSessionHistoryData{
 		SessionID: sessionID,
-	})
+	}))
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			permMu.Lock()
-			hasPerm := activePermReq != nil
-			permMu.Unlock()
 
-			if hasPerm {
+		permMu.Lock()
+		hasAsk := len(pending) > 0
+		var head pendingAsk
+		if hasAsk {
+			head = pending[0]
+		}
+		permMu.Unlock()
+
+		if line == "" {
+			switch {
+			case hasAsk && head.Perm:
 				fmt.Print("Allow or deny? (y/n/yr/nr): ")
-			} else {
+			case hasAsk:
+				fmt.Print("Answer: ")
+			default:
 				fmt.Print("> ")
 			}
 			continue
 		}
 
 		if line == "exit" || line == "quit" {
+			quitting.Store(true)
 			if cmd != nil {
 				_ = cmd.Process.Kill()
 			}
 			break
 		}
 
-		// Check if we are answering a pending permission request
-		permMu.Lock()
-		req := activePermReq
-		activePermReq = nil
-		permMu.Unlock()
-
-		if req != nil {
-			lower := strings.ToLower(line)
-			allowed := strings.HasPrefix(lower, "y")
-			remember := strings.Contains(lower, "r")
-
-			_ = clientStream.SendEvent(
-				protocol.EventPermissionResponse,
-				req.SessionID,
-				req.TurnID,
-				req.ToolCallID,
-				protocol.PermissionResponseData{
-					Allowed:  allowed,
-					Remember: remember,
-				},
-			)
+		// The next line answers the oldest pending ask. Only the reader
+		// goroutine appends to pending, so head is still pending[0] here.
+		if hasAsk {
+			if head.Perm {
+				allowed, remember, ok := parsePermissionAnswer(line)
+				if !ok {
+					fmt.Print("Please answer y, n, yr or nr: ")
+					continue
+				}
+				check(clientStream.SendEvent(
+					protocol.EventPermissionResponse,
+					head.SessionID,
+					head.TurnID,
+					head.ToolCallID,
+					protocol.PermissionResponseData{
+						Allowed:  allowed,
+						Remember: remember,
+					},
+				))
+			} else {
+				// A number picks an option; anything else is the answer as typed.
+				answer := line
+				if n, err := strconv.Atoi(line); err == nil && n >= 1 && n <= len(head.Options) {
+					answer = head.Options[n-1]
+				}
+				check(clientStream.SendEvent(protocol.EventAskUserAnswer, head.SessionID, head.TurnID, head.ToolCallID, protocol.AskUserAnswerData{
+					Answer: answer,
+				}))
+			}
+			permMu.Lock()
+			pending = pending[1:]
+			permMu.Unlock()
 			continue
 		}
 
 		// Handle Snapshot restoration command
 		if strings.HasPrefix(line, "restore ") {
 			snapID := strings.TrimSpace(strings.TrimPrefix(line, "restore "))
-			_ = clientStream.SendEvent(protocol.EventRestoreSnapshot, sessionID, "", "", protocol.RestoreSnapshotData{
+			check(clientStream.SendEvent(protocol.EventRestoreSnapshot, sessionID, "", "", protocol.RestoreSnapshotData{
 				SnapshotID: snapID,
-			})
+			}))
 			continue
 		}
 
 		// Standard user prompt
 		turnID := fmt.Sprintf("turn-%d", atomic.AddUint64(&turnCounter, 1))
-		_ = clientStream.SendEvent(protocol.EventUserPrompt, sessionID, turnID, "", protocol.UserPromptData{
+		check(clientStream.SendEvent(protocol.EventUserPrompt, sessionID, turnID, "", protocol.UserPromptData{
 			Prompt:    line,
 			SessionID: sessionID,
-		})
+		}))
 	}
 
+	quitting.Store(true)
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
 	}

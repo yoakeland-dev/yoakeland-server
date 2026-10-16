@@ -6,11 +6,12 @@ func TestClientConfigRoundTrip(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	want := ClientConfig{
-		Connect: "tcp://example.com:7890",
-		Token:   "shh",
-		CA:      "/tmp/ca.pem",
-		Name:    "test-device",
-		Session: "session-main",
+		Connect:  "tcp://example.com:7890",
+		Token:    "shh",
+		CA:       "/tmp/ca.pem",
+		Name:     "test-device",
+		Session:  "session-main",
+		DeviceID: "3f2a9c",
 	}
 	if err := saveClientConfig(want); err != nil {
 		t.Fatalf("saveClientConfig: %v", err)
