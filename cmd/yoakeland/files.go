@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -268,7 +269,13 @@ func resolveEntry(root, rel string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, path.Base(clean)), nil
+	p := filepath.Join(dir, path.Base(clean))
+	// The parent check only refuses paths inside a Hidden dir, not the dir
+	// itself: a project at $HOME could otherwise delete or move ~/.yoake.
+	if slices.Contains(normalizer.Hidden, p) {
+		return "", fmt.Errorf("%w: %s is yoakeland's own state", normalizer.ErrEscapesRoot, rel)
+	}
+	return p, nil
 }
 
 func listTree(root, rel string) ([]protocol.TreeEntry, error) {

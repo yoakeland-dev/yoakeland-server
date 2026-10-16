@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 )
 
@@ -91,5 +92,31 @@ func TestFileRequests(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(filepath.Join(root, "b.txt")); string(data) != "v2" {
 		t.Fatalf("rename lost content: %q", data)
+	}
+}
+
+// fs_op resolves only the entry's parent, so the Hidden state dir itself
+// (a project opened at $HOME contains ~/.yoake) must be refused by name.
+func TestFsOpRefusesStateDir(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, ".yoake")
+	if err := os.Mkdir(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	old := normalizer.Hidden
+	normalizer.Hidden = []string{state}
+	t.Cleanup(func() { normalizer.Hidden = old })
+
+	for _, d := range []protocol.FsOpData{
+		{Op: "delete", Path: ".yoake"},
+		{Op: "delete", Path: "./x/../.yoake/"},
+		{Op: "rename", Path: ".yoake", NewPath: "gone"},
+	} {
+		if err := fsOp(root, d); err == nil {
+			t.Fatalf("%+v should be refused", d)
+		}
+	}
+	if _, err := os.Stat(state); err != nil {
+		t.Fatalf("state dir touched: %v", err)
 	}
 }

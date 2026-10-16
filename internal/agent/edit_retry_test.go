@@ -417,3 +417,39 @@ func TestAgent_RetryMessage_NonTerminalRoundTripInMultiToolCallTurn(t *testing.T
 		t.Fatalf("expected the whole 3-message tool round-trip stashed together: %+v", alts[0])
 	}
 }
+
+// failsOnce errors the first turn (a CLI agent that isn't signed in), then answers.
+type failsOnce struct{ calls int }
+
+func (f *failsOnce) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	c, e := make(chan agent.ModelStreamChunk, 2), make(chan error, 1)
+	f.calls++
+	if f.calls == 1 {
+		e <- errors.New("not signed in")
+	} else {
+		c <- agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: "reply"}
+	}
+	close(c)
+	close(e)
+	return c, e
+}
+
+// A turn that failed before any reply was kept leaves the prompt unanswered; the client's retry
+// names a bubble the server never had, and must still regenerate rather than say "not found".
+func TestAgent_RetryMessage_AnswersPromptWhoseTurnFailed(t *testing.T) {
+	ag, sessStore, _ := testAgent(t, &failsOnce{})
+	ctx := context.Background()
+	if err := ag.RunTurn(ctx, "s6", "t1", "hello"); err == nil {
+		t.Fatal("expected the first turn to fail")
+	}
+	if err := ag.RetryMessage(ctx, "s6", "t2", "t1-reply"); err != nil {
+		t.Fatalf("retry of a failed turn: %v", err)
+	}
+	state, err := sessStore.Load("s6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(state.History); n != 2 || state.History[1].Content != "reply" {
+		t.Fatalf("history = %+v, want the prompt and its reply", state.History)
+	}
+}

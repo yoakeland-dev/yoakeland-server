@@ -2190,11 +2190,17 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 
 	a.mu.Lock()
 	idx, found := indexOfMessageLocked(a.history, messageID)
+	if !found && len(a.history) > 0 && a.history[len(a.history)-1].Role == "user" {
+		// The turn failed before anything of the reply was kept (a CLI agent that
+		// isn't signed in, say), so the client is retrying a placeholder bubble this
+		// side never had. The prompt is still waiting for its answer: answer it.
+		idx, found = len(a.history), true
+	}
 	if !found {
 		a.mu.Unlock()
 		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotFound)
 	}
-	if a.history[idx].Role != "assistant" {
+	if idx < len(a.history) && a.history[idx].Role != "assistant" {
 		a.mu.Unlock()
 		return fmt.Errorf("message %s: %w", messageID, ErrMessageNotRetryable)
 	}
@@ -2204,11 +2210,13 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 		branchPoint = a.history[idx-1].ID
 		userMessageID = branchPoint
 	}
-	if a.branches == nil {
-		a.branches = make(map[string][][]Message)
+	if idx < len(a.history) {
+		if a.branches == nil {
+			a.branches = make(map[string][][]Message)
+		}
+		a.branches[branchPoint] = append(a.branches[branchPoint], append([]Message(nil), a.history[idx:]...))
+		a.history = a.history[:idx:idx]
 	}
-	a.branches[branchPoint] = append(a.branches[branchPoint], append([]Message(nil), a.history[idx:]...))
-	a.history = a.history[:idx:idx]
 	a.mu.Unlock()
 
 	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)

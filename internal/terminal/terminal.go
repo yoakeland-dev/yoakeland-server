@@ -298,22 +298,21 @@ func (t *Terminal) appendOutput(chunk []byte) {
 	}
 	t.sequence++
 	oc := outputChunk{data: data, seq: t.sequence}
-	subs := make([]*outputSubscriber, 0, len(t.subs))
-	for _, sub := range t.subs {
-		subs = append(subs, sub)
-	}
-	t.mu.Unlock()
-
 	// Non-blocking per subscriber: appendOutput runs on pump's hot loop (the
 	// pty's sole reader), so one subscriber's full channel must never stall
-	// delivery to the others — see outputSubscriber's doc comment.
-	for _, sub := range subs {
+	// delivery to the others — see outputSubscriber's doc comment. Sent under
+	// t.mu: a channel is only closed after it leaves t.subs, so a send here
+	// can't race dropOutputSubscriber/closeOutputSubscribers into a closed
+	// channel (which panics).
+	for stream, sub := range t.subs {
 		select {
 		case sub.ch <- oc:
 		default:
-			t.dropOutputSubscriber(sub.stream)
+			delete(t.subs, stream)
+			close(sub.ch)
 		}
 	}
+	t.mu.Unlock()
 }
 
 // Manager owns every terminal (tab) open for one project, grouped by the
