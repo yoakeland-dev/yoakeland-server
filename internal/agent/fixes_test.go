@@ -154,3 +154,32 @@ func TestUsageStore_CorruptFileKept(t *testing.T) {
 		t.Fatalf("corrupt copy: %q %v", b, err)
 	}
 }
+
+// AGT-11: a session file that exists but can't be read is reported and its
+// turns refused, rather than starting an empty chat that can't save over it.
+func TestLoadSession_UnreadableFileRefusesTurns(t *testing.T) {
+	dir := t.TempDir()
+	norm, _ := normalizer.New(dir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(dir)
+	sessStore, _ := agent.NewDiskSessionStore(dir)
+	path := filepath.Join(dir, "sessions", "s1.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
+	p := &scriptProvider{func([]agent.Message, string) []agent.ModelStreamChunk {
+		return []agent.ModelStreamChunk{textChunk("hi")}
+	}}
+	ag := agent.NewAgent(ipc, p, "p", nil, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(100000, 4000), nil)
+	t.Cleanup(ag.WaitBackground)
+
+	if err := ag.LoadSession("s1"); err == nil {
+		t.Fatal("expected the unreadable session to be reported")
+	}
+	if err := ag.RunTurn(context.Background(), "s1", "t1", "hello"); err == nil {
+		t.Fatal("expected a turn on the unreadable session to be refused")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "{not json" {
+		t.Fatalf("the unreadable file was overwritten: %q", b)
+	}
+}

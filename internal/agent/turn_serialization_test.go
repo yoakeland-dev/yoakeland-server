@@ -170,3 +170,73 @@ func TestAgent_WithdrawTurn_QueuedTurnNeverRuns(t *testing.T) {
 		t.Fatalf("the withdrawn turn was announced as started:\n%s", out)
 	}
 }
+
+// AGT-5: deleting a session cancels its queued turns too, so they never call
+// the model or touch the deleted session.
+func TestAgent_DeleteCancelsQueuedTurns(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+
+	release := make(chan struct{})
+	var starts atomic.Int32
+	provider := &blockingCostProvider{onStart: func() { starts.Add(1); <-release }}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
+	ag := agent.NewAgent(ipc, provider, "test-provider", nil, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(1_000_000, 20), nil)
+	t.Cleanup(ag.WaitBackground)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = ag.RunTurn(context.Background(), "s", "turn-a", "first") }()
+	for starts.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	go func() { defer wg.Done(); _ = ag.RunTurn(context.Background(), "s", "turn-b", "second") }()
+	for ag.QueuedTurns() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	ag.Discard()
+	ag.CancelAll()
+	close(release)
+	wg.Wait()
+
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("model was called %d times; only the turn already running may have called it", n)
+	}
+}
+
+// AGT-3: switching branches while a turn runs is refused at once, rather than
+// blocking the connection that asked (which may be the one that would cancel).
+func TestAgent_SwitchBranchRefusedWhileTurnRuns(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+
+	release := make(chan struct{})
+	provider := &blockingCostProvider{onStart: func() { <-release }}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
+	ag := agent.NewAgent(ipc, provider, "test-provider", nil, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(1_000_000, 20), nil)
+	t.Cleanup(ag.WaitBackground)
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = ag.RunTurn(context.Background(), "s", "turn-a", "first") }()
+	for ag.ActiveTurnCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	errc := make(chan error, 1)
+	go func() { errc <- ag.SwitchBranch("s", "m1") }()
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("SwitchBranch succeeded while a turn was running")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SwitchBranch blocked behind the running turn")
+	}
+	close(release)
+	<-done
+}

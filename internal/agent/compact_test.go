@@ -3,6 +3,7 @@ package agent_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -87,5 +88,33 @@ func TestCompact_TooShortSummaryWithInstructionsIsRedoneWithout(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "kept detail") {
 		t.Fatalf("the full summary should be the one recorded: %s", out.String())
+	}
+}
+
+// summarizerDownProvider answers turns but fails every summarizer request, as
+// a rate-limited or unreachable utility model does.
+type summarizerDownProvider struct{}
+
+func (summarizerDownProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []tool.ToolDefinition, system string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	c, e := make(chan agent.ModelStreamChunk, 1), make(chan error, 1)
+	if strings.Contains(system, "summarize a coding agent's session") {
+		e <- errors.New("429 rate limited")
+	} else {
+		c <- agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: "reply"}
+	}
+	close(c)
+	close(e)
+	return c, e
+}
+
+// A failed summary must not stand in for the conversation: nothing is
+// recorded, so the model keeps the full history.
+func TestCompact_FailedSummaryRecordsNothing(t *testing.T) {
+	ag, out := compactFixture(t, summarizerDownProvider{})
+	if err := ag.Compact(context.Background(), "s1", "t2", ""); err == nil {
+		t.Fatal("expected the failed compaction to be reported")
+	}
+	if s := out.String(); strings.Contains(s, `"type":"context_compacted"`) {
+		t.Fatalf("a failed compaction must not be announced: %s", s)
 	}
 }

@@ -366,6 +366,8 @@ func contextView(history []Message, prefixKey string) []Message {
 		out = append(out, m)
 	}
 
+	out = pairToolCalls(out)
+
 	replay := true
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i].Role != "assistant" {
@@ -377,6 +379,41 @@ func contextView(history []Message, prefixKey string) []Message {
 		if !replay {
 			out[i].RawContent = nil
 		}
+	}
+	return out
+}
+
+// pairToolCalls gives every API tool call in view a tool result. A turn that
+// was cancelled, failed or panicked mid-round leaves calls with no result,
+// and providers reject the whole request for an unanswered tool_use. The
+// synthetic result goes after the call's own results, in the view only;
+// history keeps what really happened. Native calls are flattened to text for
+// API providers, so they are left alone.
+func pairToolCalls(view []Message) []Message {
+	answered := map[string]bool{}
+	for _, m := range view {
+		if m.Role == "tool" {
+			answered[m.ToolCallID] = true
+		}
+	}
+	out := make([]Message, 0, len(view))
+	for i := 0; i < len(view); i++ {
+		m := view[i]
+		out = append(out, m)
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		j := i + 1
+		for ; j < len(view) && view[j].Role == "tool"; j++ {
+			out = append(out, view[j])
+		}
+		for _, tc := range m.ToolCalls {
+			if !tc.Native && !answered[tc.ID] {
+				out = append(out, Message{Role: "tool", ToolCallID: tc.ID, Content: "no result: the turn ended before this tool ran"})
+				answered[tc.ID] = true
+			}
+		}
+		i = j - 1
 	}
 	return out
 }
@@ -555,8 +592,9 @@ func transcriptForSummary(view []Message) string {
 	return sb.String()
 }
 
-// fallbackSummary is the summary used when the summarizing model call
-// fails: the conversation's own words, without tool output.
+// fallbackSummary is the summary for a binding with no API model to ask (a
+// native agent keeps its own context): the conversation's own words, without
+// tool output.
 func fallbackSummary(view []Message) string {
 	var sb strings.Builder
 	for _, m := range view {
@@ -618,16 +656,24 @@ func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBindi
 		return protocol.UsageData{}
 	}
 
-	return a.compactBySummary(ctx, turnID, bound, view, used, overhead, "", false)
+	usage, err := a.compactBySummary(ctx, turnID, bound, view, used, overhead, "", false)
+	if err != nil {
+		log.Printf("session %s: compaction failed (%v); keeping the full context and trying again next round", a.CurrentSessionID(), err)
+	}
+	return usage
 }
 
 // compactBySummary records a summary compaction of view, which holds used
-// tokens, and returns the summarizer's usage. extra is the caller's one-off
-// guidance, added after the server's compactInstructions.
-func (a *Agent) compactBySummary(ctx context.Context, turnID string, bound RoleBinding, view []Message, used, overhead int, extra string, manual bool) protocol.UsageData {
+// tokens, and returns the summarizer's usage. It records nothing when the
+// summary fails. extra is the caller's one-off guidance, added after the
+// server's compactInstructions.
+func (a *Agent) compactBySummary(ctx context.Context, turnID string, bound RoleBinding, view []Message, used, overhead int, extra string, manual bool) (protocol.UsageData, error) {
 	summarizer := a.roleOr(RoleUtility, bound)
 	instructions := strings.TrimSpace(compactInstructions() + "\n" + extra)
-	summary, usage := summarize(ctx, summarizer, view, instructions, minSummaryTokens(used), a.contextManager)
+	summary, usage, err := summarize(ctx, summarizer, view, instructions, minSummaryTokens(used), a.contextManager)
+	if err != nil {
+		return usage, err
+	}
 	a.recordCompaction(turnID, Message{
 		Role:     "compaction",
 		Content:  summary,
@@ -638,7 +684,7 @@ func (a *Agent) compactBySummary(ctx context.Context, turnID string, bound RoleB
 			Kind: CompactionSummary, TokensBefore: used, TokensAfter: overhead + a.contextManager.EstimateTokens(summaryOpening+summary),
 		},
 	}, manual)
-	return usage
+	return usage, nil
 }
 
 // Compact summarizes the session's conversation now (compact_context).
@@ -672,25 +718,29 @@ func (a *Agent) Compact(ctx context.Context, sessionID, turnID, extra string) er
 	}
 	overhead := a.requestOverhead()
 	used, _ := a.contextManager.contextTokens(history, view, overhead)
-	usage := a.compactBySummary(ctx, turnID, bound, view, used, overhead, extra, true)
+	usage, err := a.compactBySummary(ctx, turnID, bound, view, used, overhead, extra, true)
 	if a.usageStore != nil {
 		if usage.CostUnknown {
 			a.usageStore.MarkCostUnknown(sessionID)
 		}
 		a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
 	}
+	if err != nil {
+		return fmt.Errorf("compaction failed, the conversation is unchanged: %w", err)
+	}
 	return a.persistCurrentState()
 }
 
-// summarize asks b's model for a summary of view, falling back to the
-// conversation's own words if that fails: compaction must never fail a turn.
+// summarize asks b's model for a summary of view. A failure is returned, not
+// replaced with fallbackSummary: that would stand in for the whole
+// conversation from then on, so the caller keeps the full history instead.
 // instructions are the user's own guidance; if they bring back a summary
 // shorter than minTokens it is thrown away and the base prompt runs alone, so
 // a careless instruction can't leave the agent with nothing to go on.
-func summarize(ctx context.Context, b RoleBinding, view []Message, instructions string, minTokens int, cm *ContextManager) (string, protocol.UsageData) {
+func summarize(ctx context.Context, b RoleBinding, view []Message, instructions string, minTokens int, cm *ContextManager) (string, protocol.UsageData, error) {
 	var usage protocol.UsageData
 	if _, native := b.Provider.(NativeAgent); native || b.Provider == nil {
-		return fallbackSummary(view), usage
+		return fallbackSummary(view), usage, nil
 	}
 	summary, u, err := requestSummary(ctx, b, view, withInstructions(instructions))
 	usage = u
@@ -700,11 +750,13 @@ func summarize(ctx context.Context, b RoleBinding, view []Message, instructions 
 		addUsage(&usage, u)
 		usage.CostUSD += u.CostUSD
 	}
-	if err == nil && summary != "" {
-		return summary, usage
+	if err != nil {
+		return "", usage, fmt.Errorf("summary via %s: %w", b.ProviderName, err)
 	}
-	log.Printf("compaction summary via %s failed (%v); using the conversation's own text", b.ProviderName, err)
-	return fallbackSummary(view), usage
+	if summary == "" {
+		return "", usage, fmt.Errorf("summary via %s: empty", b.ProviderName)
+	}
+	return summary, usage, nil
 }
 
 func requestSummary(ctx context.Context, b RoleBinding, view []Message, system string) (string, protocol.UsageData, error) {

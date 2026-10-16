@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"log"
 	"sync"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
@@ -299,7 +300,12 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 		ag.stream.SetTap(r.eventTap)
 	}
 	ag.hooks = r.hooks
-	_ = ag.LoadSession(sessionID)
+	if err := ag.LoadSession(sessionID); err != nil {
+		// Not kept, so the next Get reads the file again. This agent refuses
+		// its turns with the error, so nothing runs on the empty chat it shows.
+		log.Printf("session %s: %v", sessionID, err)
+		return ag
+	}
 	r.sessions[sessionID] = ag
 	return ag
 }

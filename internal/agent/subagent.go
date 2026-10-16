@@ -7,6 +7,7 @@ import (
 	"log"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"yoakeland/internal/protocol"
@@ -57,11 +58,37 @@ type subagentResult struct {
 	transcript      []Message
 }
 
+// spendTally is the cost a round's subagents are checked against: what the
+// session had spent when they started, plus what each has priced since. They
+// run at once, so checking each one's own spend alone would let N of them
+// together pass a cap that none of them alone breaks.
+type spendTally struct {
+	mu  sync.Mutex
+	usd float64
+}
+
+func (t *spendTally) add(usd float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.usd += usd
+}
+
+func (t *spendTally) total() float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.usd
+}
+
 // startSubagents launches every subagent call in calls the current mode
 // allows, each in its own goroutine, keyed by call id. Each channel gets
-// exactly one result.
-func (a *Agent) startSubagents(ctx context.Context, turnID string, author Author, bound RoleBinding, calls []ToolCall) map[string]chan subagentResult {
+// exactly one result. spentThisTurn is the turn's priced cost so far, which
+// the subagents' spend tally starts from.
+func (a *Agent) startSubagents(ctx context.Context, turnID string, author Author, bound RoleBinding, calls []ToolCall, spentThisTurn float64) map[string]chan subagentResult {
 	var out map[string]chan subagentResult
+	tally := &spendTally{usd: spentThisTurn}
+	if a.usageStore != nil {
+		tally.usd += a.usageStore.SessionTotal(a.CurrentSessionID()).CostUSD
+	}
 	for _, tc := range calls {
 		if tc.Name != SubagentToolName || !a.isToolAllowedInMode(tc.Name) {
 			continue
@@ -78,13 +105,13 @@ func (a *Agent) startSubagents(ctx context.Context, turnID string, author Author
 					ch <- subagentResult{errText: fmt.Sprintf("subagent crashed: %v", r)}
 				}
 			}()
-			ch <- a.runSubagent(ctx, turnID, author, bound, tc)
+			ch <- a.runSubagent(ctx, turnID, author, bound, tc, tally)
 		}(tc)
 	}
 	return out
 }
 
-func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, bound RoleBinding, tc ToolCall) subagentResult {
+func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, bound RoleBinding, tc ToolCall, tally *spendTally) subagentResult {
 	var args struct{ Description, Prompt, Kind string }
 	if err := json.Unmarshal(tc.Args, &args); err != nil || strings.TrimSpace(args.Prompt) == "" {
 		return subagentResult{errText: "subagent needs a prompt"}
@@ -94,6 +121,7 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 		bound = a.roleOr(RoleExplore, bound)
 	}
 	child := a.newSubagent(tc.ID, bound, explore)
+	child.tally = tally
 	start := time.Now()
 	child.mu.Lock()
 	promptID := child.nextMessageIDLocked()

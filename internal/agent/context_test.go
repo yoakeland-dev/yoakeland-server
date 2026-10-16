@@ -304,3 +304,45 @@ func TestMinSummaryTokens(t *testing.T) {
 		}
 	}
 }
+
+// A turn cut short mid-round leaves tool calls with no result; the model's
+// view must still answer each one, or the provider rejects every later
+// request. A fully answered history is left as it is.
+func TestContextView_PairsOrphanToolCalls(t *testing.T) {
+	history := []Message{
+		{ID: "m1", Role: "user", Content: "do two things"},
+		{ID: "m2", Role: "assistant", ToolCalls: []ToolCall{
+			{ID: "c1", Name: "bash"}, {ID: "c2", Name: "file_write"}, {ID: "c3", Name: "bash"},
+		}},
+		{ID: "m3", Role: "tool", ToolCallID: "c1", Content: "ok"},
+		{ID: "m4", Role: "user", Content: "try again"},
+	}
+	view := contextView(history, "k")
+	if len(view) != 6 {
+		t.Fatalf("expected two synthetic results, got %d messages: %+v", len(view), view)
+	}
+	for _, id := range []string{"c2", "c3"} {
+		found := false
+		for _, m := range view {
+			if m.Role == "tool" && m.ToolCallID == id {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("no result for %s in view: %+v", id, view)
+		}
+	}
+	if view[2].ToolCallID != "c1" || view[2].Content != "ok" || view[5].Role != "user" {
+		t.Fatalf("real result moved or user message out of place: %+v", view)
+	}
+
+	paired := []Message{
+		{ID: "m1", Role: "user", Content: "hi"},
+		{ID: "m2", Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "bash"}}},
+		{ID: "m3", Role: "tool", ToolCallID: "c1", Content: "ok"},
+		{ID: "m4", Role: "assistant", Content: "done"},
+	}
+	if got := contextView(paired, "k"); len(got) != 4 || got[2].Content != "ok" {
+		t.Fatalf("expected a fully paired history unchanged, got %+v", got)
+	}
+}

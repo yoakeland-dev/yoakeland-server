@@ -441,10 +441,17 @@ type Agent struct {
 	// nativeRuleID is the agent-own suggestion the answer picked, by ask.
 	nativeRuleID map[string]string
 
+	// loadErr is why the session's file could not be read (LoadSession); turns
+	// are refused while it is set. Under mu.
+	loadErr error
+
 	// systemPrompt overrides the mode's prompt (a subagent's own); subagents
 	// are the running ones by the id of the call that started each (under mu).
 	systemPrompt string
 	subagents    map[string]*Agent
+	// tally is set on a subagent: the cost its round's siblings and parent
+	// have reached (see spendTally).
+	tally *spendTally
 
 	// roles is the server-wide model role table (roles.go); projectRoot is
 	// where the project's instructions file is read from (instructions.go).
@@ -483,43 +490,56 @@ func (h Hooks) asksChanged() {
 }
 
 // lockTurn claims the session's turn slot, counting the turn as queued
-// while it waits behind the current one. A queued turn can be withdrawn
-// (CancelTurn/WithdrawTurn, or ctx ending) before it starts: lockTurn then
-// reports turn_completed "cancelled" itself and returns false, and the
-// caller must return without touching history. A turn that gets the slot is
-// announced with turn_started, the point after which it can't be withdrawn.
-func (a *Agent) lockTurn(ctx context.Context, sessionID, turnID string) bool {
+// while it waits behind the current one. The returned context is the turn's
+// own, cancelled by CancelTurn, WithdrawTurn, CancelAll or ctx ending from the
+// moment the turn is queued, so a cancel can't fall into the gap before the
+// generation loop registers its own. A queued turn that is withdrawn before
+// it starts reports turn_completed "cancelled" itself and returns false, and
+// the caller must return without touching history. A turn that gets the slot
+// is announced with turn_started, the point after which it can't be
+// withdrawn. release ends the turn: it gives the slot back.
+func (a *Agent) lockTurn(ctx context.Context, sessionID, turnID string) (context.Context, func(), bool) {
+	tctx, cancel := context.WithCancel(ctx)
+	got := false
 	select {
 	case a.turnSlot <- struct{}{}:
+		got = true
 	default:
-		qctx, cancel := context.WithCancel(ctx)
-		defer cancel()
 		a.mu.Lock()
 		a.queuedTurns[turnID] = cancel
 		a.mu.Unlock()
 		a.hooks.queueChanged()
-		got := false
 		select {
 		case a.turnSlot <- struct{}{}:
 			got = true
-		case <-qctx.Done():
+		case <-tctx.Done():
 		}
 		a.mu.Lock()
 		delete(a.queuedTurns, turnID)
 		a.mu.Unlock()
 		a.hooks.queueChanged()
 		// Both cases can be ready at once; a withdrawn turn must never run.
-		if got && qctx.Err() != nil {
+		if got && tctx.Err() != nil {
 			a.unlockTurn()
 			got = false
 		}
-		if !got {
-			_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("cancelled", protocol.UsageData{}, time.Now(), "", ""))
-			return false
-		}
 	}
+	if !got {
+		cancel()
+		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("cancelled", protocol.UsageData{}, time.Now(), "", ""))
+		return nil, nil, false
+	}
+	a.mu.Lock()
+	a.activeTurnCancels[turnID] = cancel
+	a.mu.Unlock()
 	_ = a.getStream().SendEvent(protocol.EventTurnStarted, sessionID, turnID, "", protocol.TurnStartedData{})
-	return true
+	return tctx, func() {
+		a.mu.Lock()
+		delete(a.activeTurnCancels, turnID)
+		a.mu.Unlock()
+		cancel()
+		a.unlockTurn()
+	}, true
 }
 
 func (a *Agent) unlockTurn() { <-a.turnSlot }
@@ -660,6 +680,13 @@ func (a *Agent) LoadSession(sessionID string) error {
 
 	state, err := a.sessionStore.Load(sessionID)
 	if err != nil {
+		if !errors.Is(err, ErrSessionNotFound) {
+			// The file is there but unreadable. An empty chat in its place would
+			// only fail every save over it, so the session is refused instead
+			// (beginTurn) and the file is left alone.
+			a.loadErr = err
+			return err
+		}
 		a.sessionID = sessionID
 		a.history = make([]Message, 0)
 		a.branches = make(map[string][][]Message)
@@ -1115,12 +1142,15 @@ func (a *Agent) ActiveTurnCount() int {
 	return len(a.activeTurnCancels)
 }
 
-// CancelAll cancels every turn currently running on this agent, e.g. before
-// its session is deleted out from under it.
+// CancelAll cancels every turn on this agent, running or still queued, e.g.
+// before its session is deleted out from under it.
 func (a *Agent) CancelAll() {
 	a.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(a.activeTurnCancels))
+	cancels := make([]context.CancelFunc, 0, len(a.activeTurnCancels)+len(a.queuedTurns))
 	for _, cancel := range a.activeTurnCancels {
+		cancels = append(cancels, cancel)
+	}
+	for _, cancel := range a.queuedTurns {
 		cancels = append(cancels, cancel)
 	}
 	a.mu.Unlock()
@@ -1232,10 +1262,11 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	// (both happen below) so the check-then-record isn't itself racy. Also
 	// serializes against EditMessage/RetryMessage/SwitchBranch on the same
 	// Agent — all four mutate a.history/a.branches and must never interleave.
-	if !a.lockTurn(parentCtx, sessionID, turnID) {
+	turnCtx, release, ok := a.lockTurn(parentCtx, sessionID, turnID)
+	if !ok {
 		return nil
 	}
-	defer a.unlockTurn()
+	defer release()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
@@ -1268,7 +1299,7 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		go a.runTitleGeneration(parentCtx, sessionID, turnID, prompt, autoGenerateTitle, bound)
 	}
 
-	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)
+	return a.runGenerationLoop(turnCtx, turnID, startTime, author, bound, userMessageID)
 }
 
 // beginTurn resolves and binds sessionID, then runs the two checks that can
@@ -1279,6 +1310,15 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 // RetryMessage, which all start a turn the same way.
 func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (RoleBinding, error) {
 	a.mu.Lock()
+	if a.loadErr != nil {
+		a.mu.Unlock()
+		return RoleBinding{}, fmt.Errorf("session %s could not be loaded, so this turn was not run: %w", sessionID, a.loadErr)
+	}
+	// Deleted while this turn waited for the slot: it must not run at all.
+	if a.discarded {
+		a.mu.Unlock()
+		return RoleBinding{}, fmt.Errorf("session %s was deleted", sessionID)
+	}
 	if a.sessionID == "" || a.sessionID != sessionID {
 		a.sessionID = sessionID
 	}
@@ -1768,6 +1808,9 @@ turn:
 		priceUsage(bound.Model, &roundTripUsage)
 		addUsage(&totalUsage, roundTripUsage)
 		totalUsage.CostUSD += roundTripUsage.CostUSD
+		if a.tally != nil {
+			a.tally.add(roundTripUsage.CostUSD)
+		}
 
 		if cutShort || streamErr != nil {
 			break turn
@@ -1842,7 +1885,7 @@ turn:
 			break
 		}
 
-		subs = a.startSubagents(turnCtx, turnID, author, bound, toolCalls)
+		subs = a.startSubagents(turnCtx, turnID, author, bound, toolCalls, totalUsage.CostUSD)
 		// The round's other calls run while its subagents work, so a
 		// question or permission ask next to a subagent call isn't held
 		// back until the subagent finishes; their results are collected
@@ -2095,6 +2138,8 @@ turn:
 	}
 
 	if streamErr != nil {
+		// No turn_completed on this exit, so the spend is recorded here.
+		a.recordSpend(sessionID, totalUsage)
 		return streamErr
 	}
 	if cutShort {
@@ -2113,10 +2158,11 @@ turn:
 // the tree one hop at a time composes correctly without a full recursive
 // lookup — see the plan's scope note).
 func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messageID, content string, autoGenerateTitle bool) error {
-	if !a.lockTurn(parentCtx, sessionID, turnID) {
+	turnCtx, release, ok := a.lockTurn(parentCtx, sessionID, turnID)
+	if !ok {
 		return nil
 	}
-	defer a.unlockTurn()
+	defer release()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
@@ -2170,7 +2216,7 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 		go a.runTitleGeneration(parentCtx, sessionID, turnID, content, autoGenerateTitle, bound)
 	}
 
-	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)
+	return a.runGenerationLoop(turnCtx, turnID, startTime, author, bound, userMessageID)
 }
 
 // RetryMessage discards a past assistant message and regenerates a fresh
@@ -2185,10 +2231,11 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 // restore_snapshot (SPEC.md §3.1) is the tool for reverting the filesystem
 // itself, and is orthogonal to this.
 func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messageID string) error {
-	if !a.lockTurn(parentCtx, sessionID, turnID) {
+	turnCtx, release, ok := a.lockTurn(parentCtx, sessionID, turnID)
+	if !ok {
 		return nil
 	}
-	defer a.unlockTurn()
+	defer release()
 
 	startTime := time.Now()
 	author := AuthorFromContext(parentCtx)
@@ -2229,15 +2276,14 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 	}
 	a.mu.Unlock()
 
-	return a.runGenerationLoop(parentCtx, turnID, startTime, author, bound, userMessageID)
+	return a.runGenerationLoop(turnCtx, turnID, startTime, author, bound, userMessageID)
 }
 
 // SwitchBranch makes the branch containing messageID the active one,
 // stashing whatever suffix was active at that branch point back into
-// Branches in its place. Pure navigation — no model call, no cost. Blocks
-// on turnSlot so it never races a concurrently in-flight turn on the same
-// session; it simply waits for one to finish rather than switching out the
-// history a turn is actively appending to.
+// Branches in its place. Pure navigation — no model call, no cost. Refused
+// while a turn runs, so it never switches out the history a turn is actively
+// appending to, and never blocks the connection that asked.
 //
 // messageID may be any message within a stashed alternate, not just its
 // first one. Only branches reachable from the current active history can be
@@ -2245,8 +2291,12 @@ func (a *Agent) RetryMessage(parentCtx context.Context, sessionID, turnID, messa
 // reachable only after switching to that outer one first, which is just
 // walking the (implicit) tree one hop at a time.
 func (a *Agent) SwitchBranch(sessionID, messageID string) error {
-	a.turnSlot <- struct{}{}
-	defer a.unlockTurn()
+	select {
+	case a.turnSlot <- struct{}{}:
+		defer a.unlockTurn()
+	default:
+		return errors.New("a turn is running; switch branch once it finishes")
+	}
 
 	a.mu.Lock()
 	if a.sessionID == "" || a.sessionID != sessionID {
@@ -2333,6 +2383,28 @@ func limitTitle(title string) string {
 	return string(runes)
 }
 
+// recordSpend adds a turn's priced usage to the session and project totals
+// and returns them. Every exit that spent money calls it, the stream-error
+// exit included, so a failed turn's priced rounds still count towards the cap.
+func (a *Agent) recordSpend(sessionID string, usage protocol.UsageData) *protocol.SpendData {
+	if a.usageStore == nil {
+		return nil
+	}
+	// Unpriced usage is not free: it is recorded as unknown next to the
+	// priced total, and reported as such, rather than counting as $0 towards
+	// the per-session spend cap without a word. The cap can only act on what
+	// has a price, so it is a floor when SessionCostUnknown is set.
+	if usage.CostUnknown {
+		a.usageStore.MarkCostUnknown(sessionID)
+		log.Printf("session %s: %s has no known price; this turn's cost is unknown and not counted towards spend or the cap", sessionID, a.getModelName())
+	}
+	sessTotals, projTotals := a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
+	return &protocol.SpendData{
+		SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD,
+		SessionCostUnknown: sessTotals.CostUnknown, ProjectCostUnknown: projTotals.CostUnknown,
+	}
+}
+
 // buildTurnCompletedData assembles a turn_completed payload including the
 // context-window fullness and running spend, so every emission point (normal
 // completion and each cancellation path) reports the same enriched data.
@@ -2347,22 +2419,7 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 	// some part had no rate at all.
 	usage.CostKnown = !usage.CostUnknown
 
-	// Unpriced usage is not free: it is recorded as unknown next to the
-	// priced total, and reported as such, rather than counting as $0 towards
-	// the per-session spend cap without a word. The cap can only act on what
-	// has a price, so it is a floor when SessionCostUnknown is set.
-	var spend *protocol.SpendData
-	if a.usageStore != nil {
-		if usage.CostUnknown {
-			a.usageStore.MarkCostUnknown(sessionID)
-			log.Printf("session %s: %s has no known price; this turn's cost is unknown and not counted towards spend or the cap", sessionID, a.getModelName())
-		}
-		sessTotals, projTotals := a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
-		spend = &protocol.SpendData{
-			SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD,
-			SessionCostUnknown: sessTotals.CostUnknown, ProjectCostUnknown: projTotals.CostUnknown,
-		}
-	}
+	spend := a.recordSpend(sessionID, usage)
 
 	// The provider's own reported size of the last request (its actual
 	// tokenizer, system prompt and tool schemas included) beats a char/4
