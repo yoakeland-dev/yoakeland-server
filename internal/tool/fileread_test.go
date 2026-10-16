@@ -253,6 +253,10 @@ func TestSearch_SkipsRefusedFiles(t *testing.T) {
 	if strings.Contains(out, ".env") || !strings.Contains(out, "app.txt:1:") {
 		t.Fatalf("search output:\n%s", out)
 	}
+	// Named outright, the file is searched: the approval was for that path.
+	if out, err = tool.NewSearchTool(norm).Execute(context.Background(), ctx, []byte(`{"pattern":"KEY","path":".env"}`)); err != nil || !strings.Contains(out, ".env:1:") {
+		t.Fatalf("named file: %q, %v", out, err)
+	}
 }
 
 // A symlink repointed between the permission check and the write (a sandboxed

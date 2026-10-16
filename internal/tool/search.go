@@ -133,7 +133,9 @@ func (t *SearchTool) visit(fsys fs.FS, abs, p string, d fs.DirEntry, start strin
 			return nil
 		}
 	}
-	if readAllowed != nil && !readAllowed(abs) {
+	// The start path was asked for (and approved, if it needed that) as it
+	// is; only files the walk turns up are filtered.
+	if abs != start && readAllowed != nil && !readAllowed(abs) {
 		return nil
 	}
 	rel := filepath.FromSlash(p)
