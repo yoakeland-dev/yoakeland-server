@@ -106,7 +106,7 @@ func TestScanFindsSkillsAcrossRootsAndFoldsDuplicates(t *testing.T) {
 	if !find(sk, "mine").For(Native) || find(sk, "mine").For("claude") {
 		t.Fatal("a skill in yoakeland's own folder is for yoakeland's own loop")
 	}
-	// Both reviews exist; the project's wins.
+	// Both reviews exist; the user's wins, so a repo's skill can't shadow it.
 	var proj1, user1 *Skill
 	for i := range sk {
 		if sk[i].Name == "review" {
@@ -117,10 +117,10 @@ func TestScanFindsSkillsAcrossRootsAndFoldsDuplicates(t *testing.T) {
 			}
 		}
 	}
-	if proj1 == nil || user1 == nil || proj1.Shadowed || !user1.Shadowed || user1.Active() {
+	if proj1 == nil || user1 == nil || user1.Shadowed || !proj1.Shadowed || proj1.Active() {
 		t.Fatalf("project review = %+v, user review = %+v", proj1, user1)
 	}
-	if got, ok := Find(sk, "review", Native); !ok || got.Description != "Project review" {
+	if got, ok := Find(sk, "review", Native); !ok || got.Description != "User review" {
 		t.Fatalf("Find(review) = %+v", got)
 	}
 	if sk[0].Scope != ScopeProject {
@@ -287,5 +287,31 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A repo's skills are off until the user switches them on, and off again once
+// their files change: a cloned repo can't put instructions into the prompt by itself.
+func TestProjectSkillsNeedSwitchingOnForTheirCurrentFiles(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	dir := skill(t, filepath.Join(proj, ".agents", "skills"), "deploy", "deploy", "Ship it")
+	real, _ := filepath.EvalSymlinks(dir)
+	c, err := NewCatalog(state, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ForAgent(proj, Native); len(got) != 0 {
+		t.Fatalf("a repo's skill is offered before the user switched it on: %+v", got)
+	}
+	if err := c.SetEnabled(proj, real, true); err != nil || len(c.ForAgent(proj, Native)) != 1 {
+		t.Fatalf("switching on failed: %v", err)
+	}
+	c2, _ := NewCatalog(state, home)
+	if sk := c2.Scan(proj).Skills; len(sk) != 1 || !sk[0].Enabled {
+		t.Fatalf("the approval didn't persist: %+v", sk)
+	}
+	write(t, filepath.Join(dir, File), "---\nname: deploy\ndescription: Ship it\n---\nRun a different command now.\n")
+	if sk := c2.Scan(proj).Skills; len(sk) != 1 || sk[0].Enabled {
+		t.Fatalf("a changed skill must be off until switched on again: %+v", sk)
 	}
 }

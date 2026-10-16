@@ -6,7 +6,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -137,6 +140,84 @@ func TestStdioCloseKillsTheProcess(t *testing.T) {
 	case <-c.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("the process outlived Close")
+	}
+}
+
+// A server that never reads its stdin fills the pipe; the call must give up at
+// its deadline and the stuck process must go, not hold every later call.
+func TestStdioWriteToAServerThatStopsReadingGivesUp(t *testing.T) {
+	tr, err := startStdio("sh", []string{"-c", "sleep 30"}, t.TempDir(), os.Environ(), func(*message) *message { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	big := json.RawMessage(`"` + strings.Repeat("x", 1<<20) + `"`)
+	start := time.Now()
+	if _, err := tr.call(ctx, &message{JSONRPC: "2.0", ID: json.RawMessage("1"), Method: "tools/list", Params: big}); err == nil {
+		t.Fatal("a call into a full pipe must fail")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the call waited %v on a server that stopped reading", time.Since(start))
+	}
+	select {
+	case <-tr.done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stuck server was not killed")
+	}
+}
+
+// Server-initiated requests run on at most maxReplies goroutines at once.
+func TestServerRequestsAreBounded(t *testing.T) {
+	slots := make(chan struct{}, maxReplies)
+	release := make(chan struct{})
+	var running atomic.Int32
+	h := func(*message) *message { running.Add(1); <-release; return nil }
+	req := &message{JSONRPC: "2.0", ID: json.RawMessage("1"), Method: "ping"}
+	for i := 0; i < 3*maxReplies; i++ {
+		answerRequest(slots, h, nil, req)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for running.Load() < maxReplies && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := running.Load(); n != maxReplies {
+		t.Fatalf("%d handlers running, want %d", n, maxReplies)
+	}
+	close(release)
+}
+
+// Calls that all hit one expired session re-initialize once between them.
+func TestHTTPConcurrentSessionExpiryRestartsOnce(t *testing.T) {
+	h := newHTTPFake(t, "legacy", true, false, "")
+	c, err := Dial(ctx5(t), Options{Config: ServerConfig{URL: h.srv.URL}, Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	before := h.initializes()
+	c.t.(*httpTransport).setSession("sess-stale")
+	var wg sync.WaitGroup
+	errs := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.ListTools(ctx5(t))
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := h.initializes() - before; n != 1 {
+		t.Fatalf("%d initializes for one expired session, want 1", n)
 	}
 }
 
@@ -291,6 +372,13 @@ func TestLegacySSEEndpointMustStayOnTheServer(t *testing.T) {
 	}
 }
 
+func TestServerInfoIsCapped(t *testing.T) {
+	got := limitInfo(ServerInfo{Name: strings.Repeat("n", 5000), Instructions: strings.Repeat("i", 9000)})
+	if len(got.Name) > 210 || len(got.Instructions) > 2060 {
+		t.Fatalf("name %d bytes, instructions %d bytes: not capped", len(got.Name), len(got.Instructions))
+	}
+}
+
 func TestParseMessagesDropsNullEntries(t *testing.T) {
 	for _, c := range []struct {
 		in   string
@@ -319,5 +407,25 @@ func TestReadSSE(t *testing.T) {
 	}
 	if len(got) != 3 || got[0].Event != "a" || got[0].Data != "one\ntwo" || got[1].ID != "7" || got[2].Data != "tail" {
 		t.Fatalf("events = %+v", got)
+	}
+}
+
+// Headers and tokens never go over plain http to another host, but do to this machine.
+func TestCleartextRemoteRefusesSecrets(t *testing.T) {
+	for raw, bad := range map[string]bool{
+		"https://example.com/mcp":     false,
+		"http://127.0.0.1:9/mcp":      false,
+		"http://localhost:9/mcp":      false,
+		"http://[::1]:9/mcp":          false,
+		"http://intranet.example/mcp": true,
+		"http://10.0.0.5/mcp":         true,
+	} {
+		if cleartextRemote(raw) != bad {
+			t.Errorf("cleartextRemote(%q) = %v", raw, !bad)
+		}
+	}
+	_, err := Dial(ctx5(t), Options{Config: ServerConfig{URL: "http://intranet.example/mcp", Headers: map[string]string{"X-Key": "k"}}, Dir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "plain http") {
+		t.Fatalf("err = %v, want a refusal to send headers over plain http", err)
 	}
 }

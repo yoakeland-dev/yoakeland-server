@@ -2,10 +2,14 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -38,7 +42,11 @@ const (
 const (
 	// maxToolsPerServer bounds what one server can add to every request.
 	maxToolsPerServer = 200
-	connectTimeout    = 60 * time.Second
+	// Tool definitions ride along on every model request: a byte budget per
+	// server, and one for all of them together, so a count cap isn't the only limit.
+	maxToolBytes    = 32 << 10
+	maxToolBytesAll = 128 << 10
+	connectTimeout  = 60 * time.Second
 )
 
 // entry is one server of one project.
@@ -380,9 +388,24 @@ func (m *Manager) setTools(e *entry, infos []ToolInfo, res []ResourceInfo) {
 			desc = strings.ToValidUTF8(desc[:maxDescription], "") + "…"
 		}
 		wire := wireName(e.name, info.Name, taken)
-		e.tools = append(e.tools, &mcpTool{srv: e, wire: wire, raw: info.Name, info: info, def: tool.ToolDefinition{
+		size := len(desc)
+		if b, err := json.Marshal(schema); err == nil {
+			size += len(b)
+		}
+		e.tools = append(e.tools, &mcpTool{srv: e, wire: wire, raw: info.Name, info: info, size: size, def: tool.ToolDefinition{
 			Name: wire, Description: "[MCP server " + e.name + "] " + desc, Parameters: schema,
 		}})
+	}
+	// Over budget, the largest tools go first, and the count of those dropped is shown.
+	var total int
+	for _, t := range e.tools {
+		total += t.size
+	}
+	sort.Slice(e.tools, func(i, j int) bool { return e.tools[i].size > e.tools[j].size })
+	for total > maxToolBytes && len(e.tools) > 0 {
+		total -= e.tools[0].size
+		e.tools = e.tools[1:]
+		e.truncated++
 	}
 	sort.Slice(e.tools, func(i, j int) bool { return e.tools[i].wire < e.tools[j].wire })
 	if e.info.Resources {
@@ -392,7 +415,7 @@ func (m *Manager) setTools(e *entry, infos []ToolInfo, res []ResourceInfo) {
 				fmt.Fprintf(&list, "\n… and %d more", len(res)-i)
 				break
 			}
-			fmt.Fprintf(&list, "\n- %s (%s)", r.URI, r.Name)
+			fmt.Fprintf(&list, "\n- %s (%s)", shorten(r.URI, 200), shorten(r.Name, 200))
 		}
 		desc := "[MCP server " + e.name + "] Read a resource this server offers by its URI."
 		if list.Len() > 0 {
@@ -467,9 +490,14 @@ func (m *Manager) Tools() []tool.Tool {
 	}
 	sort.Strings(names)
 	var out []tool.Tool
+	var used int
 	for _, n := range names {
 		e := m.entries[n]
 		for _, t := range e.tools {
+			if used+t.size > maxToolBytesAll {
+				continue
+			}
+			used += t.size
 			out = append(out, t)
 		}
 		if e.resTool != nil {
@@ -509,7 +537,7 @@ func (m *Manager) ready(ctx context.Context, e *entry) (*Client, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return nil, fmt.Errorf("MCP server %s isn't available: %s", e.name, e.err)
+	return nil, serverErr(e, fmt.Sprintf("MCP server %s isn't available: %s", e.name, e.err))
 }
 
 func (m *Manager) callTimeout(e *entry) time.Duration {
@@ -543,16 +571,22 @@ func (m *Manager) callFailed(e *entry, c *Client, err error, turn, call context.
 		c.Close()
 		return fmt.Errorf("MCP server %s needs sign-in: open Settings → MCP servers", e.name)
 	case errors.As(err, &rerr):
-		return fmt.Errorf("MCP server %s: %s", e.name, rerr.Message)
+		return serverErr(e, fmt.Sprintf("MCP server %s: %s", e.name, rerr.Message))
 	case errors.Is(err, errInputRequired):
 		return fmt.Errorf("MCP server %s: %w", e.name, err)
 	}
 	select {
 	case <-c.Done():
-		return fmt.Errorf("MCP server %s went away: %w", e.name, err)
+		return serverErr(e, fmt.Sprintf("MCP server %s went away: %s", e.name, err))
 	default:
 	}
-	return fmt.Errorf("MCP server %s: %w", e.name, err)
+	return serverErr(e, fmt.Sprintf("MCP server %s: %s", e.name, err))
+}
+
+// serverErr is an error whose text the server wrote (its messages, its stderr),
+// so it reaches the model framed as untrusted data, like a tool's output does.
+func serverErr(e *entry, msg string) error {
+	return errors.New(tool.WrapUntrusted("the MCP server "+e.name, msg))
 }
 
 // Close stops every server.
@@ -646,8 +680,9 @@ func (m *Manager) Reconnect(name string) error {
 // Redacted stands in for a secret value on the wire.
 const Redacted = "••••••"
 
-// redact hides what a server's config keeps secret. A value that is only a
-// ${VAR} reference holds no secret and is shown as is.
+// redact hides what a server's config keeps secret: env and header values,
+// URL query values, and arguments that follow a secret-looking flag. A value
+// that is only ${VAR} references (no defaults) holds no secret and is shown as is.
 func redact(cfg ServerConfig) ServerConfig {
 	hide := func(in map[string]string) map[string]string {
 		if in == nil {
@@ -655,7 +690,7 @@ func redact(cfg ServerConfig) ServerConfig {
 		}
 		out := make(map[string]string, len(in))
 		for k, v := range in {
-			if v == "" || (varRe.MatchString(v) && varRe.ReplaceAllString(v, "") == "") {
+			if v == "" || isVarRef(v) {
 				out[k] = v
 			} else {
 				out[k] = Redacted
@@ -664,6 +699,8 @@ func redact(cfg ServerConfig) ServerConfig {
 		return out
 	}
 	cfg.Env, cfg.Headers = hide(cfg.Env), hide(cfg.Headers)
+	cfg.URL = redactURL(cfg.URL)
+	cfg.Args = redactArgs(cfg.Args)
 	if cfg.OAuth != nil {
 		o := *cfg.OAuth
 		if o.ClientSecret != "" {
@@ -672,6 +709,73 @@ func redact(cfg ServerConfig) ServerConfig {
 		cfg.OAuth = &o
 	}
 	return cfg
+}
+
+// isVarRef reports whether v is only ${VAR} references with no defaults: a name
+// of a variable, not a value. A default is a literal, so it can be a secret.
+func isVarRef(v string) bool {
+	refs := varRe.FindAllStringSubmatch(v, -1)
+	if len(refs) == 0 || varRe.ReplaceAllString(v, "") != "" {
+		return false
+	}
+	for _, r := range refs {
+		if r[2] != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// secretName is a flag or parameter name that suggests its value is a secret.
+var secretName = regexp.MustCompile(`(?i)token|secret|passw|key|auth|credential|session`)
+
+// redactArgs hides the value of a secret-looking flag, as --token=x or --token x.
+func redactArgs(args []string) []string {
+	if args == nil {
+		return nil
+	}
+	out := append([]string(nil), args...)
+	for i := range out {
+		name, val, eq := strings.Cut(out[i], "=")
+		switch {
+		case eq && strings.HasPrefix(name, "-") && secretName.MatchString(name) && val != "" && !isVarRef(val):
+			out[i] = name + "=" + Redacted
+		case !eq && strings.HasPrefix(out[i], "-") && secretName.MatchString(out[i]) && i+1 < len(out) && out[i+1] != "" && !isVarRef(out[i+1]):
+			out[i+1] = Redacted
+		}
+	}
+	return out
+}
+
+// redactURL hides the values in a URL's query string.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.RawQuery == "" {
+		return raw
+	}
+	parts := strings.Split(u.RawQuery, "&")
+	for i, p := range parts {
+		if k, v, eq := strings.Cut(p, "="); eq && v != "" && !isVarRef(v) {
+			parts[i] = k + "=" + Redacted
+		}
+	}
+	u.RawQuery = strings.Join(parts, "&")
+	return u.String()
+}
+
+// restoreRedacted keeps a URL or argument list the client sent back unchanged,
+// and refuses an edited one that still hides a value: that value isn't stored
+// in a form that can be put back.
+func restoreRedacted(what string, in, stored, shown []string) ([]string, error) {
+	if slices.Equal(in, shown) {
+		return stored, nil
+	}
+	for _, s := range in {
+		if strings.Contains(s, Redacted) {
+			return nil, fmt.Errorf("the %s has a hidden value that can't be kept after an edit: type the %s again", what, what)
+		}
+	}
+	return in, nil
 }
 
 // restoreSecrets fills in the values a client sent back as Redacted from what
@@ -696,6 +800,18 @@ func restoreSecrets(in, prev ServerConfig) (ServerConfig, error) {
 	if err := fix("header", in.Headers, prev.Headers); err != nil {
 		return in, err
 	}
+	if in.URL != "" && in.URL != prev.URL {
+		if strings.Contains(in.URL, Redacted) && in.URL == redactURL(prev.URL) {
+			in.URL = prev.URL
+		} else if strings.Contains(in.URL, Redacted) {
+			return in, errors.New("the URL has a hidden value that can't be kept after an edit: type the URL again")
+		}
+	}
+	args, err := restoreRedacted("arguments", in.Args, prev.Args, redactArgs(prev.Args))
+	if err != nil {
+		return in, err
+	}
+	in.Args = args
 	if in.OAuth != nil && in.OAuth.ClientSecret == Redacted {
 		if prev.OAuth == nil || prev.OAuth.ClientSecret == "" {
 			return in, errors.New("the client secret has no stored value to keep: type it again")
@@ -949,7 +1065,7 @@ func (m *Manager) Status() (servers []ServerStatus, problems []string) {
 			wires[t.raw] = t.wire
 		}
 		for _, ti := range e.toolInfos {
-			ts := ToolStatus{Name: wires[ti.Name], Raw: ti.Name, Title: ti.Title, Description: shorten(ti.Description, 240), Enabled: !off[ti.Name]}
+			ts := ToolStatus{Name: wires[ti.Name], Raw: ti.Name, Title: shorten(ti.Title, 200), Description: shorten(ti.Description, 240), Enabled: !off[ti.Name]}
 			if a := ti.Annotations; a != nil {
 				ts.ReadOnly = a.ReadOnlyHint != nil && *a.ReadOnlyHint
 				ts.Destructive = a.DestructiveHint != nil && *a.DestructiveHint

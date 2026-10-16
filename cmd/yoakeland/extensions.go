@@ -38,12 +38,12 @@ type extensions struct {
 	skillErr   error
 }
 
-func newExtensions(stateDir string) *extensions {
+func newExtensions(stateDir, masterKey string) *extensions {
 	x := &extensions{}
 	home, _ := os.UserHomeDir()
 	x.mcpImports = mcp.NewImporter(mcp.DefaultImportPaths(home, os.Getenv))
-	if x.mcpStore, x.mcpErr = mcp.NewStore(stateDir); x.mcpErr == nil {
-		if x.mcpAuth, x.mcpErr = mcp.NewAuthStore(stateDir); x.mcpErr == nil {
+	if x.mcpStore, x.mcpErr = mcp.NewStore(stateDir, masterKey); x.mcpErr == nil {
+		if x.mcpAuth, x.mcpErr = mcp.NewAuthStore(stateDir, masterKey); x.mcpErr == nil {
 			x.mcpFlow = mcp.NewFlow(x.mcpAuth)
 		}
 	}

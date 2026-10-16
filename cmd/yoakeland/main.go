@@ -112,8 +112,8 @@ func main() {
 	warnSecretFlags()
 	if masterKey == "" {
 		logWarnDetail(
-			"no -master-key set; providers.json will be stored in plaintext",
-			"neither -master-key nor YOAKELAND_MASTER_KEY is set: providers.json (API keys) is stored in plaintext, protected only by 0600 file permissions.",
+			"no -master-key set; providers.json and MCP credentials will be stored in plaintext",
+			"neither -master-key nor YOAKELAND_MASTER_KEY is set: providers.json (API keys), mcp.json and mcp-auth.json are stored in plaintext, protected only by 0600 file permissions.",
 		)
 	}
 
@@ -152,7 +152,7 @@ func main() {
 	// path for a session that never called set_provider, so there's no
 	// registered name to stamp; it's still better than leaving every such
 	// message's Provider blank.
-	projects, err := NewProjectRegistry(modelProv, providerName, maxSessionCostUSD, stateDir)
+	projects, err := NewProjectRegistry(modelProv, providerName, maxSessionCostUSD, stateDir, masterKey)
 	if err != nil {
 		logFatal("failed to open project list store: %v", err)
 	}

@@ -26,6 +26,7 @@ type Approval struct {
 type Store struct {
 	mu        sync.Mutex
 	path      string
+	key       string // the master key the file is sealed under, or ""
 	servers   map[string]ServerConfig
 	approvals map[string]map[string]Approval // project root -> server -> decision
 }
@@ -38,17 +39,20 @@ type storeFile struct {
 
 // NewStore opens (or starts) the store in dir. A file that doesn't parse is an
 // error, not a reset: it holds the user's servers.
-func NewStore(dir string) (*Store, error) {
+func NewStore(dir, key string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &Store{path: filepath.Join(dir, "mcp.json"), servers: map[string]ServerConfig{}, approvals: map[string]map[string]Approval{}}
+	s := &Store{path: filepath.Join(dir, "mcp.json"), key: key, servers: map[string]ServerConfig{}, approvals: map[string]map[string]Approval{}}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if data, err = openFile(data, key); err != nil {
+		return nil, fmt.Errorf("%s: %w", s.path, err)
 	}
 	var f storeFile
 	if err := json.Unmarshal(data, &f); err != nil {
@@ -68,6 +72,9 @@ func NewStore(dir string) (*Store, error) {
 func (s *Store) saveLocked() error {
 	b, err := json.MarshalIndent(storeFile{Version: 1, Servers: s.servers, Approvals: s.approvals}, "", "  ")
 	if err != nil {
+		return err
+	}
+	if b, err = sealFile(b, s.key); err != nil {
 		return err
 	}
 	return fsutil.WriteFileAtomic(s.path, b, 0o600)

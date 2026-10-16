@@ -9,7 +9,7 @@ import (
 )
 
 func TestChatProject(t *testing.T) {
-	r, err := NewProjectRegistry(nil, "", 0, t.TempDir())
+	r, err := NewProjectRegistry(nil, "", 0, t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestChatProject(t *testing.T) {
 }
 
 func TestChatRegistryIsChat(t *testing.T) {
-	r, _ := NewProjectRegistry(nil, "", 0, t.TempDir())
+	r, _ := NewProjectRegistry(nil, "", 0, t.TempDir(), "")
 	pc, err := r.Resolve("c2", protocol.ChatProject, "")
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +48,7 @@ func TestChatRegistryIsChat(t *testing.T) {
 
 func TestChatWorkspaceAndPrune(t *testing.T) {
 	state := t.TempDir()
-	r, err := NewProjectRegistry(nil, "", 0, state)
+	r, err := NewProjectRegistry(nil, "", 0, state, "")
 	if err != nil {
 		t.Fatal(err)
 	}

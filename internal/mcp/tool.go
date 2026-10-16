@@ -23,6 +23,7 @@ const (
 	maxWireName    = 64 // what the model APIs allow
 	maxDescription = 1500
 	maxSchemaBytes = 64 << 10
+	maxSchemaText  = 1000
 	maxResultBytes = 1 << 20
 )
 
@@ -54,15 +55,6 @@ func wireName(server, raw string, taken map[string]bool) string {
 	return name
 }
 
-// ParseWireName splits mcp__<server>__<tool>.
-func ParseWireName(name string) (server, rest string, ok bool) {
-	if !strings.HasPrefix(name, ToolPrefix) {
-		return "", "", false
-	}
-	server, rest, ok = strings.Cut(strings.TrimPrefix(name, ToolPrefix), "__")
-	return server, rest, ok && server != "" && rest != ""
-}
-
 // normalizeSchema makes whatever a server called its input schema into an
 // object schema every model API accepts, or reports that it can't.
 func normalizeSchema(raw json.RawMessage) (map[string]any, error) {
@@ -78,6 +70,7 @@ func normalizeSchema(raw json.RawMessage) (map[string]any, error) {
 	if s == nil {
 		s = map[string]any{}
 	}
+	clipSchemaText(s)
 	delete(s, "$schema")
 	if t, _ := s["type"].(string); t != "object" {
 		if s["type"] != nil {
@@ -91,12 +84,31 @@ func normalizeSchema(raw json.RawMessage) (map[string]any, error) {
 	return s, nil
 }
 
+// clipSchemaText caps the free text inside a schema, which the model reads too.
+func clipSchemaText(v any) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, c := range x {
+			if s, ok := c.(string); ok && (k == "description" || k == "default") && len(s) > maxSchemaText {
+				x[k] = strings.ToValidUTF8(s[:maxSchemaText], "") + "…"
+				continue
+			}
+			clipSchemaText(c)
+		}
+	case []any:
+		for _, c := range x {
+			clipSchemaText(c)
+		}
+	}
+}
+
 // mcpTool is one server tool, offered to the model as an ordinary tool.
 type mcpTool struct {
 	srv  *entry
 	wire string
 	raw  string // the server's own name for it
 	info ToolInfo
+	size int // bytes of description and schema, for the budget
 	def  tool.ToolDefinition
 }
 

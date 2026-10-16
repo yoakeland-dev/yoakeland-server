@@ -35,6 +35,23 @@ func (e *errNeedsAuth) Error() string {
 // carried an Mcp-Session-Id), so the client must start a new one.
 var errSessionExpired = errors.New("the server's session expired")
 
+var errCleartext = errors.New("won't send headers or a token over plain http to a host other than this machine; use https")
+
+// cleartextRemote reports whether rawURL sends requests in the clear to a host
+// other than this machine, where headers and tokens must not go.
+func cleartextRemote(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "https" {
+		return err != nil
+	}
+	h := strings.ToLower(u.Hostname())
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return false
+	}
+	ip := net.ParseIP(h)
+	return ip == nil || !ip.IsLoopback()
+}
+
 // httpError is a status the transport has no meaning for.
 type httpError struct {
 	Status int
@@ -64,12 +81,13 @@ type httpTransport struct {
 	session string // Mcp-Session-Id, legacy servers only
 	version string // MCP-Protocol-Version to send once negotiated
 	modern  bool   // add the per-request headers the 2026-07-28 revision requires
+	replies chan struct{}
 	closed  chan struct{}
 	once    sync.Once
 }
 
 func newHTTP(rawURL string, headers map[string]string, bearer bearerFunc, h handler) *httpTransport {
-	return &httpTransport{url: rawURL, hc: newHTTPClient(rawURL), headers: headers, bearer: bearer, h: h, closed: make(chan struct{})}
+	return &httpTransport{url: rawURL, hc: newHTTPClient(rawURL), headers: headers, bearer: bearer, h: h, replies: make(chan struct{}, maxReplies), closed: make(chan struct{})}
 }
 
 // newHTTPClient is a client with no overall timeout (a response may stream for
@@ -131,6 +149,9 @@ func (t *httpTransport) newRequest(ctx context.Context, method string, body []by
 	if err != nil {
 		return nil, err
 	}
+	if len(t.headers) > 0 && cleartextRemote(t.url) {
+		return nil, errCleartext
+	}
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -141,7 +162,7 @@ func (t *httpTransport) newRequest(ctx context.Context, method string, body []by
 	t.mu.Lock()
 	session, version, modern := t.session, t.version, t.modern
 	t.mu.Unlock()
-	if session != "" {
+	if session != "" && (m == nil || m.Method != "initialize") {
 		req.Header.Set("Mcp-Session-Id", session)
 	}
 	if version != "" {
@@ -159,6 +180,9 @@ func (t *httpTransport) newRequest(ctx context.Context, method string, body []by
 			return nil, err
 		}
 		if tok != "" {
+			if cleartextRemote(t.url) {
+				return nil, errCleartext
+			}
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 	}
@@ -231,9 +255,7 @@ func (t *httpTransport) call(ctx context.Context, req *message) (*message, error
 				return false
 			}
 		case m.isRequest():
-			if reply := t.h(m); reply != nil {
-				go t.post(context.WithoutCancel(ctx), reply)
-			}
+			answerRequest(t.replies, t.h, t.post, m)
 		default:
 			t.h(m)
 		}
@@ -399,9 +421,7 @@ func (t *httpTransport) listen(ctx context.Context) {
 			for _, m := range msgs {
 				switch {
 				case m.isRequest():
-					if reply := t.h(m); reply != nil {
-						go t.post(context.WithoutCancel(ctx), reply)
-					}
+					answerRequest(t.replies, t.h, t.post, m)
 				case m.isNotify():
 					t.h(m)
 				}

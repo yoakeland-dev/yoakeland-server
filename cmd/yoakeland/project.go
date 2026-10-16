@@ -578,7 +578,7 @@ func (r *ProjectRegistry) Stats() (activeTurns, openProjects int) {
 // providers.json) — this is what makes list_projects reflect every project
 // this server has ever opened, not just ones opened in the current process's
 // lifetime.
-func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64, stateDir string) (*ProjectRegistry, error) {
+func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName string, maxSessionSpendUSD float64, stateDir, masterKey string) (*ProjectRegistry, error) {
 	known, err := projectstore.New(stateDir)
 	if err != nil {
 		return nil, fmt.Errorf("project list store: %w", err)
@@ -603,7 +603,7 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 		stateDir:            stateDir,
 		gits:                make(map[string]*gitWatcher),
 		roles:               agent.NewRoles(),
-		ext:                 newExtensions(stateDir),
+		ext:                 newExtensions(stateDir, masterKey),
 	}, nil
 }
 

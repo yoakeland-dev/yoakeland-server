@@ -97,7 +97,7 @@ func newAuthFake(t *testing.T) *authFake {
 
 func TestOAuthFullFlow(t *testing.T) {
 	f := newAuthFake(t)
-	auth, _ := NewAuthStore(t.TempDir())
+	auth, _ := NewAuthStore(t.TempDir(), "")
 	flow := NewFlow(auth)
 	cfg := ServerConfig{URL: f.srv.URL + "/mcp"}
 
@@ -193,7 +193,7 @@ func asNeedsAuth(err error, out **errNeedsAuth) bool {
 
 func TestOAuthRevokedRefreshMeansSignInAgain(t *testing.T) {
 	f := newAuthFake(t)
-	auth, _ := NewAuthStore(t.TempDir())
+	auth, _ := NewAuthStore(t.TempDir(), "")
 	cfg := ServerConfig{URL: f.srv.URL + "/mcp"}
 	_ = auth.put(cfg.URL, tokenEntry{TokenEndpoint: f.srv.URL + "/token", ClientID: "client-xyz", Resource: authKey(cfg.URL),
 		AccessToken: "old", RefreshToken: "revoked", ExpiresAt: time.Now().Add(-time.Hour)})
@@ -242,7 +242,7 @@ func TestOAuthRefusesRemoteMetadataAimedAtPrivateAddresses(t *testing.T) {
 
 func TestOAuthRedirectMustBeLocal(t *testing.T) {
 	f := newAuthFake(t)
-	auth, _ := NewAuthStore(t.TempDir())
+	auth, _ := NewAuthStore(t.TempDir(), "")
 	flow := NewFlow(auth)
 	for _, bad := range []string{"https://evil.example/cb", "http://evil.example:80/cb", "javascript:alert(1)", "http://localhost.evil.example/cb", ""} {
 		if _, _, err := flow.Begin(context.Background(), ServerConfig{URL: f.srv.URL + "/mcp"}, nil, bad); err == nil {
@@ -253,7 +253,7 @@ func TestOAuthRedirectMustBeLocal(t *testing.T) {
 
 func TestOAuthPreRegisteredClient(t *testing.T) {
 	f := newAuthFake(t)
-	auth, _ := NewAuthStore(t.TempDir())
+	auth, _ := NewAuthStore(t.TempDir(), "")
 	flow := NewFlow(auth)
 	cfg := ServerConfig{URL: f.srv.URL + "/mcp", OAuth: &OAuthConfig{ClientID: "mine", Scope: "repo"}}
 	p, authURL, err := flow.Begin(ctx5(t), cfg, nil, "http://127.0.0.1:1/callback")
@@ -268,12 +268,23 @@ func TestOAuthPreRegisteredClient(t *testing.T) {
 
 func TestAuthStoreIsPrivateAndPersistent(t *testing.T) {
 	dir := t.TempDir()
-	a, _ := NewAuthStore(dir)
+	a, _ := NewAuthStore(dir, "")
 	_ = a.put("https://x.example/mcp/", tokenEntry{AccessToken: "t", RefreshToken: "r"})
-	b, err := NewAuthStore(dir)
+	b, err := NewAuthStore(dir, "")
 	if err != nil || !b.SignedIn("https://X.example/mcp") {
 		t.Fatalf("reload: %v, signed in = %v (the key is the canonical URL)", err, b.SignedIn("https://X.example/mcp"))
 	}
 }
 
 func netIP(s string) net.IP { return net.ParseIP(s) }
+
+// A server that says its answers name the issuer (RFC 9207) must name it.
+func TestOAuthAnswerMustNameIssuerWhenServerSaysSo(t *testing.T) {
+	p := &Pending{State: "s", Issuer: "https://as.example", IssRequired: true}
+	if err := (&Flow{}).Complete(context.Background(), p, "code", "s", ""); err == nil || !strings.Contains(err.Error(), "RFC 9207") {
+		t.Fatalf("an answer without iss must be refused, got %v", err)
+	}
+	if err := (&Flow{}).Complete(context.Background(), p, "code", "s", "https://elsewhere.example"); err == nil || strings.Contains(err.Error(), "RFC 9207") {
+		t.Fatalf("an answer from another issuer must be refused, got %v", err)
+	}
+}

@@ -231,12 +231,16 @@ func TestServeConnection_SkillsListSwitchAndRead(t *testing.T) {
 
 	envs := runDispatch(t, deps, envelopeJSON(t, protocol.EventListSkills, map[string]any{}))
 	r := skillsReply(t, envs, 0)
-	if r.Error != "" || len(r.Skills) != 1 || r.Skills[0].Name != "release" || r.Skills[0].Scope != "project" || !r.Skills[0].Enabled {
-		t.Fatalf("list = %+v", r)
+	if r.Error != "" || len(r.Skills) != 1 || r.Skills[0].Name != "release" || r.Skills[0].Scope != "project" || r.Skills[0].Enabled {
+		t.Fatalf("list = %+v (a project's skill starts off until the user switches it on)", r)
 	}
 	real, _ := filepath.EvalSymlinks(dir)
 	if r.Skills[0].Dir != real {
 		t.Fatalf("dir = %s, want %s", r.Skills[0].Dir, real)
+	}
+	envs = runDispatch(t, deps, envelopeJSON(t, protocol.EventSetSkillEnabled, map[string]any{"dir": real, "enabled": true}))
+	if r := skillsReply(t, envs, 0); r.Error != "" || len(r.Skills) != 1 || !r.Skills[0].Enabled {
+		t.Fatalf("switch on = %+v", r)
 	}
 	if len(r.Roots) < 5 {
 		t.Fatalf("roots = %+v (the page lists every place skills are looked for)", r.Roots)
@@ -288,6 +292,12 @@ func TestProjectSkillsLoadRules(t *testing.T) {
 	mk("open", "")
 	mk("useronly", "disable-model-invocation: true\n")
 	mk("modelonly", "user-invocable: false\n")
+	for _, n := range []string{"open", "useronly", "modelonly"} {
+		real, _ := filepath.EvalSymlinks(filepath.Join(root, ".agents", "skills", n))
+		if err := deps.projects.ext.skills.SetEnabled(root, real, true); err != nil {
+			t.Fatal(err)
+		}
+	}
 	ps := projectSkills{cat: deps.projects.ext.skills, root: root}
 	if doc, err := ps.LoadSkill("open", false); err != nil || doc.Body != "BODY-open" {
 		t.Fatalf("open = %+v, %v", doc, err)

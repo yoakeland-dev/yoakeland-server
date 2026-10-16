@@ -237,9 +237,17 @@ func scanImports(p ImportPaths, project string, mine map[string]ServerConfig) (o
 	return out, problems
 }
 
-// readCapped reads a file at most limit bytes long, through an os.Root on its
-// folder so a symlink can't lead elsewhere.
+// readCapped reads a regular file at most limit bytes long. A dotfile manager
+// links a config into place, so a symlink is followed to the file it names, as
+// long as that file is inside the user's home folder; that file is read through
+// an os.Root on its own folder.
 func readCapped(path string, limit int64) ([]byte, error) {
+	if real, err := filepath.EvalSymlinks(path); err == nil && real != path {
+		if !underHome(real) {
+			return nil, errors.New("is a link to a file outside your home folder")
+		}
+		path = real
+	}
 	r, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
 		return nil, err
@@ -250,6 +258,9 @@ func readCapped(path string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, errors.New("is not a regular file")
+	}
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
@@ -258,6 +269,16 @@ func readCapped(path string, limit int64) ([]byte, error) {
 		return nil, errors.New("is too large to read")
 	}
 	return data, nil
+}
+
+// underHome reports whether path is inside the user's home folder.
+func underHome(path string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	rel, err := filepath.Rel(home, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // suggestName makes name fit the name rule, then keeps it clear of the user's own servers.

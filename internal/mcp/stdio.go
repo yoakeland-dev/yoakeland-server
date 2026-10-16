@@ -64,6 +64,7 @@ type stdioTransport struct {
 	wmu     sync.Mutex
 	mu      sync.Mutex
 	pending map[string]chan *message
+	replies chan struct{} // slots for answering the server's requests
 	closed  chan struct{}
 	exitErr error
 }
@@ -74,7 +75,7 @@ func startStdio(command string, args []string, dir string, env []string, h handl
 	cmd.Dir = dir
 	cmd.Env = env
 	ownProcessGroup(cmd)
-	t := &stdioTransport{cmd: cmd, h: h, pending: map[string]chan *message{}, closed: make(chan struct{})}
+	t := &stdioTransport{cmd: cmd, h: h, pending: map[string]chan *message{}, replies: make(chan struct{}, maxReplies), closed: make(chan struct{})}
 	cmd.Stderr = &t.stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -130,30 +131,42 @@ func (t *stdioTransport) dispatch(m *message) {
 			ch <- m
 		}
 	case m.isRequest():
-		go func() { // a request can block (it may wait on a person), so it never holds up the read loop
-			if reply := t.h(m); reply != nil {
-				_ = t.write(reply)
-			}
-		}()
+		answerRequest(t.replies, t.h, t.write, m)
 	default:
 		t.h(m)
 	}
 }
 
-func (t *stdioTransport) write(m *message) error {
+// write sends m, giving up when ctx ends. A write blocks once a server stops
+// reading and its pipe fills; the framing is then lost, so the process is
+// killed rather than left wedged with every later call queued behind it.
+func (t *stdioTransport) write(ctx context.Context, m *message) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	t.wmu.Lock()
-	defer t.wmu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		t.wmu.Lock()
+		defer t.wmu.Unlock()
+		select {
+		case <-t.closed:
+			done <- t.gone()
+			return
+		default:
+		}
+		_, err := t.stdin.Write(append(b, '\n'))
+		done <- err
+	}()
 	select {
+	case err := <-done:
+		return err
 	case <-t.closed:
 		return t.gone()
-	default:
+	case <-ctx.Done():
+		killTree(t.cmd)
+		return ctx.Err()
 	}
-	_, err = t.stdin.Write(append(b, '\n'))
-	return err
 }
 
 func (t *stdioTransport) call(ctx context.Context, req *message) (*message, error) {
@@ -167,7 +180,7 @@ func (t *stdioTransport) call(ctx context.Context, req *message) (*message, erro
 		delete(t.pending, key)
 		t.mu.Unlock()
 	}
-	if err := t.write(req); err != nil {
+	if err := t.write(ctx, req); err != nil {
 		forget()
 		return nil, err
 	}
@@ -183,7 +196,7 @@ func (t *stdioTransport) call(ctx context.Context, req *message) (*message, erro
 	}
 }
 
-func (t *stdioTransport) notify(_ context.Context, n *message) error { return t.write(n) }
+func (t *stdioTransport) notify(ctx context.Context, n *message) error { return t.write(ctx, n) }
 
 // gone is the error for a call on a process that has ended: how it ended, and
 // the last thing it said about it.

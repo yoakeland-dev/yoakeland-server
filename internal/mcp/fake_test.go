@@ -25,6 +25,9 @@ type fakeServer struct {
 	listCalls int
 }
 
+// errInvalidParams is what the fake answers an unknown tool with.
+const errInvalidParams = -32602
+
 func (f *fakeServer) tools() []ToolInfo {
 	ro := true
 	return []ToolInfo{
@@ -164,6 +167,7 @@ type httpFake struct {
 
 	mu      sync.Mutex
 	headers []http.Header
+	inits   int
 }
 
 func newHTTPFake(t *testing.T, era string, sessions, sse bool, token string) *httpFake {
@@ -172,6 +176,13 @@ func newHTTPFake(t *testing.T, era string, sessions, sse bool, token string) *ht
 	h.srv = httptest.NewServer(http.HandlerFunc(h.serve))
 	t.Cleanup(h.srv.Close)
 	return h
+}
+
+// initializes is how many times a client has initialized a session.
+func (h *httpFake) initializes() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.inits
 }
 
 func (h *httpFake) serve(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +215,11 @@ func (h *httpFake) serve(w http.ResponseWriter, r *http.Request) {
 	if h.sessions && m.Method != "initialize" && r.Header.Get("Mcp-Session-Id") != "sess-1" {
 		w.WriteHeader(http.StatusNotFound)
 		return
+	}
+	if m.Method == "initialize" {
+		h.mu.Lock()
+		h.inits++
+		h.mu.Unlock()
 	}
 	resp := h.handle(&m)
 	if resp == nil {

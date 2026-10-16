@@ -25,6 +25,7 @@ type sseTransport struct {
 	bearer   bearerFunc
 	h        handler
 	endpoint string
+	replies  chan struct{}
 
 	cancel  context.CancelFunc
 	mu      sync.Mutex
@@ -37,7 +38,7 @@ type sseTransport struct {
 // connectSSE opens the stream and waits for the server to say where to POST.
 func connectSSE(ctx context.Context, rawURL string, headers map[string]string, bearer bearerFunc, h handler) (*sseTransport, error) {
 	t := &sseTransport{url: rawURL, hc: newHTTPClient(rawURL), headers: headers, bearer: bearer, h: h,
-		pending: map[string]chan *message{}, closed: make(chan struct{})}
+		pending: map[string]chan *message{}, replies: make(chan struct{}, maxReplies), closed: make(chan struct{})}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
 	req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, rawURL, nil)
@@ -83,6 +84,9 @@ func connectSSE(ctx context.Context, rawURL string, headers map[string]string, b
 }
 
 func (t *sseTransport) decorate(ctx context.Context, req *http.Request) error {
+	if len(t.headers) > 0 && cleartextRemote(t.url) {
+		return errCleartext
+	}
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -92,6 +96,9 @@ func (t *sseTransport) decorate(ctx context.Context, req *http.Request) error {
 			return err
 		}
 		if tok != "" {
+			if cleartextRemote(t.url) {
+				return errCleartext
+			}
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
 	}
@@ -159,11 +166,7 @@ func (t *sseTransport) dispatch(m *message) {
 			ch <- m
 		}
 	case m.isRequest():
-		go func() {
-			if reply := t.h(m); reply != nil {
-				_ = t.send(context.Background(), reply)
-			}
-		}()
+		answerRequest(t.replies, t.h, t.send, m)
 	default:
 		t.h(m)
 	}

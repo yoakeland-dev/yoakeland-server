@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,14 +18,16 @@ import (
 // Catalog finds skills and remembers which the user switched off. The switch is
 // kept in yoakeland's own state, not by renaming the skill's files: the same
 // folder is read by other agents too, and turning a skill off here must not
-// take it away from them.
+// take it away from them. A project's skills are the repo's to write, so they
+// are off until the user switches them on, and off again once their files change.
 type Catalog struct {
 	stateDir string
 	home     string
 
 	mu       sync.Mutex
 	path     string
-	disabled map[string]bool // by real directory
+	disabled map[string]bool   // user skills switched off, by real directory
+	approved map[string]string // project skills switched on, by directory, with the fingerprint they were on at
 	cache    map[string]cached
 }
 
@@ -43,7 +46,7 @@ func NewCatalog(stateDir, home string) (*Catalog, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
-	c := &Catalog{stateDir: stateDir, home: home, path: filepath.Join(stateDir, "skills.json"), disabled: map[string]bool{}, cache: map[string]cached{}}
+	c := &Catalog{stateDir: stateDir, home: home, path: filepath.Join(stateDir, "skills.json"), disabled: map[string]bool{}, approved: map[string]string{}, cache: map[string]cached{}}
 	data, err := os.ReadFile(c.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return c, nil
@@ -51,22 +54,34 @@ func NewCatalog(stateDir, home string) (*Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
-	var f struct {
-		Disabled []string `json:"disabled"`
-	}
+	var f catalogFile
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("%s doesn't parse (fix or move it): %w", c.path, err)
 	}
 	for _, d := range f.Disabled {
 		c.disabled[d] = true
 	}
+	for d, fp := range f.Approved {
+		c.approved[d] = fp
+	}
 	return c, nil
 }
 
-func (c *Catalog) isDisabled(dir string) bool {
+// catalogFile is skills.json.
+type catalogFile struct {
+	Disabled []string          `json:"disabled"`
+	Approved map[string]string `json:"approved,omitempty"`
+}
+
+// off is the user's switch for sk: a project skill is off unless it was switched
+// on with the files it has now.
+func (c *Catalog) off(sk Skill) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.disabled[dir]
+	if sk.Scope == ScopeProject {
+		return c.approved[sk.Dir] != sk.Fingerprint
+	}
+	return c.disabled[sk.Dir]
 }
 
 // Result is what a scan found.
@@ -79,7 +94,7 @@ type Result struct {
 // Scan reads every skill folder for the project at projectRoot ("" for none).
 func (c *Catalog) Scan(projectRoot string) Result {
 	roots := Roots(c.stateDir, c.home, projectRoot)
-	sk, problems := Scan(roots, c.isDisabled)
+	sk, problems := Scan(roots, c.off)
 	return Result{Skills: sk, Roots: roots, Problems: problems}
 }
 
@@ -102,31 +117,32 @@ func (c *Catalog) Cached(projectRoot string) Result {
 // be one a scan finds: a client can't use this to write arbitrary paths into
 // the state file.
 func (c *Catalog) SetEnabled(projectRoot, dir string, enabled bool) error {
-	found := false
+	var found *Skill
 	for _, sk := range c.Scan(projectRoot).Skills {
 		if sk.Dir == dir {
-			found = true
+			found = &sk
 			break
 		}
 	}
-	if !found {
+	if found == nil {
 		return fmt.Errorf("no skill at %s", dir)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cache = map[string]cached{}
-	prev, had := c.disabled[dir]
-	if enabled {
+	prevDisabled, prevApproved := maps.Clone(c.disabled), maps.Clone(c.approved)
+	switch {
+	case found.Scope == ScopeProject && enabled:
+		c.approved[dir] = found.Fingerprint
+	case found.Scope == ScopeProject:
+		delete(c.approved, dir)
+	case enabled:
 		delete(c.disabled, dir)
-	} else {
+	default:
 		c.disabled[dir] = true
 	}
 	if err := c.saveLocked(); err != nil {
-		if had {
-			c.disabled[dir] = prev
-		} else {
-			delete(c.disabled, dir)
-		}
+		c.disabled, c.approved = prevDisabled, prevApproved
 		return err
 	}
 	return nil
@@ -138,9 +154,7 @@ func (c *Catalog) saveLocked() error {
 		list = append(list, d)
 	}
 	sort.Strings(list)
-	b, err := json.MarshalIndent(struct {
-		Disabled []string `json:"disabled"`
-	}{list}, "", "  ")
+	b, err := json.MarshalIndent(catalogFile{Disabled: list, Approved: c.approved}, "", "  ")
 	if err != nil {
 		return err
 	}

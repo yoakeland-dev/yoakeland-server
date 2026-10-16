@@ -50,22 +50,25 @@ type tokenEntry struct {
 type AuthStore struct {
 	mu      sync.Mutex
 	path    string
+	key     string // the master key the file is sealed under, or ""
 	entries map[string]tokenEntry
-	hc      *http.Client // tests replace it
-	refresh sync.Mutex   // one refresh at a time (refresh tokens rotate)
+	refresh sync.Mutex // one refresh at a time (refresh tokens rotate)
 }
 
-func NewAuthStore(dir string) (*AuthStore, error) {
+func NewAuthStore(dir, key string) (*AuthStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	a := &AuthStore{path: filepath.Join(dir, "mcp-auth.json"), entries: map[string]tokenEntry{}}
+	a := &AuthStore{path: filepath.Join(dir, "mcp-auth.json"), key: key, entries: map[string]tokenEntry{}}
 	data, err := os.ReadFile(a.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return a, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if data, err = openFile(data, key); err != nil {
+		return nil, fmt.Errorf("%s: %w", a.path, err)
 	}
 	if err := json.Unmarshal(data, &a.entries); err != nil {
 		return nil, fmt.Errorf("%s doesn't parse (fix or move it): %w", a.path, err)
@@ -76,6 +79,9 @@ func NewAuthStore(dir string) (*AuthStore, error) {
 func (a *AuthStore) saveLocked() error {
 	b, err := json.MarshalIndent(a.entries, "", "  ")
 	if err != nil {
+		return err
+	}
+	if b, err = sealFile(b, a.key); err != nil {
 		return err
 	}
 	return fsutil.WriteFileAtomic(a.path, b, 0o600)
@@ -211,13 +217,6 @@ func (e *oauthError) Error() string {
 	return e.Code
 }
 
-func (a *AuthStore) client(serverURL string) *http.Client {
-	if a.hc != nil {
-		return a.hc
-	}
-	return oauthClient(serverURL)
-}
-
 func (a *AuthStore) tokenRequest(ctx context.Context, serverURL, endpoint, clientID, secret string, form url.Values) (*tokenResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -228,7 +227,7 @@ func (a *AuthStore) tokenRequest(ctx context.Context, serverURL, endpoint, clien
 	if secret != "" {
 		req.SetBasicAuth(url.QueryEscape(clientID), url.QueryEscape(secret))
 	}
-	resp, err := a.client(serverURL).Do(req)
+	resp, err := oauthClient(serverURL).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -314,6 +313,7 @@ type Pending struct {
 	State         string
 	Redirect      string
 	Issuer        string
+	IssRequired   bool // the server says every answer names its issuer (RFC 9207)
 	TokenEndpoint string
 	ClientID      string
 	ClientSecret  string
@@ -351,7 +351,7 @@ func (f *Flow) getJSON(ctx context.Context, serverURL, target string, out any) e
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := f.auth.client(serverURL).Do(req)
+	resp, err := oauthClient(serverURL).Do(req)
 	if err != nil {
 		return err
 	}
@@ -481,7 +481,7 @@ func (f *Flow) Begin(ctx context.Context, cfg ServerConfig, ch *errNeedsAuth, re
 		scope = strings.Join(scopes, " ")
 	}
 	p := &Pending{ID: randToken(12), ServerURL: cfg.URL, Verifier: randToken(32), State: randToken(16), Redirect: redirect,
-		Issuer: md.Issuer, TokenEndpoint: md.TokenEndpoint, Resource: authKey(cfg.URL), Scope: scope, Expires: time.Now().Add(10 * time.Minute)}
+		Issuer: md.Issuer, IssRequired: md.IssParam, TokenEndpoint: md.TokenEndpoint, Resource: authKey(cfg.URL), Scope: scope, Expires: time.Now().Add(10 * time.Minute)}
 	if cfg.OAuth != nil {
 		p.ClientID, p.ClientSecret = cfg.OAuth.ClientID, cfg.OAuth.ClientSecret
 	} else if prev, ok := f.auth.get(cfg.URL); ok && prev.ClientID != "" && prev.Issuer == md.Issuer {
@@ -536,7 +536,7 @@ func (f *Flow) register(ctx context.Context, serverURL, endpoint, redirect strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	resp, err := f.auth.client(serverURL).Do(req)
+	resp, err := oauthClient(serverURL).Do(req)
 	if err != nil {
 		return "", "", err
 	}
@@ -575,6 +575,10 @@ func (f *Flow) Complete(ctx context.Context, p *Pending, code, state, iss string
 	}
 	if iss != "" && iss != p.Issuer {
 		return errors.New("the sign-in answer came from a different authorization server than the one asked")
+	}
+	if iss == "" && p.IssRequired {
+		// A redirect without iss could be a replayed or injected answer from another server.
+		return errors.New("the sign-in answer didn't name its authorization server, which this one always does (RFC 9207)")
 	}
 	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {p.Redirect},
 		"client_id": {p.ClientID}, "code_verifier": {p.Verifier}, "resource": {p.Resource}}

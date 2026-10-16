@@ -209,7 +209,7 @@ func TestProjectRegistry_KeepsStateOutOfTheProject(t *testing.T) {
 	stateDir := t.TempDir()
 	root := t.TempDir()
 
-	reg, err := NewProjectRegistry(nil, "", 0, stateDir)
+	reg, err := NewProjectRegistry(nil, "", 0, stateDir, "")
 	if err != nil {
 		t.Fatalf("NewProjectRegistry: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestProjectRegistry_ListSurvivesRestart(t *testing.T) {
 	stateDir := t.TempDir()
 	root := t.TempDir()
 
-	first, err := NewProjectRegistry(nil, "", 0, stateDir)
+	first, err := NewProjectRegistry(nil, "", 0, stateDir, "")
 	if err != nil {
 		t.Fatalf("NewProjectRegistry: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestProjectRegistry_ListSurvivesRestart(t *testing.T) {
 		t.Fatalf("Get(root): %v", err)
 	}
 
-	second, err := NewProjectRegistry(nil, "", 0, stateDir)
+	second, err := NewProjectRegistry(nil, "", 0, stateDir, "")
 	if err != nil {
 		t.Fatalf("NewProjectRegistry (restart): %v", err)
 	}
@@ -331,7 +331,7 @@ func mustAbs(t *testing.T, path string) string {
 // each test's projects.json is isolated from every other test's.
 func newTestRegistry(t *testing.T) *ProjectRegistry {
 	t.Helper()
-	projects, err := NewProjectRegistry(nil, "", 0, t.TempDir())
+	projects, err := NewProjectRegistry(nil, "", 0, t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("NewProjectRegistry: %v", err)
 	}
@@ -340,7 +340,7 @@ func newTestRegistry(t *testing.T) *ProjectRegistry {
 
 // A TCP peer can use projects the server already has, never a new path.
 func TestScopeRemoteProject(t *testing.T) {
-	reg, err := NewProjectRegistry(nil, "", 0, t.TempDir())
+	reg, err := NewProjectRegistry(nil, "", 0, t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

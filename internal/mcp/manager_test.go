@@ -10,17 +10,18 @@ import (
 	"testing"
 	"time"
 
+	"yoakeland/internal/permission"
 	"yoakeland/internal/tool"
 )
 
 func newTestManager(t *testing.T) (*Manager, *Store, string, *atomic.Int32) {
 	t.Helper()
 	state, root := t.TempDir(), t.TempDir()
-	store, err := NewStore(state)
+	store, err := NewStore(state, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth, err := NewAuthStore(state)
+	auth, err := NewAuthStore(state, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,8 +78,8 @@ func TestManagerOffersAServersToolsAndRunsThem(t *testing.T) {
 	if err != nil || !strings.Contains(out, "hi there") || !strings.Contains(out, "untrusted content") {
 		t.Fatalf("echo = %q, %v (output must be framed as untrusted)", out, err)
 	}
-	if _, err := toolByName(tools, "mcp__fake__fail").Execute(context.Background(), tool.ExecutionContext{}, nil); err == nil || !strings.Contains(err.Error(), "it broke") {
-		t.Fatalf("a tool's isError must be an error, got %v", err)
+	if _, err := toolByName(tools, "mcp__fake__fail").Execute(context.Background(), tool.ExecutionContext{}, nil); err == nil || !strings.Contains(err.Error(), "it broke") || !strings.Contains(err.Error(), "untrusted content") {
+		t.Fatalf("a tool's isError must be an error, framed as untrusted, got %v", err)
 	}
 	out, _ = toolByName(tools, "mcp__fake__structured").Execute(context.Background(), tool.ExecutionContext{}, nil)
 	if !strings.Contains(out, `"n": 3`) {
@@ -263,6 +264,36 @@ func TestMissingEnvironmentVariableIsReportedNotStarted(t *testing.T) {
 	}
 }
 
+// A default is a literal, URL query values and secret-looking args are hidden
+// too, and an edit that sends them back unchanged keeps what was stored.
+func TestRedactionCoversDefaultsURLsAndArgs(t *testing.T) {
+	cfg := ServerConfig{
+		URL:  "https://example.com/mcp?api_key=abc&v=1&region=${REGION}",
+		Args: []string{"--token", "t0k", "--name=${NAME}", "--secret=s3", "--verbose"},
+		Env:  map[string]string{"A": "${X:-hunter2}", "B": "${Y}"},
+	}
+	shown := redact(cfg)
+	if shown.Env["A"] != Redacted || shown.Env["B"] != "${Y}" {
+		t.Fatalf("env = %v: a default is a secret, a bare reference is not", shown.Env)
+	}
+	if strings.Contains(shown.URL, "abc") || strings.Contains(shown.URL, "v=1") || !strings.Contains(shown.URL, "region=${REGION}") {
+		t.Fatalf("url = %s", shown.URL)
+	}
+	if strings.Contains(strings.Join(shown.Args, " "), "t0k") || strings.Contains(strings.Join(shown.Args, " "), "s3") ||
+		shown.Args[2] != "--name=${NAME}" || shown.Args[4] != "--verbose" {
+		t.Fatalf("args = %v", shown.Args)
+	}
+	back, err := restoreSecrets(shown, cfg)
+	if err != nil || back.URL != cfg.URL || strings.Join(back.Args, " ") != strings.Join(cfg.Args, " ") || back.Env["A"] != "${X:-hunter2}" {
+		t.Fatalf("an unchanged edit must keep the stored values: %+v, %v", back, err)
+	}
+	edited := shown
+	edited.Args = []string{"--token", Redacted}
+	if _, err := restoreSecrets(edited, cfg); err == nil {
+		t.Fatal("an edited argument list that still hides a value must be refused, not stored")
+	}
+}
+
 func TestSecretsAreHiddenOnTheWireAndKeptOnEdit(t *testing.T) {
 	m, store, _, _ := newTestManager(t)
 	cfg := ServerConfig{URL: "https://example.com/mcp", Headers: map[string]string{"Authorization": "Bearer s3cret"}, Env: nil}
@@ -334,10 +365,10 @@ func TestSavingValidatesAndRenames(t *testing.T) {
 
 func TestStoreSurvivesRestartAndKeepsItsFileSecret(t *testing.T) {
 	dir := t.TempDir()
-	s, _ := NewStore(dir)
+	s, _ := NewStore(dir, "")
 	_ = s.Save("a", "", ServerConfig{Command: "x", Env: map[string]string{"K": "v"}})
 	_ = s.SetApproval("/p", "n", "h1", true)
-	s2, err := NewStore(dir)
+	s2, err := NewStore(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,8 +383,53 @@ func TestStoreSurvivesRestartAndKeepsItsFileSecret(t *testing.T) {
 		t.Fatalf("mcp.json is %v; it holds secrets", fi.Mode().Perm())
 	}
 	_ = os.WriteFile(filepath.Join(dir, "mcp.json"), []byte("{broken"), 0o600)
-	if _, err := NewStore(dir); err == nil {
+	if _, err := NewStore(dir, ""); err == nil {
 		t.Fatal("a corrupt store must be an error, not silently emptied")
+	}
+}
+
+// With a master key, mcp.json and mcp-auth.json are sealed like providers.json.
+// A plaintext file from before the key was set is still read, and sealed on its next write.
+func TestStoreSealsUnderTheMasterKey(t *testing.T) {
+	dir := t.TempDir()
+	plain, _ := NewStore(dir, "")
+	_ = plain.Save("a", "", ServerConfig{Command: "x", Env: map[string]string{"K": "env-secret"}})
+	s, err := NewStore(dir, "pw")
+	if err != nil || s.Servers()["a"].Env["K"] != "env-secret" {
+		t.Fatalf("a plaintext store must still open under a key: %v", err)
+	}
+	if err := s.Save("b", "", ServerConfig{Command: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "mcp.json"))
+	if strings.Contains(string(raw), "env-secret") || !strings.Contains(string(raw), `"encrypted": true`) {
+		t.Fatalf("mcp.json must be sealed once a key is set: %s", raw)
+	}
+	if _, err := NewStore(dir, ""); err == nil {
+		t.Fatal("a sealed store must not open without the key")
+	}
+	if _, err := NewStore(dir, "wrong"); err == nil {
+		t.Fatal("a sealed store must not open with the wrong key")
+	}
+	back, err := NewStore(dir, "pw")
+	if err != nil || back.Servers()["a"].Env["K"] != "env-secret" || back.Servers()["b"].Command != "y" {
+		t.Fatalf("sealed store did not round-trip: %v", err)
+	}
+
+	auth, _ := NewAuthStore(dir, "pw")
+	auth.mu.Lock()
+	auth.entries["https://mcp.example"] = tokenEntry{RefreshToken: "refresh-secret"}
+	err = auth.saveLocked()
+	auth.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(dir, "mcp-auth.json"))
+	if strings.Contains(string(raw), "refresh-secret") {
+		t.Fatalf("mcp-auth.json holds a refresh token in plaintext: %s", raw)
+	}
+	if _, err := NewAuthStore(dir, ""); err == nil {
+		t.Fatal("sealed tokens must not open without the key")
 	}
 }
 
@@ -379,8 +455,8 @@ func TestWireNames(t *testing.T) {
 		t.Fatal("names must be stable across reconnects")
 	}
 	for _, n := range []string{a, b, c, d} {
-		if s, rest, ok := ParseWireName(n); !ok || s != "gh" || rest == "" {
-			t.Fatalf("ParseWireName(%s) = %q %q %v", n, s, rest, ok)
+		if s, rest, ok := permission.ParseMCPTool(n); !ok || s != "gh" || rest == "" {
+			t.Fatalf("ParseMCPTool(%s) = %q %q %v", n, s, rest, ok)
 		}
 	}
 }
@@ -406,6 +482,11 @@ func TestSchemaNormalization(t *testing.T) {
 	}
 	if _, err := normalizeSchema(json.RawMessage(`{"type":"object","x":"` + strings.Repeat("a", maxSchemaBytes) + `"}`)); err == nil {
 		t.Error("a huge schema must be refused")
+	}
+	// Schema descriptions reach the model, so they are capped like the tool's own.
+	clipped, err := normalizeSchema(json.RawMessage(`{"type":"object","properties":{"a":{"description":"` + strings.Repeat("d", 5000) + `"}}}`))
+	if d := clipped["properties"].(map[string]any)["a"].(map[string]any)["description"].(string); err != nil || len(d) > maxSchemaText+10 {
+		t.Errorf("schema description not clipped: %d bytes, %v", len(d), err)
 	}
 }
 
@@ -445,7 +526,35 @@ func TestProjectServerCannotReadDaemonSecrets(t *testing.T) {
 	}
 	prepare(t, m)
 	st, _ := m.Status()
-	if len(st) != 1 || !strings.Contains(st[0].Error, "YOAKELAND_MASTER_KEY") || !strings.Contains(st[0].Error, "is not set") {
+	// Either variable may be the one reported: headers are read in map order.
+	if len(st) != 1 || !strings.Contains(st[0].Error, "is not set") ||
+		!strings.Contains(st[0].Error, "YOAKELAND_MASTER_KEY") && !strings.Contains(st[0].Error, "OPENAI_API_KEY") {
 		t.Fatalf("status = %+v", st)
+	}
+}
+
+// A server's tools are held to a byte budget; the largest go first and are counted.
+func TestToolBudgetDropsTheLargest(t *testing.T) {
+	big := strings.Repeat("x", 9<<10)
+	var infos []ToolInfo
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		// examples is not clipped, so the bulk survives into the budget.
+		schema := json.RawMessage(`{"type":"object","properties":{"s":{"type":"string","examples":["` + big + `"]}}}`)
+		infos = append(infos, ToolInfo{Name: n, InputSchema: schema})
+	}
+	infos = append(infos, ToolInfo{Name: "small", InputSchema: json.RawMessage(`{}`)})
+	e := &entry{name: "srv"}
+	(&Manager{}).setTools(e, infos, nil)
+	var total int
+	kept := map[string]bool{}
+	for _, x := range e.tools {
+		total += x.size
+		kept[x.wire] = true
+	}
+	if e.truncated == 0 || total > maxToolBytes || e.truncated+len(e.tools) != len(infos) {
+		t.Fatalf("total %d, kept %d, dropped %d of %d", total, len(e.tools), e.truncated, len(infos))
+	}
+	if !kept["mcp__srv__small"] {
+		t.Fatal("the small tool must survive the budget")
 	}
 }

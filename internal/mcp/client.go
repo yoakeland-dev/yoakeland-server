@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -43,23 +44,30 @@ type ServerInfo struct {
 	Prompts   bool `json:"prompts,omitempty"`
 }
 
+// limitInfo caps what a server says about itself. It goes to every peer on each
+// status push, so a server can't make that push arbitrarily large.
+func limitInfo(info ServerInfo) ServerInfo {
+	info.Name, info.Title, info.Version = shorten(info.Name, 200), shorten(info.Title, 200), shorten(info.Version, 200)
+	if len(info.Instructions) > 2048 {
+		info.Instructions = strings.ToValidUTF8(info.Instructions[:2048], "") + "…"
+	}
+	return info
+}
+
 type ToolAnnotations struct {
 	Title           string `json:"title,omitempty"`
 	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
 	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
-	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
-	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
 }
 
 // ToolInfo is one tool as a server lists it. Everything in it came from the
 // server, so none of it is trusted.
 type ToolInfo struct {
-	Name         string           `json:"name"`
-	Title        string           `json:"title,omitempty"`
-	Description  string           `json:"description,omitempty"`
-	InputSchema  json.RawMessage  `json:"inputSchema,omitempty"`
-	OutputSchema json.RawMessage  `json:"outputSchema,omitempty"`
-	Annotations  *ToolAnnotations `json:"annotations,omitempty"`
+	Name        string           `json:"name"`
+	Title       string           `json:"title,omitempty"`
+	Description string           `json:"description,omitempty"`
+	InputSchema json.RawMessage  `json:"inputSchema,omitempty"`
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // ContentBlock is one piece of a tool result.
@@ -240,12 +248,17 @@ func (c *Client) initialize(ctx context.Context) error {
 	info.Resources = len(res.Capabilities.Resources) > 0
 	info.Prompts = len(res.Capabilities.Prompts) > 0
 	c.mu.Lock()
-	c.era, c.version, c.info = "legacy", res.ProtocolVersion, info
+	c.era, c.version, c.info = "legacy", res.ProtocolVersion, limitInfo(info)
 	c.mu.Unlock()
 	if ht, ok := c.t.(*httpTransport); ok {
 		ht.setVersion(res.ProtocolVersion, false)
 		lctx, lcancel := context.WithCancel(context.Background())
+		c.mu.Lock()
+		if c.listenCt != nil { // a new session replaces the listener of the old one
+			c.listenCt()
+		}
 		c.listenCt = lcancel
+		c.mu.Unlock()
 		go ht.listen(lctx)
 	}
 	return nil
@@ -293,7 +306,7 @@ func (c *Client) discover(ctx context.Context) error {
 	_, info.Resources = res.Capabilities["resources"]
 	_, info.Prompts = res.Capabilities["prompts"]
 	c.mu.Lock()
-	c.info = info
+	c.info = limitInfo(info)
 	c.mu.Unlock()
 	return nil
 }
@@ -313,9 +326,11 @@ func (c *Client) Diag() string { return c.t.diag() }
 
 // Close ends the connection and, for a local server, its process.
 func (c *Client) Close() {
+	c.mu.Lock()
 	if c.listenCt != nil {
 		c.listenCt()
 	}
+	c.mu.Unlock()
 	if c.t != nil {
 		c.t.close()
 	}
@@ -325,9 +340,17 @@ func (c *Client) Close() {
 // _meta; a legacy HTTP request whose session expired is retried once on a new one.
 func (c *Client) rpc(ctx context.Context, method string, params map[string]any, out any) error {
 	for attempt := 0; ; attempt++ {
+		used := ""
+		if ht, ok := c.t.(*httpTransport); ok {
+			used = ht.sessionID()
+		}
 		err := c.rpcOnce(ctx, method, params, out)
-		if errors.Is(err, errSessionExpired) && attempt == 0 && method != "initialize" {
-			if rerr := c.restartSession(ctx); rerr != nil {
+		// A call that was sent while another call was renewing the session goes
+		// out without one, and the server answers that 404 too.
+		var herr *httpError
+		gone := errors.Is(err, errSessionExpired) || (used != "" && errors.As(err, &herr) && herr.Status == http.StatusNotFound)
+		if gone && attempt == 0 && method != "initialize" {
+			if rerr := c.restartSession(ctx, used); rerr != nil {
 				return rerr
 			}
 			continue
@@ -336,15 +359,25 @@ func (c *Client) rpc(ctx context.Context, method string, params map[string]any, 
 	}
 }
 
-func (c *Client) restartSession(ctx context.Context) error {
+// restartSession starts a new session, unless another call already replaced the
+// one that failed (failed) while this one waited for the lock.
+func (c *Client) restartSession(ctx context.Context, failed string) error {
 	c.reinit.Lock()
 	defer c.reinit.Unlock()
 	ht, ok := c.t.(*httpTransport)
 	if !ok {
 		return errSessionExpired
 	}
-	ht.setSession("")
-	return c.initialize(ctx)
+	if ht.sessionID() != failed {
+		return nil
+	}
+	// The old session stays until the new one is known, so a call sent meanwhile
+	// fails the same way and waits here for this restart rather than seeing none.
+	err := c.initialize(ctx)
+	if err == nil && ht.sessionID() == failed {
+		ht.setSession("") // the server gave no new session
+	}
+	return err
 }
 
 func (c *Client) rpcOnce(ctx context.Context, method string, params map[string]any, out any) error {
