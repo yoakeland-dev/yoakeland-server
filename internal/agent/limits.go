@@ -93,11 +93,16 @@ func (a *Agent) limitHit(tl *turnLimits, spentThisTurn float64) (limitKind, stri
 	if maxRounds > 0 && tl.rounds >= maxRounds+tl.extraRounds {
 		return limitRounds, fmt.Sprintf("This turn has made %d model calls.", tl.rounds)
 	}
-	// Sub-agents have no usage store: their spend rolls up into the parent's
-	// turn total, which is checked there.
+	// Sub-agents have no usage store: they are checked against the tally
+	// their round shares, which also counts the siblings running beside them.
 	if maxCost > 0 && a.usageStore != nil {
 		spent := a.usageStore.SessionTotal(a.CurrentSessionID()).CostUSD + spentThisTurn
 		if spent >= maxCost+tl.extraCostUSD {
+			return limitCost, fmt.Sprintf("This session has spent $%.2f, at its $%.2f limit.", spent, maxCost+tl.extraCostUSD)
+		}
+	}
+	if maxCost > 0 && a.tally != nil {
+		if spent := a.tally.total(); spent >= maxCost+tl.extraCostUSD {
 			return limitCost, fmt.Sprintf("This session has spent $%.2f, at its $%.2f limit.", spent, maxCost+tl.extraCostUSD)
 		}
 	}
