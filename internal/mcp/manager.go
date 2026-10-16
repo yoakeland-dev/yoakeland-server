@@ -509,7 +509,7 @@ func (m *Manager) ready(ctx context.Context, e *entry) (*Client, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return nil, fmt.Errorf("MCP server %s isn't available: %s", e.name, e.err)
+	return nil, serverErr(e, fmt.Sprintf("MCP server %s isn't available: %s", e.name, e.err))
 }
 
 func (m *Manager) callTimeout(e *entry) time.Duration {
@@ -543,16 +543,22 @@ func (m *Manager) callFailed(e *entry, c *Client, err error, turn, call context.
 		c.Close()
 		return fmt.Errorf("MCP server %s needs sign-in: open Settings → MCP servers", e.name)
 	case errors.As(err, &rerr):
-		return fmt.Errorf("MCP server %s: %s", e.name, rerr.Message)
+		return serverErr(e, fmt.Sprintf("MCP server %s: %s", e.name, rerr.Message))
 	case errors.Is(err, errInputRequired):
 		return fmt.Errorf("MCP server %s: %w", e.name, err)
 	}
 	select {
 	case <-c.Done():
-		return fmt.Errorf("MCP server %s went away: %w", e.name, err)
+		return serverErr(e, fmt.Sprintf("MCP server %s went away: %s", e.name, err))
 	default:
 	}
-	return fmt.Errorf("MCP server %s: %w", e.name, err)
+	return serverErr(e, fmt.Sprintf("MCP server %s: %s", e.name, err))
+}
+
+// serverErr is an error whose text the server wrote (its messages, its stderr),
+// so it reaches the model framed as untrusted data, like a tool's output does.
+func serverErr(e *entry, msg string) error {
+	return errors.New(tool.WrapUntrusted("the MCP server "+e.name, msg))
 }
 
 // Close stops every server.

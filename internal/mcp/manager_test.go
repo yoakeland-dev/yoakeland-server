@@ -77,8 +77,8 @@ func TestManagerOffersAServersToolsAndRunsThem(t *testing.T) {
 	if err != nil || !strings.Contains(out, "hi there") || !strings.Contains(out, "untrusted content") {
 		t.Fatalf("echo = %q, %v (output must be framed as untrusted)", out, err)
 	}
-	if _, err := toolByName(tools, "mcp__fake__fail").Execute(context.Background(), tool.ExecutionContext{}, nil); err == nil || !strings.Contains(err.Error(), "it broke") {
-		t.Fatalf("a tool's isError must be an error, got %v", err)
+	if _, err := toolByName(tools, "mcp__fake__fail").Execute(context.Background(), tool.ExecutionContext{}, nil); err == nil || !strings.Contains(err.Error(), "it broke") || !strings.Contains(err.Error(), "untrusted content") {
+		t.Fatalf("a tool's isError must be an error, framed as untrusted, got %v", err)
 	}
 	out, _ = toolByName(tools, "mcp__fake__structured").Execute(context.Background(), tool.ExecutionContext{}, nil)
 	if !strings.Contains(out, `"n": 3`) {
