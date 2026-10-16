@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -677,8 +680,9 @@ func (m *Manager) Reconnect(name string) error {
 // Redacted stands in for a secret value on the wire.
 const Redacted = "••••••"
 
-// redact hides what a server's config keeps secret. A value that is only a
-// ${VAR} reference holds no secret and is shown as is.
+// redact hides what a server's config keeps secret: env and header values,
+// URL query values, and arguments that follow a secret-looking flag. A value
+// that is only ${VAR} references (no defaults) holds no secret and is shown as is.
 func redact(cfg ServerConfig) ServerConfig {
 	hide := func(in map[string]string) map[string]string {
 		if in == nil {
@@ -686,7 +690,7 @@ func redact(cfg ServerConfig) ServerConfig {
 		}
 		out := make(map[string]string, len(in))
 		for k, v := range in {
-			if v == "" || (varRe.MatchString(v) && varRe.ReplaceAllString(v, "") == "") {
+			if v == "" || isVarRef(v) {
 				out[k] = v
 			} else {
 				out[k] = Redacted
@@ -695,6 +699,8 @@ func redact(cfg ServerConfig) ServerConfig {
 		return out
 	}
 	cfg.Env, cfg.Headers = hide(cfg.Env), hide(cfg.Headers)
+	cfg.URL = redactURL(cfg.URL)
+	cfg.Args = redactArgs(cfg.Args)
 	if cfg.OAuth != nil {
 		o := *cfg.OAuth
 		if o.ClientSecret != "" {
@@ -703,6 +709,73 @@ func redact(cfg ServerConfig) ServerConfig {
 		cfg.OAuth = &o
 	}
 	return cfg
+}
+
+// isVarRef reports whether v is only ${VAR} references with no defaults: a name
+// of a variable, not a value. A default is a literal, so it can be a secret.
+func isVarRef(v string) bool {
+	refs := varRe.FindAllStringSubmatch(v, -1)
+	if len(refs) == 0 || varRe.ReplaceAllString(v, "") != "" {
+		return false
+	}
+	for _, r := range refs {
+		if r[2] != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// secretName is a flag or parameter name that suggests its value is a secret.
+var secretName = regexp.MustCompile(`(?i)token|secret|passw|key|auth|credential|session`)
+
+// redactArgs hides the value of a secret-looking flag, as --token=x or --token x.
+func redactArgs(args []string) []string {
+	if args == nil {
+		return nil
+	}
+	out := append([]string(nil), args...)
+	for i := range out {
+		name, val, eq := strings.Cut(out[i], "=")
+		switch {
+		case eq && strings.HasPrefix(name, "-") && secretName.MatchString(name) && val != "" && !isVarRef(val):
+			out[i] = name + "=" + Redacted
+		case !eq && strings.HasPrefix(out[i], "-") && secretName.MatchString(out[i]) && i+1 < len(out) && out[i+1] != "" && !isVarRef(out[i+1]):
+			out[i+1] = Redacted
+		}
+	}
+	return out
+}
+
+// redactURL hides the values in a URL's query string.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.RawQuery == "" {
+		return raw
+	}
+	parts := strings.Split(u.RawQuery, "&")
+	for i, p := range parts {
+		if k, v, eq := strings.Cut(p, "="); eq && v != "" && !isVarRef(v) {
+			parts[i] = k + "=" + Redacted
+		}
+	}
+	u.RawQuery = strings.Join(parts, "&")
+	return u.String()
+}
+
+// restoreRedacted keeps a URL or argument list the client sent back unchanged,
+// and refuses an edited one that still hides a value: that value isn't stored
+// in a form that can be put back.
+func restoreRedacted(what string, in, stored, shown []string) ([]string, error) {
+	if slices.Equal(in, shown) {
+		return stored, nil
+	}
+	for _, s := range in {
+		if strings.Contains(s, Redacted) {
+			return nil, fmt.Errorf("the %s has a hidden value that can't be kept after an edit: type the %s again", what, what)
+		}
+	}
+	return in, nil
 }
 
 // restoreSecrets fills in the values a client sent back as Redacted from what
@@ -727,6 +800,18 @@ func restoreSecrets(in, prev ServerConfig) (ServerConfig, error) {
 	if err := fix("header", in.Headers, prev.Headers); err != nil {
 		return in, err
 	}
+	if in.URL != "" && in.URL != prev.URL {
+		if strings.Contains(in.URL, Redacted) && in.URL == redactURL(prev.URL) {
+			in.URL = prev.URL
+		} else if strings.Contains(in.URL, Redacted) {
+			return in, errors.New("the URL has a hidden value that can't be kept after an edit: type the URL again")
+		}
+	}
+	args, err := restoreRedacted("arguments", in.Args, prev.Args, redactArgs(prev.Args))
+	if err != nil {
+		return in, err
+	}
+	in.Args = args
 	if in.OAuth != nil && in.OAuth.ClientSecret == Redacted {
 		if prev.OAuth == nil || prev.OAuth.ClientSecret == "" {
 			return in, errors.New("the client secret has no stored value to keep: type it again")

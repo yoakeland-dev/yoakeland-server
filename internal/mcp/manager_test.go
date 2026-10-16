@@ -263,6 +263,36 @@ func TestMissingEnvironmentVariableIsReportedNotStarted(t *testing.T) {
 	}
 }
 
+// A default is a literal, URL query values and secret-looking args are hidden
+// too, and an edit that sends them back unchanged keeps what was stored.
+func TestRedactionCoversDefaultsURLsAndArgs(t *testing.T) {
+	cfg := ServerConfig{
+		URL:  "https://example.com/mcp?api_key=abc&v=1&region=${REGION}",
+		Args: []string{"--token", "t0k", "--name=${NAME}", "--secret=s3", "--verbose"},
+		Env:  map[string]string{"A": "${X:-hunter2}", "B": "${Y}"},
+	}
+	shown := redact(cfg)
+	if shown.Env["A"] != Redacted || shown.Env["B"] != "${Y}" {
+		t.Fatalf("env = %v: a default is a secret, a bare reference is not", shown.Env)
+	}
+	if strings.Contains(shown.URL, "abc") || strings.Contains(shown.URL, "v=1") || !strings.Contains(shown.URL, "region=${REGION}") {
+		t.Fatalf("url = %s", shown.URL)
+	}
+	if strings.Contains(strings.Join(shown.Args, " "), "t0k") || strings.Contains(strings.Join(shown.Args, " "), "s3") ||
+		shown.Args[2] != "--name=${NAME}" || shown.Args[4] != "--verbose" {
+		t.Fatalf("args = %v", shown.Args)
+	}
+	back, err := restoreSecrets(shown, cfg)
+	if err != nil || back.URL != cfg.URL || strings.Join(back.Args, " ") != strings.Join(cfg.Args, " ") || back.Env["A"] != "${X:-hunter2}" {
+		t.Fatalf("an unchanged edit must keep the stored values: %+v, %v", back, err)
+	}
+	edited := shown
+	edited.Args = []string{"--token", Redacted}
+	if _, err := restoreSecrets(edited, cfg); err == nil {
+		t.Fatal("an edited argument list that still hides a value must be refused, not stored")
+	}
+}
+
 func TestSecretsAreHiddenOnTheWireAndKeptOnEdit(t *testing.T) {
 	m, store, _, _ := newTestManager(t)
 	cfg := ServerConfig{URL: "https://example.com/mcp", Headers: map[string]string{"Authorization": "Bearer s3cret"}, Env: nil}
