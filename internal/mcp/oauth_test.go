@@ -277,3 +277,14 @@ func TestAuthStoreIsPrivateAndPersistent(t *testing.T) {
 }
 
 func netIP(s string) net.IP { return net.ParseIP(s) }
+
+// A server that says its answers name the issuer (RFC 9207) must name it.
+func TestOAuthAnswerMustNameIssuerWhenServerSaysSo(t *testing.T) {
+	p := &Pending{State: "s", Issuer: "https://as.example", IssRequired: true}
+	if err := (&Flow{}).Complete(context.Background(), p, "code", "s", ""); err == nil || !strings.Contains(err.Error(), "RFC 9207") {
+		t.Fatalf("an answer without iss must be refused, got %v", err)
+	}
+	if err := (&Flow{}).Complete(context.Background(), p, "code", "s", "https://elsewhere.example"); err == nil || strings.Contains(err.Error(), "RFC 9207") {
+		t.Fatalf("an answer from another issuer must be refused, got %v", err)
+	}
+}

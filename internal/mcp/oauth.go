@@ -320,6 +320,7 @@ type Pending struct {
 	State         string
 	Redirect      string
 	Issuer        string
+	IssRequired   bool // the server says every answer names its issuer (RFC 9207)
 	TokenEndpoint string
 	ClientID      string
 	ClientSecret  string
@@ -487,7 +488,7 @@ func (f *Flow) Begin(ctx context.Context, cfg ServerConfig, ch *errNeedsAuth, re
 		scope = strings.Join(scopes, " ")
 	}
 	p := &Pending{ID: randToken(12), ServerURL: cfg.URL, Verifier: randToken(32), State: randToken(16), Redirect: redirect,
-		Issuer: md.Issuer, TokenEndpoint: md.TokenEndpoint, Resource: authKey(cfg.URL), Scope: scope, Expires: time.Now().Add(10 * time.Minute)}
+		Issuer: md.Issuer, IssRequired: md.IssParam, TokenEndpoint: md.TokenEndpoint, Resource: authKey(cfg.URL), Scope: scope, Expires: time.Now().Add(10 * time.Minute)}
 	if cfg.OAuth != nil {
 		p.ClientID, p.ClientSecret = cfg.OAuth.ClientID, cfg.OAuth.ClientSecret
 	} else if prev, ok := f.auth.get(cfg.URL); ok && prev.ClientID != "" && prev.Issuer == md.Issuer {
@@ -581,6 +582,10 @@ func (f *Flow) Complete(ctx context.Context, p *Pending, code, state, iss string
 	}
 	if iss != "" && iss != p.Issuer {
 		return errors.New("the sign-in answer came from a different authorization server than the one asked")
+	}
+	if iss == "" && p.IssRequired {
+		// A redirect without iss could be a replayed or injected answer from another server.
+		return errors.New("the sign-in answer didn't name its authorization server, which this one always does (RFC 9207)")
 	}
 	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {p.Redirect},
 		"client_id": {p.ClientID}, "code_verifier": {p.Verifier}, "resource": {p.Resource}}
