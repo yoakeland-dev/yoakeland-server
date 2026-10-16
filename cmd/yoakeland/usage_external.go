@@ -61,6 +61,7 @@ func codexDir() string {
 func scanExternal() ([]extRec, map[string]string) {
 	var recs []extRec
 	titles := map[string]string{}
+	seen := map[string]bool{}
 	visit := func(root string, parse func(*os.File) *extFile) {
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
@@ -70,6 +71,7 @@ func scanExternal() ([]extRec, map[string]string) {
 			if err != nil {
 				return nil
 			}
+			seen[path] = true
 			extFiles.Lock()
 			c := extFiles.m[path]
 			extFiles.Unlock()
@@ -98,6 +100,14 @@ func scanExternal() ([]extRec, map[string]string) {
 	for k, v := range codexThreadNames() {
 		titles[k] = v
 	}
+	// Forget transcripts that are gone, so the cache holds only what's on disk.
+	extFiles.Lock()
+	for path := range extFiles.m {
+		if !seen[path] {
+			delete(extFiles.m, path)
+		}
+	}
+	extFiles.Unlock()
 	return recs, titles
 }
 

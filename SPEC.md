@@ -794,7 +794,7 @@ Reads a page of the server's audit log (§6): what was approved or refused, what
 - `limit`: default 100, clamped to 500. `before`: only events with a lower `seq`; pass the last event of the previous page to read the next one. `kinds`: only these kinds (§6 lists them). `sessionId`, `projectPath`: only events for that chat / project (a project-level event such as a rule change has a project and no session). `since`: RFC 3339, only events at or after it; anything else answers with `error` set. Filters combine (all must match).
 
 #### `get_usage`
-Asks for every recorded model round-trip on this server, for a usage page. Replies `usage_report` (§3.2) with the same `requestId`.
+Asks for every recorded model round-trip on this server, for a usage page. Replies `usage_report` (§3.2) with the same `requestId`. Requests with the same `since`/`external` that arrive within 30 seconds share one scan of the transcripts on disk, so the reply can be up to 30 seconds old.
 ```json
 {"type": "get_usage", "data": {"requestId": "rq-1", "since": "2026-06-30T00:00:00Z", "external": true}}
 ```

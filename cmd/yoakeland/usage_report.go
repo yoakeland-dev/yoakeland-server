@@ -119,6 +119,30 @@ func parseUsageSession(path string, fi os.FileInfo, projectPath string) *usagePa
 // usagePricer prices a request with cache reads/writes split out of input.
 type usagePricer func(model string, input, cacheRead, cacheWrite, output int) float64
 
+// usageReportTTL is how long a get_usage result is reused. Each scan walks every transcript on
+// disk, so a client asking again within this window gets the last answer, not another scan.
+const usageReportTTL = 30 * time.Second
+
+// usageReports runs one get_usage scan at a time and reuses its result for the same query within
+// usageReportTTL. Requests that arrive during a scan queue behind it and then find its result.
+var usageReports struct {
+	sync.Mutex
+	key string
+	at  time.Time
+	out protocol.UsageReportData
+}
+
+func cachedUsageReport(key string, build func() protocol.UsageReportData) protocol.UsageReportData {
+	usageReports.Lock()
+	defer usageReports.Unlock()
+	if usageReports.key == key && time.Since(usageReports.at) < usageReportTTL {
+		return usageReports.out
+	}
+	out := build()
+	usageReports.key, usageReports.at, usageReports.out = key, time.Now(), out
+	return out
+}
+
 // buildUsageReport scans stateDir itself (pre-project-layout servers kept
 // sessions there) and every projects/<id> data dir, known or since removed,
 // then with external the CLIs' own transcripts. providerKinds maps
@@ -176,6 +200,7 @@ func buildUsageReport(stateDir string, providerKinds map[string]string, since ti
 	}
 
 	native := map[string]bool{}
+	live := map[string]bool{}
 	for _, dir := range dirs {
 		projectPath := ""
 		if b, err := os.ReadFile(filepath.Join(dir, "project.json")); err == nil {
@@ -192,6 +217,7 @@ func buildUsageReport(stateDir string, providerKinds map[string]string, since ti
 			if err != nil {
 				continue
 			}
+			live[path] = true
 			p := parseUsageSession(path, fi, projectPath)
 			if p == nil {
 				continue
@@ -221,6 +247,15 @@ func buildUsageReport(stateDir string, providerKinds map[string]string, since ti
 			}
 		}
 	}
+
+	// Forget session files deleted since the last scan, so the cache holds only what's on disk.
+	usageFiles.Lock()
+	for path := range usageFiles.m {
+		if !live[path] {
+			delete(usageFiles.m, path)
+		}
+	}
+	usageFiles.Unlock()
 
 	if external {
 		recs, titles := scanExternal()

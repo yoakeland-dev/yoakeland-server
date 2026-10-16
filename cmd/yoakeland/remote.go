@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"net"
-	"os"
 	"sync"
 
 	"yoakeland/internal/tlsca"
@@ -120,9 +121,8 @@ func (r *remoteControl) RTCFingerprint() string {
 // operator-supplied certificate instead (resolveServerCert's real-cert
 // branch, same -tls-cert/-tls-key test): there's no private CA to hand out
 // there, a client just needs the public trust store like normal TLS.
-// Idempotent and cheap — same EnsureServerCert call Start makes, which
-// loads the persisted CA rather than regenerating it, so this works even
-// before remote access has ever been turned on.
+// Cheap enough for every unauthenticated GET /ca.crt: it reads the CA file, and only creates
+// the CA when there isn't one yet, so this works even before remote access has ever been turned on.
 func (r *remoteControl) CAPEM() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -140,15 +140,14 @@ func (r *remoteControl) caPEM() (string, error) {
 	if r.tlsCert != "" || r.tlsKey != "" {
 		return "", nil
 	}
-	_, caPEMPath, _, err := tlsca.EnsureServerCert(r.stateDir, tlsca.DefaultSANs())
-	if err != nil {
-		return "", err
+	out, err := tlsca.ReadCAPEM(r.stateDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		if _, _, _, err := tlsca.EnsureServerCert(r.stateDir, tlsca.DefaultSANs()); err != nil {
+			return "", err
+		}
+		out, err = tlsca.ReadCAPEM(r.stateDir)
 	}
-	pem, err := os.ReadFile(caPEMPath)
-	if err != nil {
-		return "", err
-	}
-	return string(pem), nil
+	return out, err
 }
 
 // Stop closes the TCP listener, if running, and force-closes every

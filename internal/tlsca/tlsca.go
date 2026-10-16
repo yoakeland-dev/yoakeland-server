@@ -17,7 +17,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"net"
 	"os"
@@ -30,6 +32,10 @@ import (
 const (
 	caValidity   = 20 * 365 * 24 * time.Hour // ~20 years: a personal server's own private root
 	leafValidity = 365 * 24 * time.Hour      // ~1 year: cheap to auto-regenerate, so kept short-lived
+
+	// RenewBefore is how close to expiry a leaf is regenerated. A caller serving the leaf for
+	// longer than that (a daemon up for over a year) should check it and call EnsureServerCert again.
+	RenewBefore = 30 * 24 * time.Hour
 
 	dirMode = 0755
 	keyMode = 0600
@@ -188,12 +194,26 @@ func EnsureServerCert(stateDir string, sans []string) (cert tls.Certificate, caP
 	return tlsCert, caPEMPath, fingerprint(caCert), nil
 }
 
+// ReadCAPEM returns the CA certificate's PEM as EnsureServerCert last wrote it, without checking
+// or regenerating anything. A missing CA is an error wrapping fs.ErrNotExist.
+func ReadCAPEM(stateDir string) (string, error) {
+	pem, err := os.ReadFile(filepath.Join(tlsDir(stateDir), "ca.pem"))
+	return string(pem), err
+}
+
 func loadOrCreateCA(certPath, keyPath string, sans []string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
-	if cert, key, err := loadCertKeyPair(certPath, keyPath); err == nil {
+	cert, key, err := loadCertKeyPair(certPath, keyPath)
+	if err == nil {
 		return cert, key, nil
 	}
+	// Only a CA that doesn't exist yet is made. Once ca.pem exists a client may have pinned it, so
+	// one that won't load is for the operator to fix, not a reason to replace it (NET-18). A
+	// ca.key with no ca.pem was never handed out (the key is written first), so it's safe to overwrite.
+	if _, statErr := os.Stat(certPath); !errors.Is(statErr, fs.ErrNotExist) {
+		return nil, nil, fmt.Errorf("CA certificate exists but can't be loaded, not replacing it: %w", err)
+	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating CA key: %w", err)
 	}
@@ -229,19 +249,20 @@ func loadOrCreateCA(certPath, keyPath string, sans []string) (*x509.Certificate,
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating CA certificate: %w", err)
 	}
-	cert, err := x509.ParseCertificate(der)
+	cert, err = x509.ParseCertificate(der)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing freshly created CA certificate: %w", err)
 	}
 
-	if err := writePEM(certPath, "CERTIFICATE", der, 0644); err != nil {
-		return nil, nil, err
-	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshaling CA key: %w", err)
 	}
+	// Key first: ca.pem only appears once its key is in place.
 	if err := writePEM(keyPath, "EC PRIVATE KEY", keyDER, keyMode); err != nil {
+		return nil, nil, err
+	}
+	if err := writePEM(certPath, "CERTIFICATE", der, 0644); err != nil {
 		return nil, nil, err
 	}
 
@@ -307,7 +328,7 @@ func loadOrCreateLeaf(certPath, keyPath string, caCert *x509.Certificate, caKey 
 // reuse: not expired-or-expiring-soon, and its SAN list matches wantSANs
 // exactly (a changed LAN IP/hostname means a new cert is needed).
 func leafStillValid(cert *x509.Certificate, wantSANs []string) bool {
-	if time.Until(cert.NotAfter) < 30*24*time.Hour {
+	if time.Until(cert.NotAfter) < RenewBefore {
 		return false
 	}
 
@@ -356,6 +377,9 @@ func loadCertKeyPair(certPath, keyPath string) (*x509.Certificate, *ecdsa.Privat
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", keyPath, err)
 	}
+	if !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, nil, fmt.Errorf("%s: key doesn't match the certificate", keyPath)
+	}
 
 	return cert, key, nil
 }
@@ -369,9 +393,14 @@ func randomSerial() (*big.Int, error) {
 	return serial, nil
 }
 
+// writePEM replaces path atomically, so a crash mid-write leaves the old file or the new one.
 func writePEM(path, blockType string, der []byte, mode os.FileMode) error {
 	buf := pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: der})
-	if err := os.WriteFile(path, buf, mode); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf, mode); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil

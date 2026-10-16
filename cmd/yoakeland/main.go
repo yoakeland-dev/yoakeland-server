@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -421,12 +422,16 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 		return nil, "", err
 	}
 
-	cert, _, _, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
+	cert, usingAutoCA, _, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
 	if err != nil {
 		_ = ln.Close()
 		return nil, "", fmt.Errorf("resolving TLS certificate: %w", err)
 	}
-	ln = wrapTLS(ln, cert)
+	if usingAutoCA {
+		ln = tls.NewListener(ln, &tls.Config{GetCertificate: renewingCert(stateDir, cert)})
+	} else {
+		ln = wrapTLS(ln, cert)
+	}
 
 	// The shared token is deliberately not logged: a log or journal outlives the session and
 	// the token never expires. Devices pair with a fresh single-use code (printPairQR below
@@ -753,6 +758,25 @@ func parseListenAddr(listenAddr, stateDir string) (network, address string) {
 // resolveServerCert) — this function doesn't care which one produced cert.
 func wrapTLS(ln net.Listener, cert tls.Certificate) net.Listener {
 	return tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+}
+
+// renewingCert serves the self-managed leaf, regenerating it once it's close to expiry: the leaf
+// is otherwise only made at startup, and a daemon can run for over a year (NET-18).
+func renewingCert(stateDir string, cert tls.Certificate) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var mu sync.Mutex
+	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil && time.Until(leaf.NotAfter) < tlsca.RenewBefore {
+			if renewed, _, _, err := tlsca.EnsureServerCert(stateDir, tlsca.DefaultSANs()); err != nil {
+				logWarn("renewing TLS certificate: %v", err)
+			} else {
+				cert = renewed
+			}
+		}
+		c := cert
+		return &c, nil
+	}
 }
 
 // resolveServerCert obtains the certificate the TCP listener should present.
@@ -2078,7 +2102,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 					return usd
 				}
 			}
-			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External, price)
+			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), data.External)
+			out := cachedUsageReport(key, func() protocol.UsageReportData {
+				return buildUsageReport(deps.projects.stateDir, kinds, since, data.External, price)
+			})
 			out.Accounts = usageAccounts(deps.providerStore)
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)
