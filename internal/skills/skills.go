@@ -6,6 +6,8 @@
 package skills
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,13 +70,19 @@ var agentsOf = map[string][]string{
 	"amp":      {"amp"},
 }
 
-// Roots lists every folder skills may live in, in precedence order: the
-// project's before the user's, and within each yoakeland's own, then the shared
-// .agents, then the rest. stateDir is yoakeland's own state directory.
+// Roots lists every folder skills may live in, in precedence order: the user's
+// before the project's, so a repo's skill can't shadow one of the user's own. Within
+// each, yoakeland's own come first, then the shared .agents, then the rest.
+// stateDir is yoakeland's own state directory.
 func Roots(stateDir, home, projectRoot string) []Root {
-	var out []Root
+	var out, projectOut []Root
 	add := func(scope Scope, source, path string) {
-		if path != "" {
+		if path == "" {
+			return
+		}
+		if scope == ScopeProject {
+			projectOut = append(projectOut, Root{Path: path, Source: source, Scope: scope})
+		} else {
 			out = append(out, Root{Path: path, Source: source, Scope: scope})
 		}
 	}
@@ -110,7 +118,7 @@ func Roots(stateDir, home, projectRoot string) []Root {
 		add(ScopeUser, "omp", h(".omp/agent/skills"))
 		add(ScopeUser, "amp", h(".config/agents/skills"))
 	}
-	return out
+	return append(out, projectOut...)
 }
 
 // Skill is one skill folder.
@@ -126,8 +134,11 @@ type Skill struct {
 	AlsoIn []string `json:"alsoIn,omitempty"`
 	// Shadowed: another skill of the same name takes precedence over this one.
 	Shadowed bool `json:"shadowed,omitempty"`
-	// Enabled is the user's switch.
+	// Enabled is the user's switch. A project skill is on only once the user
+	// has switched it on for its current Fingerprint.
 	Enabled bool `json:"enabled"`
+	// Fingerprint identifies the skill's files as they are now (see measure).
+	Fingerprint string `json:"-"`
 
 	License       string `json:"license,omitempty"`
 	Compatibility string `json:"compatibility,omitempty"`
@@ -329,13 +340,15 @@ func readSkillFile(dir string) (data []byte, modified int64, err error) {
 }
 
 // measure counts the files in a skill folder and their size, bounded so a
-// runaway tree can't stall a scan.
-func measure(dir string) (files int, bytes int64) {
+// runaway tree can't stall a scan. listing names each file with its size and
+// modification time, which is what a skill's fingerprint is made of.
+func measure(dir string) (files int, bytes int64, listing string) {
 	r, err := os.OpenRoot(dir)
 	if err != nil {
-		return 0, 0
+		return 0, 0, ""
 	}
 	defer r.Close()
+	var sb strings.Builder
 	_ = fs.WalkDir(r.FS(), ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -355,13 +368,22 @@ func measure(dir string) (files int, bytes int64) {
 		if fi, err := d.Info(); err == nil && fi.Mode().IsRegular() {
 			files++
 			bytes += fi.Size()
+			fmt.Fprintf(&sb, "%s %d %d\n", p, fi.Size(), fi.ModTime().UnixNano())
 		}
 		return nil
 	})
 	if files > 0 {
 		files-- // SKILL.md itself isn't a supporting file
 	}
-	return files, bytes
+	return files, bytes, sb.String()
+}
+
+// fingerprint changes whenever a skill's document or any file beside it does.
+func fingerprint(doc []byte, listing string) string {
+	h := sha256.New()
+	h.Write(doc)
+	h.Write([]byte(listing))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // scanRoot reads every skill folder directly under root.
@@ -433,15 +455,18 @@ func scanRoot(root Root, out *[]Skill, problems *[]string) {
 			sk.Description = strings.ToValidUTF8(sk.Description[:maxDescription], "") + "…"
 			sk.Warnings = append(sk.Warnings, fmt.Sprintf("the description was cut to %d characters", maxDescription))
 		}
-		sk.Files, sk.Bytes = measure(real)
+		var listing string
+		sk.Files, sk.Bytes, listing = measure(real)
+		sk.Fingerprint = fingerprint(data, listing)
 		*out = append(*out, sk)
 	}
 }
 
 // Scan reads every root and returns the skills, with duplicates folded: the
 // same folder reached through several roots is one skill, and when two different
-// skills share a name the one from the earlier root wins.
-func Scan(roots []Root, disabled func(dir string) bool) (skills []Skill, problems []string) {
+// skills share a name the one from the earlier root wins. off says which skills
+// the user has switched off; nil means none.
+func Scan(roots []Root, off func(sk Skill) bool) (skills []Skill, problems []string) {
 	var raw []Skill
 	for _, r := range roots {
 		scanRoot(r, &raw, &problems)
@@ -458,7 +483,10 @@ func Scan(roots []Root, disabled func(dir string) bool) (skills []Skill, problem
 			}
 			continue
 		}
-		sk.Enabled = disabled == nil || !disabled(sk.Dir)
+		sk.Enabled = off == nil || !off(sk)
+		if !sk.Enabled && sk.Scope == ScopeProject {
+			sk.Warnings = append(sk.Warnings, "from this project; it is used only once you switch it on")
+		}
 		// A skill of the same name from an earlier (higher-precedence) root hides
 		// this one for the agents the two share.
 		for _, j := range byName[sk.Name] {
