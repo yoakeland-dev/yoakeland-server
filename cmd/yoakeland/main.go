@@ -2786,5 +2786,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = ipc.SendEvent(protocol.EventTokenRemoved, env.SessionID, env.TurnID, "", protocol.TokenRemovedData{
 			Name: data.Name,
 		})
+	default:
+		// Not an event this server handles (a newer or older client, or a typo): say so, or the
+		// client waits for a reply that never comes. Explicit no-ops such as pong are cases above.
+		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{
+			Message: fmt.Sprintf("unknown event type %q", env.Type),
+		})
 	}
 }

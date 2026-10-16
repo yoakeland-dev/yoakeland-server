@@ -98,6 +98,8 @@ interface Envelope {
 }
 ```
 
+A `type` the server doesn't handle gets an `error` naming it (`unknown event type "..."`), with no `turnId`, so a client never waits on a reply that won't come. Inbound-only and no-op types (`pong`) are handled and get no reply.
+
 ---
 
 ## 2a. Transport Modes & Authentication

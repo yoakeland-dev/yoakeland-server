@@ -894,12 +894,16 @@ func (r *ProjectRegistry) Resolve(sessionID, explicitPath, defaultRoot string) (
 			return nil, fmt.Errorf("resolving project path %q: %w", explicitPath, err)
 		}
 
+		// An envelope with no session (set_web_tools_enabled names only a project) must not bind
+		// the empty id, or the next project to name no session would hit this conflict.
 		r.mu.Lock()
-		if bound, ok := r.sessionProject[sessionID]; ok && bound != key {
-			r.mu.Unlock()
-			return nil, fmt.Errorf("session %s is already bound to project %q, not %q", sessionID, bound, key)
+		if sessionID != "" {
+			if bound, ok := r.sessionProject[sessionID]; ok && bound != key {
+				r.mu.Unlock()
+				return nil, fmt.Errorf("session %s is already bound to project %q, not %q", sessionID, bound, key)
+			}
+			r.sessionProject[sessionID] = key
 		}
-		r.sessionProject[sessionID] = key
 		r.mu.Unlock()
 
 		return r.Get(key)

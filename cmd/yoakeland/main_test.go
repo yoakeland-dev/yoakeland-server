@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"strings"
 	"testing"
 	"yoakeland/internal/protocol"
 )
@@ -67,4 +69,14 @@ func TestHandshake_UnixAllowsOptionalAuth(t *testing.T) {
 			t.Fatalf("handshake() = name=%q deviceType=%q pending=%v ok=%v, want identity captured with no pending envelope", name, deviceType, pending, ok)
 		}
 	})
+}
+
+// An event the server doesn't know gets an error naming it, so the client isn't left waiting.
+func TestServeConnection_UnknownEventReplies(t *testing.T) {
+	deps := newTestDeps(t)
+	out := &bytes.Buffer{}
+	serveConnection(context.Background(), protocol.NewIPCStream(bytes.NewBufferString(`{"type":"no_such_event","data":{}}`+"\n"), out), deps, "unix", "", nil)
+	if !strings.Contains(out.String(), `"type":"error"`) || !strings.Contains(out.String(), "unknown event type") || !strings.Contains(out.String(), "no_such_event") {
+		t.Fatalf("no error for an unknown event: %q", out.String())
+	}
 }
