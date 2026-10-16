@@ -172,3 +172,16 @@ func TestACPAgentIsHandedTheServersOnANewSession(t *testing.T) {
 		t.Fatalf("mcpServers = %v", servers)
 	}
 }
+
+// An ACP agent takes its MCP servers at session start, so a turn that asks
+// for a different set must get a different process: the signature differs.
+func TestMCPSigChangesWithServers(t *testing.T) {
+	a := []tool.AgentServer{{Name: "fs", Type: "stdio", Command: "fs-mcp", Env: map[string]string{"ROOT": "/a"}}}
+	b := []tool.AgentServer{{Name: "fs", Type: "stdio", Command: "fs-mcp", Env: map[string]string{"ROOT": "/b"}}}
+	if mcpSig(a) == mcpSig(b) {
+		t.Fatal("a changed server env kept the same signature")
+	}
+	if mcpSig(a) != mcpSig(a) {
+		t.Fatal("the same servers must keep one signature")
+	}
+}

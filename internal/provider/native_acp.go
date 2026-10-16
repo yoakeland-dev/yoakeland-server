@@ -561,7 +561,7 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 }
 
 func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
-	ns, reused, release, err := acquireSession(nt, p.Kind, p.Dir, func(nativeSession) bool { return true },
+	ns, reused, release, err := acquireSession(nt, p.Kind, p.Dir+"\x00"+mcpSig(nt.MCP), func(nativeSession) bool { return true },
 		func() (nativeSession, error) { return p.startACP(spec) })
 	if err != nil {
 		return err

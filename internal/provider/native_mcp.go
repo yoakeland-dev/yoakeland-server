@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"sort"
@@ -72,6 +74,14 @@ func writeSecretFile(pattern string, data []byte) (path string, remove func(), e
 		return "", nil, err
 	}
 	return f.Name(), remove, nil
+}
+
+// mcpSig fingerprints the MCP servers a turn is given. A live ACP process
+// takes its servers once, at session start, so a change needs a new process.
+func mcpSig(servers []tool.AgentServer) string {
+	b, _ := json.Marshal(servers)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
 }
 
 // acpMCPServers is the mcpServers parameter of session/new, load and resume.
