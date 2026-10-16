@@ -290,3 +290,47 @@ func TestPricingCacheCostNeverNegative(t *testing.T) {
 		t.Fatalf("cost = %v ok=%v, want a non-negative cost", cost, ok)
 	}
 }
+
+// PRV-15: a filtered reply is a refusal, and OpenRouter's reasoning field is
+// read like DeepSeek's.
+func TestOpenAIStream_ContentFilterIsRefusalAndReasoningIsRead(t *testing.T) {
+	got, err := openAIStream(t,
+		`data: {"choices":[{"delta":{"reasoning":"hmm"}}]}`+"\n\n",
+		`data: {"choices":[{"delta":{"content":"part"}}]}`+"\n\n",
+		`data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var reasoning, finish string
+	for _, c := range got {
+		switch c.Kind {
+		case agent.StreamChunkReasoning:
+			reasoning = c.Delta
+		case agent.StreamChunkFinish:
+			finish = c.FinishReason
+		}
+	}
+	if reasoning != "hmm" || finish != "refusal" {
+		t.Fatalf("reasoning = %q, finish = %q; want \"hmm\" and \"refusal\"", reasoning, finish)
+	}
+}
+
+// PRV-15: a turn Anthropic paused for a server-tool continuation is not a
+// finished answer.
+func TestAnthropicStream_PauseTurnIsAnError(t *testing.T) {
+	srv := sseServer(t,
+		"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	defer srv.Close()
+	p := NewAnthropic("k", "claude-sonnet-5")
+	p.BaseURL = srv.URL
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
+	_, err := collectStream(t, chunks, errs)
+	if err == nil || !strings.Contains(err.Error(), "pause_turn") {
+		t.Fatalf("stream error = %v, want a pause_turn error", err)
+	}
+}
