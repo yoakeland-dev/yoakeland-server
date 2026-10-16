@@ -399,7 +399,9 @@ func (p *AnthropicProvider) StreamTurn(
 		var anthroTools []anthropicTool
 		var system any = systemPrompt
 		if len(tools) > 0 {
-			if os.Getenv("ANTHROPIC_DISABLE_WEB_SEARCH") == "" {
+			// The server-side search runs only when the web_search rule allows
+			// it (agent.RequestHints.ServerWebSearch).
+			if hints.ServerWebSearch && os.Getenv("ANTHROPIC_DISABLE_WEB_SEARCH") == "" {
 				anthroTools = append(anthroTools, webSearchTool(p.Model))
 			}
 			if hints.AdvisorModel != "" && hints.AdvisorModel != p.Model {

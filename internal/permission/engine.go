@@ -320,7 +320,7 @@ func (s *subject) matches(e *Engine, r *Rule) bool {
 		return (s.reqRel != "" && matchPathPattern(pat, s.reqRel, true)) ||
 			(s.resolvedRel != "" && matchPathPattern(pat, s.resolvedRel, true))
 	default:
-		if _, _, ok := ParseMCPTool(r.Tool); ok {
+		if _, _, ok := ParseMCPTool(r.Tool); ok || r.Tool == ToolWebSearch {
 			return true // covering the tool was the whole question
 		}
 		return len(r.Pattern) == 1 && strings.EqualFold(r.Pattern[0], s.req.Target)
@@ -381,6 +381,8 @@ func (e *Engine) suggest(req Request, subj *subject) []Suggestion {
 		}
 		return append(out, Suggestion{ID: SuggestExact, Tool: ToolEdit, Pattern: []string{escapeGlob(rel)}, Scope: ScopeProject,
 			Label: "Allow edits to `" + rel + "`"})
+	case ToolWebSearch:
+		return []Suggestion{{ID: SuggestExact, Tool: ToolWebSearch, Pattern: []string{"*"}, Scope: ScopeProject, Label: "Always allow web searches"}}
 	case "web_fetch", "browser":
 		if req.Target == "" {
 			return nil

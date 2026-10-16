@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -47,8 +48,14 @@ func (t *WebSearchTool) Description() string {
 	return "Search the web and return matching page titles, URLs, and snippets."
 }
 
+// MaxWebSearchQueryRunes caps a query: the query is sent to a third party, so
+// a long one is mostly a prompt-injection payload or leaked file contents.
+const MaxWebSearchQueryRunes = 256
+
+// RequiresPermission: a query leaves the machine, so it asks like web_fetch
+// does. The permission is for the query as a whole (see agent.permissionTarget).
 func (t *WebSearchTool) RequiresPermission(_ []byte) bool {
-	return false
+	return true
 }
 
 type braveSearchResponse struct {
@@ -68,6 +75,9 @@ func (t *WebSearchTool) Execute(ctx context.Context, _ ExecutionContext, argsJSO
 	}
 	if strings.TrimSpace(args.Query) == "" {
 		return "", fmt.Errorf("query must not be empty")
+	}
+	if utf8.RuneCountInString(args.Query) > MaxWebSearchQueryRunes {
+		return "", fmt.Errorf("query must be at most %d characters", MaxWebSearchQueryRunes)
 	}
 
 	var results string

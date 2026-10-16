@@ -893,6 +893,7 @@ func permissionTarget(toolName string, args json.RawMessage) string {
 		Input      string `json:"input"`
 		Expression string `json:"expression"`
 		Path       string `json:"path"`
+		Query      string `json:"query"`
 		// Untagged like the browser tool's own args struct.
 		Action, URL string
 	}
@@ -902,6 +903,8 @@ func permissionTarget(toolName string, args json.RawMessage) string {
 		return a.Command
 	case "terminal_output":
 		return a.Input
+	case "web_search":
+		return truncateRunes(a.Query, tool.MaxWebSearchQueryRunes)
 	case "browser":
 		if a.Action == "navigate" {
 			return urlHost(a.URL, args)
@@ -1047,6 +1050,22 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 	default: // ModeReadWrite, ModeAcceptEdits, ModeAuto, ModeAutonomous
 		return true
 	}
+}
+
+// serverWebSearchAllowed reports whether a provider may run its own web search
+// this turn. That search never comes back as a tool call, so yoakeland can't
+// ask about it per query; it gets the rule that governs the web_search tool
+// instead: the web-tools toggle and mode, and an allow rule (a deny or ask
+// rule keeps it off). Autonomous mode skips the engine, as it does for tools.
+func (a *Agent) serverWebSearchAllowed() bool {
+	if !a.isToolAllowedInMode("web_search") {
+		return false
+	}
+	mode := a.Mode()
+	if mode == ModeAutonomous {
+		return true
+	}
+	return a.permEngine.Check(permission.Request{Tool: "web_search", Mode: string(mode)}).Decision == permission.DecisionAllow
 }
 
 // activeSystemPrompt returns the system prompt to send this turn — Plan
@@ -1606,7 +1625,7 @@ turn:
 			activeContext = contextView(a.history, prefixKey)
 			a.mu.Unlock()
 			activeContext = withAttachmentNotes(dropEmptyAssistants(flattenNativeTools(activeContext)))
-			streamCtx = WithRequestHints(turnCtx, RequestHints{CacheKey: sessionID, AdvisorModel: a.advisorModel(bound)})
+			streamCtx = WithRequestHints(turnCtx, RequestHints{CacheKey: sessionID, AdvisorModel: a.advisorModel(bound), ServerWebSearch: a.serverWebSearchAllowed()})
 		}
 
 		// flushSegment stores a native round's output so far as its own
