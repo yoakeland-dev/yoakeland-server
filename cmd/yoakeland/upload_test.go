@@ -78,3 +78,25 @@ func TestValidateAttachments_TCPConfinedUnixNot(t *testing.T) {
 		}
 	}
 }
+
+// A peer can hold only maxPendingPerPeer uploads open at once, and a refused begin leaves no file behind.
+func TestUploadStore_PendingLimit(t *testing.T) {
+	s, err := NewUploadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxPendingPerPeer; i++ {
+		if _, _, err := s.Begin("p1", protocol.UploadBeginData{UploadID: string(rune('a' + i)), Name: "f", Size: 10, SHA256: shaHex([]byte("0123456789"))}); err != nil {
+			t.Fatalf("begin %d: %v", i, err)
+		}
+	}
+	if _, _, err := s.Begin("p1", protocol.UploadBeginData{UploadID: "over", Name: "f", Size: 10, SHA256: shaHex([]byte("0123456789"))}); err == nil {
+		t.Fatal("peer exceeded its pending uploads")
+	}
+	if _, _, err := s.Begin("p2", protocol.UploadBeginData{UploadID: "other", Name: "f", Size: 10, SHA256: shaHex([]byte("0123456789"))}); err != nil {
+		t.Fatalf("another peer was refused: %v", err)
+	}
+	if left, _ := os.ReadDir(filepath.Join(s.dir, ".tmp")); len(left) != maxPendingPerPeer+1 {
+		t.Fatalf("%d temp files, want %d (a refused begin must not leave one)", len(left), maxPendingPerPeer+1)
+	}
+}

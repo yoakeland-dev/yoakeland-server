@@ -619,6 +619,10 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 		}
 	}
 
+	if network == "tcp" && who.TokenName != "" && deps.peers.AtCredentialLimit(who.TokenName) {
+		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: "too many connections on this credential", Fatal: true})
+		return
+	}
 	peer := deps.peers.Add(ipc, conn, network, who)
 	defer deps.peers.Remove(peer.ID)
 	deps.recordPeer(audit.PeerJoin, peer)
@@ -791,7 +795,10 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 		})
 		return who, nil, false
 	}
-	who = peerIdentity{Name: data.Name, DeviceType: data.DeviceType, Avatar: data.Avatar, DeviceID: data.DeviceID}
+	who = peerIdentity{Name: data.Name, DeviceType: cleanName(data.DeviceType), Avatar: data.Avatar, DeviceID: data.DeviceID}
+	if len(who.DeviceID) > maxDeviceIDLen {
+		who.DeviceID = who.DeviceID[:maxDeviceIDLen]
+	}
 	if network == "unix" {
 		return who, nil, true
 	}
@@ -1995,6 +2002,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListDirectory:
 		var data protocol.ListDirectoryData
 		_ = json.Unmarshal(env.Data, &data)
+		if network == "tcp" && !deps.projects.Within(data.Path) {
+			_ = ipc.SendEvent(protocol.EventDirectoryList, env.SessionID, env.TurnID, "", protocol.DirectoryListData{
+				Path:    data.Path,
+				Entries: []protocol.DirEntry{},
+				Error:   "remote connections can only browse inside projects opened here",
+			})
+			return
+		}
 		abs, entries, err := listDirectory(data.Path)
 		if err != nil {
 			_ = ipc.SendEvent(protocol.EventDirectoryList, env.SessionID, env.TurnID, "", protocol.DirectoryListData{
@@ -2052,7 +2067,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 					return usd
 				}
 			}
-			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External, price)
+			// External scans read other tools' session files on this host (their folders and titles): the
+			// owner's view, so a remote connection never gets them.
+			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External && network != "tcp", price)
 			out.Accounts = usageAccounts(deps.providerStore)
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)

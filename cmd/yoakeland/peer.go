@@ -72,6 +72,13 @@ type peerIdentity struct {
 	pake                               *protocol.PakeStart // set when the first frame asked to pair with a PIN (pairpake.go); the connection never becomes a peer
 }
 
+// maxConnsPerToken caps live connections on one credential. Each one's roster entry is sent to
+// every peer, so an unbounded count (or one oversized field) would wedge every client's peer_list.
+const maxConnsPerToken = 8
+
+// maxDeviceIDLen caps AuthData.DeviceID, which is echoed in the roster and stored with a pairing.
+const maxDeviceIDLen = 128
+
 // maxNameLen caps a display name; cleanName trims it and drops control characters, since a name
 // is shown in every peer's roster and chat.
 const maxNameLen = 64
@@ -97,7 +104,7 @@ func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network stri
 	id := randomID()
 	who.Name = cleanName(who.Name)
 	if who.Name == "" {
-		who.Name = who.DeviceType + "-" + id[:6]
+		who.Name = cleanName(who.DeviceType + "-" + id[:6])
 	}
 	if len(who.Avatar) > maxAvatarLen {
 		who.Avatar = ""
@@ -239,6 +246,21 @@ func (r *PeerRegistry) IsRestricted(id string) bool {
 	defer r.mu.Unlock()
 	p, ok := r.peers[id]
 	return !ok || p.Restricted
+}
+
+// AtCredentialLimit reports whether credential tokenName already has maxConnsPerToken live
+// connections. Checked before a new one is added, so a racing pair can overshoot by a connection.
+// ponytail: check-then-add, not atomic; fine for a limit that only stops floods.
+func (r *PeerRegistry) AtCredentialLimit(tokenName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, p := range r.peers {
+		if p.TokenName == tokenName {
+			n++
+		}
+	}
+	return n >= maxConnsPerToken
 }
 
 // SetScope applies a tier change to every live connection on credential tokenName and broadcasts

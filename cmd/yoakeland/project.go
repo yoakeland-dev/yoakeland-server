@@ -818,6 +818,21 @@ func (r *ProjectRegistry) Known(key string) bool {
 	return open || r.isChat(key) || slices.Contains(r.List(), key)
 }
 
+// Within reports whether dir is a known project's root or inside one, with symlinks resolved.
+// A remote connection browses a project's files this way, not the rest of the host's.
+func (r *ProjectRegistry) Within(dir string) bool {
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil || !filepath.IsAbs(real) {
+		return false
+	}
+	for _, root := range r.List() {
+		if real == root || strings.HasPrefix(real, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // scopeRemoteProject keeps a TCP peer to projects the server already knows
 // (opened from the local socket, via -project, or in an earlier run). Without
 // it a token reached any directory: open_project "/home/you" then read_file
@@ -830,7 +845,7 @@ func (r *ProjectRegistry) Known(key string) bool {
 // it means fd-based (openat/RESOLVE_BENEATH) path handling in every handler.
 func scopeRemoteProject(deps connDeps, env *protocol.Envelope) error {
 	field := "projectPath"
-	if env.Type == protocol.EventOpenProject {
+	if env.Type == protocol.EventOpenProject || env.Type == protocol.EventRemoveProject {
 		field = "path"
 	}
 	var m map[string]json.RawMessage
