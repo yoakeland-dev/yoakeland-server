@@ -134,15 +134,21 @@ func TestAgent_MaxSessionSpendUSD_AppliesToEditAndRetry(t *testing.T) {
 	}
 }
 
-// usageThenFailProvider reports one priced round, then fails the stream: the
-// spend must still be counted, or a turn that keeps failing never reaches the cap.
-type usageThenFailProvider struct{}
+// usageThenFailProvider prices its first round (a tool call, so the turn
+// goes on), then fails the next round's stream. The first round's spend must
+// still be counted, or a turn that keeps failing never reaches the cap.
+type usageThenFailProvider struct{ calls int }
 
-func (usageThenFailProvider) StreamTurn(context.Context, []agent.Message, []tool.ToolDefinition, string) (<-chan agent.ModelStreamChunk, <-chan error) {
-	cChan := make(chan agent.ModelStreamChunk, 1)
+func (p *usageThenFailProvider) StreamTurn(context.Context, []agent.Message, []tool.ToolDefinition, string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	cChan := make(chan agent.ModelStreamChunk, 2)
 	eChan := make(chan error, 1)
-	cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{InputTokens: 10, OutputTokens: 10, CostUSD: 0.5, CostKnown: true}}
-	eChan <- errors.New("connection reset by peer")
+	p.calls++
+	if p.calls == 1 {
+		cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{InputTokens: 10, OutputTokens: 10, CostUSD: 0.5, CostKnown: true}}
+		cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &agent.ToolCall{ID: "c1", Name: "noop", Args: []byte(`{}`)}}
+	} else {
+		eChan <- errors.New("connection reset by peer")
+	}
 	close(eChan)
 	close(cChan)
 	return cChan, eChan
@@ -159,13 +165,13 @@ func TestAgent_StreamErrorTurnRecordsSpend(t *testing.T) {
 		t.Fatalf("NewUsageStore: %v", err)
 	}
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
-	ag := agent.NewAgent(ipc, usageThenFailProvider{}, "test-provider", nil, engine, snapStore, sessStore, agent.NewContextManager(100, 20), usageStore)
+	ag := agent.NewAgent(ipc, &usageThenFailProvider{}, "test-provider", nil, engine, snapStore, sessStore, agent.NewContextManager(100, 20), usageStore)
 	t.Cleanup(ag.WaitBackground)
 
 	if err := ag.RunTurn(context.Background(), "session-fail-spend", "turn-1", "hello"); err == nil {
 		t.Fatal("expected the stream error to fail the turn")
 	}
 	if got := usageStore.SessionTotal("session-fail-spend").CostUSD; got != 0.5 {
-		t.Fatalf("spend after a failed turn = %v, want the priced round's 0.5", got)
+		t.Fatalf("spend after a failed turn = %v, want the first round's 0.5", got)
 	}
 }
