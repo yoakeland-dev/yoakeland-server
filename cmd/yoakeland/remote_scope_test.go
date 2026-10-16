@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"yoakeland/internal/protocol"
 )
@@ -107,5 +108,57 @@ func TestResolveAuthor_AvatarFallback(t *testing.T) {
 	deps.peers.SetAvatar(p.ID, "data:image/png;base64,AA")
 	if a := resolveAuthor(deps, p.ID, "x", "🦊"); a.Avatar != "data:image/png;base64,AA" {
 		t.Fatalf("registered avatar should win: got %+v", a)
+	}
+}
+
+// A remote connection browses only inside projects open here, and can't remove one it doesn't know.
+func TestRemoteScope_ProjectBoundaries(t *testing.T) {
+	deps := newTestDeps(t)
+	person := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "laptop", DeviceType: "desktop"})
+	outside := t.TempDir()
+	for _, tc := range []struct{ envelope, want string }{
+		{`{"type":"list_directory","data":{"path":"` + outside + `"}}`, "can only browse inside projects"},
+		{`{"type":"remove_project","data":{"path":"` + outside + `"}}`, "isn't open on this server"},
+	} {
+		out := &bytes.Buffer{}
+		serveConnection(context.Background(), protocol.NewIPCStream(bytes.NewBufferString(tc.envelope+"\n"), out), deps, "tcp", person.ID, nil)
+		if !strings.Contains(out.String(), tc.want) {
+			t.Fatalf("%s: expected %q, got %q", tc.envelope, tc.want, out.String())
+		}
+	}
+	// The project the server has open is still browsable.
+	if !deps.projects.Within(deps.defaultProjectRoot) || deps.projects.Within(outside) {
+		t.Fatal("Within does not match the open project's tree")
+	}
+}
+
+// A device's self-reported identity is capped before it reaches the roster, and the name a
+// device falls back to is cleaned like any other.
+func TestPeerIdentity_Capped(t *testing.T) {
+	long := strings.Repeat("x", 100_000)
+	ipc := protocol.NewIPCStream(bytes.NewBufferString(`{"type":"auth","data":{"deviceType":"`+long+`","deviceId":"`+long+`"}}`+"\n"), &bytes.Buffer{})
+	who, _, ok := handshake(ipc, "unix", nil)
+	if !ok || len(who.DeviceID) > maxDeviceIDLen || utf8.RuneCountInString(who.DeviceType) > maxNameLen {
+		t.Fatalf("identity not capped: ok=%v idLen=%d typeLen=%d", ok, len(who.DeviceID), len(who.DeviceType))
+	}
+	reg := NewPeerRegistry()
+	p := reg.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{DeviceType: long})
+	if utf8.RuneCountInString(p.Name) > maxNameLen {
+		t.Fatalf("fallback name is %d runes, want at most %d", utf8.RuneCountInString(p.Name), maxNameLen)
+	}
+	// A bidi override can't make a name read as another one.
+	if got := cleanName("pay\u202Ealice"); got != "payalice" {
+		t.Fatalf("cleanName kept a format character: %q", got)
+	}
+}
+
+// One credential may hold only maxConnsPerToken live connections.
+func TestPeerRegistry_AtCredentialLimit(t *testing.T) {
+	reg := NewPeerRegistry()
+	for i := 0; i < maxConnsPerToken; i++ {
+		reg.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{TokenName: "phone"})
+	}
+	if !reg.AtCredentialLimit("phone") || reg.AtCredentialLimit("laptop") {
+		t.Fatal("limit is not per credential")
 	}
 }

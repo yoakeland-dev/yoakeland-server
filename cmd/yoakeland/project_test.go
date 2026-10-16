@@ -373,3 +373,15 @@ func TestScopeRemoteProject(t *testing.T) {
 		}
 	}
 }
+
+// set_web_tools_enabled names a project but no session. It must not bind the empty session id,
+// or the next project named the same way is refused as a conflict.
+func TestResolve_NoSessionDoesNotBind(t *testing.T) {
+	deps := newTestDeps(t)
+	if _, err := deps.projects.Resolve("", t.TempDir(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deps.projects.Resolve("", t.TempDir(), ""); err != nil {
+		t.Fatalf("second project refused: %v", err)
+	}
+}

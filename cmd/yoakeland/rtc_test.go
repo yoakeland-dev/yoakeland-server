@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pion/stun/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -154,5 +156,55 @@ func TestRTCCertIsStable(t *testing.T) {
 	_, b, err := loadRTCCert(dir)
 	if err != nil || a != b {
 		t.Fatalf("fingerprint changed across loads: %q vs %q (%v)", a, b, err)
+	}
+}
+
+// Close frees the UDP port before it returns: a listener restarted on the same address binds.
+func TestRTCCloseFreesPort(t *testing.T) {
+	cert, _, err := loadRTCCert(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := startRTCListener(context.Background(), "127.0.0.1:0", cert, func(net.Conn) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	l2, err := startRTCListener(context.Background(), addr, cert, func(net.Conn) {})
+	if err != nil {
+		t.Fatalf("port still held after Close: %v", err)
+	}
+	l2.Close()
+}
+
+// One source address can start at most rtcMaxPeersPerSource setups at once; a different one still can.
+func TestRTCPerSourceLimit(t *testing.T) {
+	cert, _, err := loadRTCCert(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := startRTCListener(context.Background(), "127.0.0.1:0", cert, func(net.Conn) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+	knock := func(i int) []byte {
+		u := fmt.Sprintf("%s%016d:%s", rtcUfragPrefix, i, fmt.Sprintf("%016d", i))
+		m := stun.New()
+		if err := m.Build(stun.BindingRequest, stun.NewUsername(u)); err != nil {
+			t.Fatal(err)
+		}
+		return m.Raw
+	}
+	src := netip.MustParseAddrPort("203.0.113.7:4000")
+	for i := 0; i < rtcMaxPeersPerSource+3; i++ {
+		l.onUnhandled(knock(i), src)
+	}
+	l.onUnhandled(knock(100), netip.MustParseAddrPort("203.0.113.8:4000"))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n := len(l.active); n != rtcMaxPeersPerSource+1 {
+		t.Fatalf("%d setups started, want %d (8 from one source, 1 from another)", n, rtcMaxPeersPerSource+1)
 	}
 }

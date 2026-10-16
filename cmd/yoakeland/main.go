@@ -599,7 +599,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 		if err := deps.pairWithPIN(ipc, conn, who); err != nil {
 			time.Sleep(authFailDelay) // after the slot is free, so it slows a guesser without holding one
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
-			deps.recordAuthFail(remoteIP(conn, network), network)
+			deps.recordAuthFail(remoteIP(conn, network), network, "pairing failed")
 		}
 		// Let the client hang up first: closing a WebRTC data channel right after a write can drop
 		// the write, and the write here is the credential.
@@ -609,7 +609,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if !ok {
 		if badCredential {
-			deps.recordAuthFail(remoteIP(conn, network), network)
+			deps.recordAuthFail(remoteIP(conn, network), network, "unknown credential")
 		}
 		return
 	}
@@ -618,11 +618,16 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if who.TokenName != "" {
 		if err := deps.admitPairing(ipc, who, tokenRec, remoteIP(conn, network)); err != nil {
+			deps.recordAuthFail(remoteIP(conn, network), network, err.Error())
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
 			return
 		}
 	}
 
+	if network == "tcp" && who.TokenName != "" && deps.peers.AtCredentialLimit(who.TokenName) {
+		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: "too many connections on this credential", Fatal: true})
+		return
+	}
 	peer := deps.peers.Add(ipc, conn, network, who)
 	defer deps.peers.Remove(peer.ID)
 	deps.recordPeer(audit.PeerJoin, peer)
@@ -795,7 +800,10 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 		})
 		return who, nil, false
 	}
-	who = peerIdentity{Name: data.Name, DeviceType: data.DeviceType, Avatar: data.Avatar, DeviceID: data.DeviceID}
+	who = peerIdentity{Name: data.Name, DeviceType: cleanName(data.DeviceType), Avatar: data.Avatar, DeviceID: data.DeviceID}
+	if len(who.DeviceID) > maxDeviceIDLen {
+		who.DeviceID = who.DeviceID[:maxDeviceIDLen]
+	}
 	if network == "unix" {
 		return who, nil, true
 	}
@@ -1999,6 +2007,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListDirectory:
 		var data protocol.ListDirectoryData
 		_ = json.Unmarshal(env.Data, &data)
+		if network == "tcp" && !deps.projects.Within(data.Path) {
+			_ = ipc.SendEvent(protocol.EventDirectoryList, env.SessionID, env.TurnID, "", protocol.DirectoryListData{
+				Path:    data.Path,
+				Entries: []protocol.DirEntry{},
+				Error:   "remote connections can only browse inside projects opened here",
+			})
+			return
+		}
 		abs, entries, err := listDirectory(data.Path)
 		if err != nil {
 			_ = ipc.SendEvent(protocol.EventDirectoryList, env.SessionID, env.TurnID, "", protocol.DirectoryListData{
@@ -2056,7 +2072,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 					return usd
 				}
 			}
-			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External, price)
+			// External scans read other tools' session files on this host (their folders and titles): the
+			// owner's view, so a remote connection never gets them.
+			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External && network != "tcp", price)
 			out.Accounts = usageAccounts(deps.providerStore)
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)
@@ -2772,6 +2790,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenRemove, Target: data.Name, Outcome: "ok", Detail: map[string]any{"disconnected": dropped}})
 		_ = ipc.SendEvent(protocol.EventTokenRemoved, env.SessionID, env.TurnID, "", protocol.TokenRemovedData{
 			Name: data.Name,
+		})
+	default:
+		// Not an event this server handles (a newer or older client, or a typo): say so, or the
+		// client waits for a reply that never comes. Explicit no-ops such as pong are cases above.
+		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{
+			Message: fmt.Sprintf("unknown event type %q", env.Type),
 		})
 	}
 }

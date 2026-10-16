@@ -226,3 +226,42 @@ func TestPairingNeedsApprovalWhenSomeoneCanGiveIt(t *testing.T) {
 		t.Fatalf("unanswered pairing got %q", r)
 	}
 }
+
+// Two devices holding the same unclaimed code: while the first waits for approval the second is
+// refused, and a device that comes late with a stale copy of the code can't take the claimed code down.
+func TestPairingOneWaiterPerCode(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.pairings = newPairingGate()
+	deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuf{}), &fakeCloser{}, "unix", peerIdentity{Name: "desktop", DeviceType: "desktop"})
+	if err := deps.settings.AddPairingToken("code", "tok", ""); err != nil {
+		t.Fatal(err)
+	}
+	_, rec, _ := deps.settings.LookupToken("tok")
+	pairingApprovalWait = 300 * time.Millisecond
+	t.Cleanup(func() { pairingApprovalWait = 60 * time.Second })
+
+	first := make(chan error, 1)
+	go func() {
+		first <- deps.admitPairing(protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuf{}), peerIdentity{TokenName: "code", DeviceID: "dev-a"}, rec, "1.2.3.4")
+	}()
+	for i := 0; i < 200 && !deps.pairings.answerable("code"); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := deps.admitPairing(protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuf{}), peerIdentity{TokenName: "code", DeviceID: "dev-b"}, rec, "5.6.7.8"); err == nil || !strings.Contains(err.Error(), "already waiting") {
+		t.Fatalf("second device got %v, want it refused while the first waits", err)
+	}
+	deps.pairings.answer("code", true)
+	if err := <-first; err != nil {
+		t.Fatalf("first device refused: %v", err)
+	}
+	if _, now, _ := deps.settings.LookupToken("tok"); now.DeviceID != "dev-a" {
+		t.Fatalf("code bound to %q, want dev-a", now.DeviceID)
+	}
+
+	if err := deps.admitPairing(protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuf{}), peerIdentity{TokenName: "code", DeviceID: "dev-b"}, rec, "5.6.7.8"); err == nil {
+		t.Fatal("a stale copy of a claimed code was admitted")
+	}
+	if _, _, ok := deps.settings.LookupToken("tok"); !ok {
+		t.Fatal("a timed-out waiter removed a code another device had claimed")
+	}
+}

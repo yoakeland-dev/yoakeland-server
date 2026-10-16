@@ -25,6 +25,10 @@ const (
 	// ponytail: age-based GC, a session referencing an older upload just
 	// can't read it anymore; switch to reference counting if that bites.
 	uploadMaxAge = 30 * 24 * time.Hour
+	// Uploads in progress each hold an open file and may grow to maxUploadSize before their
+	// checksum is known, so a peer can't start them without limit.
+	maxPendingPerPeer = 4
+	maxPendingTotal   = 32
 )
 
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -119,6 +123,19 @@ func (s *UploadStore) Begin(peerID string, d protocol.UploadBeginData) (path str
 	s.mu.Lock()
 	if old := s.pending[key]; old != nil {
 		old.discard()
+		delete(s.pending, key)
+	}
+	perPeer := 0
+	for k := range s.pending {
+		if strings.HasPrefix(k, peerID+"/") {
+			perPeer++
+		}
+	}
+	if perPeer >= maxPendingPerPeer || len(s.pending) >= maxPendingTotal {
+		s.mu.Unlock()
+		f.Close()
+		_ = os.Remove(f.Name())
+		return "", false, errors.New("too many uploads in progress; finish one first")
 	}
 	s.pending[key] = &pendingUpload{f: f, h: sha256.New(), name: safeUploadName(d.Name), sha: sha, size: d.Size}
 	s.mu.Unlock()

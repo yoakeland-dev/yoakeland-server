@@ -216,3 +216,16 @@ func TestAppendOnlyNeverTruncates(t *testing.T) {
 		t.Fatalf("reopening lost history: %+v", got)
 	}
 }
+
+// A secret that straddles the clip point is redacted whole before it is cut, so no fragment of it
+// survives (a fragment is too short for the patterns to match).
+func TestSecretStraddlingClipIsRedacted(t *testing.T) {
+	l, dir := open(t)
+	key := "sk-proj-" + strings.Repeat("Q", 30)
+	// The key starts at rune 290, so the clip at maxFieldN falls inside it, after "sk-proj-QQ".
+	l.Append(Event{Kind: ToolExec, Target: strings.Repeat("a", 289) + " " + key})
+	raw, _ := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+	if strings.Contains(string(raw), "sk-proj-") {
+		t.Fatalf("a fragment of the key reached the log:\n%s", raw)
+	}
+}

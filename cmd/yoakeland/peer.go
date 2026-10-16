@@ -72,13 +72,21 @@ type peerIdentity struct {
 	pake                               *protocol.PakeStart // set when the first frame asked to pair with a PIN (pairpake.go); the connection never becomes a peer
 }
 
+// maxConnsPerToken caps live connections on one credential. Each one's roster entry is sent to
+// every peer, so an unbounded count (or one oversized field) would wedge every client's peer_list.
+const maxConnsPerToken = 8
+
+// maxDeviceIDLen caps AuthData.DeviceID, which is echoed in the roster and stored with a pairing.
+const maxDeviceIDLen = 128
+
 // maxNameLen caps a display name; cleanName trims it and drops control characters, since a name
 // is shown in every peer's roster and chat.
 const maxNameLen = 64
 
 func cleanName(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		// Format characters (bidi overrides, zero-width joiners) can make a name read as someone else's.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r
@@ -97,7 +105,7 @@ func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network stri
 	id := randomID()
 	who.Name = cleanName(who.Name)
 	if who.Name == "" {
-		who.Name = who.DeviceType + "-" + id[:6]
+		who.Name = cleanName(who.DeviceType + "-" + id[:6])
 	}
 	if len(who.Avatar) > maxAvatarLen {
 		who.Avatar = ""
@@ -241,6 +249,21 @@ func (r *PeerRegistry) IsRestricted(id string) bool {
 	return !ok || p.Restricted
 }
 
+// AtCredentialLimit reports whether credential tokenName already has maxConnsPerToken live
+// connections. Checked before a new one is added, so a racing pair can overshoot by a connection.
+// ponytail: check-then-add, not atomic; fine for a limit that only stops floods.
+func (r *PeerRegistry) AtCredentialLimit(tokenName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, p := range r.peers {
+		if p.TokenName == tokenName {
+			n++
+		}
+	}
+	return n >= maxConnsPerToken
+}
+
 // SetScope applies a tier change to every live connection on credential tokenName and broadcasts
 // the roster. Returns how many connections changed.
 func (r *PeerRegistry) SetScope(tokenName string, restricted bool) int {
@@ -266,6 +289,31 @@ func (r *PeerRegistry) SetBrowserHost(id string, enabled bool) {
 	if p, ok := r.peers[id]; ok {
 		p.BrowserHost = enabled
 	}
+}
+
+// BrowserHostFor picks the peer that runs sessionID's browser: a host that has this chat open,
+// else the newest local (unix socket) one. A remote peer never gets another chat's browser traffic
+// just by offering to host. It also returns the project that peer last opened, read under the
+// lock, since SetActivity writes it there.
+func (r *PeerRegistry) BrowserHostFor(sessionID string) (*Peer, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var local *Peer
+	for _, p := range r.peers {
+		if !p.BrowserHost {
+			continue
+		}
+		if p.SessionID == sessionID {
+			return p, p.ProjectPath
+		}
+		if p.Network == "unix" && (local == nil || p.ConnectedAt.After(local.ConnectedAt)) {
+			local = p
+		}
+	}
+	if local == nil {
+		return nil, ""
+	}
+	return local, local.ProjectPath
 }
 
 // SetActivity records the chat id last opened, broadcasting only on a

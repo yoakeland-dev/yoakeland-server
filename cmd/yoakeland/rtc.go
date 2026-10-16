@@ -48,6 +48,9 @@ const (
 	rtcMaxMessage = 16384
 	// rtcMaxPeers bounds peers in setup plus live ones, so a UDP flood can't allocate without end.
 	rtcMaxPeers = 64
+	// rtcMaxPeersPerSource keeps one source address from holding most of those slots. Spoofed
+	// sources aren't stopped by this; that needs a round trip before any allocation.
+	rtcMaxPeersPerSource = 8
 	// rtcSetupTimeout is how long a peer may take to open its data channel.
 	rtcSetupTimeout = 20 * time.Second
 )
@@ -145,7 +148,7 @@ type rtcListener struct {
 	accept func(net.Conn)
 
 	mu     sync.Mutex
-	active map[string]struct{} // ufrags in setup or live
+	active map[string]netip.Addr // ufrags in setup or live, with the address each came from
 }
 
 // startRTCListener binds addr (UDP) and calls accept for each opened data channel, wrapped as a
@@ -156,7 +159,7 @@ func startRTCListener(ctx context.Context, addr string, cert webrtc.Certificate,
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	l := &rtcListener{ctx: ctx, cancel: cancel, udp: udp, cert: cert, accept: accept, active: map[string]struct{}{}}
+	l := &rtcListener{ctx: ctx, cancel: cancel, udp: udp, cert: cert, accept: accept, active: map[string]netip.Addr{}}
 	// The muxer calls onUnhandled from its own goroutine as soon as it exists, so l.mux is only
 	// visible to it once assigned.
 	l.mu.Lock()
@@ -175,7 +178,16 @@ func startRTCListener(ctx context.Context, addr string, cert webrtc.Certificate,
 
 func (l *rtcListener) Addr() net.Addr { return l.udp.LocalAddr() }
 
-func (l *rtcListener) Close() { l.cancel() }
+// Close stops the listener and releases its UDP port before it returns, so a restart can bind the
+// same address straight away.
+func (l *rtcListener) Close() {
+	l.cancel()
+	l.mu.Lock()
+	mux := l.mux
+	l.mu.Unlock()
+	_ = mux.Close()
+	_ = l.udp.Close()
+}
 
 // onUnhandled sees every UDP packet the muxer can't route to a known ufrag. A STUN binding request
 // whose username is "<ufrag>:<ufrag>" with our prefix is a new client; its first packet is dropped
@@ -197,11 +209,17 @@ func (l *rtcListener) onUnhandled(data []byte, from netip.AddrPort) {
 		return
 	}
 	l.mu.Lock()
-	if _, dup := l.active[ufrag]; dup || len(l.active) >= rtcMaxPeers {
+	fromSource := 0
+	for _, addr := range l.active {
+		if addr == from.Addr() {
+			fromSource++
+		}
+	}
+	if _, dup := l.active[ufrag]; dup || len(l.active) >= rtcMaxPeers || fromSource >= rtcMaxPeersPerSource {
 		l.mu.Unlock()
 		return
 	}
-	l.active[ufrag] = struct{}{}
+	l.active[ufrag] = from.Addr()
 	l.mu.Unlock()
 	go l.runPeer(ufrag, from)
 }
