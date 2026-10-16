@@ -125,8 +125,9 @@ func (l *authFailLimiter) allow(ip string, now time.Time) (bool, int) {
 
 var authFails authFailLimiter
 
-// recordAuthFail logs a TCP client that presented a bad credential.
-func (d connDeps) recordAuthFail(ip, network string) {
+// recordAuthFail logs a TCP client that was refused: a bad credential, or a pairing code that is
+// expired, used, declined or unanswered (reason says which).
+func (d connDeps) recordAuthFail(ip, network, reason string) {
 	if d.audit == nil {
 		return
 	}
@@ -135,8 +136,15 @@ func (d connDeps) recordAuthFail(ip, network string) {
 		return
 	}
 	e := audit.Event{Kind: audit.AuthFail, IP: ip, Network: network, Outcome: "deny"}
+	detail := map[string]any{}
+	if reason != "" {
+		detail["reason"] = reason
+	}
 	if skipped > 0 {
-		e.Detail = map[string]any{"alsoRejected": skipped}
+		detail["alsoRejected"] = skipped
+	}
+	if len(detail) > 0 {
+		e.Detail = detail
 	}
 	d.audit.Append(e)
 }

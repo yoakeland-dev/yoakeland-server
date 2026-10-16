@@ -179,7 +179,7 @@ func (l *Log) Append(e Event) {
 	if l == nil {
 		return
 	}
-	e.Target = Redact(clip(e.Target))
+	e.Target = clip(Redact(e.Target))
 	e.Detail = scrubDetail(e.Detail)
 	e.At = time.Now().UTC()
 
@@ -333,11 +333,11 @@ func scrubDetail(d map[string]any) map[string]any {
 		}
 		switch x := v.(type) {
 		case string:
-			out[k] = Redact(clip(x))
+			out[k] = clip(Redact(x))
 		case []string:
 			c := make([]string, len(x))
 			for i, s := range x {
-				c[i] = Redact(clip(s))
+				c[i] = clip(Redact(s))
 			}
 			out[k] = c
 		default:

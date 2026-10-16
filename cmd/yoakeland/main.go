@@ -595,7 +595,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 		if err := deps.pairWithPIN(ipc, conn, who); err != nil {
 			time.Sleep(authFailDelay) // after the slot is free, so it slows a guesser without holding one
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
-			deps.recordAuthFail(remoteIP(conn, network), network)
+			deps.recordAuthFail(remoteIP(conn, network), network, "pairing failed")
 		}
 		// Let the client hang up first: closing a WebRTC data channel right after a write can drop
 		// the write, and the write here is the credential.
@@ -605,7 +605,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if !ok {
 		if badCredential {
-			deps.recordAuthFail(remoteIP(conn, network), network)
+			deps.recordAuthFail(remoteIP(conn, network), network, "unknown credential")
 		}
 		return
 	}
@@ -614,6 +614,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if who.TokenName != "" {
 		if err := deps.admitPairing(ipc, who, tokenRec, remoteIP(conn, network)); err != nil {
+			deps.recordAuthFail(remoteIP(conn, network), network, err.Error())
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
 			return
 		}
