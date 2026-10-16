@@ -495,7 +495,9 @@ func TestProjectServerCannotReadDaemonSecrets(t *testing.T) {
 	}
 	prepare(t, m)
 	st, _ := m.Status()
-	if len(st) != 1 || !strings.Contains(st[0].Error, "YOAKELAND_MASTER_KEY") || !strings.Contains(st[0].Error, "is not set") {
+	// Either variable may be the one reported: headers are read in map order.
+	if len(st) != 1 || !strings.Contains(st[0].Error, "is not set") ||
+		!strings.Contains(st[0].Error, "YOAKELAND_MASTER_KEY") && !strings.Contains(st[0].Error, "OPENAI_API_KEY") {
 		t.Fatalf("status = %+v", st)
 	}
 }
