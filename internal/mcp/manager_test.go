@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"yoakeland/internal/permission"
 	"yoakeland/internal/tool"
 )
 
@@ -454,8 +455,8 @@ func TestWireNames(t *testing.T) {
 		t.Fatal("names must be stable across reconnects")
 	}
 	for _, n := range []string{a, b, c, d} {
-		if s, rest, ok := ParseWireName(n); !ok || s != "gh" || rest == "" {
-			t.Fatalf("ParseWireName(%s) = %q %q %v", n, s, rest, ok)
+		if s, rest, ok := permission.ParseMCPTool(n); !ok || s != "gh" || rest == "" {
+			t.Fatalf("ParseMCPTool(%s) = %q %q %v", n, s, rest, ok)
 		}
 	}
 }

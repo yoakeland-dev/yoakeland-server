@@ -43,7 +43,6 @@ func (e *rpcError) Error() string { return fmt.Sprintf("%s (code %d)", e.Message
 
 const (
 	errMethodNotFound = -32601
-	errInvalidParams  = -32602
 )
 
 func newRequest(id int64, method string, params any) (*message, error) {

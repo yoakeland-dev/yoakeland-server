@@ -51,8 +51,7 @@ type AuthStore struct {
 	path    string
 	key     string // the master key the file is sealed under, or ""
 	entries map[string]tokenEntry
-	hc      *http.Client // tests replace it
-	refresh sync.Mutex   // one refresh at a time (refresh tokens rotate)
+	refresh sync.Mutex // one refresh at a time (refresh tokens rotate)
 }
 
 func NewAuthStore(dir, key string) (*AuthStore, error) {
@@ -217,13 +216,6 @@ func (e *oauthError) Error() string {
 	return e.Code
 }
 
-func (a *AuthStore) client(serverURL string) *http.Client {
-	if a.hc != nil {
-		return a.hc
-	}
-	return oauthClient(serverURL)
-}
-
 func (a *AuthStore) tokenRequest(ctx context.Context, serverURL, endpoint, clientID, secret string, form url.Values) (*tokenResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -234,7 +226,7 @@ func (a *AuthStore) tokenRequest(ctx context.Context, serverURL, endpoint, clien
 	if secret != "" {
 		req.SetBasicAuth(url.QueryEscape(clientID), url.QueryEscape(secret))
 	}
-	resp, err := a.client(serverURL).Do(req)
+	resp, err := oauthClient(serverURL).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +350,7 @@ func (f *Flow) getJSON(ctx context.Context, serverURL, target string, out any) e
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := f.auth.client(serverURL).Do(req)
+	resp, err := oauthClient(serverURL).Do(req)
 	if err != nil {
 		return err
 	}
@@ -543,7 +535,7 @@ func (f *Flow) register(ctx context.Context, serverURL, endpoint, redirect strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	resp, err := f.auth.client(serverURL).Do(req)
+	resp, err := oauthClient(serverURL).Do(req)
 	if err != nil {
 		return "", "", err
 	}

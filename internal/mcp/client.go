@@ -58,19 +58,16 @@ type ToolAnnotations struct {
 	Title           string `json:"title,omitempty"`
 	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
 	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
-	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
-	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
 }
 
 // ToolInfo is one tool as a server lists it. Everything in it came from the
 // server, so none of it is trusted.
 type ToolInfo struct {
-	Name         string           `json:"name"`
-	Title        string           `json:"title,omitempty"`
-	Description  string           `json:"description,omitempty"`
-	InputSchema  json.RawMessage  `json:"inputSchema,omitempty"`
-	OutputSchema json.RawMessage  `json:"outputSchema,omitempty"`
-	Annotations  *ToolAnnotations `json:"annotations,omitempty"`
+	Name        string           `json:"name"`
+	Title       string           `json:"title,omitempty"`
+	Description string           `json:"description,omitempty"`
+	InputSchema json.RawMessage  `json:"inputSchema,omitempty"`
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // ContentBlock is one piece of a tool result.

@@ -25,6 +25,9 @@ type fakeServer struct {
 	listCalls int
 }
 
+// errInvalidParams is what the fake answers an unknown tool with.
+const errInvalidParams = -32602
+
 func (f *fakeServer) tools() []ToolInfo {
 	ro := true
 	return []ToolInfo{

@@ -208,6 +208,7 @@ func TestDefaultImportPathsHonourCodexAndGrokHomes(t *testing.T) {
 // A dotfile manager links a config into place; the file it names is the one read.
 func TestReadCappedFollowsASymlinkedConfig(t *testing.T) {
 	dir, dotfiles := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", dotfiles)
 	target := filepath.Join(dotfiles, "settings.json")
 	if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)

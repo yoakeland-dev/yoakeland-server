@@ -55,15 +55,6 @@ func wireName(server, raw string, taken map[string]bool) string {
 	return name
 }
 
-// ParseWireName splits mcp__<server>__<tool>.
-func ParseWireName(name string) (server, rest string, ok bool) {
-	if !strings.HasPrefix(name, ToolPrefix) {
-		return "", "", false
-	}
-	server, rest, ok = strings.Cut(strings.TrimPrefix(name, ToolPrefix), "__")
-	return server, rest, ok && server != "" && rest != ""
-}
-
 // normalizeSchema makes whatever a server called its input schema into an
 // object schema every model API accepts, or reports that it can't.
 func normalizeSchema(raw json.RawMessage) (map[string]any, error) {
