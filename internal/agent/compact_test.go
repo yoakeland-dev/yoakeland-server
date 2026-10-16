@@ -40,13 +40,14 @@ func (p *summaryProvider) StreamTurn(_ context.Context, _ []agent.Message, _ []t
 	return c, e
 }
 
-func compactFixture(t *testing.T, p agent.ModelProvider) (*agent.Agent, *bytes.Buffer) {
+// out is a syncBuf: background work (title generation) writes to it while the test reads.
+func compactFixture(t *testing.T, p agent.ModelProvider) (*agent.Agent, *syncBuf) {
 	t.Helper()
 	dir := t.TempDir()
 	norm, _ := normalizer.New(dir)
 	snapStore, _ := snapshot.NewDiskSnapshotStore(dir)
 	sessStore, _ := agent.NewDiskSessionStore(dir)
-	out := &bytes.Buffer{}
+	out := &syncBuf{}
 	ag := agent.NewAgent(protocol.NewIPCStream(bytes.NewBuffer(nil), out), p, "test", nil, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(64000, 100), nil)
 	t.Cleanup(ag.WaitBackground)
 	t.Cleanup(func() { agent.SetCompactDefaults(0, "") })
