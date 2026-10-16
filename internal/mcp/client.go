@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -245,7 +246,12 @@ func (c *Client) initialize(ctx context.Context) error {
 	if ht, ok := c.t.(*httpTransport); ok {
 		ht.setVersion(res.ProtocolVersion, false)
 		lctx, lcancel := context.WithCancel(context.Background())
+		c.mu.Lock()
+		if c.listenCt != nil { // a new session replaces the listener of the old one
+			c.listenCt()
+		}
 		c.listenCt = lcancel
+		c.mu.Unlock()
 		go ht.listen(lctx)
 	}
 	return nil
@@ -313,9 +319,11 @@ func (c *Client) Diag() string { return c.t.diag() }
 
 // Close ends the connection and, for a local server, its process.
 func (c *Client) Close() {
+	c.mu.Lock()
 	if c.listenCt != nil {
 		c.listenCt()
 	}
+	c.mu.Unlock()
 	if c.t != nil {
 		c.t.close()
 	}
@@ -325,9 +333,17 @@ func (c *Client) Close() {
 // _meta; a legacy HTTP request whose session expired is retried once on a new one.
 func (c *Client) rpc(ctx context.Context, method string, params map[string]any, out any) error {
 	for attempt := 0; ; attempt++ {
+		used := ""
+		if ht, ok := c.t.(*httpTransport); ok {
+			used = ht.sessionID()
+		}
 		err := c.rpcOnce(ctx, method, params, out)
-		if errors.Is(err, errSessionExpired) && attempt == 0 && method != "initialize" {
-			if rerr := c.restartSession(ctx); rerr != nil {
+		// A call that was sent while another call was renewing the session goes
+		// out without one, and the server answers that 404 too.
+		var herr *httpError
+		gone := errors.Is(err, errSessionExpired) || (used != "" && errors.As(err, &herr) && herr.Status == http.StatusNotFound)
+		if gone && attempt == 0 && method != "initialize" {
+			if rerr := c.restartSession(ctx, used); rerr != nil {
 				return rerr
 			}
 			continue
@@ -336,15 +352,25 @@ func (c *Client) rpc(ctx context.Context, method string, params map[string]any, 
 	}
 }
 
-func (c *Client) restartSession(ctx context.Context) error {
+// restartSession starts a new session, unless another call already replaced the
+// one that failed (failed) while this one waited for the lock.
+func (c *Client) restartSession(ctx context.Context, failed string) error {
 	c.reinit.Lock()
 	defer c.reinit.Unlock()
 	ht, ok := c.t.(*httpTransport)
 	if !ok {
 		return errSessionExpired
 	}
-	ht.setSession("")
-	return c.initialize(ctx)
+	if ht.sessionID() != failed {
+		return nil
+	}
+	// The old session stays until the new one is known, so a call sent meanwhile
+	// fails the same way and waits here for this restart rather than seeing none.
+	err := c.initialize(ctx)
+	if err == nil && ht.sessionID() == failed {
+		ht.setSession("") // the server gave no new session
+	}
+	return err
 }
 
 func (c *Client) rpcOnce(ctx context.Context, method string, params map[string]any, out any) error {

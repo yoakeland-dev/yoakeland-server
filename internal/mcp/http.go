@@ -142,7 +142,7 @@ func (t *httpTransport) newRequest(ctx context.Context, method string, body []by
 	t.mu.Lock()
 	session, version, modern := t.session, t.version, t.modern
 	t.mu.Unlock()
-	if session != "" {
+	if session != "" && (m == nil || m.Method != "initialize") {
 		req.Header.Set("Mcp-Session-Id", session)
 	}
 	if version != "" {

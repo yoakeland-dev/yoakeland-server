@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,6 +187,38 @@ func TestServerRequestsAreBounded(t *testing.T) {
 		t.Fatalf("%d handlers running, want %d", n, maxReplies)
 	}
 	close(release)
+}
+
+// Calls that all hit one expired session re-initialize once between them.
+func TestHTTPConcurrentSessionExpiryRestartsOnce(t *testing.T) {
+	h := newHTTPFake(t, "legacy", true, false, "")
+	c, err := Dial(ctx5(t), Options{Config: ServerConfig{URL: h.srv.URL}, Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	before := h.initializes()
+	c.t.(*httpTransport).setSession("sess-stale")
+	var wg sync.WaitGroup
+	errs := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.ListTools(ctx5(t))
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := h.initializes() - before; n != 1 {
+		t.Fatalf("%d initializes for one expired session, want 1", n)
+	}
 }
 
 func TestHTTPLegacyWithSessionAndSSE(t *testing.T) {
