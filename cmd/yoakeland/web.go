@@ -21,6 +21,7 @@ import (
 // share its port, certificate and on/off switch. One http.Server per
 // connection keeps acceptLoop's connection tracking exact.
 func serveWeb(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
+	conn = deadlineConn{conn}
 	mux := http.NewServeMux()
 	mux.Handle("/", spaHandler(deps.webRootDir()))
 	// The public half of the auto-managed CA, so a phone can install it before it trusts this
@@ -47,7 +48,9 @@ func serveWeb(ctx context.Context, conn net.Conn, network string, deps connDeps,
 		ws.SetReadLimit(protocol.MaxFrameSize + 1) // + the newline
 		serveAccepted(ctx, websocket.NetConn(ctx, ws, websocket.MessageText), network, deps, lookupToken)
 	})
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// IdleTimeout ends a keep-alive that never sends its next request. No ReadTimeout or
+	// WriteTimeout: their deadlines would outlive the request and cut off a hijacked /ws.
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	_ = srv.Serve(newOneConnListener(conn))
 }
 

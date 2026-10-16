@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -104,5 +105,34 @@ func TestRunHeartbeat_ClosesOnFailedPing(t *testing.T) {
 
 	if !closer.closed.Load() {
 		t.Fatal("expected a failed ping send to close the connection immediately")
+	}
+}
+
+// A ping stuck on a peer that never reads must not keep the heartbeat from
+// closing that peer: the write times out and the ping failure closes it.
+func TestRunHeartbeat_ClosesPeerWhoseWriteIsStuck(t *testing.T) {
+	old := peerWriteTimeout.Load()
+	peerWriteTimeout.Store(int64(20 * time.Millisecond))
+	defer peerWriteTimeout.Store(old)
+
+	srv, cli := net.Pipe()
+	defer cli.Close()
+	conn := deadlineConn{srv}
+	ipc := protocol.NewIPCStream(conn, conn)
+	closer := &fakeCloser{}
+
+	var lastSeen atomic.Int64
+	lastSeen.Store(time.Now().UnixNano())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runHeartbeat(ctx, ipc, closer, &lastSeen, 5*time.Millisecond, time.Hour, nil)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !closer.closed.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !closer.closed.Load() {
+		t.Fatal("expected the heartbeat to close a peer whose ping is stuck")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"yoakeland/internal/protocol"
@@ -477,6 +478,35 @@ func (r *PeerRegistry) Broadcast() {
 	for _, p := range peers {
 		_ = p.ipc.SendEvent(protocol.EventPeerList, "", "", "", protocol.PeerListData{Peers: list, You: p.ID})
 	}
+}
+
+// peerWriteTimeout bounds one write to a peer. A peer that stops reading (a
+// suspended phone, a client that never reads) fills its socket buffer, and an
+// unbounded write would then stall every fan-out (turn streams, broadcasts,
+// the peer's own heartbeat) for every other peer. Atomic because a test shortens it while
+// goroutines from an earlier test may still be writing.
+var peerWriteTimeout atomic.Int64 // nanoseconds
+
+func init() { peerWriteTimeout.Store(int64(15 * time.Second)) }
+
+// peerMinBytesPerSec is the slowest a peer may take a write before it counts as stuck: a large
+// frame gets that much extra time per byte, so it isn't dropped on a slow link.
+const peerMinBytesPerSec = 64 << 10
+
+// deadlineConn gives every Write a deadline and closes the connection when a
+// write fails, so a stuck peer is dropped rather than blocking its writers.
+type deadlineConn struct {
+	net.Conn
+}
+
+func (c deadlineConn) Write(p []byte) (int, error) {
+	allow := time.Duration(peerWriteTimeout.Load()) + time.Duration(len(p))*time.Second/peerMinBytesPerSec
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(allow))
+	n, err := c.Conn.Write(p)
+	if err != nil {
+		_ = c.Conn.Close()
+	}
+	return n, err
 }
 
 // remoteIP extracts a bare IP (no port) from a network connection's remote

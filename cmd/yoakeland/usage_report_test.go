@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"yoakeland/internal/protocol"
 )
 
 func TestBuildUsageReport(t *testing.T) {
@@ -69,5 +71,63 @@ func TestBuildUsageReport(t *testing.T) {
 	}
 	if n != 2 || r.FirstAt != "2026-09-19T08:00:00Z" {
 		t.Fatalf("since: n=%d firstAt=%s", n, r.FirstAt)
+	}
+}
+
+// Concurrent or repeated get_usage requests share one scan within usageReportTTL, and a
+// different query gets its own scan (NET-19).
+func TestCachedUsageReport_SharesOneScan(t *testing.T) {
+	usageReports.Lock()
+	usageReports.key, usageReports.at = "", time.Time{}
+	usageReports.Unlock()
+
+	scans := 0
+	build := func() protocol.UsageReportData {
+		scans++
+		return protocol.UsageReportData{Sessions: []protocol.UsageSession{{ID: "s"}}}
+	}
+	for i := 0; i < 3; i++ {
+		if r := cachedUsageReport("q1", build); len(r.Sessions) != 1 {
+			t.Fatalf("result %d lost its sessions: %+v", i, r)
+		}
+	}
+	if scans != 1 {
+		t.Fatalf("3 identical requests ran %d scans, want 1", scans)
+	}
+	cachedUsageReport("q2", build)
+	if scans != 2 {
+		t.Fatalf("a different query ran %d scans in total, want 2", scans)
+	}
+}
+
+// A session file deleted since the last scan is dropped from the parse cache (ARC-22).
+func TestBuildUsageReport_PrunesDeletedSessionFiles(t *testing.T) {
+	state := t.TempDir()
+	dir := filepath.Join(state, "projects", "prune")
+	if err := os.MkdirAll(filepath.Join(dir, "sessions"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "sessions", "gone.json")
+	if err := os.WriteFile(path, []byte(`{"sessionId":"gone","history":[]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	buildUsageReport(state, nil, time.Time{}, false, nil)
+
+	usageFiles.Lock()
+	cached := usageFiles.m[path] != nil
+	usageFiles.Unlock()
+	if !cached {
+		t.Fatal("expected the session file to be cached after a scan")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	buildUsageReport(state, nil, time.Time{}, false, nil)
+	usageFiles.Lock()
+	cached = usageFiles.m[path] != nil
+	usageFiles.Unlock()
+	if cached {
+		t.Fatal("a deleted session file is still in the cache")
 	}
 }

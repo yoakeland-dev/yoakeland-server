@@ -45,8 +45,17 @@ func pakeCI(binding []byte) []byte { return cpace.LVCat([]byte(pakeLabel), bindi
 // channelBinding is the TLS exporter for the connection under conn, or nil when it is not a raw TLS
 // connection (a unix socket, a WebSocket, a WebRTC channel).
 func channelBinding(conn net.Conn) []byte {
-	if bc, ok := conn.(*bufferedConn); ok {
-		conn = bc.Conn
+	// Peel the wrappers acceptLoop and serveAccepted add: the TLS state is under them.
+	for {
+		switch c := conn.(type) {
+		case *bufferedConn:
+			conn = c.Conn
+			continue
+		case deadlineConn:
+			conn = c.Conn
+			continue
+		}
+		break
 	}
 	tc, ok := conn.(*tls.Conn)
 	if !ok {

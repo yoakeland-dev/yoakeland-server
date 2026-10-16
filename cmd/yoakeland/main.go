@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -425,12 +426,16 @@ func setupTCPListener(addr, stateDir, tlsCert, tlsKey, authToken string) (net.Li
 		return nil, "", err
 	}
 
-	cert, _, _, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
+	cert, usingAutoCA, _, _, err := resolveServerCert(stateDir, tlsCert, tlsKey)
 	if err != nil {
 		_ = ln.Close()
 		return nil, "", fmt.Errorf("resolving TLS certificate: %w", err)
 	}
-	ln = wrapTLS(ln, cert)
+	if usingAutoCA {
+		ln = tls.NewListener(ln, &tls.Config{GetCertificate: renewingCert(stateDir, cert)})
+	} else {
+		ln = wrapTLS(ln, cert)
+	}
 
 	// The shared token is deliberately not logged: a log or journal outlives the session and
 	// the token never expires. Devices pair with a fresh single-use code (printPairQR below
@@ -506,15 +511,25 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 		_ = ln.Close()
 	}()
 
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
+			// Accept keeps failing while the cause lasts (EMFILE, say): back off rather than
+			// spin and log on every attempt.
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
 			logWarn("accept error on %s: %v", ln.Addr(), err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			continue
 		}
+		backoff = 0
 
 		tracker.Add(conn)
 
@@ -524,8 +539,17 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 
 			var c net.Conn = conn
 			if tlsConn, ok := conn.(*tls.Conn); ok {
+				// Nothing else bounds connections before they authenticate, and each
+				// handshake costs an ECDSA signature: cap how many run at once (NET-8).
+				select {
+				case handshakeSlots <- struct{}{}:
+				default:
+					logWarn("too many TLS handshakes in progress, dropping %s", conn.RemoteAddr())
+					return
+				}
 				_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 				if err := tlsConn.Handshake(); err != nil {
+					<-handshakeSlots
 					logWarn("TLS handshake failed from %s: %s", conn.RemoteAddr(), logSafe(err.Error()))
 					return
 				}
@@ -533,6 +557,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 				br := bufio.NewReader(conn)
 				first, err := br.Peek(1)
 				_ = tlsConn.SetDeadline(time.Time{})
+				<-handshakeSlots
 				if err != nil {
 					return
 				}
@@ -563,8 +588,14 @@ var preAuthTimeout = 10 * time.Second // var for tests
 
 var preAuthSlots = make(chan struct{}, maxPreAuth)
 
+// maxHandshakes caps TLS handshakes in progress across all clients (see acceptLoop).
+const maxHandshakes = 64
+
+var handshakeSlots = make(chan struct{}, maxHandshakes)
+
 // Shared by socket clients and browser WebSockets (web.go).
 func serveAccepted(ctx context.Context, conn net.Conn, network string, deps connDeps, lookupToken func(token string) (name string, rec TokenRecord, ok bool)) {
+	conn = deadlineConn{conn} // a peer that stops reading must not stall everyone else (NET-1)
 	ipc := protocol.NewIPCStream(conn, conn)
 	if network == "tcp" {
 		select {
@@ -736,6 +767,25 @@ func parseListenAddr(listenAddr, stateDir string) (network, address string) {
 // resolveServerCert) — this function doesn't care which one produced cert.
 func wrapTLS(ln net.Listener, cert tls.Certificate) net.Listener {
 	return tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+}
+
+// renewingCert serves the self-managed leaf, regenerating it once it's close to expiry: the leaf
+// is otherwise only made at startup, and a daemon can run for over a year (NET-18).
+func renewingCert(stateDir string, cert tls.Certificate) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var mu sync.Mutex
+	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil && time.Until(leaf.NotAfter) < tlsca.RenewBefore {
+			if renewed, _, _, err := tlsca.EnsureServerCert(stateDir, tlsca.DefaultSANs()); err != nil {
+				logWarn("renewing TLS certificate: %v", err)
+			} else {
+				cert = renewed
+			}
+		}
+		c := cert
+		return &c, nil
+	}
 }
 
 // resolveServerCert obtains the certificate the TCP listener should present.
@@ -2074,7 +2124,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			}
 			// External scans read other tools' session files on this host (their folders and titles): the
 			// owner's view, so a remote connection never gets them.
-			out := buildUsageReport(deps.projects.stateDir, kinds, since, data.External && network != "tcp", price)
+			external := data.External && network != "tcp"
+			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), external)
+			out := cachedUsageReport(key, func() protocol.UsageReportData {
+				return buildUsageReport(deps.projects.stateDir, kinds, since, external, price)
+			})
 			out.Accounts = usageAccounts(deps.providerStore)
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)

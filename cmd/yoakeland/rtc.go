@@ -250,7 +250,7 @@ func (l *rtcListener) runPeer(ufrag string, from netip.AddrPort) {
 		return
 	}
 	dc.OnOpen(func() {
-		raw, err := dc.Detach()
+		raw, err := dc.DetachWithDeadline()
 		if err != nil {
 			closePeer()
 			return
@@ -338,16 +338,22 @@ func rtcClientOffer(ufrag string) string {
 
 func ptr[T any](v T) *T { return &v }
 
+// rtcStream is a detached data channel: its writes take a deadline (pion's DetachWithDeadline).
+type rtcStream interface {
+	io.ReadWriteCloser
+	SetWriteDeadline(time.Time) error
+}
+
 // rtcConn adapts a detached data channel to the net.Conn serveAccepted wants. Reads go through a
 // net.Pipe so deadlines and EOF behave like a socket's; writes are cut into data-channel messages.
 type rtcConn struct {
 	net.Conn // the pipe's read side
-	rw       io.ReadWriteCloser
+	rw       rtcStream
 	remote   net.Addr
 	closer   func()
 }
 
-func newRTCConn(rw io.ReadWriteCloser, closePeer func(), remote net.Addr) *rtcConn {
+func newRTCConn(rw rtcStream, closePeer func(), remote net.Addr) *rtcConn {
 	feed, read := net.Pipe()
 	c := &rtcConn{Conn: read, rw: rw, remote: remote, closer: closePeer}
 	go func() {
@@ -379,6 +385,10 @@ func (c *rtcConn) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// SetWriteDeadline reaches the data channel; the embedded pipe is only the read side, so without
+// this override a write deadline (see deadlineConn) would never bound a stuck WebRTC peer.
+func (c *rtcConn) SetWriteDeadline(t time.Time) error { return c.rw.SetWriteDeadline(t) }
 
 func (c *rtcConn) RemoteAddr() net.Addr { return c.remote }
 

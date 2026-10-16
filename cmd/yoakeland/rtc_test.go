@@ -39,7 +39,7 @@ func rtcTestClient(t *testing.T, addr *net.UDPAddr, fingerprint string) net.Conn
 	}
 	opened := make(chan net.Conn, 1)
 	dc.OnOpen(func() {
-		rw, err := dc.Detach()
+		rw, err := dc.DetachWithDeadline()
 		if err != nil {
 			t.Error(err)
 			return

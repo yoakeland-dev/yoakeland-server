@@ -1,6 +1,7 @@
 package tlsca_test
 
 import (
+	"bytes"
 	"crypto/x509"
 	"os"
 	"path/filepath"
@@ -146,5 +147,28 @@ func TestDefaultSANs_IncludesLocalhostLoopbackAndHostname(t *testing.T) {
 		if !found {
 			t.Errorf("expected DefaultSANs() to include %q, got %v", k, sans)
 		}
+	}
+}
+
+// A CA that exists but can't be loaded must be reported, not silently replaced: clients that
+// already trust ca.pem would be stranded by a new CA (NET-18).
+func TestEnsureServerCert_KeepsUnreadableCA(t *testing.T) {
+	stateDir := t.TempDir()
+	sans := []string{"localhost", "127.0.0.1"}
+	if _, _, _, err := tlsca.EnsureServerCert(stateDir, sans); err != nil {
+		t.Fatalf("EnsureServerCert: %v", err)
+	}
+	dir := filepath.Join(stateDir, "tls")
+	before, _ := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if err := os.WriteFile(filepath.Join(dir, "ca.key"), []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := tlsca.EnsureServerCert(stateDir, sans); err == nil {
+		t.Fatal("expected an error for an unreadable CA key")
+	}
+	after, _ := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if !bytes.Equal(before, after) {
+		t.Fatal("ca.pem was replaced")
 	}
 }
