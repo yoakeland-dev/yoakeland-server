@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"os/exec"
 	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
@@ -62,14 +61,15 @@ func CLIKinds() []CLIKind {
 	return []CLIKind{CLIKindClaude, CLIKindCodex, CLIKindCursor, CLIKindKimi, CLIKindOpenCode, CLIKindGemini, CLIKindGrok, CLIKindDeepSeek, CLIKindAmp, CLIKindPi, CLIKindOhMyPi}
 }
 
-// DetectCLI reports whether kind's binary is on PATH, so a frontend can show
-// which subscription agents this machine has before the user registers one.
+// DetectCLI reports whether kind's binary is installed (on cliPath, so one
+// installed since the daemon started counts), so a frontend can show which
+// subscription agents this machine has before the user registers one.
 func DetectCLI(kind CLIKind) bool {
 	spec, ok := cliSpecs[kind]
 	if !ok {
 		return false
 	}
-	_, err := exec.LookPath(spec.Binary)
+	_, err := lookCLI(spec.Binary)
 	return err == nil
 }
 

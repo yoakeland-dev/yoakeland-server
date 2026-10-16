@@ -349,6 +349,7 @@ func TestDetectCLI(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("YOAKELAND_STRICT_PATH", "1") // this machine's own CLIs stay out of it
 	if !DetectCLI(CLIKindClaude) || !DetectCLI(CLIKindCursor) || DetectCLI(CLIKindCodex) || DetectCLI(CLIKindKimi) {
 		t.Fatal("DetectCLI should find exactly the binaries on PATH")
 	}

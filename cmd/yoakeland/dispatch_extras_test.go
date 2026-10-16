@@ -199,6 +199,7 @@ func TestServeConnection_DetectCLI(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", tempDir)
+	t.Setenv("YOAKELAND_STRICT_PATH", "1") // this machine's own CLIs stay out of it
 
 	envs := runDispatch(t, deps, envelopeJSON(t, protocol.EventDetectCLI, struct{}{}))
 	if len(envs) != 1 || envs[0].Type != protocol.EventCLIAvailability {

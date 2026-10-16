@@ -29,9 +29,13 @@ type nativeProc struct {
 type procStarter func(ctx context.Context, name string, args []string, dir string) (*nativeProc, error)
 
 func startProc(ctx context.Context, name string, args []string, dir string) (*nativeProc, error) {
+	// Found on cliPath, not the daemon's PATH, so a CLI installed since start runs.
+	if p, err := lookCLI(name); err == nil {
+		name = p
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.Env = cliEnv(os.Environ())
+	cmd.Env = withCLIPath(cliEnv(os.Environ()))
 	ownProcessGroup(cmd)
 	cmd.Cancel = func() error { return killTree(cmd) }
 	stdin, err := cmd.StdinPipe()
