@@ -206,3 +206,33 @@ func TestSearch_SkipsHiddenStateDir(t *testing.T) {
 		t.Fatalf("search output:\n%s", out)
 	}
 }
+
+// Yoakeland's state dir can't be read through an attached folder, the way
+// file_read refuses it inside the project; the upload store under it can.
+func TestFileReadTool_AttachedStateDirRefused(t *testing.T) {
+	root, _ := normalizer.CanonicalRoot(t.TempDir())
+	state := filepath.Join(root, ".yoake")
+	uploads := filepath.Join(state, "uploads")
+	if err := os.MkdirAll(uploads, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(state, "server.json"), []byte("token"), 0o600)
+	_ = os.WriteFile(filepath.Join(uploads, "u.txt"), []byte("U"), 0o600)
+	oldHidden, oldUploads := normalizer.Hidden, normalizer.Uploads
+	normalizer.Hidden, normalizer.Uploads = []string{state}, uploads
+	t.Cleanup(func() { normalizer.Hidden, normalizer.Uploads = oldHidden, oldUploads })
+	norm, _ := normalizer.New(root)
+	rt := tool.NewFileReadTool(norm)
+
+	ctx := tool.ExecutionContext{ExtraReadPaths: []string{state}}
+	read := func(p string) (string, error) {
+		args, _ := json.Marshal(tool.FileReadArgs{Path: p})
+		return rt.Execute(context.Background(), ctx, args)
+	}
+	if _, err := read(filepath.Join(state, "server.json")); err == nil {
+		t.Fatal("state file read through an attached folder")
+	}
+	if out, err := read(filepath.Join(uploads, "u.txt")); err != nil || out != "     1\tU" {
+		t.Fatalf("upload: %q, %v", out, err)
+	}
+}

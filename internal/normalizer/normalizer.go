@@ -21,6 +21,11 @@ var (
 // sandbox also mounts an empty tmpfs over each (sandbox_linux.go).
 var Hidden []string
 
+// Uploads is the store clients' attachments are copied into. It sits under a
+// Hidden dir, and is the one part of one that an attachment may point at.
+// Set once at startup, next to Hidden.
+var Uploads string
+
 // HiddenIn returns the Hidden dirs strictly inside root.
 func HiddenIn(root string) []string {
 	var out []string
@@ -30,6 +35,26 @@ func HiddenIn(root string) []string {
 		}
 	}
 	return out
+}
+
+// InHidden reports whether abs (symlink-resolved) is inside a Hidden dir,
+// other than the upload store. Attachments are refused here exactly as
+// ResolveAndValidatePath refuses the same path for a project file.
+func InHidden(abs string) bool {
+	if Uploads != "" && within(Uploads, abs) {
+		return false
+	}
+	for _, h := range Hidden {
+		if within(h, abs) {
+			return true
+		}
+	}
+	return false
+}
+
+func within(dir, abs string) bool {
+	rel, err := filepath.Rel(dir, abs)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 type Normalizer struct {

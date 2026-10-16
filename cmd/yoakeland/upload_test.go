@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 )
 
@@ -76,5 +77,31 @@ func TestValidateAttachments_TCPConfinedUnixNot(t *testing.T) {
 		if err := validateAttachments("tcp", s, project, []string{p}); err == nil {
 			t.Fatalf("tcp attached %s", p)
 		}
+	}
+}
+
+// A TCP peer can't attach yoakeland's own state (the tokens live there), but
+// it can attach what it uploaded, which is stored under that state dir.
+func TestValidateAttachments_RefusesStateDir(t *testing.T) {
+	project, _ := normalizer.CanonicalRoot(t.TempDir())
+	state := filepath.Join(project, ".yoake")
+	s, err := NewUploadStore(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHidden, oldUploads := normalizer.Hidden, normalizer.Uploads
+	normalizer.Hidden, normalizer.Uploads = []string{state}, s.dir
+	t.Cleanup(func() { normalizer.Hidden, normalizer.Uploads = oldHidden, oldUploads })
+
+	token := filepath.Join(state, "server.json")
+	_ = os.WriteFile(token, []byte("t"), 0o600)
+	if err := validateAttachments("tcp", s, project, []string{token}); err == nil {
+		t.Fatal("tcp attached the state dir")
+	}
+	up := filepath.Join(s.dir, "abc", "a.txt")
+	_ = os.MkdirAll(filepath.Dir(up), 0o700)
+	_ = os.WriteFile(up, []byte("a"), 0o600)
+	if err := validateAttachments("tcp", s, project, []string{up}); err != nil {
+		t.Fatalf("tcp upload: %v", err)
 	}
 }

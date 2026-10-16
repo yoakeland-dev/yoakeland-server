@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 )
 
@@ -228,6 +229,9 @@ func validateAttachments(network string, uploads *UploadStore, projectRoot strin
 		real, err := filepath.EvalSymlinks(p)
 		if err != nil {
 			return fmt.Errorf("attachment %q: %w", p, err)
+		}
+		if normalizer.InHidden(real) {
+			return fmt.Errorf("attachment %q is yoakeland's own state", p)
 		}
 		allowed := false
 		for _, root := range []string{projectRoot, uploadsDir(uploads)} {
