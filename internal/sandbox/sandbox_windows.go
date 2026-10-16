@@ -187,7 +187,7 @@ func (p *windowsPTYSession) Wait() (int, error) {
 
 // applyJobObjectLimits confines pid to a Windows Job Object capping memory
 // and active-process count — the Job Object equivalent of
-// cgroup_linux.go's applyCgroupLimits. Every step's error is checked, same
+// cgroup_linux.go's newCgroupLeaf. Every step's error is checked, same
 // "don't claim success on a partial failure" rule that function documents.
 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes the job handle itself a kill
 // switch: closing it (which the OS does automatically if this daemon
