@@ -254,3 +254,39 @@ func TestOpenAIStream_CancelReleasesBlockedSender(t *testing.T) {
 		t.Fatal("stream goroutine is still blocked after cancel")
 	}
 }
+
+// PRV-16: Anthropic bills web searches per use; the count reaches the usage
+// so the spend cap sees it.
+func TestAnthropicStream_ReportsWebSearchCount(t *testing.T) {
+	srv := sseServer(t,
+		"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":5,\"server_tool_use\":{\"web_search_requests\":0}}}}\n\n",
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"server_tool_use\":{\"web_search_requests\":2}}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	defer srv.Close()
+	p := NewAnthropic("k", "claude-sonnet-5")
+	p.BaseURL = srv.URL
+	chunks, errs := p.StreamTurn(context.Background(), nil, nil, "")
+	got, err := collectStream(t, chunks, errs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var searches int
+	for _, c := range got {
+		if c.Kind == agent.StreamChunkUsage {
+			searches = c.Usage.WebSearches
+		}
+	}
+	if searches != 2 {
+		t.Fatalf("WebSearches = %d, want 2", searches)
+	}
+}
+
+// A cache count larger than the input total must not price tokens negative.
+func TestPricingCacheCostNeverNegative(t *testing.T) {
+	pc := &PricingCache{rates: map[string]pricingRate{"m": {InputPerToken: 1e-6, OutputPerToken: 1e-6}}}
+	cost, ok := pc.CostUSD("m", 10, 20, 0, 0)
+	if !ok || cost < 0 {
+		t.Fatalf("cost = %v ok=%v, want a non-negative cost", cost, ok)
+	}
+}

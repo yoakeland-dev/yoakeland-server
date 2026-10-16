@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -18,6 +19,10 @@ import (
 // auth needed). It's their internal implementation detail, not a published
 // contract, so everything reading it (parseManifest) does so defensively.
 const modelManifestURL = "https://raw.githubusercontent.com/pingdotgg/t3code/main/apps/server/src/provider/model-manifest.json"
+
+// maxUpstreamBytes caps what a fetched model list or rate table may be: both
+// are a few MB, and a runaway body must not be read whole into memory.
+const maxUpstreamBytes = 8 << 20
 
 // embeddedManifestFallback is a last-known-good snapshot baked into the
 // binary, so a fresh install that has never successfully fetched still
@@ -171,7 +176,7 @@ func (mc *ManifestCache) Refresh() error {
 		return err
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBytes))
 	if err != nil {
 		mc.recordFailure(err)
 		return err
@@ -317,7 +322,24 @@ func parseManifest(raw []byte) (claude, codex []ModelInfo, err error) {
 	for _, slug := range m.CurrentModels.Codex {
 		codex = append(codex, ModelInfo{ID: slug, DisplayName: slug})
 	}
+	claude, codex = slugsOnly(claude), slugsOnly(codex)
 	return claude, codex, nil
+}
+
+// slugPattern is the shape of a model id. Ids from upstream become --model
+// arguments for the CLI agents, so a leading dash (a flag) or whitespace has no
+// business there.
+var slugPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$`)
+
+// slugsOnly drops the models whose ids don't look like a model id.
+func slugsOnly(models []ModelInfo) []ModelInfo {
+	out := models[:0]
+	for _, m := range models {
+		if slugPattern.MatchString(m.ID) {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func optionDescriptorCapabilities(descs []manifestOptionDescriptor) map[string]any {

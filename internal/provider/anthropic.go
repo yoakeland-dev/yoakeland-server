@@ -508,6 +508,9 @@ func (p *AnthropicProvider) StreamTurn(
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
+			ServerToolUse            struct {
+				WebSearchRequests int `json:"web_search_requests"`
+			} `json:"server_tool_use"`
 		}
 		applyUsage := func(u anthropicUsage) {
 			if in := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens; in > 0 {
@@ -517,6 +520,11 @@ func (p *AnthropicProvider) StreamTurn(
 			}
 			if u.OutputTokens > 0 {
 				usage.OutputTokens = u.OutputTokens
+			}
+			// Server tools are billed per use, and the count is cumulative like
+			// the output tokens.
+			if n := u.ServerToolUse.WebSearchRequests; n > 0 {
+				usage.WebSearches = n
 			}
 		}
 

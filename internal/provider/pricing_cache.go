@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -72,7 +73,15 @@ type PricingCache struct {
 	rates      map[string]pricingRate
 	overrides  map[string]pricingRate // pricing-overrides.json; wins over rates
 	failStreak int
+
+	// refusedSum and refusedN track a fetched table that pricingShift turned
+	// away: the same body refused pricingRefusalsToAccept times in a row is
+	// taken as a real repricing rather than a bad push.
+	refusedSum [sha256.Size]byte
+	refusedN   int
 }
+
+const pricingRefusalsToAccept = 3
 
 // NewPricingCache loads <stateDir>/pricing-cache.json if present, falling
 // back to the embedded snapshot otherwise (or on a corrupt cache file). It
@@ -190,7 +199,7 @@ func (pc *PricingCache) CostUSD(model string, input, cacheRead, cacheWrite, outp
 	if writeRate == 0 {
 		writeRate = r.InputPerToken
 	}
-	plain := input - cacheRead - cacheWrite
+	plain := max(input-cacheRead-cacheWrite, 0) // a cache count outside input must not go negative
 	return float64(plain)*r.InputPerToken + float64(cacheRead)*readRate + float64(cacheWrite)*writeRate + float64(output)*r.OutputPerToken, true
 }
 
@@ -286,7 +295,7 @@ func (pc *PricingCache) Refresh() error {
 		return err
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBytes))
 	if err != nil {
 		pc.recordFailure(err)
 		return err
@@ -298,6 +307,28 @@ func (pc *PricingCache) Refresh() error {
 		pc.recordFailure(err)
 		return err
 	}
+
+	pc.mu.RLock()
+	why := pricingShift(pc.rates, rates)
+	pc.mu.RUnlock()
+	sum := sha256.Sum256(body)
+	pc.mu.Lock()
+	if why != "" {
+		if sum == pc.refusedSum {
+			pc.refusedN++
+		} else {
+			pc.refusedSum, pc.refusedN = sum, 1
+		}
+		if pc.refusedN <= pricingRefusalsToAccept {
+			pc.mu.Unlock()
+			err := fmt.Errorf("refusing pricing table: %s", why)
+			log.Printf("pricing table: %v; keeping last-good rates", err)
+			pc.recordFailure(err)
+			return err
+		}
+	}
+	pc.refusedN = 0
+	pc.mu.Unlock()
 
 	newETag := resp.Header.Get("ETag")
 	pc.mu.Lock()
@@ -336,6 +367,43 @@ func (pc *PricingCache) recordSuccess() {
 	pc.mu.Unlock()
 }
 
+// pricingShift says why next shouldn't replace prev as the rate table, or ""
+// when it may. Most of the models gone, or one moved more than tenfold, is far
+// likelier to be a bad upstream push than a real repricing, and a price zeroed
+// or inflated that way would skew the cost cap.
+func pricingShift(prev, next map[string]pricingRate) string {
+	if len(prev) == 0 {
+		return ""
+	}
+	dropped := 0
+	for name, old := range prev {
+		cur, ok := next[name]
+		if !ok {
+			dropped++
+			continue
+		}
+		if repriced(old.InputPerToken, cur.InputPerToken) || repriced(old.OutputPerToken, cur.OutputPerToken) {
+			return fmt.Sprintf("%s changed price more than tenfold", name)
+		}
+	}
+	if dropped*5 > len(prev) {
+		return fmt.Sprintf("%d of %d models dropped", dropped, len(prev))
+	}
+	return ""
+}
+
+// repriced is whether a rate moved more than tenfold. Going to or from zero
+// counts as moving.
+func repriced(a, b float64) bool {
+	if a == b {
+		return false
+	}
+	if a <= 0 || b <= 0 {
+		return true
+	}
+	return a/b > 10 || b/a > 10
+}
+
 // rawPricingEntry is only the slice of each LiteLLM entry yoakeland actually
 // uses. Extra upstream fields are simply ignored by encoding/json, which is
 // what keeps this defensive against upstream reshaping.
@@ -363,6 +431,9 @@ func parsePricing(raw []byte) (map[string]pricingRate, error) {
 	rates := make(map[string]pricingRate, len(doc))
 	for name, entry := range doc {
 		if entry.InputCostPerToken == nil || entry.OutputCostPerToken == nil {
+			continue
+		}
+		if *entry.InputCostPerToken < 0 || *entry.OutputCostPerToken < 0 {
 			continue
 		}
 		window, _ := entry.MaxInputTokens.(float64)
