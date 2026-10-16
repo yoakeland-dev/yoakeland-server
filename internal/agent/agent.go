@@ -2085,6 +2085,8 @@ turn:
 	}
 
 	if streamErr != nil {
+		// No turn_completed on this exit, so the spend is recorded here.
+		a.recordSpend(sessionID, totalUsage)
 		return streamErr
 	}
 	if cutShort {
@@ -2323,6 +2325,28 @@ func limitTitle(title string) string {
 	return string(runes)
 }
 
+// recordSpend adds a turn's priced usage to the session and project totals
+// and returns them. Every exit that spent money calls it, the stream-error
+// exit included, so a failed turn's priced rounds still count towards the cap.
+func (a *Agent) recordSpend(sessionID string, usage protocol.UsageData) *protocol.SpendData {
+	if a.usageStore == nil {
+		return nil
+	}
+	// Unpriced usage is not free: it is recorded as unknown next to the
+	// priced total, and reported as such, rather than counting as $0 towards
+	// the per-session spend cap without a word. The cap can only act on what
+	// has a price, so it is a floor when SessionCostUnknown is set.
+	if usage.CostUnknown {
+		a.usageStore.MarkCostUnknown(sessionID)
+		log.Printf("session %s: %s has no known price; this turn's cost is unknown and not counted towards spend or the cap", sessionID, a.getModelName())
+	}
+	sessTotals, projTotals := a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
+	return &protocol.SpendData{
+		SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD,
+		SessionCostUnknown: sessTotals.CostUnknown, ProjectCostUnknown: projTotals.CostUnknown,
+	}
+}
+
 // buildTurnCompletedData assembles a turn_completed payload including the
 // context-window fullness and running spend, so every emission point (normal
 // completion and each cancellation path) reports the same enriched data.
@@ -2337,22 +2361,7 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 	// some part had no rate at all.
 	usage.CostKnown = !usage.CostUnknown
 
-	// Unpriced usage is not free: it is recorded as unknown next to the
-	// priced total, and reported as such, rather than counting as $0 towards
-	// the per-session spend cap without a word. The cap can only act on what
-	// has a price, so it is a floor when SessionCostUnknown is set.
-	var spend *protocol.SpendData
-	if a.usageStore != nil {
-		if usage.CostUnknown {
-			a.usageStore.MarkCostUnknown(sessionID)
-			log.Printf("session %s: %s has no known price; this turn's cost is unknown and not counted towards spend or the cap", sessionID, a.getModelName())
-		}
-		sessTotals, projTotals := a.usageStore.Record(sessionID, usage.InputTokens, usage.OutputTokens, usage.CostUSD)
-		spend = &protocol.SpendData{
-			SessionTotalUSD: sessTotals.CostUSD, ProjectTotalUSD: projTotals.CostUSD,
-			SessionCostUnknown: sessTotals.CostUnknown, ProjectCostUnknown: projTotals.CostUnknown,
-		}
-	}
+	spend := a.recordSpend(sessionID, usage)
 
 	// The provider's own reported size of the last request (its actual
 	// tokenizer, system prompt and tool schemas included) beats a char/4

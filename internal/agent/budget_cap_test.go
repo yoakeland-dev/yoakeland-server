@@ -3,6 +3,7 @@ package agent_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"yoakeland/internal/agent"
@@ -10,6 +11,7 @@ import (
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/snapshot"
+	"yoakeland/internal/tool"
 )
 
 // TestAgent_MaxSessionSpendUSD guards the runaway-cost gate: once a session
@@ -129,5 +131,41 @@ func TestAgent_MaxSessionSpendUSD_AppliesToEditAndRetry(t *testing.T) {
 	}
 	if err := ag.RetryMessage(context.Background(), "session-budget-2", "turn-3", assistantID); err == nil {
 		t.Fatal("expected RetryMessage to be refused once the session is over its spend cap")
+	}
+}
+
+// usageThenFailProvider reports one priced round, then fails the stream: the
+// spend must still be counted, or a turn that keeps failing never reaches the cap.
+type usageThenFailProvider struct{}
+
+func (usageThenFailProvider) StreamTurn(context.Context, []agent.Message, []tool.ToolDefinition, string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	cChan := make(chan agent.ModelStreamChunk, 1)
+	eChan := make(chan error, 1)
+	cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &protocol.UsageData{InputTokens: 10, OutputTokens: 10, CostUSD: 0.5, CostKnown: true}}
+	eChan <- errors.New("connection reset by peer")
+	close(eChan)
+	close(cChan)
+	return cChan, eChan
+}
+
+func TestAgent_StreamErrorTurnRecordsSpend(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	engine := permission.New(norm, nil)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	usageStore, err := agent.NewUsageStore(tempDir)
+	if err != nil {
+		t.Fatalf("NewUsageStore: %v", err)
+	}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{})
+	ag := agent.NewAgent(ipc, usageThenFailProvider{}, "test-provider", nil, engine, snapStore, sessStore, agent.NewContextManager(100, 20), usageStore)
+	t.Cleanup(ag.WaitBackground)
+
+	if err := ag.RunTurn(context.Background(), "session-fail-spend", "turn-1", "hello"); err == nil {
+		t.Fatal("expected the stream error to fail the turn")
+	}
+	if got := usageStore.SessionTotal("session-fail-spend").CostUSD; got != 0.5 {
+		t.Fatalf("spend after a failed turn = %v, want the priced round's 0.5", got)
 	}
 }
