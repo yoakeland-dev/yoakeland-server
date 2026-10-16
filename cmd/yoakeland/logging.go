@@ -3,10 +3,13 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/term"
 )
@@ -30,26 +33,94 @@ var (
 	logFile io.Writer // nil until initLogging opens it — stderr-only until then
 )
 
+// logMaxBytes is the size at which yoakeland.log is rotated. A var for tests.
+var logMaxBytes int64 = 10 << 20
+
+// rotatingLog is the file behind logFile. It has no lock of its own: every
+// call is made under logMu.
+type rotatingLog struct {
+	path string
+	f    *os.File
+	size int64
+}
+
+func (r *rotatingLog) open() error {
+	f, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	r.f, r.size = f, fi.Size()
+	return nil
+}
+
+// rotate moves the current file to <path>.1, replacing the previous copy, and
+// starts a new one. Only one old copy is kept, so an unattended daemon can't
+// fill the state disk.
+func (r *rotatingLog) rotate() error {
+	_ = r.f.Close()
+	_ = os.Rename(r.path, r.path+".1")
+	return r.open()
+}
+
+func (r *rotatingLog) Write(p []byte) (int, error) {
+	if r.size > 0 && r.size+int64(len(p)) > logMaxBytes {
+		if err := r.rotate(); err != nil {
+			return 0, err
+		}
+	}
+	n, err := r.f.Write(p)
+	r.size += int64(n)
+	return n, err
+}
+
+// stdlogWriter takes the stdlib logger's output (what internal/ packages
+// write) and sends it through logLine, so it reaches the log file too.
+type stdlogWriter struct{}
+
+func (stdlogWriter) Write(p []byte) (int, error) {
+	logInfo("%s", strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+// logSafe replaces control characters in text a stranger sent (an error
+// string, a name), so it can't forge extra lines in the log.
+func logSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, s)
+}
+
 // initLogging opens <stateDir>/logs/yoakeland.log for append and tees every
 // subsequent log line to it alongside stderr. A daemon has no attached
 // terminal to scroll back through, so this is the only durable record once
 // stderr is gone. Best-effort: a failure to open the file (e.g. read-only
 // state dir) just falls back to stderr-only rather than blocking startup.
 func initLogging(stateDir string) {
+	log.SetFlags(0)
+	log.SetOutput(stdlogWriter{})
+
 	dir := filepath.Join(stateDir, "logs")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		logWarn("could not create log directory %s: %v (logging to stderr only)", dir, err)
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "yoakeland.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
+	r := &rotatingLog{path: filepath.Join(dir, "yoakeland.log")}
+	if err := r.open(); err != nil {
 		logWarn("could not open log file: %v (logging to stderr only)", err)
 		return
 	}
 	logMu.Lock()
-	logFile = f
+	logFile = r
 	logMu.Unlock()
-	logInfo("logging to %s", f.Name())
+	logInfo("logging to %s", r.path)
 }
 
 func logLine(color, level, format string, args ...any) {
