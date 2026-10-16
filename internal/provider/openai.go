@@ -5,12 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
@@ -142,17 +141,10 @@ type openAIRequest struct {
 
 const defaultMaxTokens = 8192
 
-// rateLimitBackoff is the wait before each retry of a 429; a var so tests
-// can shrink it. A Retry-After header from the provider wins over it.
-var rateLimitBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
-
-const maxRetryAfter = 30 * time.Second
-
-// post sends body to the provider, retrying on 429 with backoff. Retrying is
-// safe because nothing has been streamed to the caller yet: a 429 comes back
-// as the response status, before any body.
+// post sends body to the provider, retrying transient failures (see
+// doWithRetry).
 func (p *OpenAICompatibleProvider) post(ctx context.Context, body []byte) (*http.Response, error) {
-	for attempt := 0; ; attempt++ {
+	return doWithRetry(ctx, p.Client, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
@@ -162,21 +154,8 @@ func (p *OpenAICompatibleProvider) post(ctx context.Context, body []byte) (*http
 		for k, v := range p.ExtraHeaders {
 			req.Header.Set(k, v)
 		}
-		resp, err := p.Client.Do(req)
-		if err != nil || resp.StatusCode != http.StatusTooManyRequests || attempt >= len(rateLimitBackoff) {
-			return resp, err
-		}
-		wait := rateLimitBackoff[attempt]
-		if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs >= 0 {
-			wait = min(time.Duration(secs)*time.Second, maxRetryAfter)
-		}
-		resp.Body.Close()
-		select {
-		case <-time.After(wait):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+		return req, nil
+	})
 }
 
 // GenerateTitle implements agent.TitleGenerator with a small, non-streaming
@@ -203,11 +182,7 @@ func (p *OpenAICompatibleProvider) GenerateTitle(ctx context.Context, prompt str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error struct{ Message string } `json:"error"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		return "", fmt.Errorf("provider error (%d): %s", resp.StatusCode, errResp.Error.Message)
+		return "", httpError(resp, "provider")
 	}
 
 	var out struct {
@@ -361,29 +336,47 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			eChan <- err
 			return
 		}
-		defer resp.Body.Close()
+		body := newStallReader(resp.Body, streamIdleTimeout)
+		defer body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			var errResp struct {
-				Error struct{ Message string } `json:"error"`
-			}
-			_ = json.NewDecoder(resp.Body).Decode(&errResp)
-			eChan <- fmt.Errorf("provider error (%d): %s", resp.StatusCode, errResp.Error.Message)
+			eChan <- httpError(resp, "provider")
 			return
 		}
 
-		// Accumulator map for streaming tool arguments
-		toolCallAccum := make(map[int]*agent.ToolCall)
-		toolArgBuffers := make(map[int]*bytes.Buffer)
+		// Tool calls are keyed by index, but a backend may skip indexes or send
+		// none at all. Each call keeps its first-seen position, and a new id at
+		// an index that already has a call starts a new one rather than merging
+		// two calls' arguments.
+		type toolAcc struct {
+			call agent.ToolCall
+			args bytes.Buffer
+		}
+		var calls []*toolAcc
+		filling := make(map[int]*toolAcc) // index -> the call it is filling now
 		var usage protocol.UsageData
 		var finishReason string
+		var sawData, sawFinish, sawDone bool
+		send := func(c agent.ModelStreamChunk) error {
+			select {
+			case cChan <- c:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 
-		if readErr := ReadSSEStream(resp.Body, func(ev SSEEvent) error {
+		if readErr := ReadSSEStream(body, func(ev SSEEvent) error {
 			if ev.Data == "[DONE]" {
+				sawDone = true
 				return nil
 			}
+			sawData = true
 
 			var chunk struct {
+				// A failure mid-stream arrives as a chunk with an error
+				// member (OpenRouter sends it on HTTP 200).
+				Error   json.RawMessage `json:"error"`
 				Choices []struct {
 					Delta struct {
 						Content   string           `json:"content"`
@@ -391,7 +384,9 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 						// ReasoningContent is DeepSeek-reasoner's (and
 						// similar reasoning models') chain-of-thought
 						// field, streamed alongside/before Content.
+						// Reasoning is OpenRouter's name for the same thing.
 						ReasoningContent string `json:"reasoning_content"`
+						Reasoning        string `json:"reasoning"`
 					} `json:"delta"`
 					FinishReason *string `json:"finish_reason"`
 				} `json:"choices"`
@@ -408,6 +403,13 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 
 			if err := json.Unmarshal([]byte(ev.Data), &chunk); err != nil {
 				return nil
+			}
+			if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+				msg := errorMessage(chunk.Error)
+				if msg == "" {
+					msg = string(chunk.Error)
+				}
+				return fmt.Errorf("provider stream error: %s", msg)
 			}
 
 			// The usage-carrying final chunk (stream_options.include_usage)
@@ -426,54 +428,50 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 
 			choice := chunk.Choices[0]
 			if choice.Delta.Content != "" {
-				cChan <- agent.ModelStreamChunk{
-					Kind:  agent.StreamChunkDelta,
-					Delta: choice.Delta.Content,
+				if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: choice.Delta.Content}); err != nil {
+					return err
 				}
 			}
-			if choice.Delta.ReasoningContent != "" {
-				cChan <- agent.ModelStreamChunk{
-					Kind:  agent.StreamChunkReasoning,
-					Delta: choice.Delta.ReasoningContent,
+			reasoning := choice.Delta.ReasoningContent
+			if reasoning == "" {
+				reasoning = choice.Delta.Reasoning
+			}
+			if reasoning != "" {
+				if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkReasoning, Delta: reasoning}); err != nil {
+					return err
 				}
 			}
 
 			for _, tc := range choice.Delta.ToolCalls {
-				idx := tc.Index
-				if _, exists := toolCallAccum[idx]; !exists {
-					toolCallAccum[idx] = &agent.ToolCall{
-						ID:   tc.ID,
-						Name: tc.Function.Name,
-					}
-					toolArgBuffers[idx] = &bytes.Buffer{}
+				c := filling[tc.Index]
+				if c == nil || (tc.ID != "" && c.call.ID != "" && tc.ID != c.call.ID) {
+					c = &toolAcc{}
+					calls = append(calls, c)
+					filling[tc.Index] = c
 				}
-
 				if tc.ID != "" {
-					toolCallAccum[idx].ID = tc.ID
+					c.call.ID = tc.ID
 				}
 				if tc.Function.Name != "" {
-					toolCallAccum[idx].Name = tc.Function.Name
+					c.call.Name = tc.Function.Name
 				}
-				toolArgBuffers[idx].WriteString(tc.Function.Arguments)
+				c.args.WriteString(tc.Function.Arguments)
 			}
 
-			// When turn finishes, emit accumulated tool calls
-			if choice.FinishReason != nil && *choice.FinishReason == "tool_calls" {
-				for i := 0; i < len(toolCallAccum); i++ {
-					tc := toolCallAccum[i]
-					tc.Args = json.RawMessage(toolArgBuffers[i].Bytes())
-					cChan <- agent.ModelStreamChunk{
-						Kind:     agent.StreamChunkToolCall,
-						ToolCall: tc,
-					}
+			if fr := choice.FinishReason; fr != nil && *fr != "" {
+				sawFinish = true
+				switch *fr {
+				case "error":
+					return fmt.Errorf("provider stream error: the reply failed")
+				// "length" means the response was truncated at the token limit
+				// before the model naturally finished — without this, that looks
+				// identical to an ordinary "stop" to the rest of the turn loop.
+				case "length":
+					finishReason = "length"
+				// content_filter is the same thing as Anthropic's refusal.
+				case "content_filter":
+					finishReason = "refusal"
 				}
-			}
-
-			// "length" means the response was truncated at the token limit
-			// before the model naturally finished — without this, that looks
-			// identical to an ordinary "stop" to the rest of the turn loop.
-			if choice.FinishReason != nil && *choice.FinishReason == "length" {
-				finishReason = "length"
 			}
 
 			return nil
@@ -488,12 +486,39 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			return
 		}
 
+		// Some local servers end the stream without a [DONE] or a finish_reason.
+		// That is only a clean end when nothing came before it.
+		if !sawFinish && !sawDone && sawData {
+			eChan <- fmt.Errorf("provider stream ended before the reply finished: %w", io.ErrUnexpectedEOF)
+			return
+		}
+
+		// The tool calls go out once the stream is whole, so a backend that ends
+		// the reply with "stop" instead of "tool_calls" still delivers them.
+		for _, c := range calls {
+			args := c.args.Bytes()
+			if len(args) == 0 {
+				args = []byte("{}")
+			}
+			c.call.Args = json.RawMessage(append([]byte(nil), args...))
+			call := c.call
+			if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &call}); err != nil {
+				eChan <- err
+				return
+			}
+		}
+
 		if finishReason != "" {
-			cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkFinish, FinishReason: finishReason}
+			if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkFinish, FinishReason: finishReason}); err != nil {
+				eChan <- err
+				return
+			}
 		}
 
 		if usage.TotalTokens > 0 || usage.InputTokens > 0 || usage.OutputTokens > 0 {
-			cChan <- agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &usage}
+			if err := send(agent.ModelStreamChunk{Kind: agent.StreamChunkUsage, Usage: &usage}); err != nil {
+				eChan <- err
+			}
 		}
 	}()
 
