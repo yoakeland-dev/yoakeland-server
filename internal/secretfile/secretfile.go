@@ -1,4 +1,6 @@
-package provider
+// Package secretfile encrypts the files that hold credentials (providers.json,
+// mcp.json, mcp-auth.json) under the master key, so they share one scheme.
+package secretfile
 
 import (
 	"crypto/aes"
@@ -23,11 +25,11 @@ func deriveKey(passphrase string, salt []byte) ([]byte, error) {
 	return scrypt.Key([]byte(passphrase), salt, scryptN, scryptR, scryptP, aesKeySize)
 }
 
-// encryptBytes encrypts plaintext under a key derived from passphrase and a
+// Encrypt encrypts plaintext under a key derived from passphrase and a
 // freshly generated random salt, returning the salt, the AES-GCM nonce, and
 // the ciphertext — none of which are secret on their own; the passphrase is
 // the only thing that must stay secret.
-func encryptBytes(plaintext []byte, passphrase string) (salt, nonce, ciphertext []byte, err error) {
+func Encrypt(plaintext []byte, passphrase string) (salt, nonce, ciphertext []byte, err error) {
 	salt = make([]byte, saltSize)
 	if _, err = rand.Read(salt); err != nil {
 		return nil, nil, nil, err
@@ -52,7 +54,7 @@ func encryptBytes(plaintext []byte, passphrase string) (salt, nonce, ciphertext 
 	return salt, nonce, ciphertext, nil
 }
 
-func decryptBytes(salt, nonce, ciphertext []byte, passphrase string) ([]byte, error) {
+func Decrypt(salt, nonce, ciphertext []byte, passphrase string) ([]byte, error) {
 	key, err := deriveKey(passphrase, salt)
 	if err != nil {
 		return nil, err

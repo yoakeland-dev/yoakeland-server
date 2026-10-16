@@ -16,11 +16,11 @@ import (
 func newTestManager(t *testing.T) (*Manager, *Store, string, *atomic.Int32) {
 	t.Helper()
 	state, root := t.TempDir(), t.TempDir()
-	store, err := NewStore(state)
+	store, err := NewStore(state, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth, err := NewAuthStore(state)
+	auth, err := NewAuthStore(state, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,10 +334,10 @@ func TestSavingValidatesAndRenames(t *testing.T) {
 
 func TestStoreSurvivesRestartAndKeepsItsFileSecret(t *testing.T) {
 	dir := t.TempDir()
-	s, _ := NewStore(dir)
+	s, _ := NewStore(dir, "")
 	_ = s.Save("a", "", ServerConfig{Command: "x", Env: map[string]string{"K": "v"}})
 	_ = s.SetApproval("/p", "n", "h1", true)
-	s2, err := NewStore(dir)
+	s2, err := NewStore(dir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,8 +352,53 @@ func TestStoreSurvivesRestartAndKeepsItsFileSecret(t *testing.T) {
 		t.Fatalf("mcp.json is %v; it holds secrets", fi.Mode().Perm())
 	}
 	_ = os.WriteFile(filepath.Join(dir, "mcp.json"), []byte("{broken"), 0o600)
-	if _, err := NewStore(dir); err == nil {
+	if _, err := NewStore(dir, ""); err == nil {
 		t.Fatal("a corrupt store must be an error, not silently emptied")
+	}
+}
+
+// With a master key, mcp.json and mcp-auth.json are sealed like providers.json.
+// A plaintext file from before the key was set is still read, and sealed on its next write.
+func TestStoreSealsUnderTheMasterKey(t *testing.T) {
+	dir := t.TempDir()
+	plain, _ := NewStore(dir, "")
+	_ = plain.Save("a", "", ServerConfig{Command: "x", Env: map[string]string{"K": "env-secret"}})
+	s, err := NewStore(dir, "pw")
+	if err != nil || s.Servers()["a"].Env["K"] != "env-secret" {
+		t.Fatalf("a plaintext store must still open under a key: %v", err)
+	}
+	if err := s.Save("b", "", ServerConfig{Command: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "mcp.json"))
+	if strings.Contains(string(raw), "env-secret") || !strings.Contains(string(raw), `"encrypted": true`) {
+		t.Fatalf("mcp.json must be sealed once a key is set: %s", raw)
+	}
+	if _, err := NewStore(dir, ""); err == nil {
+		t.Fatal("a sealed store must not open without the key")
+	}
+	if _, err := NewStore(dir, "wrong"); err == nil {
+		t.Fatal("a sealed store must not open with the wrong key")
+	}
+	back, err := NewStore(dir, "pw")
+	if err != nil || back.Servers()["a"].Env["K"] != "env-secret" || back.Servers()["b"].Command != "y" {
+		t.Fatalf("sealed store did not round-trip: %v", err)
+	}
+
+	auth, _ := NewAuthStore(dir, "pw")
+	auth.mu.Lock()
+	auth.entries["https://mcp.example"] = tokenEntry{RefreshToken: "refresh-secret"}
+	err = auth.saveLocked()
+	auth.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(dir, "mcp-auth.json"))
+	if strings.Contains(string(raw), "refresh-secret") {
+		t.Fatalf("mcp-auth.json holds a refresh token in plaintext: %s", raw)
+	}
+	if _, err := NewAuthStore(dir, ""); err == nil {
+		t.Fatal("sealed tokens must not open without the key")
 	}
 }
 

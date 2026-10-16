@@ -2289,7 +2289,7 @@ Passing `-master-key` (or setting `YOAKELAND_MASTER_KEY`) turns on real encrypti
 - A wrong passphrase against an already-encrypted file is a hard startup error, not silent data loss — the server refuses to start rather than quietly discarding an unreadable registry.
 - Without `-master-key`/`YOAKELAND_MASTER_KEY` set, the server logs a plaintext warning at startup — insecure-by-omission is always visible, never silent, the same principle behind auto-generating a CA rather than silently running the TCP listener in plaintext (§2a).
 
-This only protects `providers.json`. It says nothing about the OS keychain, and a frontend (e.g. a Tauri client) holding its own copy of a connection token or key locally should use its platform's real credential storage rather than assuming the backend's encryption covers it too.
+The same key seals `mcp.json` (MCP servers' environment, headers and OAuth client secrets) and `mcp-auth.json` (OAuth tokens), in the same envelope. It says nothing about the OS keychain, and a frontend (e.g. a Tauri client) holding its own copy of a connection token or key locally should use its platform's real credential storage rather than assuming the backend's encryption covers it too.
 
 ---
 

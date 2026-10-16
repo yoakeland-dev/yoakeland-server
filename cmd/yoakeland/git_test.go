@@ -56,7 +56,7 @@ func TestProjectRegistry_WatchesKnownReposWithoutOpening(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	first, err := NewProjectRegistry(nil, "", 0, stateDir)
+	first, err := NewProjectRegistry(nil, "", 0, stateDir, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestProjectRegistry_WatchesKnownReposWithoutOpening(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := NewProjectRegistry(nil, "", 0, stateDir)
+	second, err := NewProjectRegistry(nil, "", 0, stateDir, "")
 	if err != nil {
 		t.Fatal(err)
 	}

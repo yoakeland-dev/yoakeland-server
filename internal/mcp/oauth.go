@@ -49,22 +49,26 @@ type tokenEntry struct {
 type AuthStore struct {
 	mu      sync.Mutex
 	path    string
+	key     string // the master key the file is sealed under, or ""
 	entries map[string]tokenEntry
 	hc      *http.Client // tests replace it
 	refresh sync.Mutex   // one refresh at a time (refresh tokens rotate)
 }
 
-func NewAuthStore(dir string) (*AuthStore, error) {
+func NewAuthStore(dir, key string) (*AuthStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	a := &AuthStore{path: filepath.Join(dir, "mcp-auth.json"), entries: map[string]tokenEntry{}}
+	a := &AuthStore{path: filepath.Join(dir, "mcp-auth.json"), key: key, entries: map[string]tokenEntry{}}
 	data, err := os.ReadFile(a.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return a, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if data, err = openFile(data, key); err != nil {
+		return nil, fmt.Errorf("%s: %w", a.path, err)
 	}
 	if err := json.Unmarshal(data, &a.entries); err != nil {
 		return nil, fmt.Errorf("%s doesn't parse (fix or move it): %w", a.path, err)
@@ -75,6 +79,9 @@ func NewAuthStore(dir string) (*AuthStore, error) {
 func (a *AuthStore) saveLocked() error {
 	b, err := json.MarshalIndent(a.entries, "", "  ")
 	if err != nil {
+		return err
+	}
+	if b, err = sealFile(b, a.key); err != nil {
 		return err
 	}
 	return writeFileAtomic(a.path, b)

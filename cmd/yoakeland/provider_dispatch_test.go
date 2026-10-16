@@ -20,7 +20,7 @@ func newTestDeps(t *testing.T) connDeps {
 	tempDir := t.TempDir()
 	stateDir := t.TempDir()
 
-	projects, err := NewProjectRegistry(nil, "", 0, stateDir)
+	projects, err := NewProjectRegistry(nil, "", 0, stateDir, "")
 	if err != nil {
 		t.Fatalf("project registry: %v", err)
 	}

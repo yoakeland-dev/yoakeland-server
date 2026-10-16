@@ -110,7 +110,7 @@ func (s *scriptedBrowsing) StreamTurn(_ context.Context, _ []agent.Message, _ []
 // model marked as untrusted.
 func TestBrowserTool_RelaysThroughProject(t *testing.T) {
 	peers := NewPeerRegistry()
-	projects, err := NewProjectRegistry(&scriptedBrowsing{}, "p", 0, t.TempDir())
+	projects, err := NewProjectRegistry(&scriptedBrowsing{}, "p", 0, t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

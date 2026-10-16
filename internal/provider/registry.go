@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"yoakeland/internal/secretfile"
 )
 
 type ProviderKind string
@@ -141,7 +143,7 @@ func (s *ProviderStore) load(data []byte) error {
 		if err != nil {
 			return fmt.Errorf("malformed providers.json: bad ciphertext: %w", err)
 		}
-		plaintext, err := decryptBytes(salt, nonce, ciphertext, s.passphrase)
+		plaintext, err := secretfile.Decrypt(salt, nonce, ciphertext, s.passphrase)
 		if err != nil {
 			return err
 		}
@@ -234,7 +236,7 @@ func (s *ProviderStore) save() error {
 
 	out := data
 	if s.passphrase != "" {
-		salt, nonce, ciphertext, err := encryptBytes(data, s.passphrase)
+		salt, nonce, ciphertext, err := secretfile.Encrypt(data, s.passphrase)
 		if err != nil {
 			return fmt.Errorf("encrypting providers.json: %w", err)
 		}
