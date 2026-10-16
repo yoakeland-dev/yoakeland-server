@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -329,7 +330,11 @@ func (pc *PricingCache) Refresh() error {
 		}
 	}
 	pc.refusedN = 0
+	held := holdRepriced(pc.rates, rates)
 	pc.mu.Unlock()
+	if len(held) > 0 {
+		log.Printf("pricing table: kept the previous rates for %s (zeroed or moved more than tenfold)", strings.Join(held, ", "))
+	}
 
 	newETag := resp.Header.Get("ETag")
 	pc.mu.Lock()
@@ -366,22 +371,17 @@ func (pc *PricingCache) recordSuccess() {
 }
 
 // pricingShift says why next shouldn't replace prev as the rate table, or ""
-// when it may. Most of the models gone, or one moved more than tenfold, is far
-// likelier to be a bad upstream push than a real repricing, and a price zeroed
-// or inflated that way would skew the cost cap.
+// when it may: most of the models gone is far likelier to be a bad upstream
+// push than a real change. A single model's odd price is handled per model
+// (holdRepriced), so one preview model can't hold back every other update.
 func pricingShift(prev, next map[string]pricingRate) string {
 	if len(prev) == 0 {
 		return ""
 	}
 	dropped := 0
-	for name, old := range prev {
-		cur, ok := next[name]
-		if !ok {
+	for name := range prev {
+		if _, ok := next[name]; !ok {
 			dropped++
-			continue
-		}
-		if repriced(old.InputPerToken, cur.InputPerToken) || repriced(old.OutputPerToken, cur.OutputPerToken) {
-			return fmt.Sprintf("%s changed price more than tenfold", name)
 		}
 	}
 	if dropped*5 > len(prev) {
@@ -390,16 +390,31 @@ func pricingShift(prev, next map[string]pricingRate) string {
 	return ""
 }
 
-// repriced is whether a rate moved more than tenfold. Going to or from zero
-// counts as moving.
+// holdRepriced keeps prev's rate in next for every model whose priced rate was
+// zeroed or moved more than tenfold, a likelier upstream slip than a real
+// repricing, and one that would skew the cost cap. A model gaining its first
+// price is normal and taken. It returns the held models' names, sorted.
+// ponytail: a real tenfold repricing is held forever; let it through after a
+// few identical fetches if that ever happens.
+func holdRepriced(prev, next map[string]pricingRate) []string {
+	var held []string
+	for name, old := range prev {
+		cur, ok := next[name]
+		if ok && (repriced(old.InputPerToken, cur.InputPerToken) || repriced(old.OutputPerToken, cur.OutputPerToken)) {
+			next[name] = old
+			held = append(held, name)
+		}
+	}
+	sort.Strings(held)
+	return held
+}
+
+// repriced is whether a priced rate was zeroed or moved more than tenfold.
 func repriced(a, b float64) bool {
-	if a == b {
+	if a <= 0 || a == b {
 		return false
 	}
-	if a <= 0 || b <= 0 {
-		return true
-	}
-	return a/b > 10 || b/a > 10
+	return b <= 0 || a/b > 10 || b/a > 10
 }
 
 // rawPricingEntry is only the slice of each LiteLLM entry yoakeland actually

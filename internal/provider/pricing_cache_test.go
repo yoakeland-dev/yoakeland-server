@@ -138,36 +138,51 @@ func TestPricingCacheKeepsLastGoodOnMalformedFetch(t *testing.T) {
 	}
 }
 
-// A table that drops most models, or reprices one tenfold, is refused and the
-// last good rates kept; the same body served again and again is taken as real.
+// A table that drops most models is refused and the last good rates kept; the
+// same body served again and again is taken as real. One model zeroed or moved
+// tenfold keeps its old rate while the rest of the table is taken, and a model
+// getting its first price is taken too.
 func TestPricingCacheRefusesImplausibleTable(t *testing.T) {
 	pc := &PricingCache{}
-	pc.rates = map[string]pricingRate{}
+	pc.rates = map[string]pricingRate{"free": {}}
 	for i := 0; i < 10; i++ {
 		pc.rates[fmt.Sprintf("m%d", i)] = pricingRate{InputPerToken: 1e-6, OutputPerToken: 2e-6}
 	}
 
-	zeroed := `{"m0": {"input_cost_per_token": 0, "output_cost_per_token": 0}}`
+	next := map[string]pricingRate{"free": {InputPerToken: 5e-6, OutputPerToken: 5e-6}}
+	for i := 0; i < 10; i++ {
+		next[fmt.Sprintf("m%d", i)] = pricingRate{InputPerToken: 2e-6, OutputPerToken: 3e-6}
+	}
+	next["m0"] = pricingRate{}
+	next["m1"] = pricingRate{InputPerToken: 1e-3, OutputPerToken: 2e-6}
+	if why := pricingShift(pc.rates, next); why != "" {
+		t.Fatalf("pricingShift refused a table with every model present: %s", why)
+	}
+	if held := holdRepriced(pc.rates, next); fmt.Sprint(held) != "[m0 m1]" {
+		t.Fatalf("held = %v, want [m0 m1]", held)
+	}
+	if next["m0"] != pc.rates["m0"] || next["m1"] != pc.rates["m1"] || next["m2"].InputPerToken != 2e-6 || next["free"].InputPerToken != 5e-6 {
+		t.Fatalf("next = %+v", next)
+	}
+
 	dropped := `{"m0": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}}`
-	for _, body := range []string{zeroed, dropped} {
-		next, err := parsePricing([]byte(body))
-		if err != nil {
-			t.Fatalf("parsePricing: %v", err)
-		}
-		if why := pricingShift(pc.rates, next); why == "" {
-			t.Fatalf("pricingShift accepted %s", body)
-		}
+	parsed, err := parsePricing([]byte(dropped))
+	if err != nil {
+		t.Fatalf("parsePricing: %v", err)
+	}
+	if why := pricingShift(pc.rates, parsed); why == "" {
+		t.Fatal("pricingShift accepted a table missing most models")
 	}
 
 	// Sustained: the same implausible body eventually counts as real.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(zeroed))
+		_, _ = w.Write([]byte(dropped))
 	}))
 	defer srv.Close()
 	pc.httpClient, pc.url = srv.Client(), srv.URL
 	for i := 0; i < pricingRefusalsToAccept; i++ {
 		if err := pc.Refresh(); err == nil {
-			t.Fatalf("refresh %d accepted a zeroed table", i+1)
+			t.Fatalf("refresh %d accepted a gutted table", i+1)
 		}
 	}
 	if err := pc.Refresh(); err != nil {

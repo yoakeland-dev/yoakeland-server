@@ -304,7 +304,9 @@ func TestAgent_AskUserQuestionsStackAndResume(t *testing.T) {
 	t.Cleanup(ag.WaitBackground)
 
 	go func() {
-		waitForSubstring(t, out, "second?", 2*time.Second)
+		// The second question's own event, not "second?": that is in the tool call's args too,
+		// which are sent before either question is pending.
+		waitForSubstring(t, out, `"index":2,"total":2`, 2*time.Second)
 		if n := len(ag.PendingAsks()); n != 2 {
 			t.Errorf("pending asks = %d, want 2", n)
 		}
