@@ -424,25 +424,25 @@ func (r *PeerRegistry) BroadcastEvent(exceptPeerID string, eventType protocol.Ev
 	}
 }
 
-// HasLocal reports whether any client is connected over the local socket (one that could approve
-// a pairing).
+// HasLocal reports whether any client is connected that could approve a pairing: one on the local
+// socket or a full-access remote device (a server used only remotely has no other).
 func (r *PeerRegistry) HasLocal() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, p := range r.peers {
-		if p.Network == "unix" {
+		if p.Network == "unix" || !p.Restricted {
 			return true
 		}
 	}
 	return false
 }
 
-// BroadcastLocal sends an event to the local-socket peers only.
+// BroadcastLocal sends an event to the peers that could approve a pairing (see HasLocal).
 func (r *PeerRegistry) BroadcastLocal(eventType protocol.EventType, data any) {
 	r.mu.Lock()
 	var peers []*Peer
 	for _, p := range r.peers {
-		if p.Network == "unix" {
+		if p.Network == "unix" || !p.Restricted {
 			peers = append(peers, p)
 		}
 	}

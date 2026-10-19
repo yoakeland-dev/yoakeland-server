@@ -49,6 +49,9 @@ const (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "pair" {
+		os.Exit(runPair(os.Args[2:]))
+	}
 	var projectDir string
 	var stateDir string
 	var providerName string
@@ -653,6 +656,8 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
 			return
 		}
+		// An approval may have granted full access since the credential was looked up.
+		who.Restricted = deps.settings.TokenRestricted(who.TokenName)
 	}
 
 	if network == "tcp" && who.TokenName != "" && deps.peers.AtCredentialLimit(who.TokenName) {
@@ -682,7 +687,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
 	onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
 
-	_ = ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID(), Version: version})
+	sendServerIdentity(deps, peer)
 	_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
 	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
 	_ = ipc.SendEvent(protocol.EventNotifyPrefs, "", "", "", deps.settings.GetNotifyPrefs())
@@ -1059,6 +1064,14 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 	return pc, sessID, nil
 }
 
+// sendServerIdentity tells p who this server is and which tier p is on.
+func sendServerIdentity(deps connDeps, p *Peer) {
+	_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{
+		Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID(), Version: version,
+		Restricted: deps.peers.IsRestricted(p.ID) && p.Network == "tcp",
+	})
+}
+
 func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
 	if remoteDenied(deps, network, peerID, env.Type) {
 		_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -1066,7 +1079,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		})
 		return
 	}
-	if network == "tcp" {
+	// A full-access device is the owner: it may open any folder. A limited one stays confined.
+	if network == "tcp" && deps.peers.IsRestricted(peerID) {
 		if err := scopeRemoteProject(deps, env); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
@@ -2057,7 +2071,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListDirectory:
 		var data protocol.ListDirectoryData
 		_ = json.Unmarshal(env.Data, &data)
-		if network == "tcp" && !deps.projects.Within(data.Path) {
+		if network == "tcp" && deps.peers.IsRestricted(peerID) && !deps.projects.Within(data.Path) {
 			_ = ipc.SendEvent(protocol.EventDirectoryList, env.SessionID, env.TurnID, "", protocol.DirectoryListData{
 				Path:    data.Path,
 				Entries: []protocol.DirEntry{},
@@ -2123,8 +2137,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				}
 			}
 			// External scans read other tools' session files on this host (their folders and titles): the
-			// owner's view, so a remote connection never gets them.
-			external := data.External && network != "tcp"
+			// owner's view, so a limited remote device never gets them.
+			external := data.External && (network != "tcp" || !deps.peers.IsRestricted(peerID))
 			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), external)
 			out := cachedUsageReport(key, func() protocol.UsageReportData {
 				return buildUsageReport(deps.projects.stateDir, kinds, since, external, price)
@@ -2615,6 +2629,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: "that credential no longer exists"})
 		default:
 			deps.peers.SetScope(target.TokenName, !data.Full)
+			for _, p := range deps.peers.All() {
+				if p.TokenName == target.TokenName {
+					sendServerIdentity(deps, p) // tell the device its new tier
+				}
+			}
 			deps.record(ipc, peerID, audit.Event{Kind: audit.PeerScope, Target: target.TokenName, Outcome: "ok", Detail: map[string]any{"full": data.Full}})
 		}
 		return
@@ -2634,7 +2653,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		for _, p := range deps.peers.All() {
-			_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{Identity: data.Name, ServerID: deps.settings.GetServerID(), Version: version})
+			sendServerIdentity(deps, p)
 		}
 
 	case protocol.EventSetAutoGenerateTitle:
@@ -2719,12 +2738,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = ipc.SendEvent(protocol.EventRemotePasswordSet, env.SessionID, env.TurnID, "", protocol.RemotePasswordSetData{})
 
 	case protocol.EventRestartServer:
-		if network != "unix" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "restart_server is local-socket-only",
-			})
-			return
-		}
+		// Local socket or full-access credential: remoteDenied already refused a limited device.
 		var data protocol.RestartServerData
 		_ = json.Unmarshal(env.Data, &data) // no payload is fine: not forced
 		if active, _ := deps.projects.Stats(); active > 0 && !data.Force {
@@ -2741,12 +2755,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}()
 
 	case protocol.EventApprovePairing:
-		if network != "unix" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "approve_pairing is local-socket-only",
-			})
-			return
-		}
+		// Local socket or full-access credential: remoteDenied already refused a limited device.
 		var data protocol.ApprovePairingData
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.Credential == "" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -2760,12 +2769,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		deps.pairings.answer(data.Credential, data.Allow)
 
 	case protocol.EventRegisterToken:
-		if network != "unix" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "register_token is local-socket-only",
-			})
-			return
-		}
+		// Local socket or full-access credential: remoteDenied already refused a limited device.
 		var data protocol.RegisterTokenData
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -2790,7 +2794,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenAdd, Target: data.Name, Outcome: "ok"}) // the name, never the token
+		if data.Pairing && data.Full {
+			deps.settings.SetTokenScope(data.Name, true)
+		}
+		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenAdd, Target: data.Name, Outcome: "ok", Detail: map[string]any{"full": data.Pairing && data.Full}}) // the name, never the token
 		// Best-effort: a client can still pair by pasting the CA separately
 		// (or doesn't need one at all, on an operator-supplied cert) if this
 		// fails, so a CA read error shouldn't fail token registration itself.
@@ -2805,26 +2812,16 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		})
 
 	case protocol.EventListTokens:
-		if network != "unix" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "list_tokens is local-socket-only",
-			})
-			return
-		}
+		// Local socket or full-access credential: remoteDenied already refused a limited device.
 		summaries := deps.settings.ListTokenNames()
 		out := make([]protocol.TokenSummary, len(summaries))
 		for i, s := range summaries {
-			out[i] = protocol.TokenSummary{Name: s.Name, Email: s.Email, HasAvatar: s.HasAvatar}
+			out[i] = protocol.TokenSummary{Name: s.Name, Email: s.Email, HasAvatar: s.HasAvatar, Restricted: s.Restricted}
 		}
 		_ = ipc.SendEvent(protocol.EventTokenList, env.SessionID, env.TurnID, "", protocol.TokenListData{Tokens: out})
 
 	case protocol.EventRemoveToken:
-		if network != "unix" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "remove_token is local-socket-only",
-			})
-			return
-		}
+		// Local socket or full-access credential: remoteDenied already refused a limited device.
 		var data protocol.RemoveTokenData
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{

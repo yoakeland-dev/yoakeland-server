@@ -321,7 +321,7 @@ func (s *ServerSettings) ListTokenNames() []TokenSummaryInternal {
 	s.purgeExpiredLocked()
 	out := make([]TokenSummaryInternal, 0, len(s.Tokens))
 	for n, r := range s.Tokens {
-		out = append(out, TokenSummaryInternal{Name: n, Email: r.Email, HasAvatar: r.Avatar != ""})
+		out = append(out, TokenSummaryInternal{Name: n, Email: r.Email, HasAvatar: r.Avatar != "", Restricted: r.Restricted()})
 	}
 	return out
 }
@@ -330,9 +330,10 @@ func (s *ServerSettings) ListTokenNames() []TokenSummaryInternal {
 // package-local type so settings.go doesn't need to import internal/protocol
 // just for this shape; main.go converts it at the dispatch boundary.
 type TokenSummaryInternal struct {
-	Name      string
-	Email     string
-	HasAvatar bool
+	Name       string
+	Email      string
+	HasAvatar  bool
+	Restricted bool
 }
 
 // RemoveToken deletes a named credential, idempotently (removing a name
@@ -376,6 +377,14 @@ func (s *ServerSettings) SetTokenAvatar(name, avatar string) bool {
 	s.Tokens[name] = rec
 	_ = s.save()
 	return true
+}
+
+// TokenRestricted reports whether credential name is held to remoteAllowed now.
+func (s *ServerSettings) TokenRestricted(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.Tokens[name]
+	return !ok || rec.Restricted()
 }
 
 // SetTokenScope makes a credential full (unrestricted) or limited. False if no such credential.

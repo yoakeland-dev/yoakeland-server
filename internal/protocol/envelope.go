@@ -1153,6 +1153,9 @@ type RegisterTokenData struct {
 	// device that uses it, and (with a local client connected to say yes)
 	// waits for approval before that first use.
 	Pairing bool `json:"pairing,omitempty"`
+	// Full, with Pairing, makes the code grant full access instead of the paired-device scope:
+	// for pairing another computer rather than a phone.
+	Full bool `json:"full,omitempty"`
 }
 
 // PairingRequestData is pushed to local-socket peers when a device presents a
@@ -1217,6 +1220,8 @@ type TokenSummary struct {
 	Name      string `json:"name"`
 	Email     string `json:"email,omitempty"`
 	HasAvatar bool   `json:"hasAvatar"`
+	// Restricted: devices on this credential are held to the paired-device scope.
+	Restricted bool `json:"restricted,omitempty"`
 }
 
 type TokenListData struct {
@@ -1257,6 +1262,11 @@ type ServerIdentityData struct {
 	// latest release to flag an out-of-date server; a non-numeric value is
 	// never flagged.
 	Version string `json:"version,omitempty"`
+
+	// Restricted is true when this connection is held to the paired-device scope (SPEC.md
+	// "Paired-device scope"), so a client can say which tier it is on and why a screen is
+	// unavailable. Pushed again when the tier changes. Omitted for full access.
+	Restricted bool `json:"restricted,omitempty"`
 }
 
 // SetAutoGenerateTitleData sets the server-wide default applied to a first

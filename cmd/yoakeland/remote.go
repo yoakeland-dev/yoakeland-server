@@ -98,7 +98,13 @@ func (r *remoteControl) Start(ctx context.Context) error {
 		if err != nil {
 			return "", err
 		}
-		return tok, r.settings.AddPairingToken("terminal-"+id[:6], tok, "")
+		// Whoever can read the server's console owns it, so its code grants full access.
+		name := "terminal-" + id[:6]
+		if err := r.settings.AddPairingToken(name, tok, ""); err != nil {
+			return "", err
+		}
+		r.settings.SetTokenScope(name, true)
+		return tok, nil
 	}, r.RTCFingerprint(), r.caPEMLocked(), r.deps.pins)
 	return nil
 }

@@ -368,6 +368,13 @@ func main() {
 					fmt.Printf("[TOOL OUT] %s:\n%s\n", sanitize(d.ToolName), sanitize(d.Output))
 				}
 
+			case protocol.EventServerIdentity:
+				var d protocol.ServerIdentityData
+				_ = json.Unmarshal(env.Data, &d)
+				if d.Restricted {
+					fmt.Printf("\n[LIMITED ACCESS] this is a paired device: providers, settings and folder browsing are off. Ask the server's owner for full access.\n> ")
+				}
+
 			case protocol.EventTurnCompleted:
 				fmt.Printf("\n--- [Turn completed (Session: %s)] ---\n> ", sanitize(env.SessionID))
 
