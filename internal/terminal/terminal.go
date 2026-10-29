@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
@@ -53,6 +54,12 @@ const (
 	// maxTerminals caps live terminals across all chats; each is a shell
 	// plus a sandbox process.
 	maxTerminals = 64
+
+	// An agent forgets the tabs it opened, so a finished one is closed after
+	// agentExitedTTL (long enough to read why it died) and a chat may hold
+	// at most maxAgentTerminals live ones.
+	agentExitedTTL    = 15 * time.Minute
+	maxAgentTerminals = 8
 )
 
 var (
@@ -526,6 +533,9 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 
 	go func() {
 		t.pump()
+		if agent {
+			time.AfterFunc(agentExitedTTL, func() { m.reapExited(t) })
+		}
 		m.changed()
 	}()
 	m.changed()
@@ -581,6 +591,17 @@ func (m *Manager) Resize(sessionID, id string, cols, rows int) error {
 		return nil
 	}
 	return session.Resize(c, r)
+}
+
+// reapExited closes an agent's tab whose shell is still the exited one it was
+// scheduled for (a restart since then keeps it).
+func (m *Manager) reapExited(t *Terminal) {
+	t.mu.Lock()
+	gone := t.status == protocol.TerminalStatusExited
+	t.mu.Unlock()
+	if gone {
+		_ = m.Close(t.sessionID, t.id) // already closed by hand: not found, nothing to do
+	}
 }
 
 // Close ends id permanently — the shell process (if still running) and the

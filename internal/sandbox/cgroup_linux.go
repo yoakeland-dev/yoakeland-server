@@ -141,6 +141,14 @@ func (l *cgroupLeaf) release() {
 	}
 }
 
+// kill SIGKILLs every process in the leaf (cgroup.kill, Linux 5.14+; older kernels just lack the file).
+func (l *cgroupLeaf) kill() {
+	if l == nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(l.dir, "cgroup.kill"), []byte("1"), 0o644)
+}
+
 // remove deletes the leaf once its command has exited. It fails harmlessly
 // while processes are still in it.
 func (l *cgroupLeaf) remove() {

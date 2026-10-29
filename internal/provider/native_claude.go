@@ -286,7 +286,14 @@ func (t *claudeTurn) handle(ln claudeLine) {
 			t.lastAssistant.Store(ln.UUID)
 		}
 		if u := ln.Message.Usage; topLevel && u.InputTokens+u.CacheCreationInputTokens+u.CacheReadInputTokens > 0 {
-			t.contextTokens.Store(int64(claudeContextTokens(u.InputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens)))
+			// A mid-turn reading: only report it when it moved, and let the
+			// window stay whatever the turn's result later says.
+			after := int64(claudeContextTokens(u.InputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens))
+			if t.contextTokens.Swap(after) != after {
+				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkContext, Context: &agent.ContextSnapshot{
+					ContextTokens: int(after), Source: "provider",
+				}})
+			}
 		}
 		// Text already streamed as deltas; only the tool calls are new.
 		// A subagent's (Task) own calls carry the Task's id as parent.
@@ -324,7 +331,7 @@ func (t *claudeTurn) handle(ln claudeLine) {
 			if d := claudeResultDiffs(ln.ToolUseResult); d != nil {
 				diffs = d
 			}
-			r := &agent.NativeToolResult{ToolCallID: b.ToolUseID, Name: name, Diffs: diffs}
+			r := &agent.NativeToolResult{ToolCallID: b.ToolUseID, Name: name, Diffs: diffs, Images: claudeResultImages(b.Content)}
 			if !topLevel {
 				r.ParentToolCallID = *ln.ParentToolUseID
 			}
@@ -916,6 +923,28 @@ func claudeResultText(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// claudeResultImages is the pictures in a tool_result's content blocks (base64 sources only).
+func claudeResultImages(raw json.RawMessage) []protocol.ImageData {
+	var blocks []struct {
+		Type   string `json:"type"`
+		Source struct {
+			Type      string `json:"type"`
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
+		} `json:"source"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	var out []protocol.ImageData
+	for _, b := range blocks {
+		if b.Type == "image" && b.Source.Type == "base64" && b.Source.Data != "" {
+			out = append(out, protocol.ImageData{MimeType: b.Source.MediaType, Data: b.Source.Data})
+		}
+	}
+	return out
 }
 
 // parseClaudeRateLimits reads a rate_limit_event's rate_limit_info.

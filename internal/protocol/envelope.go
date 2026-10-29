@@ -27,8 +27,13 @@ const (
 	EventRetryMessage          EventType = "retry_message"
 	EventSwitchBranch          EventType = "switch_branch"
 	EventCompactContext        EventType = "compact_context"
+	EventSideQuestion          EventType = "side_question"
+	EventSideAnswer            EventType = "side_answer"
+	EventSummarizeMessage      EventType = "summarize_message"
+	EventMessageSummary        EventType = "message_summary"
 	EventPermissionResponse    EventType = "permission_response"
 	EventCancelTurn            EventType = "cancel_turn"
+	EventCancelSubagent        EventType = "cancel_subagent"
 	EventSteerTurn             EventType = "steer_turn"
 	EventSteerAccepted         EventType = "steer_accepted"
 	EventSteerRejected         EventType = "steer_rejected"
@@ -143,6 +148,8 @@ const (
 	EventPermissionRequest        EventType = "permission_request"
 	EventToolResult               EventType = "tool_result"
 	EventTurnStarted              EventType = "turn_started"
+	EventTurnContext              EventType = "turn_context"
+	EventSubagentStatus           EventType = "subagent_status"
 	EventTurnCompleted            EventType = "turn_completed"
 	EventSnapshotCapturing        EventType = "snapshot_capturing"
 	EventSnapshotCreated          EventType = "snapshot_created"
@@ -954,6 +961,73 @@ type HistoryMessage struct {
 
 	// Compaction is set on a "compaction" message only (SPEC.md §4g).
 	Compaction *CompactionInfo `json:"compaction,omitempty"`
+
+	// Summary is the short summary summarize_message made of this message;
+	// Thread is the side thread opened on it (side_question with an anchor).
+	// Neither is ever sent to the model as part of the conversation.
+	Summary string          `json:"summary,omitempty"`
+	Ask     string          `json:"ask,omitempty"`
+	Actions []QuickAction   `json:"actions,omitempty"`
+	Thread  []ThreadMessage `json:"thread,omitempty"`
+}
+
+// ThreadMessage is one turn of a side thread: Role is "user" or "assistant".
+type ThreadMessage struct {
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"createdAt,omitempty"`
+}
+
+// SideQuestionData asks a question about a session without adding to it and
+// without waiting for the session's turn (the composer's /btw). It sees the
+// conversation so far, has no tools and changes nothing. With AnchorMessageID
+// it is a reply in that message's thread: the thread's earlier turns are
+// included and both sides of the exchange are kept on the message; without
+// one nothing is kept. Answered with side_answer events carrying RequestID.
+type SideQuestionData struct {
+	SessionID       string `json:"sessionId"`
+	RequestID       string `json:"requestId"`
+	Question        string `json:"question"`
+	AnchorMessageID string `json:"anchorMessageId,omitempty"`
+	ProjectPath     string `json:"projectPath,omitempty"`
+}
+
+// SideAnswerData streams the answer: Delta chunks, then one event with Done
+// set (and Error, if it failed). A thread answer's Done carries the whole
+// Text, which is what was kept.
+type SideAnswerData struct {
+	RequestID       string `json:"requestId"`
+	AnchorMessageID string `json:"anchorMessageId,omitempty"`
+	Delta           string `json:"delta,omitempty"`
+	Done            bool   `json:"done,omitempty"`
+	Text            string `json:"text,omitempty"`
+	Error           string `json:"error,omitempty"`
+}
+
+// SummarizeMessageData asks for a short summary of one assistant message,
+// made by the utility model role. Answered with message_summary.
+type SummarizeMessageData struct {
+	SessionID   string `json:"sessionId"`
+	MessageID   string `json:"messageId"`
+	RequestID   string `json:"requestId,omitempty"`
+	ProjectPath string `json:"projectPath,omitempty"`
+}
+
+// MessageSummaryData is the answer; Error is set instead of Summary on failure.
+type MessageSummaryData struct {
+	MessageID string        `json:"messageId"`
+	RequestID string        `json:"requestId,omitempty"`
+	Summary   string        `json:"summary,omitempty"`
+	Ask       string        `json:"ask,omitempty"`
+	Actions   []QuickAction `json:"actions,omitempty"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// QuickAction is a follow-up the user can send with one click: a short Label for the
+// button and the full Prompt it sends.
+type QuickAction struct {
+	Label  string `json:"label"`
+	Prompt string `json:"prompt"`
 }
 
 // CompactionInfo describes a "compaction" history message: what kind it was
@@ -1922,6 +1996,20 @@ type SwitchBranchData struct {
 	MessageID string `json:"messageId"`
 }
 
+// CancelSubagentData stops one yoakeland subagent (§4e) without ending its parent's turn.
+type CancelSubagentData struct {
+	// ToolCallID is the id of the `subagent` call that started it.
+	ToolCallID string `json:"toolCallId"`
+}
+
+// SubagentStatusData is the first event a subagent sends (tagged parentToolCallId): which model
+// runs it and when it started, so a client can label it and time it.
+type SubagentStatusData struct {
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
+	StartedAt string `json:"startedAt"`
+}
+
 type CancelTurnData struct {
 	SessionID string `json:"sessionId,omitempty"`
 	TurnID    string `json:"turnId,omitempty"`
@@ -2149,7 +2237,7 @@ type ContextData struct {
 	EstimatedTokens int `json:"estimatedTokens"`
 	// MaxTokens is the meter's denominator: the model's context window when
 	// known, else BudgetTokens.
-	MaxTokens int `json:"maxTokens"`
+	MaxTokens int `json:"maxTokens,omitempty"`
 	// WindowTokens is the model's real context window; omitted when unknown.
 	WindowTokens int `json:"windowTokens,omitempty"`
 	// BudgetTokens is the size at which the session compacts itself: the
@@ -2172,6 +2260,15 @@ type SpendData struct {
 	// total had no rate, so the true total is higher than shown.
 	SessionCostUnknown bool `json:"sessionCostUnknown,omitempty"`
 	ProjectCostUnknown bool `json:"projectCostUnknown,omitempty"`
+}
+
+// TurnContextData is a mid-turn reading of how full the model's context is
+// (agent.ContextSnapshot), sent as the provider reports it while a turn
+// runs — Claude's message_delta counts, an ACP agent's usage_update. Purely
+// informational and best effort: turn_completed.context (same shape) remains
+// the authoritative final value.
+type TurnContextData struct {
+	ContextData
 }
 
 type TurnCompletedData struct {

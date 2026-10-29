@@ -34,6 +34,7 @@ type NativeToolResult struct {
 	Output           string
 	Error            string
 	Diffs            []*diff.FileDiff
+	Images           []protocol.ImageData // pictures the tool returned (a screenshot)
 }
 
 // NativeAsk is a NativeAgent asking permission for one of its tool calls.

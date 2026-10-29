@@ -121,6 +121,18 @@ func (m *Manager) Start(ctx context.Context, sessionID, name, cwdRel, command st
 	if name == "" {
 		name = "terminal"
 	}
+	live := 0
+	for _, s := range m.List(sessionID) {
+		if !s.Agent {
+			continue
+		}
+		if s.Status != protocol.TerminalStatusExited {
+			live++
+		}
+	}
+	if live >= maxAgentTerminals {
+		return "", fmt.Errorf("this chat already has %d terminals of yours open; stop one with terminal_stop first", live)
+	}
 	var id string
 	for n := 1; ; n++ {
 		id = fmt.Sprintf("agent-%d", n)

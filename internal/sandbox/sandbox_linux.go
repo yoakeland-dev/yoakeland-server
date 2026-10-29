@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -354,7 +355,7 @@ func (s *LinuxSandbox) SpawnPTY(ctx context.Context, argv []string, extraEnv []s
 		return nil, fmt.Errorf("pty spawn error: %w", err)
 	}
 
-	return &linuxPTYSession{cmd: cmd, ptmx: ptmx, cgroupCleanup: leaf.remove}, nil
+	return &linuxPTYSession{cmd: cmd, ptmx: ptmx, cgroupCleanup: leaf.remove, cgroupKill: leaf.kill}, nil
 }
 
 // linuxPTYSession implements PTYSession over creack/pty's master file —
@@ -363,6 +364,8 @@ type linuxPTYSession struct {
 	cmd           *exec.Cmd
 	ptmx          *os.File
 	cgroupCleanup func() // removes this session's cgroup once it's empty; nil-safe no-op if limits weren't applied
+	cgroupKill    func() // kills everything left in the cgroup; nil-safe no-op if limits weren't applied
+	waited        atomic.Bool
 }
 
 func (p *linuxPTYSession) Read(b []byte) (int, error)  { return p.ptmx.Read(b) }
@@ -379,13 +382,60 @@ func (p *linuxPTYSession) Close() error {
 	// window); Kill is a backstop for a process that ignores it.
 	err := p.ptmx.Close()
 	if p.cmd.Process != nil {
+		// Not once the shell has been reaped: its pid could be anyone's by then. Job control gives
+		// each background job its own group, so the tree is walked rather than signalled as a group.
+		if !p.waited.Load() {
+			for _, pid := range descendants(p.cmd.Process.Pid) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
 		_ = p.cmd.Process.Kill()
+	}
+	// Whatever escaped the group (setsid, daemonized): the cgroup holds every descendant.
+	if p.cgroupKill != nil {
+		p.cgroupKill()
 	}
 	return err
 }
 
+// descendants lists every process below root, found through /proc's parent links. Whatever has
+// already been orphaned to init is out of reach here (the cgroup kill covers it where there is one).
+func descendants(root int) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	kids := map[int][]int{}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// "pid (comm) S ppid ...", and comm may hold spaces and parens.
+		s := string(b)
+		f := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])
+		if len(f) < 2 {
+			continue
+		}
+		if ppid, err := strconv.Atoi(f[1]); err == nil {
+			kids[ppid] = append(kids[ppid], pid)
+		}
+	}
+	var out []int
+	for queue := kids[root]; len(queue) > 0; queue = queue[1:] {
+		out = append(out, queue[0])
+		queue = append(queue, kids[queue[0]]...)
+	}
+	return out
+}
+
 func (p *linuxPTYSession) Wait() (int, error) {
 	err := p.cmd.Wait()
+	p.waited.Store(true)
 	if p.cgroupCleanup != nil {
 		p.cgroupCleanup()
 	}

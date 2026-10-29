@@ -181,3 +181,43 @@ func TestAgent_TurnCompletedUsesNativeContextSnapshot(t *testing.T) {
 		t.Fatalf("got %+v", c)
 	}
 }
+
+// A provider's mid-turn context reading rides out to clients as turn_context,
+// without touching the turn's own usage accounting.
+func TestAgent_TurnContextEventDuringTurn(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(tempDir)
+	sessStore, _ := agent.NewDiskSessionStore(tempDir)
+	provider := &ScriptedProvider{turns: [][]agent.ModelStreamChunk{{
+		{Kind: agent.StreamChunkContext, Context: &agent.ContextSnapshot{ContextTokens: 42_000, WindowTokens: 200_000, Source: "provider"}},
+		{Kind: agent.StreamChunkDelta, Delta: "done"},
+	}}}
+
+	outBuf := &bytes.Buffer{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), outBuf)
+	ag := agent.NewAgent(ipc, provider, "test-provider", []tool.Tool{}, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(100, 20), nil)
+	t.Cleanup(ag.WaitBackground)
+
+	if err := ag.RunTurn(context.Background(), "session-live", "turn-1", "Hello"); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	var found *protocol.TurnContextData
+	for _, line := range strings.Split(strings.TrimSpace(outBuf.String()), "\n") {
+		var env protocol.Envelope
+		if err := json.Unmarshal([]byte(line), &env); err != nil || env.Type != protocol.EventTurnContext {
+			continue
+		}
+		var d protocol.TurnContextData
+		if err := json.Unmarshal(env.Data, &d); err != nil {
+			t.Fatalf("malformed turn_context data: %v", err)
+		}
+		found = &d
+	}
+	if found == nil {
+		t.Fatalf("no turn_context event found in output: %s", outBuf.String())
+	}
+	if found.EstimatedTokens != 42_000 || found.WindowTokens != 200_000 || found.Source != "provider" {
+		t.Fatalf("turn_context = %+v", *found)
+	}
+}

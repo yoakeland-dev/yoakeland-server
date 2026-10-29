@@ -12,6 +12,7 @@ import (
 	"yoakeland/internal/agent"
 	"yoakeland/internal/diff"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/tool"
 )
 
 // Codex, driven through `codex app-server` (SPEC.md §6b) — its documented
@@ -55,6 +56,9 @@ type codexItem struct {
 	Query        string          `json:"query"`
 	ContentItems json.RawMessage `json:"contentItems"`
 	Success      *bool           `json:"success"`
+	Prompt       string          `json:"prompt"`
+	// ReceiverThreadIDs: a spawnAgent call's new subagent threads.
+	ReceiverThreadIDs []string `json:"receiverThreadIds"`
 }
 
 type codexChange struct {
@@ -88,6 +92,8 @@ func codexToolCall(it codexItem) (agent.ToolCall, bool) {
 		tc.Kind, tc.Title, tc.Args = "other", it.Tool, it.Arguments
 	case "webSearch":
 		tc.Kind, tc.Title = "fetch", strings.TrimSpace("Search "+it.Query)
+	case "collabAgentToolCall": // a subagent: spawnAgent, sendInput, wait, ...
+		tc.Kind, tc.Title = "other", strings.TrimSpace(it.Tool+" "+truncate(strings.TrimSpace(it.Prompt), 80))
 	default:
 		return tc, false
 	}
@@ -119,7 +125,7 @@ func codexResult(it codexItem) *agent.NativeToolResult {
 		r.Diffs = codexDiffs(it)
 		r.Output = it.Status
 	case "mcpToolCall":
-		r.Output = string(it.Result)
+		r.Output, r.Images = codexMCPResult(it.Result)
 		if it.Error != nil {
 			r.Error = it.Error.Message
 		}
@@ -143,7 +149,8 @@ type codexSession struct {
 
 	mu     sync.Mutex
 	turn   *codexTurn
-	thread string // the thread the next turn continues
+	thread string            // the thread the next turn continues
+	child  map[string]string // subagent thread -> the spawn call that made it
 }
 
 func (s *codexSession) dead() bool {
@@ -198,7 +205,7 @@ func (p *CLISubprocessProvider) startCodex() (*codexSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &codexSession{proc: proc}
+	s := &codexSession{proc: proc, child: map[string]string{}}
 	s.conn = newRPCConn(proc, s.onNotify, s.onRequest)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -221,11 +228,42 @@ type codexTurn struct {
 
 	mu        sync.Mutex
 	changes   map[string][]*diff.FileDiff // fileChange item id -> its diffs, for its approval prompt
+	early     map[string][]codexNote      // subagent thread -> its events before its spawn named it
 	usage     protocol.UsageData
 	lastError string
 }
 
+type codexNote struct {
+	method string
+	params json.RawMessage
+}
+
 func (t *codexTurn) notify(method string, params json.RawMessage) {
+	var head struct {
+		ThreadID string `json:"threadId"`
+	}
+	_ = json.Unmarshal(params, &head)
+	// Subagents run as threads of their own. Anything from another thread is
+	// one of theirs: its tool calls nest under the spawn that made it, and its
+	// messages and turn ending aren't the reply's.
+	parent, mainThread := "", true
+	if head.ThreadID != "" {
+		t.s.mu.Lock()
+		parent = t.s.child[head.ThreadID]
+		mainThread = head.ThreadID == t.s.thread
+		t.s.mu.Unlock()
+	}
+	if !mainThread {
+		if parent == "" { // its spawn hasn't reported the thread yet
+			t.hold(head.ThreadID, method, params)
+			return
+		}
+		switch method {
+		case "item/started", "item/completed", "thread/tokenUsage/updated":
+		default:
+			return
+		}
+	}
 	emit := t.emit
 	switch method {
 	case "item/agentMessage/delta":
@@ -245,6 +283,7 @@ func (t *codexTurn) notify(method string, params json.RawMessage) {
 		if !isTool {
 			return
 		}
+		tc.ParentToolCallID = parent
 		if n.Item.Type == "fileChange" {
 			t.mu.Lock()
 			t.changes[n.Item.ID] = codexDiffs(n.Item)
@@ -253,7 +292,12 @@ func (t *codexTurn) notify(method string, params json.RawMessage) {
 		if method == "item/started" {
 			emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
 		} else {
-			emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: codexResult(n.Item)})
+			r := codexResult(n.Item)
+			r.ParentToolCallID = parent
+			emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: r})
+		}
+		if n.Item.Type == "collabAgentToolCall" {
+			t.adopt(n.Item)
 		}
 	case "thread/tokenUsage/updated":
 		// `last` is one model request's usage; a turn makes several.
@@ -274,14 +318,27 @@ func (t *codexTurn) notify(method string, params json.RawMessage) {
 			t.usage.CachedInputTokens += n.TokenUsage.Last.CachedInputTokens
 			// The sums are spend; the last request alone is the context (its
 			// reasoning tokens are counted in outputTokens, though not always
-			// resent, so this can run a little high).
-			if last := n.TokenUsage.Last; last.InputTokens > 0 {
-				t.usage.ContextTokens = last.InputTokens + last.OutputTokens
+			// resent, so this can run a little high). A subagent's request isn't ours.
+			var win int
+			moved := false
+			if last := n.TokenUsage.Last; last.InputTokens > 0 && parent == "" {
+				if c := last.InputTokens + last.OutputTokens; c != t.usage.ContextTokens {
+					t.usage.ContextTokens, moved = c, true
+				}
 			}
-			if w := n.TokenUsage.ModelContextWindow; w > 0 {
+			if w := n.TokenUsage.ModelContextWindow; w > 0 && parent == "" {
 				t.usage.WindowTokens = w
 			}
+			win = t.usage.WindowTokens
 			t.mu.Unlock()
+			// A mid-turn reading (§3.2 turn_context), only when it moved:
+			// codex repeats tokenUsage/updated often and repeats would spam.
+			if parent == "" && moved {
+				emit(agent.ModelStreamChunk{Kind: agent.StreamChunkContext, Context: &agent.ContextSnapshot{
+					ContextTokens: n.TokenUsage.Last.InputTokens + n.TokenUsage.Last.OutputTokens,
+					WindowTokens:  win, Source: "provider",
+				}})
+			}
 		}
 	case "error":
 		var n struct {
@@ -312,6 +369,41 @@ func (t *codexTurn) notify(method string, params json.RawMessage) {
 	}
 }
 
+// hold keeps a subagent's event until its spawn call names the thread.
+func (t *codexTurn) hold(thread, method string, params json.RawMessage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.early == nil {
+		t.early = map[string][]codexNote{}
+	}
+	t.early[thread] = append(t.early[thread], codexNote{method, params})
+}
+
+// adopt records the subagent threads a spawn call made, then replays what
+// they did before the spawn said so.
+func (t *codexTurn) adopt(it codexItem) {
+	if it.Tool != "spawnAgent" {
+		return
+	}
+	t.s.mu.Lock()
+	for _, id := range it.ReceiverThreadIDs {
+		if _, ok := t.s.child[id]; !ok {
+			t.s.child[id] = it.ID
+		}
+	}
+	t.s.mu.Unlock()
+	var held []codexNote
+	t.mu.Lock()
+	for _, id := range it.ReceiverThreadIDs {
+		held = append(held, t.early[id]...)
+		delete(t.early, id)
+	}
+	t.mu.Unlock()
+	for _, n := range held {
+		t.notify(n.method, n.params)
+	}
+}
+
 func (t *codexTurn) request(id json.RawMessage, method string, params json.RawMessage) {
 	conn, nt, ctx := t.s.conn, t.nt, t.ctx
 	var r struct {
@@ -327,6 +419,12 @@ func (t *codexTurn) request(id json.RawMessage, method string, params json.RawMe
 		} `json:"questions"`
 		CallID    string `json:"callId"` // legacy execCommandApproval/applyPatchApproval
 		GrantRoot string `json:"grantRoot"`
+		// mcpServer/elicitation/request
+		ServerName      string `json:"serverName"`
+		Message         string `json:"message"`
+		RequestedSchema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"requestedSchema"`
 	}
 	_ = json.Unmarshal(params, &r)
 	ask := func(toolName, desc string, d *diff.FileDiff, edit bool) (agent.NativeAnswer, error) {
@@ -402,7 +500,15 @@ func (t *codexTurn) request(id json.RawMessage, method string, params json.RawMe
 		// them isn't something a per-tool-call prompt can express.
 		conn.respond(id, map[string]any{"permissions": map[string]any{}, "scope": "turn"})
 	case "mcpServer/elicitation/request":
-		conn.respond(id, map[string]any{"action": "decline", "content": nil, "_meta": nil})
+		// Codex asks before an MCP tool runs this way: a message and no fields to fill in. That is
+		// a permission prompt; anything that wants input from the user is declined.
+		if len(r.RequestedSchema.Properties) > 0 || r.Message == "" {
+			conn.respond(id, map[string]any{"action": "decline", "content": nil, "_meta": nil})
+			return
+		}
+		r.ItemID = "mcp-" + strings.Trim(string(id), `"`)
+		action := map[string]string{"accept": "accept", "acceptForSession": "accept", "decline": "decline", "cancel": "cancel"}[decision(ask("mcp", r.ServerName+": "+r.Message, nil, false))]
+		conn.respond(id, map[string]any{"action": action, "content": nil, "_meta": nil})
 	default:
 		conn.respondError(id, -32601, "yoakeland doesn't handle "+method)
 	}
@@ -462,6 +568,9 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 	threadParams := map[string]any{"cwd": p.Dir, "sandbox": sandbox, "approvalPolicy": approval, "approvalsReviewer": codexReviewer(nt.Mode)}
 	if p.Model != "" {
 		threadParams["model"] = p.Model
+	}
+	if cfg := codexMCPConfig(nt.MCP); cfg != nil {
+		threadParams["config"] = map[string]any{"mcp_servers": cfg}
 	}
 	prompt := nt.Prompt
 	s.mu.Lock()
@@ -619,4 +728,57 @@ func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.Nati
 		return fmt.Errorf("codex: %s", msg)
 	}
 	return nil
+}
+
+// codexMCPConfig is the mcp_servers table of a thread's config overrides: each server this
+// turn was given, in Codex's own config shape (a url with headers, or a command).
+func codexMCPConfig(servers []tool.AgentServer) map[string]any {
+	if len(servers) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for _, s := range servers {
+		switch {
+		case s.URL != "":
+			e := map[string]any{"url": s.URL}
+			if len(s.Headers) > 0 {
+				e["http_headers"] = s.Headers
+			}
+			out[s.Name] = e
+		case s.Command != "":
+			e := map[string]any{"command": s.Command, "args": s.Args}
+			if len(s.Env) > 0 {
+				e["env"] = s.Env
+			}
+			out[s.Name] = e
+		}
+	}
+	return out
+}
+
+// codexMCPResult is an MCP tool's result as text plus any pictures in it, rather than the raw
+// {"content":[...]} JSON. Anything it can't read stays as it came.
+func codexMCPResult(raw json.RawMessage) (string, []protocol.ImageData) {
+	var r struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Data     string `json:"data"`
+			MimeType string `json:"mimeType"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(raw, &r) != nil || r.Content == nil {
+		return string(raw), nil
+	}
+	var texts []string
+	var images []protocol.ImageData
+	for _, c := range r.Content {
+		switch {
+		case c.Type == "image" && c.Data != "":
+			images = append(images, protocol.ImageData{MimeType: c.MimeType, Data: c.Data})
+		case c.Text != "":
+			texts = append(texts, c.Text)
+		}
+	}
+	return strings.Join(texts, "\n"), images
 }

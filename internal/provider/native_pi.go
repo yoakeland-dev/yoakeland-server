@@ -257,6 +257,7 @@ type piTurn struct {
 	err          string            // the latest error the agent reported
 	refused      string            // why the prompt itself was refused
 	tools        map[string]string // toolCallId -> tool name
+	subSeen      map[string]bool   // subagent calls and results already emitted, as "call:"/"result:" + id
 }
 
 func (t *piTurn) finish(refused string) {
@@ -367,6 +368,10 @@ func (t *piTurn) handle(ln piLine) {
 		t.mu.Unlock()
 		tc := claudeToolCall(ln.ToolCallID, ln.ToolName, ln.Args)
 		t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+	case "tool_execution_update":
+		if t.toolNameOf(ln) == piSubagentTool {
+			t.subagentRuns(ln.ToolCallID, ln.PartialResult)
+		}
 	case "tool_execution_end":
 		t.mu.Lock()
 		name := t.tools[ln.ToolCallID]
@@ -374,6 +379,9 @@ func (t *piTurn) handle(ln piLine) {
 		t.mu.Unlock()
 		if name == "" {
 			name = ln.ToolName
+		}
+		if name == piSubagentTool {
+			t.subagentRuns(ln.ToolCallID, ln.Result)
 		}
 		r := &agent.NativeToolResult{ToolCallID: ln.ToolCallID, Name: name}
 		if text := piResultText(ln.Result); ln.IsError {
@@ -399,6 +407,95 @@ func (t *piTurn) handle(ln piLine) {
 		t.err = ln.failure(t.s.flavor)
 		t.mu.Unlock()
 	}
+}
+
+// piSubagentTool is the tool a subagent runs under. It comes from a Pi extension, not Pi itself,
+// so it is only there when one provides it (T3 Code reads the same name).
+const piSubagentTool = "subagent"
+
+// toolNameOf is the name a call started with; later events don't always repeat it.
+func (t *piTurn) toolNameOf(ln piLine) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if name := t.tools[ln.ToolCallID]; name != "" {
+		return name
+	}
+	return ln.ToolName
+}
+
+// subagentRuns emits the tool calls and results a subagent made inside its parent call. The
+// subagent tool's partial and final results carry its transcript so far, so each update repeats
+// the last; a call or result seen before is skipped. Like Claude's subagents, only the tool
+// calls and results are tagged with the parent; the subagent's text stays out of the stream.
+func (t *piTurn) subagentRuns(parent string, raw json.RawMessage) {
+	var d struct {
+		Details struct {
+			Results []struct {
+				Messages []struct {
+					Role       string `json:"role"`
+					ToolCallID string `json:"toolCallId"`
+					ToolName   string `json:"toolName"`
+					IsError    bool   `json:"isError"`
+					Content    []struct {
+						Type      string          `json:"type"`
+						Text      string          `json:"text"`
+						ID        string          `json:"id"`
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"content"`
+				} `json:"messages"`
+			} `json:"results"`
+		} `json:"details"`
+	}
+	if json.Unmarshal(raw, &d) != nil {
+		return
+	}
+	for _, r := range d.Details.Results {
+		for _, m := range r.Messages {
+			switch m.Role {
+			case "assistant":
+				for _, b := range m.Content {
+					if b.Type != "toolCall" || !t.firstTime("call:"+b.ID) {
+						continue
+					}
+					tc := claudeToolCall(b.ID, b.Name, b.Arguments)
+					tc.ParentToolCallID = parent
+					t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+				}
+			case "toolResult":
+				if !t.firstTime("result:" + m.ToolCallID) {
+					continue
+				}
+				var texts []string
+				for _, b := range m.Content {
+					if b.Type == "text" {
+						texts = append(texts, b.Text)
+					}
+				}
+				res := &agent.NativeToolResult{ToolCallID: m.ToolCallID, Name: m.ToolName, ParentToolCallID: parent}
+				if text := strings.Join(texts, "\n"); m.IsError {
+					res.Error = text
+				} else {
+					res.Output = text
+				}
+				t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: res})
+			}
+		}
+	}
+}
+
+// firstTime reports whether key is new to the turn, and records it as seen.
+func (t *piTurn) firstTime(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.subSeen == nil {
+		t.subSeen = map[string]bool{}
+	}
+	if t.subSeen[key] {
+		return false
+	}
+	t.subSeen[key] = true
+	return true
 }
 
 // piResultText flattens a tool result: a string, or {content:[{type:text,text}]}, else its JSON.

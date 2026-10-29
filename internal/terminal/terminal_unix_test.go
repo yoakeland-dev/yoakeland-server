@@ -51,6 +51,49 @@ func TestManager_CloseSessionKillsTheShellProcess(t *testing.T) {
 	t.Fatalf("shell process (pid %d) still alive after CloseSession", pid)
 }
 
+// TestManager_CloseKillsBackgroundJobs: a job the shell started (its own process group, so the
+// shell's death alone doesn't reach it) must not outlive the tab.
+func TestManager_CloseKillsBackgroundJobs(t *testing.T) {
+	tempDir := t.TempDir()
+	norm, _ := normalizer.New(tempDir)
+	mgr := terminal.NewManager(sandbox.NewSandbox(tempDir, 60*time.Second), norm)
+	if _, err := mgr.Open(context.Background(), protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{}), "s", "t", "", 0, 0, nil); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := mgr.Write("s", "t", []byte("sleep 4242 &\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Found by command line: under bwrap the shell's own pid for the job is a namespace-local one.
+	running := func() bool {
+		paths, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+		for _, p := range paths {
+			if b, _ := os.ReadFile(p); string(b) == "sleep\x004242\x00" {
+				if st, _ := os.ReadFile(filepath.Dir(p) + "/stat"); !strings.Contains(string(st), ") Z ") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	waitFor := func(want bool) bool {
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if running() == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !waitFor(true) {
+		t.Fatal("the background job never started")
+	}
+
+	mgr.CloseSession("s")
+
+	if !waitFor(false) {
+		t.Fatal("background job still alive after CloseSession")
+	}
+}
+
 // TestManager_OpenStartsInRequestedCwd: terminal_open's cwd (the explorer's "Open terminal
 // here") is where the shell starts, not just what the snapshot reports.
 func TestManager_OpenStartsInRequestedCwd(t *testing.T) {

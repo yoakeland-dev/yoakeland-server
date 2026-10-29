@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,9 @@ type acpToolCall struct {
 	Locations []struct {
 		Path string `json:"path"`
 	} `json:"locations"`
+	// emittedArgs is the rawInput string the turn has already relayed,
+	// unexported so a re-encode of the call never carries it.
+	emittedArgs string
 }
 
 // merge applies a tool_call_update's present fields onto what's known.
@@ -119,6 +123,18 @@ func (t *acpToolCall) diffs() []*diff.FileDiff {
 		}
 	}
 	return out
+}
+
+// outputText is everything the call printed, as text: its content's text and
+// its raw output, for finding ids a CLI reports there.
+func (t *acpToolCall) outputText() string {
+	var parts []string
+	for _, c := range t.Content {
+		if c.Type == "content" && c.Content.Type == "text" {
+			parts = append(parts, c.Content.Text)
+		}
+	}
+	return strings.Join(parts, "\n") + "\n" + string(t.RawOutput)
 }
 
 func (t *acpToolCall) result() *agent.NativeToolResult {
@@ -355,32 +371,139 @@ func (a *acpLive) current() (*acpTurn, bool) {
 	return a.turn, a.loading
 }
 
+// rootSession is the session the turn is prompting; any other session's
+// updates belong to a subagent.
+func (a *acpLive) rootSession() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sess.SessionID
+}
+
+// acpSubagentHooks says, per CLI, how its ACP stream exposes subagents. A
+// subagent's own updates come on its own sessionId, so they can only be
+// filed under the call that spawned it once that call names the session.
+// The hook reports whether a tool call spawns a subagent, and the session id
+// once its output has it ("" until then). CLIs not listed here show nothing
+// of their subagents over ACP.
+var acpSubagentHooks = map[CLIKind]func(acpToolCall) (string, bool){
+	CLIKindGrok:     grokSubagent,
+	CLIKindOpenCode: opencodeSubagent,
+}
+
+// grokSubagentID is the session a Grok spawn call reports in its output:
+// "Agent ID: <uuid>" on a foreground spawn, "subagent_id: <uuid>" on an async
+// (background) ack, or "=== Task <uuid> ===" in a task listing.
+var grokSubagentID = regexp.MustCompile(`(?i)(?:Agent ID:\s*|subagent_id:\s*|===\s*Task\s+)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b`)
+
+// grokSubagent: Grok titles its spawn call "Task" (or spawn_subagent) and
+// carries subagent_type in its input.
+func grokSubagent(c acpToolCall) (string, bool) {
+	var in map[string]any
+	_ = json.Unmarshal(c.RawInput, &in)
+	str := func(k string) string { s, _ := in[k].(string); return strings.TrimSpace(s) }
+	title := strings.ToLower(strings.TrimSpace(c.Title))
+	variant := strings.ToLower(str("variant"))
+	spawn := title == "task" || title == "spawn_subagent" || strings.Contains(title, "spawn subagent") ||
+		variant == "cursortask" || variant == "task" || variant == "spawn_subagent" ||
+		str("subagent_type") != "" || str("subagentType") != ""
+	if !spawn {
+		return "", false
+	}
+	if m := grokSubagentID.FindStringSubmatch(c.outputText()); m != nil {
+		return m[1], true
+	}
+	return "", true
+}
+
+// opencodeSubagent: opencode titles its spawn call "task" and carries
+// subagent_type in its input. While the task runs, its tool_call_update's
+// raw output carries {"metadata": {"sessionId", "parentSessionId"}} — the
+// id of the child session, whose own updates (text and tool updates) stream
+// on that sessionId (anomalyco/opencode#32406), ready to be filed under
+// this call.
+func opencodeSubagent(c acpToolCall) (string, bool) {
+	var in map[string]any
+	_ = json.Unmarshal(c.RawInput, &in)
+	str := func(k string) string { s, _ := in[k].(string); return strings.TrimSpace(s) }
+	title := strings.ToLower(strings.TrimSpace(c.Title))
+	spawn := title == "task" || title == "spawn_subagent" ||
+		str("subagent_type") != "" || str("subagentType") != ""
+	if !spawn {
+		return "", false
+	}
+	var out struct {
+		Metadata struct {
+			SessionID string `json:"sessionId"`
+		} `json:"metadata"`
+	}
+	_ = json.Unmarshal(c.RawOutput, &out)
+	return out.Metadata.SessionID, true
+}
+
 // acpTurn is what one turn has seen of the session's output so far.
 type acpTurn struct {
 	a    *acpLive
 	ctx  context.Context
 	nt   *agent.NativeTurn
 	emit func(agent.ModelStreamChunk)
+	// sub is the CLI's subagent hook (acpSubagentHooks), nil if it has none.
+	sub func(acpToolCall) (string, bool)
 
 	seen atomic.Bool // the agent has said something this turn
 
 	mu    sync.Mutex
 	calls map[string]*acpToolCall
 	done  map[string]bool
-	cost  float64 // latest cumulative usage_update cost in USD, -1 = none seen
+	// kids maps a subagent's session id to the spawn call it runs in; pending
+	// holds its tool updates that came before that call named it.
+	kids    map[string]string
+	pending map[string][]json.RawMessage
+	cost    float64 // latest cumulative usage_update cost in USD, -1 = none seen
 	// used and size are the latest usage_update's context tokens in use and
 	// the context window; 0 = none seen.
 	used, size int
+	// Some agents send the last usage_update just after the prompt response
+	// (upstream #17505); the channel, re-armed before each wait, signals that
+	// one arrived while the turn was waiting for it.
+	usageChanged chan struct{}
 }
 
 func (t *acpTurn) seenAnything() bool { return t.seen.Load() }
+
+// signalUsage marks that a usage_update landed, without blocking the
+// notification path: the turn's waits drain and re-arm it.
+func (t *acpTurn) signalUsage() {
+	select {
+	case t.usageChanged <- struct{}{}:
+	default:
+	}
+}
+
+// awaitUsage waits for usage_updates for up to d, with each arriving update
+// buying the next one a fresh window; it returns when one goes d without a
+// follow-up. Gives an update racing the prompt response (some agents send it
+// just after the response lands, upstream #17505) time to be counted before
+// the turn's usage is read.
+func (t *acpTurn) awaitUsage(d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		select {
+		case <-t.usageChanged:
+			timer.Reset(d)
+		case <-timer.C:
+			return
+		}
+	}
+}
 
 func (a *acpLive) onNotify(method string, params json.RawMessage) {
 	if method != "session/update" {
 		return
 	}
 	var n struct {
-		Update struct {
+		SessionID string `json:"sessionId"`
+		Update    struct {
 			SessionUpdate string `json:"sessionUpdate"`
 			// An object for message chunks, an array for tool calls.
 			Content json.RawMessage `json:"content"`
@@ -408,10 +531,27 @@ func (a *acpLive) onNotify(method string, params json.RawMessage) {
 	if t == nil {
 		return
 	}
+	if t.sub != nil && n.SessionID != "" && n.SessionID != a.rootSession() {
+		// A subagent's own session: like Claude's Task, only its tool calls are
+		// shown (under the spawn call); its text and usage are not.
+		t.childUpdate(n.SessionID, u.SessionUpdate, params)
+		return
+	}
 	if u.SessionUpdate == "usage_update" && (u.Used > 0 || u.Size > 0) {
 		t.mu.Lock()
+		changed := u.Used != t.used || u.Size != t.size
 		t.used, t.size = u.Used, u.Size
 		t.mu.Unlock()
+		t.signalUsage()
+		// A mid-turn update: tell the clients now, and don't re-broadcast
+		// the same fullness when nothing changed. ("mid-turn" is an
+		// upper bound — opencode sends its only update just before the
+		// response; sending the chunk then is still correct.)
+		if changed {
+			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkContext, Context: &agent.ContextSnapshot{
+				ContextTokens: u.Used, WindowTokens: u.Size, Source: "provider",
+			}})
+		}
 	}
 	t.update(u.SessionUpdate, u.Content, u.Cost, params)
 }
@@ -441,32 +581,79 @@ func (t *acpTurn) update(kind string, content json.RawMessage, cost *struct {
 			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkReasoning, Delta: text.Text})
 		}
 	case "tool_call", "tool_call_update":
-		var c struct {
-			Update acpToolCall `json:"update"`
-		}
-		if json.Unmarshal(params, &c) != nil || c.Update.ToolCallID == "" {
-			return
-		}
-		t.mu.Lock()
-		known, seen := t.calls[c.Update.ToolCallID]
-		if !seen {
-			known = &acpToolCall{ToolCallID: c.Update.ToolCallID}
-			t.calls[c.Update.ToolCallID] = known
-		}
-		known.merge(c.Update)
-		snapshot := *known
-		finished := (snapshot.Status == "completed" || snapshot.Status == "failed") && !t.done[snapshot.ToolCallID]
-		if finished {
-			t.done[snapshot.ToolCallID] = true
-		}
+		t.toolUpdate(params, "")
+	}
+}
+
+// childUpdate files a subagent's tool update under its spawn call. One that
+// comes before the spawn names the session is held until it does.
+func (t *acpTurn) childUpdate(session, kind string, params json.RawMessage) {
+	if kind != "tool_call" && kind != "tool_call_update" {
+		return
+	}
+	t.mu.Lock()
+	parent, known := t.kids[session]
+	if !known {
+		t.pending[session] = append(t.pending[session], params)
 		t.mu.Unlock()
-		if !seen {
-			tc := snapshot.toolCall()
-			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+		return
+	}
+	t.mu.Unlock()
+	t.toolUpdate(params, parent)
+}
+
+// toolUpdate relays a tool call's update. parent is the spawn call of the
+// subagent the call ran in, "" for the turn's own calls.
+func (t *acpTurn) toolUpdate(params json.RawMessage, parent string) {
+	var c struct {
+		Update acpToolCall `json:"update"`
+	}
+	if json.Unmarshal(params, &c) != nil || c.Update.ToolCallID == "" {
+		return
+	}
+	t.mu.Lock()
+	known, seen := t.calls[c.Update.ToolCallID]
+	if !seen {
+		known = &acpToolCall{ToolCallID: c.Update.ToolCallID}
+		t.calls[c.Update.ToolCallID] = known
+	}
+	// Some agents (opencode) file the call first while pending, with a
+	// placeholder rawInput of {}; the real args only surface in a later
+	// tool_call_update. Re-emit the call whenever its args change so the
+	// client's dedupe replaces the placeholder (§3.2's same-id rule).
+	known.merge(c.Update)
+	argsChanged := !seen || string(known.RawInput) != known.emittedArgs
+	known.emittedArgs = string(known.RawInput)
+	snapshot := *known
+	finished := (snapshot.Status == "completed" || snapshot.Status == "failed") && !t.done[snapshot.ToolCallID]
+	if finished {
+		t.done[snapshot.ToolCallID] = true
+	}
+	var adopted []json.RawMessage
+	if t.sub != nil {
+		if child, spawn := t.sub(snapshot); spawn {
+			// The name the client files a subagent call under.
+			snapshot.Name = "Task"
+			if _, mapped := t.kids[child]; child != "" && !mapped {
+				t.kids[child] = snapshot.ToolCallID
+				adopted = t.pending[child]
+				delete(t.pending, child)
+			}
 		}
-		if finished {
-			t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: snapshot.result()})
-		}
+	}
+	t.mu.Unlock()
+	if !seen || argsChanged {
+		tc := snapshot.toolCall()
+		tc.ParentToolCallID = parent
+		t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &tc})
+	}
+	if finished {
+		r := snapshot.result()
+		r.ParentToolCallID = parent
+		t.emit(agent.ModelStreamChunk{Kind: agent.StreamChunkToolResult, ToolResult: r})
+	}
+	for _, p := range adopted {
+		t.toolUpdate(p, snapshot.ToolCallID)
 	}
 }
 
@@ -576,7 +763,8 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 		return acpErr(spec.Binary, err)
 	}
 
-	t := &acpTurn{a: a, ctx: ctx, nt: nt, emit: emit, calls: map[string]*acpToolCall{}, done: map[string]bool{}, cost: -1}
+	t := &acpTurn{a: a, ctx: ctx, nt: nt, emit: emit, sub: acpSubagentHooks[p.Kind], calls: map[string]*acpToolCall{}, done: map[string]bool{},
+		kids: map[string]string{}, pending: map[string][]json.RawMessage{}, cost: -1, usageChanged: make(chan struct{}, 1)}
 	a.setTurn(t)
 	defer a.setTurn(nil)
 
@@ -738,6 +926,11 @@ wait:
 		} `json:"usage"` // unstable ACP; reported by some agents only
 	}
 	_ = json.Unmarshal(res.raw, &resp)
+
+	// An agent may send its final usage_update just after the response mine
+	// reads here: wait a beat for a racing one so the turn's context numbers
+	// aren't a round behind. Prompt-response times are otherwise unaffected.
+	t.awaitUsage(150 * time.Millisecond)
 
 	usage := &protocol.UsageData{}
 	if u := resp.Usage; u != nil {

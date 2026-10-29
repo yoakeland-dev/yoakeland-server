@@ -53,6 +53,14 @@ func (a *Agent) SetSkills(src SkillSource) {
 }
 
 // SetSkills lets every session, current and future, use src's skills.
+// SetNativeServers adds MCP servers of yoakeland's own to what a CLI agent is handed each turn (the
+// browser tool, which such an agent can't be given as a plain tool). Call before sessions open.
+func (r *Registry) SetNativeServers(f func(sessionID string) []tool.AgentServer) {
+	r.mu.Lock()
+	r.nativeServers = f
+	r.mu.Unlock()
+}
+
 func (r *Registry) SetSkills(src SkillSource) {
 	r.mu.Lock()
 	r.skillSrc = src

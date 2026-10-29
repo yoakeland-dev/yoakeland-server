@@ -1214,6 +1214,20 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			ag.CancelTurn(tID)
 		}
 
+	case protocol.EventCancelSubagent:
+		var data protocol.CancelSubagentData
+		_ = json.Unmarshal(env.Data, &data)
+		sessID := env.SessionID
+		if sessID == "" {
+			sessID = "default"
+		}
+		pc, err := deps.projects.Resolve(sessID, "", deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		pc.Registry.Get(ipc, sessID).CancelSubagent(data.ToolCallID)
+
 	case protocol.EventSteerTurn:
 		var data protocol.SteerTurnData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
@@ -1853,6 +1867,64 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if err := ag.Compact(ctx, data.SessionID, env.TurnID, strings.TrimSpace(data.Instructions)); err != nil {
 				_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: "compact: " + err.Error()})
 			}
+		}()
+
+	case protocol.EventSideQuestion:
+		var data protocol.SideQuestionData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" || data.RequestID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed side_question payload (sessionId and requestId are required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		ag := pc.Registry.Get(ipc, data.SessionID)
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func() {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			defer recoverTurnPanic(ipc, data.SessionID, env.TurnID)
+			ag.SideQuestion(ctx, data.SessionID, data.RequestID, data.AnchorMessageID, data.Question, func(d protocol.SideAnswerData) {
+				_ = ipc.SendEvent(protocol.EventSideAnswer, data.SessionID, env.TurnID, "", d)
+			})
+		}()
+
+	case protocol.EventSummarizeMessage:
+		var data protocol.SummarizeMessageData
+		if err := json.Unmarshal(env.Data, &data); err != nil || data.SessionID == "" || data.MessageID == "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: "malformed summarize_message payload (sessionId and messageId are required)",
+			})
+			return
+		}
+		pc, err := deps.projects.Resolve(data.SessionID, data.ProjectPath, deps.defaultProjectRoot)
+		if err != nil {
+			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
+			return
+		}
+		ag := pc.Registry.Get(ipc, data.SessionID)
+		if deps.turnWG != nil {
+			deps.turnWG.Add(1)
+		}
+		go func() {
+			if deps.turnWG != nil {
+				defer deps.turnWG.Done()
+			}
+			defer recoverTurnPanic(ipc, data.SessionID, env.TurnID)
+			out := protocol.MessageSummaryData{MessageID: data.MessageID, RequestID: data.RequestID}
+			if s, ask, actions, err := ag.SummarizeMessage(ctx, data.MessageID); err != nil {
+				out.Error = err.Error()
+			} else {
+				out.Summary, out.Ask, out.Actions = s, ask, actions
+			}
+			_ = ipc.SendEvent(protocol.EventMessageSummary, data.SessionID, env.TurnID, "", out)
 		}()
 
 	case protocol.EventEditMessage:

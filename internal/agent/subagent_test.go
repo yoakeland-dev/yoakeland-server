@@ -249,3 +249,68 @@ func TestSubagents_SiblingCallsRunMeanwhile(t *testing.T) {
 		}
 	}
 }
+
+// stuckSubagentProvider: the parent starts one subagent that never finishes on its own, then
+// wraps up once that call has come back.
+type stuckSubagentProvider struct{}
+
+func (stuckSubagentProvider) StreamTurn(ctx context.Context, history []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
+	out := make(chan agent.ModelStreamChunk, 4)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errs)
+		switch {
+		case strings.HasPrefix(history[0].Content, "task"):
+			<-ctx.Done()
+		case len(history) == 1:
+			args, _ := json.Marshal(map[string]string{"description": "stuck", "prompt": "task x"})
+			out <- agent.ModelStreamChunk{Kind: agent.StreamChunkToolCall, ToolCall: &agent.ToolCall{ID: "sub-x", Name: agent.SubagentToolName, Args: args}}
+		default:
+			out <- agent.ModelStreamChunk{Kind: agent.StreamChunkDelta, Delta: "carried on"}
+		}
+	}()
+	return out, errs
+}
+
+func TestSubagents_CancelStopsOnlyThatSubagent(t *testing.T) {
+	dir := t.TempDir()
+	norm, _ := normalizer.New(dir)
+	snapStore, _ := snapshot.NewDiskSnapshotStore(t.TempDir())
+	sessStore, _ := agent.NewDiskSessionStore(t.TempDir())
+	sink := &lineSink{}
+	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), sink)
+	ag := agent.NewAgent(ipc, stuckSubagentProvider{}, "p", nil, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(100000, 4000), nil)
+	ag.SetMode(agent.ModeAutonomous)
+	t.Cleanup(ag.WaitBackground)
+
+	go func() {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			for _, env := range sink.envelopes() {
+				if env.Type == protocol.EventSubagentStatus && env.ParentToolCallID == "sub-x" {
+					ag.CancelSubagent("sub-x")
+					return
+				}
+			}
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- ag.RunTurn(context.Background(), "s", "t1", "go") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunTurn: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("turn never finished after cancelling the subagent")
+	}
+	history, _ := sessStore.Load("s")
+	var stopped, final bool
+	for _, m := range history.History {
+		stopped = stopped || (m.Role == "tool" && m.ToolCallID == "sub-x" && strings.Contains(m.Content, "stopped by the user"))
+		final = final || (m.Role == "assistant" && m.Content == "carried on")
+	}
+	if !stopped || !final {
+		t.Fatalf("stopped=%v final=%v history=%+v", stopped, final, history.History)
+	}
+}

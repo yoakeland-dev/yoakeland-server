@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
@@ -144,7 +145,16 @@ func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, _ []agent.Messag
 	cChan := make(chan agent.ModelStreamChunk, 16)
 	eChan := make(chan error, 1)
 	go func() {
-		defer close(cChan)
+		// A reader goroutine (ACP's usage_update, say) can still emit after the turn returned, so
+		// closing cChan and emitting share a lock and emits after the close are dropped.
+		var mu sync.Mutex
+		closed := false
+		defer func() {
+			mu.Lock()
+			closed = true
+			close(cChan)
+			mu.Unlock()
+		}()
 		defer close(eChan)
 		nt := agent.NativeTurnFromContext(ctx)
 		spec, ok := cliSpecs[p.Kind]
@@ -157,6 +167,11 @@ func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, _ []agent.Messag
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		emit := func(c agent.ModelStreamChunk) {
+			mu.Lock()
+			defer mu.Unlock()
+			if closed {
+				return
+			}
 			select {
 			case cChan <- c:
 			case <-ctx.Done():

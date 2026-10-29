@@ -122,6 +122,9 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 	}
 	child := a.newSubagent(tc.ID, bound, explore)
 	child.tally = tally
+	parentCtx := ctx
+	ctx, child.stopSubagent = context.WithCancel(parentCtx)
+	defer child.stopSubagent()
 	start := time.Now()
 	child.mu.Lock()
 	promptID := child.nextMessageIDLocked()
@@ -137,6 +140,10 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 		a.mu.Unlock()
 		a.hooks.asksChanged() // its unanswered asks, if any, are gone with it
 	}()
+
+	_ = child.stream.SendEvent(protocol.EventSubagentStatus, child.sessionID, turnID+"."+tc.ID, "", protocol.SubagentStatusData{
+		Provider: bound.ProviderName, Model: bound.Model, StartedAt: start.UTC().Format(time.RFC3339),
+	})
 
 	// Its own turn id, so its file edits get their own snapshot and its
 	// turn's end doesn't close the parent's.
@@ -156,8 +163,10 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 		}
 	}
 	switch {
-	case ctx.Err() != nil:
+	case parentCtx.Err() != nil:
 		r.errText = "subagent was cancelled"
+	case ctx.Err() != nil:
+		r.errText = "subagent was stopped by the user"
 	case err != nil:
 		r.errText = fmt.Sprintf("subagent failed: %v", err)
 	case r.output == "":

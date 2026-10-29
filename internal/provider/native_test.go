@@ -228,7 +228,7 @@ func TestCodexNativeTurn(t *testing.T) {
 		t.Fatalf("turn: %v", err)
 	}
 	wait()
-	if k := kinds(chunks); k != "delta,tool_call,tool_result,usage" {
+	if k := kinds(chunks); k != "delta,tool_call,tool_result,context,usage" {
 		t.Fatalf("chunks = %s", k)
 	}
 	if r := chunks[2].ToolResult; len(r.Diffs) != 1 || len(r.Diffs[0].Hunks) != 1 || len(r.Diffs[0].Hunks[0].Lines) != 2 {
@@ -237,7 +237,7 @@ func TestCodexNativeTurn(t *testing.T) {
 	if len(rec.asks) != 1 || rec.asks[0].ToolCallID != "fc1" || rec.asks[0].Diff == nil {
 		t.Fatalf("asks = %+v", rec.asks)
 	}
-	if nt.SessionID != "th1" || chunks[3].Usage.InputTokens != 10 || limits == nil || limits.FiveHour == nil {
+	if nt.SessionID != "th1" || chunks[4].Usage.InputTokens != 10 || limits == nil || limits.FiveHour == nil {
 		t.Fatalf("session %q usage %+v limits %+v", nt.SessionID, chunks[3].Usage, limits)
 	}
 	var decision, turnStart map[string]any
@@ -308,13 +308,13 @@ func TestACPNativeTurn(t *testing.T) {
 	if args[0] != "kimi" || args[1] != "acp" {
 		t.Fatalf("args = %v", args)
 	}
-	if k := kinds(chunks); k != "delta,tool_call,tool_result,usage" || chunks[0].Delta != "editing" {
+	if k := kinds(chunks); k != "delta,tool_call,tool_result,context,usage" || chunks[0].Delta != "editing" {
 		t.Fatalf("chunks = %s (%q)", k, chunks[0].Delta)
 	}
 	if r := chunks[2].ToolResult; len(r.Diffs) != 1 || r.Diffs[0].FilePath != "a.txt" {
 		t.Fatalf("result = %+v", r)
 	}
-	if u := chunks[3].Usage; !u.CostKnown || u.CostUSD != 0.25 || nt.SessionCostUSD != 1.25 {
+	if u := chunks[4].Usage; !u.CostKnown || u.CostUSD != 0.25 || nt.SessionCostUSD != 1.25 {
 		t.Fatalf("usage %+v, session cost %v (baseline comes from the load replay)", u, nt.SessionCostUSD)
 	}
 	var picked, setModel map[string]any

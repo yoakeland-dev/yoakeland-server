@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"yoakeland/internal/agent"
 )
@@ -37,6 +38,16 @@ func TestClaudeReportsLastRequestAsContext(t *testing.T) {
 	u := chunks[len(chunks)-1].Usage
 	if u.InputTokens != 2531 || u.ContextTokens != 6+1500+9 || u.WindowTokens != 200000 {
 		t.Fatalf("usage = %+v", u)
+	}
+	// Each request's count also rides out mid-turn as turn_context.
+	var contextChunks []agent.ModelStreamChunk
+	for _, c := range chunks {
+		if c.Kind == agent.StreamChunkContext {
+			contextChunks = append(contextChunks, c)
+		}
+	}
+	if len(contextChunks) != 2 || contextChunks[0].Context.ContextTokens != 5+1000+20+7 || contextChunks[1].Context.ContextTokens != 6+1500+9 {
+		t.Fatalf("mid-turn context chunks = %+v", contextChunks)
 	}
 }
 
@@ -91,6 +102,81 @@ func TestACPReportsUsageUpdateAsContext(t *testing.T) {
 	u := chunks[len(chunks)-1].Usage
 	if u.ContextTokens != 12345 || u.WindowTokens != 200000 {
 		t.Fatalf("usage = %+v", u)
+	}
+	var seen []agent.ContextSnapshot
+	for _, c := range chunks {
+		if c.Kind == agent.StreamChunkContext && c.Context != nil {
+			seen = append(seen, *c.Context)
+		}
+	}
+	if len(seen) != 1 || seen[0].ContextTokens != 12345 || seen[0].WindowTokens != 200000 {
+		t.Fatalf("mid-turn context = %+v", seen)
+	}
+}
+
+// opencode files a tool call while pending with a placeholder rawInput of {},
+// and the real args surface only in a later tool_call_update (upstream
+// pendingToolCall): the client must get the call re-emit so its dedupe
+// replaces the placeholder args.
+func TestACPToolCallPlaceholderArgsReemit(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	base := acpScript(new(bool))
+	p := &CLISubprocessProvider{Kind: CLIKindKimi, Model: "m1", Dir: t.TempDir(), Start: f.starter(func(n int, m map[string]any, out io.Writer) {
+		if m["method"] == "session/prompt" {
+			line(out, map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "s",
+				"update": map[string]any{"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Read", "kind": "read", "status": "pending", "rawInput": map[string]any{}}}})
+			line(out, map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "s",
+				"update": map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": "c1", "title": "Read", "kind": "read", "status": "in_progress",
+					"rawInput": map[string]any{"filePath": "a.txt"}}}})
+			line(out, map[string]any{"jsonrpc": "2.0", "id": m["id"], "result": map[string]any{"stopReason": "end_turn"}})
+		}
+		base(n, m, out)
+	})}
+	chunks, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "", "go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []agent.ToolCall
+	for _, c := range chunks {
+		if c.Kind == agent.StreamChunkToolCall {
+			calls = append(calls, *c.ToolCall)
+		}
+	}
+	if len(calls) != 2 || string(calls[0].Args) != "{}" || string(calls[1].Args) != `{"filePath":"a.txt"}` {
+		t.Fatalf("tool calls = %d, args %s then %s", len(calls), calls[0].Args, calls[1].Args)
+	}
+}
+
+// Some agents send their final usage_update just after the session/prompt
+// response (upstream #17505): the turn waits a beat so the context numbers
+// aren't a round behind.
+func TestACPLateUsageUpdateIsCounted(t *testing.T) {
+	key := t.Name()
+	t.Cleanup(func() { CloseNativeSessions(key) })
+	f := &liveFake{}
+	base := acpScript(new(bool))
+	p := &CLISubprocessProvider{Kind: CLIKindKimi, Model: "m1", Dir: t.TempDir(), Start: f.starter(func(n int, m map[string]any, out io.Writer) {
+		if m["method"] == "session/prompt" {
+			id := m["id"]
+			// The update races the response, arriving just after it.
+			line(out, map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"stopReason": "end_turn"}})
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				line(out, map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "s",
+					"update": map[string]any{"sessionUpdate": "usage_update", "used": 41000, "size": 200000}}})
+			}()
+		}
+		base(n, m, out)
+	})}
+	chunks, err := runNative(t, p, liveTurn(key, agent.ModeReadWrite, "", "go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := chunks[len(chunks)-1].Usage
+	if u.ContextTokens != 41000 || u.WindowTokens != 200000 {
+		t.Fatalf("usage = %+v; the raced usage_update was missed", u)
 	}
 }
 

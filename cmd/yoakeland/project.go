@@ -197,6 +197,10 @@ func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Me
 			CreatedAt:    m.CreatedAt,
 			GenerationMs: m.GenerationMs,
 			Usage:        m.Usage,
+			Summary:      m.Summary,
+			Ask:          m.Ask,
+			Actions:      m.Actions,
+			Thread:       m.Thread,
 		}
 		if c := m.Compaction; c != nil {
 			hm.Compaction = &protocol.CompactionInfo{Kind: c.Kind, TokensBefore: c.TokensBefore, TokensAfter: c.TokensAfter}
@@ -366,6 +370,8 @@ type ProjectRegistry struct {
 	gits map[string]*gitWatcher
 	// browser relays every project's browser tool (nil: none, in tests).
 	browser *browserBroker
+	// browserMCP hands the same browser to CLI agents as an MCP server (browser_mcp.go).
+	browserMCP *browserMCP
 	// roles is the server-wide model role table every session shares.
 	roles *agent.Roles
 	// ext is the MCP servers and skills every project shares (extensions.go).
@@ -683,6 +689,9 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 	var browser tool.BrowserRelay
 	if r.browser != nil {
 		browser = r.browser
+		if r.browserMCP == nil {
+			r.browserMCP = newBrowserMCP(r.browser)
+		}
 	}
 	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.limits, r.disableBashUnsandboxed, browser, r.ext.skills)
 	if err != nil {
@@ -692,6 +701,9 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		var notifier mcpNotifier
 		pc.MCP = mcp.NewManager(key, r.ext.mcpStore, r.ext.mcpAuth, r.ext.mcpFlow, func() { notifier.poke(func() { r.broadcastMCP(pc) }) })
 		pc.Registry.SetToolSource(pc.MCP)
+	}
+	if r.browserMCP != nil {
+		pc.Registry.SetNativeServers(r.browserMCP.serversFor)
 	}
 	pc.Permissions.SetGlobal(permission.OpenGlobal(r.stateDir))
 	r.projects[key] = pc

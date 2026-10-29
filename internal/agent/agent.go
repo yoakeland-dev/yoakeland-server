@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,14 @@ type Message struct {
 	// messages only; see subagent.go), minus its prompt — shown to the
 	// user, never sent back to the model.
 	Subagent []Message `json:"subagent,omitempty"`
+
+	// Summary and Thread belong to the user, not the model: a short summary
+	// of this message and the side thread opened on it. Providers never see
+	// them (side.go).
+	Summary string                   `json:"summary,omitempty"`
+	Ask     string                   `json:"ask,omitempty"`
+	Actions []protocol.QuickAction   `json:"actions,omitempty"`
+	Thread  []protocol.ThreadMessage `json:"thread,omitempty"`
 
 	// Images are pictures that travelled with this message, so the model can
 	// look at them: today a tool result's browser screenshot (see
@@ -242,7 +251,21 @@ const (
 	// own context (ModelStreamChunk.Compaction); the turn records it as a
 	// compaction message so the chat shows where it happened.
 	StreamChunkCompaction StreamEventKind = "compaction"
+
+	// StreamChunkContext is a provider reporting mid-turn how full the model's
+	// context window is (ContextSnapshot): Claude's message_delta counts, an
+	// ACP agent's usage_update. Purely informational — a turn's usage
+	// accounting never reads it, and turn_completed.context remains the
+	// authoritative final value.
+	StreamChunkContext StreamEventKind = "context"
 )
+
+// ContextSnapshot is one mid-turn reading of how full the model's context is.
+type ContextSnapshot struct {
+	ContextTokens int
+	WindowTokens  int
+	Source        string // "provider" once it's a provider-reported count
+}
 
 // CompactionChunk is what a native agent says about a compaction it did.
 type CompactionChunk struct {
@@ -261,10 +284,18 @@ type ModelStreamChunk struct {
 	FinishReason string
 	Raw          json.RawMessage  // StreamChunkRawContent only
 	Compaction   *CompactionChunk // StreamChunkCompaction only
+	Context      *ContextSnapshot // StreamChunkContext only
 }
 
 type ModelProvider interface {
 	StreamTurn(ctx context.Context, history []Message, tools []tool.ToolDefinition, systemPrompt string) (<-chan ModelStreamChunk, <-chan error)
+}
+
+// OneShotter is implemented by a CLI agent that can answer one tool-less request in a
+// throwaway process, apart from its conversation: how side questions, summaries and
+// titles work for an agent with no plain model behind it.
+type OneShotter interface {
+	OneShot(ctx context.Context, system, prompt string) (string, protocol.UsageData, error)
 }
 
 // TitleGenerator is implemented by providers that can make a separate,
@@ -449,6 +480,8 @@ type Agent struct {
 	// are the running ones by the id of the call that started each (under mu).
 	systemPrompt string
 	subagents    map[string]*Agent
+	// stopSubagent ends just this subagent (set on the child; see CancelSubagent).
+	stopSubagent context.CancelFunc
 	// tally is set on a subagent: the cost its round's siblings and parent
 	// have reached (see spendTally).
 	tally *spendTally
@@ -464,6 +497,8 @@ type Agent struct {
 	// the model may load (extensions.go). Both under mu; nil means none.
 	source   tool.Source
 	skillSrc SkillSource
+	// nativeServers: see Registry.SetNativeServers.
+	nativeServers func(sessionID string) []tool.AgentServer
 }
 
 // Hooks lets the server react to agent state that isn't a session event:
@@ -1141,6 +1176,25 @@ func (a *Agent) SetLimits(l *Limits) {
 }
 
 // CancelTurn stops turnID, whether it's running or still queued.
+// CancelSubagent stops one running subagent, found by its call's id (nested ones included); its
+// call then ends with an error result and the parent's turn carries on.
+func (a *Agent) CancelSubagent(toolCallID string) {
+	a.mu.Lock()
+	child := a.subagents[toolCallID]
+	var kids []*Agent
+	for _, c := range a.subagents {
+		kids = append(kids, c)
+	}
+	a.mu.Unlock()
+	if child != nil && child.stopSubagent != nil {
+		child.stopSubagent()
+		return
+	}
+	for _, c := range kids {
+		c.CancelSubagent(toolCallID)
+	}
+}
+
 func (a *Agent) CancelTurn(turnID string) {
 	a.mu.Lock()
 	cancel, exists := a.activeTurnCancels[turnID]
@@ -1652,6 +1706,9 @@ turn:
 			if src, ok := a.toolSource().(tool.AgentServerSource); ok {
 				nt.MCP = src.AgentServers()
 			}
+			if a.nativeServers != nil {
+				nt.MCP = append(nt.MCP, a.nativeServers(sessionID)...)
+			}
 			a.beginSteering(turnID, nt)
 			streamCtx = WithNativeTurn(turnCtx, nt)
 			toolDefs, systemPrompt = nil, ""
@@ -1757,7 +1814,12 @@ turn:
 				case StreamChunkToolCall:
 					if chunk.ToolCall != nil {
 						if chunk.ToolCall.Native {
-							segCalls = append(segCalls, *chunk.ToolCall)
+							// A re-emit (ACP's placeholder args, then the real ones) replaces the call, so history keeps one tool_use per id.
+							if i := slices.IndexFunc(segCalls, func(c ToolCall) bool { return c.ID == chunk.ToolCall.ID }); i >= 0 {
+								segCalls[i] = *chunk.ToolCall
+							} else {
+								segCalls = append(segCalls, *chunk.ToolCall)
+							}
 						} else {
 							toolCalls = append(toolCalls, *chunk.ToolCall)
 						}
@@ -1777,6 +1839,7 @@ turn:
 							Content:    r.Output + r.Error,
 							ToolCallID: r.ToolCallID,
 							Diffs:      r.Diffs,
+							Images:     r.Images,
 						})
 						a.mu.Unlock()
 						_ = a.streamFor(r.ParentToolCallID).SendEvent(protocol.EventToolResult, a.sessionID, turnID, r.ToolCallID, protocol.ToolResultData{
@@ -1784,6 +1847,7 @@ turn:
 							Output:   r.Output,
 							Error:    r.Error,
 							Diffs:    r.Diffs,
+							Images:   r.Images,
 						})
 					}
 				case StreamChunkUsage:
@@ -1807,6 +1871,19 @@ turn:
 						a.recordCompaction(turnID, Message{Role: "compaction", Content: c.Summary, Compaction: &Compaction{
 							Kind: CompactionSummary, TokensBefore: c.Before, TokensAfter: c.After,
 						}}, c.Manual)
+					}
+				case StreamChunkContext:
+					// Purely informational mid-turn reading (§3.2); never
+					// touches this round's usage accounting.
+					if c := chunk.Context; c != nil {
+						_ = a.getStream().SendEvent(protocol.EventTurnContext, a.sessionID, turnID, "", protocol.TurnContextData{
+							ContextData: protocol.ContextData{
+								EstimatedTokens: c.ContextTokens,
+								WindowTokens:    c.WindowTokens,
+								MaxTokens:       c.WindowTokens,
+								Source:          c.Source,
+							},
+						})
 					}
 				case StreamChunkRawContent:
 					rawContent = chunk.Raw
@@ -2059,13 +2136,21 @@ turn:
 			if mutating {
 				a.auditExec(sessionID, tc.Name, target, mode, via)
 			}
+			// The edit's diff is taken before it lands and reported with its result, so a
+			// client can show what changed without reading the file twice.
+			var editDiffs []*diff.FileDiff
+			if dt, ok := toolImpl.(tool.DiffableTool); ok {
+				if d, dErr := dt.PreviewDiff(tc.Args); dErr == nil && d != nil {
+					editDiffs = []*diff.FileDiff{d}
+				}
+			}
 			output, images, execErr := runTool(turnCtx, toolImpl, execCtx, tc.Args)
 			truncatedOutput := a.contextManager.TruncateToolOutput(output)
 
 			if execErr != nil {
 				a.recordToolResult(turnID, tc, "", execErr.Error())
 			} else {
-				a.recordToolResultAll(turnID, tc, truncatedOutput, "", nil, images)
+				a.recordToolResultAll(turnID, tc, truncatedOutput, "", nil, images, editDiffs)
 			}
 		}
 		for _, tc := range toolCalls {
@@ -2142,7 +2227,12 @@ turn:
 	// completion, a cancel, a provider failure. Not discarded: the turn's
 	// content exists nowhere else, so a failed write means the conversation the
 	// user just had is not on disk, and saying nothing would report a turn that
-	// can't be reloaded as an ordinary success.
+	// can't be reloaded as an ordinary success. The sweep runs first so the
+	// saved history never carries a tool call with no result (a call whose
+	// stream was cancelled before the turn could run it): the next turn would
+	// otherwise send the dangling call to the provider, and a reloading client
+	// would render it as running forever.
+	a.sweepUnpairedToolResults(turnID)
 	if saveErr := a.persistCurrentState(); saveErr != nil {
 		_ = a.getStream().SendEvent(protocol.EventError, a.sessionID, turnID, "", protocol.ErrorData{
 			Message: fmt.Sprintf("session %s not saved (%v); this turn will not survive a restart", a.sessionID, saveErr),
@@ -2459,13 +2549,58 @@ func (a *Agent) buildTurnCompletedData(finishReason string, usage protocol.Usage
 }
 
 func (a *Agent) recordToolResult(turnID string, tc ToolCall, output, errText string) {
-	a.recordToolResultAll(turnID, tc, output, errText, nil, nil)
+	a.recordToolResultAll(turnID, tc, output, errText, nil, nil, nil)
+}
+
+// sweepUnpairedToolResults records a result for every tool call in the
+// session's history that never received one — a call the turn recorded from
+// its provider's stream (and already told the clients about) but that got
+// cancelled, or its provider failed, before the turn could run it. Left
+// unpaired, a call is a dangling tool request in the persisted history: the
+// next turn would send it to the provider that way (an error for models that
+// require tool calls answered), and a client reloading the session renders it
+// as still running forever. Runs at the end of every turn, before the final
+// save, so the on-disk history is always self-consistent; already-paired
+// calls are left untouched, and subagent transcripts are swept too.
+func (a *Agent) sweepUnpairedToolResults(turnID string) {
+	// Forward pass collecting the calls never answered by a later tool
+	// message. Results always follow their call in history, so a call is
+	// paired iff some later message answers its ID — match by removing the ID
+	// from the open set when its result arrives, which also tolerates the
+	// same call ID being recorded twice.
+	a.mu.Lock()
+	open := map[string]ToolCall{}
+	for _, m := range a.history {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			delete(open, m.ToolCallID)
+		}
+		for _, c := range m.ToolCalls {
+			if c.ID != "" {
+				open[c.ID] = c
+			}
+		}
+	}
+
+	// Only calls with no result anywhere in the session's history remain —
+	// a call that already has one is fine and stays as it is.
+	var unpaired []ToolCall
+	for id := range open {
+		unpaired = append(unpaired, open[id])
+	}
+	a.mu.Unlock()
+
+	if len(unpaired) == 0 {
+		return
+	}
+	for _, tc := range unpaired {
+		a.recordToolResult(turnID, tc, "", "cancelled with the turn")
+	}
 }
 
 // recordToolResultWith is recordToolResult keeping a subagent call's
 // transcript (see Message.Subagent).
 func (a *Agent) recordToolResultWith(turnID string, tc ToolCall, output, errText string, transcript []Message) {
-	a.recordToolResultAll(turnID, tc, output, errText, transcript, nil)
+	a.recordToolResultAll(turnID, tc, output, errText, transcript, nil, nil)
 }
 
 // runTool dispatches one call, preferring ExecuteWithImages for a tool that can
@@ -2482,7 +2617,7 @@ func runTool(ctx context.Context, t tool.Tool, execCtx tool.ExecutionContext, ar
 // recordToolResultAll is where every finished tool call lands: the history
 // entry the model sees next round, the tool_result event clients render, and
 // whatever else the call produced — a subagent's transcript, a screenshot.
-func (a *Agent) recordToolResultAll(turnID string, tc ToolCall, output, errText string, transcript []Message, images []protocol.ImageData) {
+func (a *Agent) recordToolResultAll(turnID string, tc ToolCall, output, errText string, transcript []Message, images []protocol.ImageData, diffs []*diff.FileDiff) {
 	a.mu.Lock()
 	a.history = append(a.history, Message{
 		ID:         a.nextMessageIDLocked(),
@@ -2491,6 +2626,7 @@ func (a *Agent) recordToolResultAll(turnID string, tc ToolCall, output, errText 
 		ToolCallID: tc.ID,
 		Subagent:   transcript,
 		Images:     images,
+		Diffs:      diffs,
 	})
 	sessID := a.sessionID
 	a.mu.Unlock()
@@ -2500,6 +2636,7 @@ func (a *Agent) recordToolResultAll(turnID string, tc ToolCall, output, errText 
 		Output:   output,
 		Error:    errText,
 		Images:   images,
+		Diffs:    diffs,
 	})
 }
 

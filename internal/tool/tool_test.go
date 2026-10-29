@@ -375,6 +375,35 @@ func TestBrowserTool_NavigatePermissionAndForwardedArgs(t *testing.T) {
 	}
 }
 
+// The newer actions are checked before anything reaches the browser host.
+func TestBrowserTool_NewActionsValidateArgs(t *testing.T) {
+	bt := tool.NewBrowserTool(&recordingRelay{})
+	for args, ok := range map[string]bool{
+		`{"action":"hover","ref":"3"}`:                true,
+		`{"action":"hover"}`:                          false,
+		`{"action":"select","ref":"3","text":"Blue"}`: true,
+		`{"action":"select","ref":"3"}`:               false,
+		`{"action":"wait","ms":500}`:                  true,
+		`{"action":"wait","text":"Done"}`:             true,
+		`{"action":"wait"}`:                           false,
+		`{"action":"wait","ms":300000}`:               false,
+		`{"action":"tabs","op":"list"}`:               true,
+		`{"action":"tabs","op":"close","tab":2}`:      true,
+		`{"action":"tabs","op":"close"}`:              false,
+		`{"action":"tabs","op":"bogus"}`:              false,
+		`{"action":"tabs"}`:                           false,
+	} {
+		if _, err := bt.Execute(context.Background(), tool.ExecutionContext{}, []byte(args)); (err == nil) != ok {
+			t.Errorf("Execute(%s) err = %v, want ok=%v", args, err, ok)
+		}
+	}
+	for _, a := range []string{"hover", "select", "wait", "tabs"} {
+		if bt.RequiresPermission([]byte(`{"action":"` + a + `"}`)) {
+			t.Errorf("%s must not ask: it only works the page that is already open", a)
+		}
+	}
+}
+
 type recordingRelay struct{ args json.RawMessage }
 
 func (r *recordingRelay) Browse(_ context.Context, _, _ string, args json.RawMessage) (tool.BrowserResult, error) {

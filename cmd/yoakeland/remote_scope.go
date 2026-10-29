@@ -10,7 +10,7 @@ import "yoakeland/internal/protocol"
 var remoteAllowed = eventSet(
 	// chat
 	protocol.EventUserPrompt, protocol.EventEditMessage, protocol.EventRetryMessage, protocol.EventSwitchBranch,
-	protocol.EventCompactContext, protocol.EventPermissionResponse, protocol.EventCancelTurn, protocol.EventSteerTurn,
+	protocol.EventCompactContext, protocol.EventSideQuestion, protocol.EventSummarizeMessage, protocol.EventPermissionResponse, protocol.EventCancelTurn, protocol.EventCancelSubagent, protocol.EventSteerTurn,
 	protocol.EventRestoreSnapshot, protocol.EventSetMode, protocol.EventApprovePlan, protocol.EventSetWebToolsEnabled,
 	protocol.EventAskUserAnswer, protocol.EventGetSessionHistory, protocol.EventGetContextBreakdown,
 	protocol.EventListSessions, protocol.EventSetSessionTitle, protocol.EventSetSessionArchived,

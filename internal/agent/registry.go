@@ -35,6 +35,7 @@ type Registry struct {
 	chat            bool
 	source          tool.Source
 	skillSrc        SkillSource
+	nativeServers   func(sessionID string) []tool.AgentServer
 }
 
 // SetHooks installs hooks on every session's Agent, current and future.
@@ -296,6 +297,7 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	ag.SetShellDisabled(r.shellDisabled)
 	ag.roles, ag.projectRoot, ag.chat = r.roles, r.projectRoot, r.chat
 	ag.source, ag.skillSrc = r.source, r.skillSrc
+	ag.nativeServers = r.nativeServers
 	if r.eventTap != nil {
 		ag.stream.SetTap(r.eventTap)
 	}

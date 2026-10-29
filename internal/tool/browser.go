@@ -33,7 +33,7 @@ type BrowserRelay interface {
 // burning context.
 const maxBrowserImageBytes = 4 << 20
 
-var browserActions = []string{"navigate", "snapshot", "click", "type", "press", "scroll", "evaluate", "back", "forward", "reload", "screenshot"}
+var browserActions = []string{"navigate", "snapshot", "click", "type", "press", "scroll", "evaluate", "back", "forward", "reload", "hover", "select", "wait", "tabs", "screenshot"}
 
 // browserActionsNoScreenshot is browserActions minus the one action whose
 // result is a picture, for a model that can't see one (DefinitionWithoutImages
@@ -56,7 +56,11 @@ const browserDescription = "Use the browser panel beside the chat (the user sees
 	"returned snapshot (page text plus interactive elements, each tagged [ref=N]), then click/type/press using those refs. " +
 	"Every action returns a fresh snapshot; refs are only valid for the latest one. For a dev server you started with " +
 	"terminal_start, navigate to http://localhost:<port>. evaluate runs a JavaScript expression in the page and returns " +
-	"its JSON result. Console errors from the page are included in snapshots."
+	"its JSON result. hover moves the pointer over a ref (menus, tooltips). select picks an <option> of a dropdown ref by its " +
+	"label or value (text). wait pauses for ms and/or until text shows up on the page, then returns a snapshot — use it " +
+	"after an action that loads content. tabs works the panel's tabs: op list, new (blank; navigate afterwards), select or " +
+	"close a tab by its number (as list numbers them, from 1); actions apply to the selected tab. Console errors from the " +
+	"page are included in snapshots."
 
 // browserScreenshotDescription is the rest of it, appended only for a model
 // that can see the picture it would get back (DefinitionWithoutImages).
@@ -95,7 +99,13 @@ type browserArgs struct {
 	Key        string `json:"key,omitempty"`
 	Direction  string `json:"direction,omitempty"`
 	Expression string `json:"expression,omitempty"`
+	Ms         int    `json:"ms,omitempty"`
+	Op         string `json:"op,omitempty"`
+	Tab        int    `json:"tab,omitempty"`
 }
+
+// maxBrowserWaitMs keeps one wait inside the broker's browserTimeout (60s) with room for the snapshot.
+const maxBrowserWaitMs = 30_000
 
 func isHTTPURL(raw string) bool {
 	u, err := url.Parse(raw)
@@ -132,12 +142,15 @@ func (t *BrowserTool) definition(actions []string, description string) ToolDefin
 		"properties": map[string]any{
 			"action":     map[string]any{"type": "string", "enum": actions},
 			"url":        map[string]any{"type": "string", "description": "navigate: the URL (http/https)."},
-			"ref":        map[string]any{"type": "string", "description": "click/type/scroll: an element's ref from the latest snapshot."},
-			"text":       map[string]any{"type": "string", "description": "type: text to enter; replaces the field's current value."},
+			"ref":        map[string]any{"type": "string", "description": "click/type/scroll/hover/select: an element's ref from the latest snapshot."},
+			"text":       map[string]any{"type": "string", "description": "type: text to enter; replaces the field's current value. select: the option's label or value. wait: text to wait for."},
 			"submit":     map[string]any{"type": "boolean", "description": "type: press Enter afterwards."},
 			"key":        map[string]any{"type": "string", "description": "press: a key such as Enter, Escape, Tab, ArrowDown, or a character."},
 			"direction":  map[string]any{"type": "string", "enum": []string{"up", "down"}, "description": "scroll: page direction when no ref is given."},
 			"expression": map[string]any{"type": "string", "description": "evaluate: a JavaScript expression; its value must be JSON-serializable."},
+			"ms":         map[string]any{"type": "integer", "description": "wait: milliseconds to pause (at most 30000); with text, how long to wait for it (default 10000)."},
+			"op":         map[string]any{"type": "string", "enum": []string{"list", "new", "select", "close"}, "description": "tabs: what to do."},
+			"tab":        map[string]any{"type": "integer", "description": "tabs select/close: the tab's number, from 1, as tabs list shows it."},
 		},
 		"required": []string{"action"},
 	}}
@@ -168,8 +181,18 @@ func (t *BrowserTool) ExecuteWithImages(ctx context.Context, execCtx ExecutionCo
 		return "", nil, fmt.Errorf("navigate needs a url")
 	case a.Action == "navigate" && !isHTTPURL(a.URL):
 		return "", nil, fmt.Errorf("navigate only opens http(s) URLs")
-	case (a.Action == "click" || a.Action == "type") && a.Ref == "":
+	case (a.Action == "click" || a.Action == "type" || a.Action == "hover" || a.Action == "select") && a.Ref == "":
 		return "", nil, fmt.Errorf("%s needs a ref from the latest snapshot", a.Action)
+	case a.Action == "select" && a.Text == "":
+		return "", nil, fmt.Errorf("select needs the option's label or value as text")
+	case a.Action == "wait" && a.Ms <= 0 && a.Text == "":
+		return "", nil, fmt.Errorf("wait needs ms, text, or both")
+	case a.Action == "wait" && a.Ms > maxBrowserWaitMs:
+		return "", nil, fmt.Errorf("wait takes at most %d ms", maxBrowserWaitMs)
+	case a.Action == "tabs" && a.Op != "list" && a.Op != "new" && a.Op != "select" && a.Op != "close":
+		return "", nil, fmt.Errorf("tabs needs op list, new, select or close")
+	case a.Action == "tabs" && (a.Op == "select" || a.Op == "close") && a.Tab < 1:
+		return "", nil, fmt.Errorf("tabs %s needs the tab's number, from 1", a.Op)
 	case a.Action == "press" && a.Key == "":
 		return "", nil, fmt.Errorf("press needs a key")
 	case a.Action == "evaluate" && a.Expression == "":
