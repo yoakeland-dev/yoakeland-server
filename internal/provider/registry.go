@@ -26,9 +26,13 @@ const (
 	ProviderKindCLIClaude ProviderKind = "cli_claude"
 	// ProviderKindCLICodex is the same idea for OpenAI's `codex` CLI /
 	// ChatGPT subscription. Every other "cli_<kind>" (cli_cursor, cli_kimi,
-	// cli_opencode, cli_gemini, cli_grok, cli_deepseek) is an ACP agent —
+	// cli_opencode, cli_grok, cli_deepseek) is an ACP agent —
 	// see CLIKindOf and cliSpecs.
 	ProviderKindCLICodex ProviderKind = "cli_codex"
+	// ProviderKindCLIACP is any ACP agent the user points at by command, for
+	// one yoakeland has no preset for. Unlike the presets it isn't a singleton:
+	// each registration is its own agent.
+	ProviderKindCLIACP ProviderKind = "cli_acp"
 )
 
 // CLIKindOf reports which CLI agent a "cli_<kind>" provider kind drives.
@@ -66,6 +70,20 @@ type ProviderConfig struct {
 	// opaque strings, not validated against ListModels — an upstream outage
 	// or a temporarily-unavailable model shouldn't wipe a favorite.
 	FavoriteModels []string `json:"favoriteModels,omitempty"`
+
+	// Command and Args launch a ProviderKindCLIACP agent (Command is a name on
+	// the CLI path or an absolute path). Unused by every other kind.
+	Command string   `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
+
+	// Label is what a client shows; Name stays the stable id chats refer to, so
+	// renaming an account never orphans them.
+	Label string `json:"label,omitempty"`
+	// ConfigDir is this account's login folder for Claude Code (CLAUDE_CONFIG_DIR)
+	// and Codex (CODEX_HOME); empty is the CLI's own default folder.
+	ConfigDir string `json:"configDir,omitempty"`
+	// Env is extra environment for a custom ACP agent. Values never go to clients.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 type providerFileModel struct {
@@ -123,6 +141,13 @@ func NewProviderStore(dir string, passphrase string) (*ProviderStore, error) {
 	if s.model.Providers == nil {
 		s.model.Providers = make(map[string]ProviderConfig)
 	}
+	// cli_gemini was a preset; it is now just a custom ACP agent.
+	for name, cfg := range s.model.Providers {
+		if cfg.Kind == "cli_gemini" {
+			cfg.Kind, cfg.Command, cfg.Args = ProviderKindCLIACP, "gemini", []string{"--acp"}
+			s.model.Providers[name] = cfg
+		}
+	}
 	return s, nil
 }
 
@@ -168,23 +193,12 @@ func (s *ProviderStore) Register(cfg ProviderConfig) error {
 	if cfg.Name == "" {
 		return fmt.Errorf("provider name is required")
 	}
+	if err := normalizeAccount(&cfg); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// CLI-subprocess kinds hold no credential and there's only ever one
-	// `claude`/`codex` CLI on the machine, so registering one of these kinds
-	// again — even under a different Name — replaces the existing entry of
-	// that same kind rather than leaving a stale duplicate slot behind. The
-	// caller's chosen Name is still honored for lookup (set_provider,
-	// providers.json), unlike a fixed internal slot name would be.
-	if _, isCLI := CLIKindOf(cfg.Kind); isCLI {
-		for name, existing := range s.model.Providers {
-			if existing.Kind == cfg.Kind && name != cfg.Name {
-				delete(s.model.Providers, name)
-			}
-		}
-	}
 
 	s.model.Providers[cfg.Name] = cfg
 	return s.save()
@@ -276,7 +290,7 @@ func BuildProvider(cfg ProviderConfig, model string, projectRoot string) (Provid
 		})
 	default:
 		if kind, ok := CLIKindOf(cfg.Kind); ok {
-			return &CLISubprocessProvider{Kind: kind, Model: model, Dir: projectRoot}, nil
+			return &CLISubprocessProvider{Kind: kind, Model: model, Dir: projectRoot, Command: cfg.Command, Args: cfg.Args, ConfigDir: cfg.ConfigDir, Env: cfg.Env}, nil
 		}
 		return nil, fmt.Errorf("unknown provider kind %q", cfg.Kind)
 	}

@@ -52,49 +52,20 @@ func TestProviderStore_RegisterGetListRemove(t *testing.T) {
 	}
 }
 
-// TestProviderStore_CLIRegistrationIsSingletonPerKind covers item 6 of the
-// OpenRouter checklist: since there's only ever one `claude`/`codex` CLI on
-// the machine, re-registering a cli_claude/cli_codex provider under a new
-// Name must replace the old entry of that same kind rather than leaving a
-// stale duplicate slot behind — while still honoring whatever Name the
-// caller most recently chose for lookup.
-func TestProviderStore_CLIRegistrationIsSingletonPerKind(t *testing.T) {
-	tempDir := t.TempDir()
-	store, err := provider.NewProviderStore(tempDir, "")
+// Each registration of a coding-agent CLI is its own account (see account.go): re-using
+// a Name replaces that entry, a different Name adds one.
+func TestProviderStore_CLIRegistrationsAreAccounts(t *testing.T) {
+	store, err := provider.NewProviderStore(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("NewProviderStore: %v", err)
 	}
-
-	if err := store.Register(provider.ProviderConfig{Name: "my-claude", Kind: provider.ProviderKindCLIClaude}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	if err := store.Register(provider.ProviderConfig{Name: "renamed-claude", Kind: provider.ProviderKindCLIClaude}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	// A different kind (cli_codex) must be left alone by cli_claude churn.
-	if err := store.Register(provider.ProviderConfig{Name: "my-codex", Kind: provider.ProviderKindCLICodex}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-
-	if _, ok := store.Get("my-claude"); ok {
-		t.Error("expected the old cli_claude entry to be replaced, not kept alongside the new one")
-	}
-	if _, ok := store.Get("renamed-claude"); !ok {
-		t.Error("expected the most recently registered cli_claude entry to be findable by its name")
-	}
-	if _, ok := store.Get("my-codex"); !ok {
-		t.Error("expected the unrelated cli_codex entry to survive cli_claude re-registration")
-	}
-
-	all := store.List()
-	cliCount := 0
-	for _, c := range all {
-		if c.Kind == provider.ProviderKindCLIClaude {
-			cliCount++
+	for _, n := range []string{"my-claude", "other-claude", "my-claude"} {
+		if err := store.Register(provider.ProviderConfig{Name: n, Kind: provider.ProviderKindCLIClaude}); err != nil {
+			t.Fatalf("Register: %v", err)
 		}
 	}
-	if cliCount != 1 {
-		t.Errorf("expected exactly one cli_claude provider after re-registration, got %d", cliCount)
+	if got := len(store.List()); got != 2 {
+		t.Errorf("expected 2 accounts (a re-used name replaces), got %d", got)
 	}
 }
 

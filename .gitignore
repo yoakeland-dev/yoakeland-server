@@ -6,3 +6,5 @@
 /.cache/
 /cmd/yoakeland/tls/
 /dist/
+/go/
+/.config/

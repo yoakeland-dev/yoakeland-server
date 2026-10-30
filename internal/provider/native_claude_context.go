@@ -21,7 +21,7 @@ func (p *CLISubprocessProvider) ContextBreakdown(ctx context.Context, sessionKey
 	if p.Kind != CLIKindClaude {
 		return nil, nil
 	}
-	s, ok := liveSession(&agent.NativeTurn{SessionKey: sessionKey}, CLIKindClaude).(*claudeSession)
+	s, ok := liveSession(&agent.NativeTurn{SessionKey: sessionKey}, p.poolKind()).(*claudeSession)
 	if !ok || s == nil {
 		return nil, nil
 	}

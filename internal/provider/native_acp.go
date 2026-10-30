@@ -17,7 +17,7 @@ import (
 )
 
 // The Agent Client Protocol (agentclientprotocol.com, v1) — spoken by
-// cursor-agent, kimi, opencode, gemini, grok and dsh (SPEC.md §6b). Per
+// cursor-agent, kimi, opencode, grok, dsh and any custom command (SPEC.md §6b). Per
 // turn: initialize, session/load (or session/resume, or session/new with a
 // transcript), optionally pick model/effort/mode, session/prompt, relaying
 // session/update notifications and answering session/request_permission
@@ -748,7 +748,7 @@ func (p *CLISubprocessProvider) runACP(ctx context.Context, spec cliSpec, nt *ag
 }
 
 func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
-	ns, reused, release, err := acquireSession(nt, p.Kind, p.Dir+"\x00"+mcpSig(nt.MCP), func(nativeSession) bool { return true },
+	ns, reused, release, err := acquireSession(nt, p.poolKind(), p.Dir+"\x00"+mcpSig(nt.MCP), func(nativeSession) bool { return true },
 		func() (nativeSession, error) { return p.startACP(spec) })
 	if err != nil {
 		return err
@@ -972,14 +972,14 @@ func firstNonEmpty[T ~string](a, b T) T {
 
 // ListACPModels asks an ACP agent which models it offers, by opening a
 // throwaway session (ACP has no models call outside a session).
-func ListACPModels(ctx context.Context, kind CLIKind, dir string) ([]ModelInfo, error) {
-	spec, ok := cliSpecs[kind]
+func ListACPModels(ctx context.Context, kind CLIKind, command string, args []string, env map[string]string, dir string) ([]ModelInfo, error) {
+	p := &CLISubprocessProvider{Kind: kind, Dir: dir, Command: command, Args: args, Env: env}
+	spec, ok := p.spec()
 	if !ok || spec.Protocol != "acp" {
 		return nil, fmt.Errorf("%q is not an ACP agent", kind)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	p := &CLISubprocessProvider{Kind: kind, Dir: dir}
 	conn, _, err := p.acpInit(ctx, ctx, spec, func(string, json.RawMessage) {}, func(c *rpcConn, id json.RawMessage, m string, _ json.RawMessage) {
 		c.respondError(id, -32601, "not supported")
 	})

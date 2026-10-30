@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -118,7 +119,7 @@ func sshServerIPv4(sshConnection string) string {
 // pairHosts is lanIPv4s with the ssh session's own address first, so a server on a cloud box with
 // no private address still has one to offer.
 func pairHosts() []string {
-	hosts := lanIPv4s()
+	hosts := append(lanIPv4s(), globalIPv6s()...)
 	if ip := sshServerIPv4(os.Getenv("SSH_CONNECTION")); ip != "" {
 		hosts = append([]string{ip}, slices.DeleteFunc(hosts, func(h string) bool { return h == ip })...)
 		if len(hosts) > maxPairHosts {
@@ -126,6 +127,25 @@ func pairHosts() []string {
 		}
 	}
 	return hosts
+}
+
+// globalIPv6s is at most one public IPv6 address of this machine, listed last: behind carrier-grade
+// NAT it is the only address a client elsewhere can reach without a port forward.
+// ponytail: first one found, which may be a temporary privacy address; pick a stable one if it rotates under users.
+func globalIPv6s() []string {
+	ifaces, _ := net.Interfaces()
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 || virtualIface(ifc.Name) {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() == nil && n.IP.IsGlobalUnicast() && !n.IP.IsPrivate() {
+				return []string{n.IP.String()}
+			}
+		}
+	}
+	return nil
 }
 
 func isCGNAT(ip net.IP) bool {
@@ -173,7 +193,7 @@ func printPairQR(addr net.Addr, newToken func() (string, error), rtcFp, caPem st
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\nPair a device with %s:%d (valid for %d minutes, one device)\n", hosts[0], tcp.Port, int(PairingTTL.Minutes()))
+	fmt.Fprintf(os.Stderr, "\nPair a device with %s (valid for %d minutes, one device)\n", net.JoinHostPort(hosts[0], strconv.Itoa(tcp.Port)), int(PairingTTL.Minutes()))
 	if rtcFp != "" {
 		if q, err := qrcode.New(pairingURL(hosts, tcp.Port, token, rtcFp), qrcode.Low); err == nil {
 			fmt.Fprintf(os.Stderr, "Scan with a phone:\n%s\n", qrBlocks(q.Bitmap()))
@@ -191,5 +211,5 @@ func printPairQR(addr net.Addr, newToken func() (string, error), rtcFp, caPem st
 
 // pinAnnouncement is what to type into the app instead of scanning or pasting.
 func pinAnnouncement(host string, port int, pin string) string {
-	return fmt.Sprintf("Or type these into the app's Add remote form (the PIN works once, %d tries):\n  Address  %s:%d\n  PIN      %s\n", pinAttempts, host, port, formatPIN(pin))
+	return fmt.Sprintf("Or type these into the app's Add remote form (the PIN works once, %d tries):\n  Address  %s\n  PIN      %s\n", pinAttempts, net.JoinHostPort(host, strconv.Itoa(port)), formatPIN(pin))
 }

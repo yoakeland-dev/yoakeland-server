@@ -48,6 +48,23 @@ type ProjectContext struct {
 	MCP *mcp.Manager
 }
 
+// chatReader lets the read_chat tool read the project's other sessions.
+type chatReader struct{ store agent.SessionStore }
+
+func (r chatReader) ReadChat(id string) (string, []tool.ChatTurn, error) {
+	st, err := r.store.Load(id)
+	if err != nil {
+		return "", nil, err
+	}
+	var turns []tool.ChatTurn
+	for _, m := range st.History {
+		if m.Role == "user" || m.Role == "assistant" {
+			turns = append(turns, tool.ChatTurn{Role: m.Role, Text: m.Content})
+		}
+	}
+	return st.Title, turns, nil
+}
+
 func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider, defaultProviderName string, limits *agent.Limits, disableBashUnsandboxed bool, browser tool.BrowserRelay, skillCat *skills.Catalog) (*ProjectContext, error) {
 	norm, err := normalizer.New(root)
 	if err != nil {
@@ -107,6 +124,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		tool.NewTerminalOutputTool(terminals),
 		tool.NewTerminalStopTool(terminals),
 		tool.NewBrowserTool(browser),
+		tool.NewReadChatTool(chatReader{sessStore}),
 	}
 	braveKey := os.Getenv("BRAVE_API_KEY")
 	if braveKey == "" {

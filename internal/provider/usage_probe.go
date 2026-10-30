@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 	"yoakeland/internal/protocol"
 )
 
@@ -20,8 +21,8 @@ var ErrUsageUnsupported = errors.New("this CLI doesn't report subscription usage
 // SDK's experimental usage() call, the same data `/usage` shows); Codex its
 // app-server's `account/rateLimits/read`. Each probe is one short-lived
 // process, killed when ctx ends.
-func ProbeRateLimits(ctx context.Context, kind CLIKind) (*protocol.ProviderRateLimits, error) {
-	return probeRateLimits(ctx, kind, startProc)
+func ProbeRateLimits(ctx context.Context, kind CLIKind, configDir string) (*protocol.ProviderRateLimits, error) {
+	return probeRateLimits(ctx, kind, envStarter(startProc, procEnv(kind, configDir, nil)))
 }
 
 func probeRateLimits(ctx context.Context, kind CLIKind, start procStarter) (*protocol.ProviderRateLimits, error) {
@@ -69,6 +70,7 @@ func probeClaudeUsage(ctx context.Context, start procStarter, dir string) (*prot
 			}
 		}
 	}()
+	var email string // from initialize's answer, which precedes get_usage's
 	for proc.lines.Scan() {
 		var ln struct {
 			Type     string `json:"type"`
@@ -76,16 +78,32 @@ func probeClaudeUsage(ctx context.Context, start procStarter, dir string) (*prot
 				Subtype   string          `json:"subtype"`
 				RequestID string          `json:"request_id"`
 				Error     string          `json:"error"`
-				Response  json.RawMessage `json:"response"`
+				Raw       json.RawMessage `json:"response"`
 			} `json:"response"`
 		}
-		if json.Unmarshal(proc.lines.Bytes(), &ln) != nil || ln.Type != "control_response" || ln.Response.RequestID != "usage" {
+		if json.Unmarshal(proc.lines.Bytes(), &ln) != nil || ln.Type != "control_response" {
 			continue
 		}
-		if ln.Response.Subtype != "success" {
-			return nil, fmt.Errorf("claude get_usage: %s", ln.Response.Error)
+		switch ln.Response.RequestID {
+		case "init":
+			var init struct {
+				Account struct {
+					Email string `json:"email"`
+				} `json:"account"`
+			}
+			if json.Unmarshal(ln.Response.Raw, &init) == nil {
+				email = init.Account.Email
+			}
+		case "usage":
+			if ln.Response.Subtype != "success" {
+				return nil, fmt.Errorf("claude get_usage: %s", ln.Response.Error)
+			}
+			rl, err := parseClaudeUsage(ln.Response.Raw)
+			if rl != nil {
+				rl.Email = email
+			}
+			return rl, err
 		}
-		return parseClaudeUsage(ln.Response.Response)
 	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -177,7 +195,23 @@ func probeCodexUsage(ctx context.Context, start procStarter, dir string) (*proto
 	if err != nil {
 		return nil, err
 	}
-	return parseCodexUsage(raw)
+	rl, err := parseCodexUsage(raw)
+	if rl != nil {
+		// Best effort: the email only dedupes, so a failed read isn't a failed probe.
+		actx, acancel := context.WithTimeout(ctx, 5*time.Second)
+		defer acancel()
+		if acct, aerr := conn.call(actx, "account/read", map[string]any{"refreshToken": false}); aerr == nil {
+			var a struct {
+				Account struct {
+					Email string `json:"email"`
+				} `json:"account"`
+			}
+			if json.Unmarshal(acct, &a) == nil {
+				rl.Email = a.Account.Email
+			}
+		}
+	}
+	return rl, err
 }
 
 // parseCodexUsage reads account/rateLimits/read: the plan's own snapshot,

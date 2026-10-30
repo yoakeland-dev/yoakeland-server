@@ -1067,7 +1067,7 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 // sendServerIdentity tells p who this server is and which tier p is on.
 func sendServerIdentity(deps connDeps, p *Peer) {
 	_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{
-		Identity: deps.settings.GetIdentity(), ServerID: deps.settings.GetServerID(), Version: version,
+		Identity: deps.settings.GetIdentity(), Icon: deps.settings.GetIcon(), ServerID: deps.settings.GetServerID(), Version: version,
 		Restricted: deps.peers.IsRestricted(p.ID) && p.Network == "tcp",
 	})
 }
@@ -1272,6 +1272,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			BaseURL:      data.BaseURL,
 			APIKey:       data.APIKey,
 			AuthMethod:   data.AuthMethod,
+			Command:      data.Command,
+			Args:         data.Args,
+			Label:        data.Label,
+			ConfigDir:    data.ConfigDir,
+			Env:          data.Env,
 		}
 		if cfg.AuthMethod == "" {
 			cfg.AuthMethod = "manual"
@@ -1285,6 +1290,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// Never the key: what was registered, and where it points.
 		deps.record(ipc, peerID, audit.Event{Kind: audit.ProviderAdd, Target: cfg.Name, Outcome: "ok", Detail: map[string]any{
 			"providerKind": string(cfg.Kind), "httpProvider": cfg.HTTPProvider, "baseUrl": cfg.BaseURL, "authMethod": cfg.AuthMethod,
+			"command": cfg.Command, "args": cfg.Args, "configDir": cfg.ConfigDir, "envKeys": cfg.EnvKeys(),
 		}})
 		registered := protocol.ProviderRegisteredData{Name: cfg.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRegistered, env.SessionID, env.TurnID, "", registered)
@@ -1306,6 +1312,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				HTTPProvider:   cfg.HTTPProvider,
 				AuthMethod:     cfg.AuthMethod,
 				FavoriteModels: cfg.FavoriteModels,
+				Command:        cfg.Command,
+				Args:           cfg.Args,
+				Label:          cfg.Label,
+				ConfigDir:      cfg.ConfigDir,
+				EnvKeys:        cfg.EnvKeys(),
 			})
 		}
 		_ = ipc.SendEvent(protocol.EventProviderList, env.SessionID, env.TurnID, "", protocol.ProviderListData{
@@ -1339,7 +1350,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			}
 			defer recoverTurnPanic(ipc, env.SessionID, env.TurnID)
 			if data.Refresh {
-				provider.RetryModels(cfg.Kind)
+				provider.RetryModels(cfg)
 			}
 			models, err := provider.ListModels(cfg, deps.manifestCache)
 			if err != nil {
@@ -1359,7 +1370,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventModelList, env.SessionID, env.TurnID, "", protocol.ModelListData{
 				ProviderName: data.ProviderName,
 				Models:       summaries,
-				Fallback:     provider.ModelsFallback(cfg.Kind),
+				Fallback:     provider.ModelsFallback(cfg),
 			})
 		}()
 
@@ -2712,17 +2723,28 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 
 	case protocol.EventSetServerIdentity:
 		var data protocol.SetServerIdentityData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
+		if err := json.Unmarshal(env.Data, &data); err != nil || (data.Name == "" && data.Icon == nil) {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed set_server_identity payload (name is required)",
+				Message: "malformed set_server_identity payload (name or icon is required)",
 			})
 			return
 		}
-		if err := deps.settings.SetIdentity(data.Name); err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to save server identity: %v", err),
-			})
-			return
+		// Icon first: it's the one that can be rejected as invalid, so a bad one leaves the name untouched too.
+		if data.Icon != nil {
+			if err := deps.settings.SetIcon(*data.Icon); err != nil {
+				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+					Message: fmt.Sprintf("failed to save server icon: %v", err),
+				})
+				return
+			}
+		}
+		if data.Name != "" {
+			if err := deps.settings.SetIdentity(data.Name); err != nil {
+				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+					Message: fmt.Sprintf("failed to save server identity: %v", err),
+				})
+				return
+			}
 		}
 		for _, p := range deps.peers.All() {
 			sendServerIdentity(deps, p)

@@ -78,7 +78,7 @@ func NativePoolStats() PoolStats {
 	st := PoolStats{Max: int(poolMaxLive.Load()), IdleTimeoutSec: int(idleTimeout() / time.Second), ByKind: map[string]int{}}
 	for k, e := range pl.live {
 		st.Live++
-		if kind := k[strings.LastIndex(k, "|")+1:]; kind != "" {
+		if kind, _, _ := strings.Cut(k[strings.LastIndex(k, "|")+1:], ":"); kind != "" {
 			st.ByKind[kind]++
 		}
 		if e.busy > 0 {

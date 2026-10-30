@@ -69,7 +69,7 @@ type statusHub struct {
 
 	// probe reads one CLI's subscription usage without a turn; detect says
 	// whether its binary is installed. Tests swap both.
-	probe  func(context.Context, provider.CLIKind) (*protocol.ProviderRateLimits, error)
+	probe  func(context.Context, provider.CLIKind, string) (*protocol.ProviderRateLimits, error)
 	detect func(provider.CLIKind) bool
 	kick   chan struct{}
 
@@ -176,14 +176,26 @@ func (h *statusHub) StartUsagePolling(ctx context.Context, store *provider.Provi
 // re-enabled) still gets that last read. A failed probe keeps the last good
 // numbers and is logged once per distinct error, not on every tick.
 func (h *statusHub) refreshUsage(ctx context.Context, store *provider.ProviderStore) {
-	byKind := map[provider.CLIKind][]string{}
+	// One probe per login: the account folder is part of it, so two Claude accounts
+	// are two probes and two providers on one folder are one.
+	type login struct {
+		kind      provider.CLIKind
+		configDir string
+		names     []string
+	}
+	byKey := map[provider.CLIKind]*login{}
 	for _, cfg := range store.List() {
 		if kind, ok := provider.CLIKindOf(cfg.Kind); ok {
-			byKind[kind] = append(byKind[kind], cfg.Name)
+			key := cfg.AccountKey()
+			if byKey[key] == nil {
+				byKey[key] = &login{kind: kind, configDir: cfg.ConfigDir}
+			}
+			byKey[key].names = append(byKey[key].names, cfg.Name)
 		}
 	}
 	changed := false
-	for kind, names := range byKind {
+	for key, lg := range byKey {
+		kind, names := key, lg.names
 		h.mu.Lock()
 		if time.Since(h.probedAt[kind]) < usageMinGap {
 			if last, ok := h.lastRead[kind]; ok {
@@ -198,11 +210,11 @@ func (h *statusHub) refreshUsage(ctx context.Context, store *provider.ProviderSt
 			continue
 		}
 		h.mu.Unlock()
-		if !h.detect(kind) {
+		if !h.detect(lg.kind) {
 			continue
 		}
 		pctx, cancel := context.WithTimeout(ctx, usageTimeout)
-		rl, err := h.probe(pctx, kind)
+		rl, err := h.probe(pctx, lg.kind, lg.configDir)
 		cancel()
 		if errors.Is(err, provider.ErrUsageUnsupported) || ctx.Err() != nil {
 			continue
@@ -218,7 +230,7 @@ func (h *statusHub) refreshUsage(ctx context.Context, store *provider.ProviderSt
 			continue
 		}
 		delete(h.probeErrs, kind)
-		rl.Kind = "cli_" + string(kind)
+		rl.Kind = "cli_" + string(lg.kind)
 		rl.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		h.lastRead[kind] = *rl
 		for _, name := range names {

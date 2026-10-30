@@ -351,6 +351,13 @@ type RegisterProviderData struct {
 	BaseURL      string `json:"baseUrl,omitempty"`
 	APIKey       string `json:"apiKey,omitempty"`
 	AuthMethod   string `json:"authMethod,omitempty"`
+	// Command and Args launch a custom ACP agent (kind "cli_acp").
+	Command string   `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
+	// Label, ConfigDir and Env describe one account of a coding-agent CLI.
+	Label     string            `json:"label,omitempty"`
+	ConfigDir string            `json:"configDir,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
 }
 
 // ProviderSummary describes a registered provider without its credential.
@@ -360,6 +367,12 @@ type ProviderSummary struct {
 	HTTPProvider   string   `json:"httpProvider,omitempty"`
 	AuthMethod     string   `json:"authMethod,omitempty"`
 	FavoriteModels []string `json:"favoriteModels,omitempty"`
+	Command        string   `json:"command,omitempty"`
+	Args           []string `json:"args,omitempty"`
+	Label          string   `json:"label,omitempty"`
+	ConfigDir      string   `json:"configDir,omitempty"`
+	// EnvKeys are the names of the agent's custom environment; the values never leave the server.
+	EnvKeys []string `json:"envKeys,omitempty"`
 }
 
 type ProviderListData struct {
@@ -1312,14 +1325,34 @@ type TokenRemovedData struct {
 
 // SetServerIdentityData sets this server's display name, shown to peers.
 // Persisted under -state-dir so it survives a restart.
+//
+// Icon is optional and independent of Name: nil leaves the stored icon alone,
+// a non-nil value replaces it (an all-empty ServerIcon resets to the client's
+// derived default). Name may be empty when only Icon is being set.
 type SetServerIdentityData struct {
-	Name string `json:"name"`
+	Name string      `json:"name"`
+	Icon *ServerIcon `json:"icon,omitempty"`
+}
+
+// ServerIcon is how clients draw this server's avatar. Both fields are
+// optional: no Name means initials, no Hue means the colour clients derive
+// from ServerID.
+type ServerIcon struct {
+	// Name is a client icon-set key (lowercase letters, digits and dashes,
+	// at most 32 characters). The server doesn't know the set: a client that
+	// doesn't recognise a name falls back to initials.
+	Name string `json:"name,omitempty"`
+	// Hue is 0-359.
+	Hue *int `json:"hue,omitempty"`
 }
 
 // ServerIdentityData is pushed to a peer on connect and to every peer
 // whenever the identity changes.
 type ServerIdentityData struct {
 	Identity string `json:"identity"`
+
+	// Icon is omitted until an operator picks one.
+	Icon *ServerIcon `json:"icon,omitempty"`
 
 	// ServerID is this server's stable, never-changing identifier — unlike
 	// Identity, it never changes and is only ever included, never set via
@@ -1682,6 +1715,9 @@ type ProviderRateLimits struct {
 	// Plan is the subscription tier the CLI reports ("pro", "max", "plus",
 	// "free", ...), when it does.
 	Plan string `json:"plan,omitempty"`
+	// Email is the login's account email, when the CLI reports it. Two
+	// providers (or servers) with the same Kind and Email are one account.
+	Email string `json:"email,omitempty"`
 	// UpdatedAt is when the server last heard these numbers (RFC 3339).
 	UpdatedAt string                 `json:"updatedAt,omitempty"`
 	FiveHour  *RateLimitWindow       `json:"fiveHour,omitempty"`
@@ -1710,6 +1746,9 @@ func (rl ProviderRateLimits) Merge(u ProviderRateLimits) ProviderRateLimits {
 	}
 	if u.Plan != "" {
 		rl.Plan = u.Plan
+	}
+	if u.Email != "" {
+		rl.Email = u.Email
 	}
 	if u.UpdatedAt != "" {
 		rl.UpdatedAt = u.UpdatedAt

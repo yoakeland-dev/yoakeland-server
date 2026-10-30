@@ -281,10 +281,10 @@ func withManifest(models, manifest []ModelInfo) []ModelInfo {
 
 // ClaudeModelsDiscovered is Claude Code's own model list (cached), enriched
 // from and falling back to the manifest.
-func ClaudeModelsDiscovered(manifest *ManifestCache, dir string) []ModelInfo {
+func ClaudeModelsDiscovered(manifest *ManifestCache, dir string, acct ProviderConfig) []ModelInfo {
 	fallback := func() []ModelInfo { return manifest.ClaudeModels() }
-	return discovered.get(CLIKindClaude, func(ctx context.Context) ([]ModelInfo, error) {
-		models, err := discoverClaudeModels(ctx, dir)
+	return discovered.get(acct.AccountKey(), func(ctx context.Context) ([]ModelInfo, error) {
+		models, err := discoverClaudeModels(withProcEnv(ctx, procEnv(CLIKindClaude, acct.ConfigDir, nil)), dir)
 		if err != nil {
 			return nil, err
 		}
@@ -410,8 +410,8 @@ func codexDisplayName(name string) string {
 
 // CodexModelsDiscovered is Codex's own model list for this account (cached),
 // falling back to the manifest.
-func CodexModelsDiscovered(manifest *ManifestCache, dir string) []ModelInfo {
-	return discovered.get(CLIKindCodex, func(ctx context.Context) ([]ModelInfo, error) {
-		return discoverCodexModels(ctx, dir)
+func CodexModelsDiscovered(manifest *ManifestCache, dir string, acct ProviderConfig) []ModelInfo {
+	return discovered.get(acct.AccountKey(), func(ctx context.Context) ([]ModelInfo, error) {
+		return discoverCodexModels(withProcEnv(ctx, procEnv(CLIKindCodex, acct.ConfigDir, nil)), dir)
 	}, func() []ModelInfo { return manifest.CodexModels() })
 }

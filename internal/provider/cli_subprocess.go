@@ -21,12 +21,14 @@ const (
 	CLIKindCursor   CLIKind = "cursor"
 	CLIKindKimi     CLIKind = "kimi"
 	CLIKindOpenCode CLIKind = "opencode"
-	CLIKindGemini   CLIKind = "gemini"
 	CLIKindGrok     CLIKind = "grok"
 	CLIKindDeepSeek CLIKind = "deepseek"
 	CLIKindAmp      CLIKind = "amp"
 	CLIKindPi       CLIKind = "pi"
 	CLIKindOhMyPi   CLIKind = "ohmypi"
+	// CLIKindACP is a user-supplied ACP agent: its binary and args come from
+	// the provider (CLISubprocessProvider.Command), not from cliSpecs.
+	CLIKindACP CLIKind = "acp"
 )
 
 // cliSpec is how to launch one CLI and which wire protocol it speaks:
@@ -49,17 +51,22 @@ var cliSpecs = map[CLIKind]cliSpec{
 	CLIKindCursor:   {Binary: "cursor-agent", Args: []string{"acp"}, Protocol: "acp"},
 	CLIKindKimi:     {Binary: "kimi", Args: []string{"acp"}, Protocol: "acp"},
 	CLIKindOpenCode: {Binary: "opencode", Args: []string{"acp"}, Protocol: "acp"},
-	CLIKindGemini:   {Binary: "gemini", Args: []string{"--acp"}, Protocol: "acp"},
 	CLIKindGrok:     {Binary: "grok", Args: []string{"agent", "stdio"}, Protocol: "acp"},
 	CLIKindDeepSeek: {Binary: "dsh", Args: []string{"--profile", "acp"}, Protocol: "acp"},
 	CLIKindAmp:      {Binary: "amp", Protocol: "amp"},
 	CLIKindPi:       {Binary: "pi", Protocol: "pi"},
 	CLIKindOhMyPi:   {Binary: "omp", Protocol: "pi"},
+	CLIKindACP:      {Protocol: "acp"},
+}
+
+// acpSpec is the launch spec of a custom ACP agent.
+func acpSpec(command string, args []string) cliSpec {
+	return cliSpec{Binary: command, Args: args, Protocol: "acp"}
 }
 
 // CLIKinds lists every supported CLI, for detect_cli.
 func CLIKinds() []CLIKind {
-	return []CLIKind{CLIKindClaude, CLIKindCodex, CLIKindCursor, CLIKindKimi, CLIKindOpenCode, CLIKindGemini, CLIKindGrok, CLIKindDeepSeek, CLIKindAmp, CLIKindPi, CLIKindOhMyPi}
+	return []CLIKind{CLIKindClaude, CLIKindCodex, CLIKindCursor, CLIKindKimi, CLIKindOpenCode, CLIKindGrok, CLIKindDeepSeek, CLIKindAmp, CLIKindPi, CLIKindOhMyPi}
 }
 
 // DetectCLI reports whether kind's binary is installed (on cliPath, so one
@@ -94,12 +101,34 @@ type CLISubprocessProvider struct {
 	// Start overrides process creation (tests); nil runs the real binary.
 	Start procStarter
 
+	// Command and Args are the custom ACP agent to run (Kind CLIKindACP).
+	Command string
+	Args    []string
+	// ConfigDir and Env make the CLI run as one account (see account.go).
+	ConfigDir string
+	Env       map[string]string
+
 	effort string
 	fast   bool
 	// compactAt and compactOff are the session's own say over when Claude Code
 	// compacts itself (agent.ModelOptions); 0 / false = the server's setting.
 	compactAt  int
 	compactOff bool
+}
+
+// spec is how to launch this provider's agent.
+func (p *CLISubprocessProvider) spec() (cliSpec, bool) {
+	if p.Kind == CLIKindACP {
+		return acpSpec(p.Command, p.Args), p.Command != ""
+	}
+	s, ok := cliSpecs[p.Kind]
+	return s, ok
+}
+
+// poolKind keys the session pool: two custom agents in one chat are different
+// processes though they share a Kind.
+func (p *CLISubprocessProvider) poolKind() CLIKind {
+	return ProviderConfig{Kind: ProviderKind("cli_" + string(p.Kind)), Command: p.Command, Args: p.Args, ConfigDir: p.ConfigDir}.AccountKey()
 }
 
 func (p *CLISubprocessProvider) ModelName() string { return p.Model }
@@ -135,10 +164,11 @@ func (p *CLISubprocessProvider) SetModelOptions(opts agent.ModelOptions) {
 }
 
 func (p *CLISubprocessProvider) start() procStarter {
+	base := startProc
 	if p.Start != nil {
-		return p.Start
+		base = p.Start
 	}
-	return startProc
+	return envStarter(base, procEnv(p.Kind, p.ConfigDir, p.Env))
 }
 
 func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, _ []agent.Message, _ []tool.ToolDefinition, _ string) (<-chan agent.ModelStreamChunk, <-chan error) {
@@ -157,7 +187,7 @@ func (p *CLISubprocessProvider) StreamTurn(ctx context.Context, _ []agent.Messag
 		}()
 		defer close(eChan)
 		nt := agent.NativeTurnFromContext(ctx)
-		spec, ok := cliSpecs[p.Kind]
+		spec, ok := p.spec()
 		if nt == nil || !ok {
 			eChan <- fmt.Errorf("CLI agent %q can't run outside a native turn", p.Kind)
 			return

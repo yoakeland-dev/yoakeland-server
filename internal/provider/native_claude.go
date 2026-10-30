@@ -508,7 +508,7 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 		// A live process can't start a different conversation, fork one, or fall back to the default model.
 		return nt.ForkAt == "" && cs.id == nt.ResumeID && (p.Model != "" || cs.model == "")
 	}
-	ns, reused, release, err := acquireSession(nt, CLIKindClaude, sig, usable, func() (nativeSession, error) { return p.startClaude(nt, l) })
+	ns, reused, release, err := acquireSession(nt, p.poolKind(), sig, usable, func() (nativeSession, error) { return p.startClaude(nt, l) })
 	if err != nil {
 		return err
 	}

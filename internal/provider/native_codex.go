@@ -544,7 +544,7 @@ func (p *CLISubprocessProvider) runCodex(ctx context.Context, nt *agent.NativeTu
 }
 
 func (p *CLISubprocessProvider) runCodexOnce(ctx context.Context, nt *agent.NativeTurn, emit func(agent.ModelStreamChunk)) error {
-	ns, reused, release, err := acquireSession(nt, CLIKindCodex, p.Dir, func(nativeSession) bool { return true },
+	ns, reused, release, err := acquireSession(nt, p.poolKind(), p.Dir, func(nativeSession) bool { return true },
 		func() (nativeSession, error) { return p.startCodex() })
 	if err != nil {
 		return err

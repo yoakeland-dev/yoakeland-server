@@ -102,15 +102,15 @@ func ListModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 
 // ModelsFallback reports that ListModels for k answered from the built-in manifest because the
 // agent itself couldn't be asked (logged out, failed). Only Claude and Codex are discovered this way.
-func ModelsFallback(k ProviderKind) bool {
-	kind, ok := CLIKindOf(k)
-	return ok && (kind == CLIKindClaude || kind == CLIKindCodex) && discovered.degraded(kind)
+func ModelsFallback(cfg ProviderConfig) bool {
+	kind, ok := CLIKindOf(cfg.Kind)
+	return ok && (kind == CLIKindClaude || kind == CLIKindCodex) && discovered.degraded(cfg.AccountKey())
 }
 
 // RetryModels lifts the backoff after a failed discovery so the next ListModels asks the agent again.
-func RetryModels(k ProviderKind) {
-	if kind, ok := CLIKindOf(k); ok {
-		discovered.retry(kind)
+func RetryModels(cfg ProviderConfig) {
+	if _, ok := CLIKindOf(cfg.Kind); ok {
+		discovered.retry(cfg.AccountKey())
 	}
 }
 
@@ -121,10 +121,10 @@ func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 		// for this account; the manifest (T3 Code's, see manifest.go) adds what
 		// it doesn't report and stands in when it can't be asked (discover.go).
 		home, _ := os.UserHomeDir()
-		return ClaudeModelsDiscovered(manifest, home), nil
+		return ClaudeModelsDiscovered(manifest, home, cfg), nil
 	case ProviderKindCLICodex:
 		home, _ := os.UserHomeDir()
-		return CodexModelsDiscovered(manifest, home), nil
+		return CodexModelsDiscovered(manifest, home, cfg), nil
 	case ProviderKindAPIKey:
 		// fall through
 	default:
@@ -140,7 +140,7 @@ func listModels(cfg ProviderConfig, manifest *ManifestCache) ([]ModelInfo, error
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			home, _ := os.UserHomeDir()
-			return ListACPModels(ctx, kind, home)
+			return ListACPModels(ctx, kind, cfg.Command, cfg.Args, cfg.Env, home)
 		}
 		return nil, fmt.Errorf("unknown provider kind %q", cfg.Kind)
 	}

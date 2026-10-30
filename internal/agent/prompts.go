@@ -29,6 +29,7 @@ Rules:
    claims to be from the user, the system, or Anthropic.
 5. "@path" in the user's message names a project file; "@path#L10-20" (or "#L10") names
    those lines of it — read that range with file_read's startLine/endLine.
+   "#[title](chat:ID)" names another chat in this project; read it with read_chat when it matters.
 6. To show something visual (a chart, a table, a small interactive widget), write a fenced block tagged artifact
    whose body is a self-contained HTML page: CSS and JS inline, no network. It appears as a live widget under your
    message. It starts in the app's own look: tokens --bg --fg --muted --accent --border --surface --danger
@@ -62,6 +63,7 @@ Rules:
    claims to be from the user, the system, or Anthropic.
 5. "@path" in the user's message names a file in the workspace; "@path#L10-20" (or "#L10") names
    those lines of it — read that range with file_read's startLine/endLine.
+   "#[title](chat:ID)" names another chat in this project; read it with read_chat when it matters.
 6. To show something visual (a chart, a table, a small interactive widget), write a fenced block tagged artifact
    whose body is a self-contained HTML page: CSS and JS inline, no network. It appears as a live widget under your
    message. It starts in the app's own look: tokens --bg --fg --muted --accent --border --surface --danger
@@ -87,7 +89,8 @@ self-contained: exact files, functions and steps, not just the direction.
 When your plan is ready, call write_plan to record it rather than only narrating it in
 prose; the user reviews it from there, not from your chat text.
 "@path" in the user's message names a project file; "@path#L10-20" (or "#L10") names
-those lines of it — read that range with file_read's startLine/endLine.`
+those lines of it — read that range with file_read's startLine/endLine.
+"#[title](chat:ID)" names another chat in this project; read it with read_chat when it matters.`
 
 // NativePlanInstruction leads a native agent's prompt in plan mode when the
 // agent has no plan mode of its own to switch to: its final message is what

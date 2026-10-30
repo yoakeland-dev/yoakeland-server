@@ -383,6 +383,8 @@ var readOnlyTools = map[string]bool{
 	"ask_user_question": true,
 	// Loading a skill reads files the user put in a skill folder, nothing more.
 	tool.SkillToolName: true,
+	// Reads another chat of the project the user named; changes nothing.
+	tool.ReadChatToolName: true,
 	// Not a mutation itself: its subagent runs read-only in these modes too
 	// (see newSubagent).
 	SubagentToolName: true,

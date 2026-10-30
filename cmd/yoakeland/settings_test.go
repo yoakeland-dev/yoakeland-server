@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"yoakeland/internal/protocol"
 )
 
 // NET-16: an unparseable server.json is set aside, not overwritten by the
@@ -225,5 +226,33 @@ func TestClaimPairing_RemovedTokenIsRefused(t *testing.T) {
 	}
 	if err := s.ClaimPairing("phone", "device-1"); err == nil {
 		t.Fatal("ClaimPairing on a removed token should fail")
+	}
+}
+
+func TestServerSettings_Icon(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewServerSettings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := 330
+	if err := s.SetIcon(protocol.ServerIcon{Name: "ghost", Hue: &h}); err != nil {
+		t.Fatal(err)
+	}
+	re, _ := NewServerSettings(dir)
+	if ic := re.GetIcon(); ic == nil || ic.Name != "ghost" || ic.Hue == nil || *ic.Hue != 330 {
+		t.Fatalf("icon after reopen = %+v", ic)
+	}
+	bad := 360
+	for _, ic := range []protocol.ServerIcon{{Name: "Ghost"}, {Name: "a b"}, {Name: strings.Repeat("a", 33)}, {Hue: &bad}} {
+		if err := re.SetIcon(ic); err == nil {
+			t.Errorf("SetIcon(%+v) accepted", ic)
+		}
+	}
+	if re.GetIcon() == nil {
+		t.Fatal("a rejected icon must leave the stored one alone")
+	}
+	if err := re.SetIcon(protocol.ServerIcon{}); err != nil || re.GetIcon() != nil {
+		t.Fatalf("empty icon should clear, got %+v (%v)", re.GetIcon(), err)
 	}
 }

@@ -40,7 +40,10 @@ func TestProbeClaudeUsage(t *testing.T) {
 			}
 			_ = json.Unmarshal(in.Bytes(), &req)
 			resp := json.RawMessage(`{}`)
-			if req.Request.Subtype == "get_usage" {
+			switch req.Request.Subtype {
+			case "initialize":
+				resp = json.RawMessage(`{"account":{"email":"a@b.c"}}`)
+			case "get_usage":
 				resp = json.RawMessage(claudeUsageFixture)
 			}
 			line(out, map[string]any{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": req.RequestID, "response": resp}})
@@ -53,6 +56,9 @@ func TestProbeClaudeUsage(t *testing.T) {
 	wait()
 	if !slices.Contains(args, "--no-session-persistence") || !slices.Contains(args, "--strict-mcp-config") {
 		t.Errorf("probe should run a throwaway session, got args %v", args)
+	}
+	if rl.Email != "a@b.c" {
+		t.Errorf("email: got %q", rl.Email)
 	}
 	if rl.Plan != "pro" || rl.FiveHour == nil || rl.FiveHour.UsedPct != 22 || rl.SevenDay == nil || rl.SevenDay.UsedPct != 30 {
 		t.Fatalf("got %+v", rl)
@@ -71,6 +77,8 @@ func TestProbeCodexUsage(t *testing.T) {
 				return map[string]any{}
 			case "account/rateLimits/read":
 				return json.RawMessage(codexUsageFixture)
+			case "account/read":
+				return map[string]any{"account": map[string]any{"email": "a@b.c"}}
 			}
 			return nil
 		})
@@ -80,6 +88,9 @@ func TestProbeCodexUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait()
+	if rl.Email != "a@b.c" {
+		t.Errorf("email: got %q", rl.Email)
+	}
 	if rl.Plan != "free" || rl.FiveHour != nil || rl.SevenDay != nil {
 		t.Fatalf("got %+v", rl)
 	}
@@ -93,7 +104,7 @@ func TestProbeCodexUsage(t *testing.T) {
 }
 
 func TestProbeUnsupportedCLI(t *testing.T) {
-	if _, err := probeRateLimits(context.Background(), CLIKindGemini, nil); !errors.Is(err, ErrUsageUnsupported) {
+	if _, err := probeRateLimits(context.Background(), CLIKindKimi, nil); !errors.Is(err, ErrUsageUnsupported) {
 		t.Fatalf("got %v", err)
 	}
 }

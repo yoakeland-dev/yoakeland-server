@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -96,7 +97,7 @@ func runPair(args []string) int {
 	if *phone {
 		tier = "limited (phone)"
 	}
-	fmt.Fprintf(os.Stderr, "Pairing code for %s:%d: %s, valid for %d minutes, one device.\nPaste into the app's Pairing code field:\n", hosts[0], port, tier, int(PairingTTL.Minutes()))
+	fmt.Fprintf(os.Stderr, "Pairing code for %s: %s, valid for %d minutes, one device.\nPaste into the app's Pairing code field:\n", net.JoinHostPort(hosts[0], strconv.Itoa(port)), tier, int(PairingTTL.Minutes()))
 	fmt.Println(pairingCode(hosts, port, reg.Token, reg.RTCFingerprint, reg.CaPem))
 	return 0
 }

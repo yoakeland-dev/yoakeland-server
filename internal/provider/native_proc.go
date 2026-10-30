@@ -35,7 +35,7 @@ func startProc(ctx context.Context, name string, args []string, dir string) (*na
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.Env = withCLIPath(cliEnv(os.Environ()))
+	cmd.Env = append(withCLIPath(cliEnv(os.Environ())), procEnvFrom(ctx)...)
 	ownProcessGroup(cmd)
 	cmd.Cancel = func() error { return killTree(cmd) }
 	stdin, err := cmd.StdinPipe()

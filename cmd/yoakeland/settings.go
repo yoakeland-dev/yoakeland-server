@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 	"yoakeland/internal/fsutil"
@@ -55,6 +56,7 @@ type ServerSettings struct {
 	filePath string
 
 	Identity string                 `json:"identity,omitempty"`
+	Icon     *protocol.ServerIcon   `json:"icon,omitempty"`
 	Tokens   map[string]TokenRecord `json:"tokens,omitempty"`
 
 	// ServerID is a stable identifier minted once, the first time this
@@ -167,6 +169,34 @@ func (s *ServerSettings) SetIdentity(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Identity = name
+	return s.save()
+}
+
+func (s *ServerSettings) GetIcon() *protocol.ServerIcon {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Icon
+}
+
+// iconName is the shape of ServerIcon.Name: it's shown nowhere as text, only looked up in the
+// client's icon set, so anything else is a malformed request rather than something to repair.
+var iconName = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+// SetIcon stores the icon. Hue must be 0-359; an empty icon clears it.
+func (s *ServerSettings) SetIcon(ic protocol.ServerIcon) error {
+	if ic.Name != "" && !iconName.MatchString(ic.Name) {
+		return fmt.Errorf("invalid icon name %q", ic.Name)
+	}
+	if ic.Hue != nil && (*ic.Hue < 0 || *ic.Hue > 359) {
+		return fmt.Errorf("icon hue %d out of range 0-359", *ic.Hue)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ic.Name == "" && ic.Hue == nil {
+		s.Icon = nil
+	} else {
+		s.Icon = &ic
+	}
 	return s.save()
 }
 
