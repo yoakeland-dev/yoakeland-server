@@ -51,6 +51,8 @@ const (
 	EventSetFavoriteModels     EventType = "set_favorite_models"
 	EventListSessions          EventType = "list_sessions"
 	EventDetectCLI             EventType = "detect_cli"
+	EventListACPRegistry       EventType = "list_acp_registry"
+	EventGetPairInfo           EventType = "get_pair_info"
 	EventPing                  EventType = "ping"
 	EventOpenProject           EventType = "open_project"
 	EventListProjects          EventType = "list_projects"
@@ -86,6 +88,10 @@ const (
 	EventListTokens            EventType = "list_tokens"
 	EventRemoveToken           EventType = "remove_token"
 	EventListNotifications     EventType = "list_notifications"
+	EventListProcesses         EventType = "list_processes"
+	EventSignalProcess         EventType = "signal_process"
+	EventListProblems          EventType = "list_problems"
+	EventReadLog               EventType = "read_log"
 	EventListPermissionRules   EventType = "list_permission_rules"
 	EventAddPermissionRule     EventType = "add_permission_rule"
 	EventDeletePermissionRule  EventType = "delete_permission_rule"
@@ -124,6 +130,9 @@ const (
 	// without a request/response round trip.
 	EventTerminalOpen   EventType = "terminal_open"
 	EventTerminalAttach EventType = "terminal_attach"
+	// EventTerminalDetach is a client saying it stopped watching a terminal
+	// (its drawer closed). A shell nobody watches and nothing runs in is closed.
+	EventTerminalDetach EventType = "terminal_detach"
 	EventTerminalInput  EventType = "terminal_input"
 	EventTerminalResize EventType = "terminal_resize"
 	EventTerminalClose  EventType = "terminal_close"
@@ -137,6 +146,17 @@ const (
 	EventBrowserHost     EventType = "browser_host"
 	EventBrowserRequest  EventType = "browser_request"
 	EventBrowserResponse EventType = "browser_response"
+
+	// The server's own headless browser (SPEC.md § server browser), used when no desktop client
+	// hosts one. Clients watch it (browser_view, browser_frame_ack; any peer) and, if allowed
+	// to operate it, take control and drive it (browser_control, browser_input, browser_nav).
+	EventBrowserView     EventType = "browser_view"
+	EventBrowserFrameAck EventType = "browser_frame_ack"
+	EventBrowserControl  EventType = "browser_control"
+	EventBrowserInput    EventType = "browser_input"
+	EventBrowserNav      EventType = "browser_nav"
+	EventBrowserFrame    EventType = "browser_frame"
+	EventBrowserState    EventType = "browser_state"
 
 	EventMCPServers               EventType = "mcp_servers"
 	EventMCPOAuthURL              EventType = "mcp_oauth_url"
@@ -173,6 +193,8 @@ const (
 	EventDirectoryList            EventType = "directory_list"
 	EventSnapshotList             EventType = "snapshot_list"
 	EventCLIAvailability          EventType = "cli_availability"
+	EventACPRegistry              EventType = "acp_registry"
+	EventPairInfo                 EventType = "pair_info"
 	EventPong                     EventType = "pong"
 	EventProjectOpened            EventType = "project_opened"
 	EventProjectList              EventType = "project_list"
@@ -182,6 +204,7 @@ const (
 	EventWebToolsEnabledSet       EventType = "web_tools_enabled_set"
 	EventAskUserQuestionRequested EventType = "ask_user_question_requested"
 	EventPlanWritten              EventType = "plan_written"
+	EventTodoList                 EventType = "todo_list"
 	EventSessionHistory           EventType = "session_history"
 	EventPeerList                 EventType = "peer_list"
 	EventRemoteAccessSet          EventType = "remote_access_set"
@@ -203,6 +226,10 @@ const (
 	EventGitStatus                EventType = "git_status"
 	EventPendingAsks              EventType = "pending_asks"
 	EventNotificationList         EventType = "notification_list"
+	EventProcessList              EventType = "process_list"
+	EventProcessSignaled          EventType = "process_signaled"
+	EventProblemList              EventType = "problem_list"
+	EventLogText                  EventType = "log_text"
 	EventPermissionRules          EventType = "permission_rules"
 	EventNotificationDismissed    EventType = "notification_dismissed"
 	EventNotificationsRead        EventType = "notifications_read"
@@ -952,6 +979,9 @@ type HistoryMessage struct {
 	// (user_prompt's own attachments), so a repainted transcript can show them.
 	Attachments []string `json:"attachments,omitempty"`
 
+	// Origin is set on a user message the server started (an artifact submit or a scheduled turn).
+	Origin *Origin `json:"origin,omitempty"`
+
 	// Provider/Model are the registered provider name and model id that
 	// generated this message (assistant only). Empty for a message
 	// persisted before this field existed, or for user/tool messages —
@@ -1245,7 +1275,7 @@ type RegisterTokenData struct {
 	Full bool `json:"full,omitempty"`
 }
 
-// PairingRequestData is pushed to local-socket peers when a device presents a
+// PairingRequestData is pushed to local-socket and full-access peers when a device presents a
 // pairing token for the first time and is waiting to be let in.
 type PairingRequestData struct {
 	Credential string `json:"credential"`
@@ -1255,7 +1285,7 @@ type PairingRequestData struct {
 }
 
 // RestartServerData asks the daemon to shut down so whatever started it can start it again (the
-// desktop app does; so does a supervisor with Restart=always). Local socket only.
+// desktop app does; so does a supervisor with Restart=always). Local socket or full-access credential.
 type RestartServerData struct {
 	// Force restarts even with turns running; without it a busy server refuses.
 	Force bool `json:"force,omitempty"`
@@ -1268,7 +1298,7 @@ type ServerRestartData struct {
 	ActiveTurns int    `json:"activeTurns,omitempty"`
 }
 
-// ApprovePairingData answers a pairing_request (local socket only).
+// ApprovePairingData answers a pairing_request (local socket or full-access credential).
 type ApprovePairingData struct {
 	Credential string `json:"credential"`
 	Allow      bool   `json:"allow"`
@@ -1502,6 +1532,8 @@ type FileRequestData struct {
 	// HEAD, or against HEAD's copy of BasePath (a rename's old path).
 	SnapshotID string `json:"snapshotId,omitempty"`
 	BasePath   string `json:"basePath,omitempty"`
+	// read_media only: with an absolute Path, the session whose attachment it is.
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 type TreeEntry struct {
@@ -1552,6 +1584,7 @@ type MediaChunkRequestData struct {
 	ProjectPath string `json:"projectPath,omitempty"`
 	Path        string `json:"path"`
 	Offset      int64  `json:"offset"`
+	SessionID   string `json:"sessionId,omitempty"` // as on FileRequestData
 }
 
 // MediaChunkData answers read_media_chunk. Last marks the final slice, so
@@ -1631,6 +1664,31 @@ type FileDiffData struct {
 	Diff        *diff.FileDiff `json:"diff,omitempty"`
 	Binary      bool           `json:"binary,omitempty"`
 	Error       string         `json:"error,omitempty"`
+}
+
+// ACPAgent is one launchable agent from the public ACP registry (only the npx/uvx recipes).
+type ACPAgent struct {
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Version     string          `json:"version"`
+	Description string          `json:"description"`
+	Icon        string          `json:"icon,omitempty"`
+	Website     string          `json:"website,omitempty"`
+	Npx         json.RawMessage `json:"npx,omitempty"`
+	Uvx         json.RawMessage `json:"uvx,omitempty"`
+}
+
+// ACPRegistryData answers list_acp_registry; Error is set instead of Agents when the fetch failed.
+type ACPRegistryData struct {
+	RequestID string     `json:"requestId"`
+	Agents    []ACPAgent `json:"agents,omitempty"`
+	Error     string     `json:"error,omitempty"`
+}
+
+// PairInfoData answers get_pair_info: the addresses a phone could reach this server at, best first.
+type PairInfoData struct {
+	RequestID string   `json:"requestId"`
+	Hosts     []string `json:"hosts"`
 }
 
 // CLIAvailabilityData reports whether the `claude`/`codex` binaries are on
@@ -1866,6 +1924,80 @@ type Notification struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+// ProcessInfo is one process in the server's own process tree (the server
+// itself and every descendant: terminals, CLI agents, MCP servers, tools).
+// CPUTimeMs is cumulative; clients derive CPU % from two samples.
+type ProcessInfo struct {
+	PID         int    `json:"pid"`
+	PPID        int    `json:"ppid"`
+	StartTimeMs int64  `json:"startTimeMs"` // since boot; with PID it identifies the process
+	Name        string `json:"name"`
+	Command     string `json:"command,omitempty"`
+	Status      string `json:"status"`
+	CPUTimeMs   int64  `json:"cpuTimeMs"`
+	RSSBytes    uint64 `json:"rssBytes"`
+}
+
+type ProcessListData struct {
+	SampledAtMs int64         `json:"sampledAtMs"`
+	Processes   []ProcessInfo `json:"processes"`
+}
+
+// SignalProcessData asks the server to send SIGINT or SIGKILL to one of its own
+// descendant processes (SPEC.md `signal_process`). Local connections only.
+type SignalProcessData struct {
+	PID    int    `json:"pid"`
+	Signal string `json:"signal"`
+}
+
+// ProcessSignaledData answers signal_process. Message says why nothing was sent.
+type ProcessSignaledData struct {
+	PID      int    `json:"pid"`
+	Signal   string `json:"signal"`
+	Signaled bool   `json:"signaled"`
+	Message  string `json:"message,omitempty"`
+}
+
+// ProblemListData answers list_problems (SPEC.md `problem_list`): recent tool
+// failures and slow tool runs from the audit log, and recent WARN/ERROR lines
+// from the server log. Local connections only.
+type ProblemListData struct {
+	ReadAtMs        int64            `json:"readAtMs"`
+	ToolCalls       int              `json:"toolCalls"`
+	FailedCount     int              `json:"failedCount"`
+	SlowThresholdMs int64            `json:"slowThresholdMs"`
+	SlowCount       int              `json:"slowCount"`
+	WarnCount       int              `json:"warnCount"`
+	LatestFailures  []ProblemFailure `json:"latestFailures"`
+	Slowest         []ProblemSlow    `json:"slowest"`
+	Warnings        []ProblemWarning `json:"warnings"`
+}
+
+// LogTextData answers read_log: the tail of yoakeland.log, secrets redacted.
+type LogTextData struct {
+	Text      string `json:"text"`
+	Truncated bool   `json:"truncated"`
+}
+
+type ProblemFailure struct {
+	Tool       string `json:"tool"`
+	Cause      string `json:"cause"`
+	DurationMs int64  `json:"durationMs"`
+	AtMs       int64  `json:"atMs"`
+}
+
+type ProblemSlow struct {
+	Tool       string `json:"tool"`
+	DurationMs int64  `json:"durationMs"`
+	AtMs       int64  `json:"atMs"`
+}
+
+type ProblemWarning struct {
+	AtMs    int64  `json:"atMs"`
+	Level   string `json:"level"`
+	Message string `json:"message"`
+}
+
 type NotificationListData struct {
 	Notifications []Notification `json:"notifications"`
 }
@@ -2088,6 +2220,8 @@ type UserMessageData struct {
 	Attachments  []string `json:"attachments,omitempty"`
 	Author       string   `json:"author,omitempty"`
 	AuthorAvatar string   `json:"authorAvatar,omitempty"`
+	// Origin is set when the server started the turn (see Origin); a person's message has none.
+	Origin *Origin `json:"origin,omitempty"`
 }
 
 type ModelDeltaData struct {
@@ -2412,6 +2546,13 @@ type TerminalAttachData struct {
 	RestartIfExited bool   `json:"restartIfExited,omitempty"`
 }
 
+// TerminalDetachData: see EventTerminalDetach.
+type TerminalDetachData struct {
+	SessionID   string `json:"sessionId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	TerminalID  string `json:"terminalId"`
+}
+
 // TerminalInputData writes raw bytes to the terminal's pty, exactly as
 // typed/pasted client-side — this is not a command string (no parsing,
 // no argv, unlike the bash tool); the shell on the other end interprets it.
@@ -2484,6 +2625,9 @@ type TerminalSnapshotData struct {
 	// Name/Agent: see TerminalSummary.
 	Name  string `json:"name,omitempty"`
 	Agent bool   `json:"agent,omitempty"`
+	// Busy: a command is running in the shell (the server's own reading of the pty's foreground
+	// process group, not something a client should infer from the output).
+	Busy bool `json:"busy,omitempty"`
 }
 
 // TerminalOutputData.Data is base64-encoded raw bytes — see
@@ -2520,6 +2664,8 @@ type TerminalSummary struct {
 	// and Agent marks one it started — a client shows it like any other tab.
 	Name  string `json:"name,omitempty"`
 	Agent bool   `json:"agent,omitempty"`
+	// Busy: see TerminalSnapshotData.Busy. Pushed in terminal_index whenever it flips.
+	Busy bool `json:"busy,omitempty"`
 	// Set only in terminal_index, where rows span sessions and projects.
 	SessionID   string `json:"sessionId,omitempty"`
 	ProjectPath string `json:"projectPath,omitempty"`
@@ -2646,6 +2792,78 @@ type BrowserRequestData struct {
 	// asks the user. Old clients ignore both fields.
 	AllowedHosts     []string `json:"allowedHosts,omitempty"`
 	BlockCrossOrigin bool     `json:"blockCrossOrigin,omitempty"`
+}
+
+// BrowserViewData subscribes (or unsubscribes) the sender to the server browser's active tab.
+// Width and Height are the viewer's CSS size; the server clamps them.
+type BrowserViewData struct {
+	On     bool `json:"on"`
+	Width  int  `json:"width"`
+	Height int  `json:"height"`
+	// SessionID is the chat the viewer's panel belongs to; tabs this connection creates are that
+	// chat's, so its agent (and only it) can see them.
+	SessionID string `json:"sessionId,omitempty"`
+}
+
+// BrowserFrameAckData confirms the browser_frame with this Seq was drawn.
+type BrowserFrameAckData struct {
+	Seq uint64 `json:"seq"`
+}
+
+// BrowserControlData takes (or releases) the server browser's single human controller seat.
+type BrowserControlData struct {
+	Take bool `json:"take"`
+}
+
+// BrowserInputData is one pointer or keyboard event for the server browser, in page CSS pixels.
+// Kind is mouse, wheel, key or text; Type (down, up, move) qualifies mouse and key; Modifiers is
+// the CDP bitmask (alt 1, ctrl 2, meta 4, shift 8).
+type BrowserInputData struct {
+	Kind      string   `json:"kind"`
+	Type      string   `json:"type,omitempty"`
+	X         *float64 `json:"x,omitempty"`
+	Y         *float64 `json:"y,omitempty"`
+	Button    string   `json:"button,omitempty"`
+	Clicks    int      `json:"clicks,omitempty"`
+	DX        float64  `json:"dx,omitempty"`
+	DY        float64  `json:"dy,omitempty"`
+	Key       string   `json:"key,omitempty"`
+	Code      string   `json:"code,omitempty"`
+	Modifiers int      `json:"modifiers,omitempty"`
+	Text      string   `json:"text,omitempty"`
+}
+
+// BrowserNavData is a navigation or tab command from a human operator.
+type BrowserNavData struct {
+	Action string `json:"action"` // navigate, back, forward, reload, tab_new, tab_select, tab_close
+	URL    string `json:"url,omitempty"`
+	Index  int    `json:"index,omitempty"`
+}
+
+// BrowserFrameData is one JPEG of the active tab; the viewer acks Seq.
+type BrowserFrameData struct {
+	Seq    uint64 `json:"seq"`
+	Data   string `json:"data"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+// BrowserTabInfo is one tab of the server browser.
+type BrowserTabInfo struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Active  bool   `json:"active"`
+	Loading bool   `json:"loading"`
+}
+
+// BrowserStateData is the server browser as one peer sees it, sent to every peer on any change.
+type BrowserStateData struct {
+	Available  bool             `json:"available"`
+	Error      string           `json:"error,omitempty"`
+	Tabs       []BrowserTabInfo `json:"tabs"`
+	Controller string           `json:"controller"` // "", "agent" or "human"
+	YouControl bool             `json:"youControl"`
+	CanOperate bool             `json:"canOperate"`
 }
 
 // BrowserResponseData answers one browser_request: Output is the text the

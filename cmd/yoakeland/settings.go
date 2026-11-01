@@ -76,6 +76,10 @@ type ServerSettings struct {
 	// touched.
 	AutoGenerateTitle *bool `json:"autoGenerateTitle,omitempty"`
 
+	// LimitAction is what happens when a turn stops at a usage limit (limit.go): "ask" (the
+	// default), "continue" or "stop".
+	LimitAction string `json:"limitAction,omitempty"`
+
 	// ModelRoles is the server-wide model role table (set_model_roles,
 	// SPEC.md §4f), keyed by role name.
 	ModelRoles map[string]protocol.ModelRole `json:"modelRoles,omitempty"`
@@ -440,4 +444,27 @@ func (s *ServerSettings) save() error {
 		return err
 	}
 	return fsutil.WriteFileAtomic(s.filePath, data, 0600)
+}
+
+// GetLimitAction is the server-wide choice for a usage limit, "ask" unless set.
+func (s *ServerSettings) GetLimitAction() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.LimitAction {
+	case protocol.LimitActionContinue, protocol.LimitActionStop:
+		return s.LimitAction
+	}
+	return protocol.LimitActionAsk
+}
+
+func (s *ServerSettings) SetLimitAction(action string) error {
+	switch action {
+	case protocol.LimitActionAsk, protocol.LimitActionContinue, protocol.LimitActionStop:
+	default:
+		return fmt.Errorf("limit action must be ask, continue or stop")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LimitAction = action
+	return s.save()
 }

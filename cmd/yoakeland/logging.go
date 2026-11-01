@@ -138,6 +138,9 @@ func logLine(color, level, format string, args ...any) {
 		// Never colorized — the log file is plain text on disk.
 		fmt.Fprintf(logFile, "%s %-5s %s\n", ts, level, msg)
 	}
+	if level == "WARN" || level == "ERROR" {
+		recordWarning(level, msg)
+	}
 }
 
 func logInfo(format string, args ...any)  { logLine(colorCyan, "INFO", format, args...) }
@@ -161,6 +164,9 @@ func logLineDetail(color, level, short, detail string) {
 	}
 	if logFile != nil {
 		fmt.Fprintf(logFile, "%s %-5s %s\n", ts, level, detail)
+	}
+	if level == "WARN" || level == "ERROR" {
+		recordWarning(level, short)
 	}
 }
 

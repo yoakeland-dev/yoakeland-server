@@ -744,6 +744,9 @@ func codexMCPConfig(servers []tool.AgentServer) map[string]any {
 			if len(s.Headers) > 0 {
 				e["http_headers"] = s.Headers
 			}
+			if s.Name == "yoake-browser" { // its todo and log tools only touch the app's own state: no approval round trip
+				e["tools"] = map[string]any{"todo_write": map[string]any{"approval_mode": "approve"}, "artifact_logs": map[string]any{"approval_mode": "approve"}}
+			}
 			out[s.Name] = e
 		case s.Command != "":
 			e := map[string]any{"command": s.Command, "args": s.Args}

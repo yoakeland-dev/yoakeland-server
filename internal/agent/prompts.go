@@ -30,12 +30,8 @@ Rules:
 5. "@path" in the user's message names a project file; "@path#L10-20" (or "#L10") names
    those lines of it — read that range with file_read's startLine/endLine.
    "#[title](chat:ID)" names another chat in this project; read it with read_chat when it matters.
-6. To show something visual (a chart, a table, a small interactive widget), write a fenced block tagged artifact
-   whose body is a self-contained HTML page: CSS and JS inline, no network. It appears as a live widget under your
-   message. It starts in the app's own look: tokens --bg --fg --muted --accent --border --surface --danger
-   --success --warning --radius --font --mono (override them in your own :root rule to restyle), classes .card
-   .grid .row .stat .tag .muted .ok .warn .bad .bar, and styled table, button and input. Diagrams go in a
-   mermaid fence; math as $x$ or $$x$$, with \ce{...} for chemistry.`
+6. ` + artifactGuide + `
+7. On work with several steps, keep a todo list with todo_write (it replaces the whole list): one item in_progress at a time, mark each completed as you finish it.`
 
 // ChatSystemPrompt replaces DefaultSystemPrompt in a chat with no project
 // (SPEC.md §4b): a general assistant whose tools act on a small private
@@ -64,12 +60,26 @@ Rules:
 5. "@path" in the user's message names a file in the workspace; "@path#L10-20" (or "#L10") names
    those lines of it — read that range with file_read's startLine/endLine.
    "#[title](chat:ID)" names another chat in this project; read it with read_chat when it matters.
-6. To show something visual (a chart, a table, a small interactive widget), write a fenced block tagged artifact
+6. ` + artifactGuide + `
+7. On work with several steps, keep a todo list with todo_write (it replaces the whole list): one item in_progress at a time, mark each completed as you finish it.`
+
+// artifactGuide is how the model is told to show a live widget (rule 6 of the API-provider prompts and
+// the note a CLI agent's first prompt carries). Keep in step with src/lib/artifact.ts in the client.
+const artifactGuide = `To show something visual (a chart, a table, a small interactive widget), write a fenced block tagged artifact
    whose body is a self-contained HTML page: CSS and JS inline, no network. It appears as a live widget under your
    message. It starts in the app's own look: tokens --bg --fg --muted --accent --border --surface --danger
    --success --warning --radius --font --mono (override them in your own :root rule to restyle), classes .card
-   .grid .row .stat .tag .muted .ok .warn .bad .bar, and styled table, button and input. Diagrams go in a
+   .grid .row .stat .tag .muted .ok .warn .bad .bar, and styled table, button and input. The page can answer:
+   yoake.submit(obj), called from a click or form handler, sends what the user chose to you as your next
+   message (use it to offer options or collect input, then act on the reply). A page answers once: anything it sends
+   after the first submit is dropped, so collect everything in one submit (a form with a send button, not a click per field); yoake.log(...) and uncaught errors
+   are kept, and artifact_logs shows them to you when a page misbehaves. Diagrams go in a
    mermaid fence; math as $x$ or $$x$$, with \ce{...} for chemistry.`
+
+// CLISystemNote is added to a CLI agent's own system prompt (Claude Code's --append-system-prompt): what
+// is specific to this app's chat. Not put in the user's message, which may start with a slash command.
+const CLISystemNote = "In this app, " + artifactGuide + " On work with several steps, keep a todo list with the todo_write tool of the yoake-browser MCP server " +
+	"(listed as mcp__yoake-browser__todo_write, yoake-browser_todo_write or plain todo_write, depending on the agent; it replaces the whole list; one item in_progress at a time) and read a page's errors with its artifact_logs tool."
 
 // NativeChatInstruction leads a native agent's first prompt in a chat with no
 // project: such an agent defaults to coding in a repository.

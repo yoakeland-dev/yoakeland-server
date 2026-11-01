@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 
 	"yoakeland/internal/protocol"
@@ -33,7 +34,7 @@ type BrowserRelay interface {
 // burning context.
 const maxBrowserImageBytes = 4 << 20
 
-var browserActions = []string{"navigate", "snapshot", "click", "type", "press", "scroll", "evaluate", "back", "forward", "reload", "hover", "select", "wait", "tabs", "screenshot"}
+var browserActions = []string{"navigate", "snapshot", "click", "type", "press", "scroll", "evaluate", "back", "forward", "reload", "hover", "select", "wait", "tabs", "resize", "drag", "upload", "network", "emulate", "screenshot"}
 
 // browserActionsNoScreenshot is browserActions minus the one action whose
 // result is a picture, for a model that can't see one (DefinitionWithoutImages
@@ -59,13 +60,18 @@ const browserDescription = "Use the browser panel beside the chat (the user sees
 	"its JSON result. hover moves the pointer over a ref (menus, tooltips). select picks an <option> of a dropdown ref by its " +
 	"label or value (text). wait pauses for ms and/or until text shows up on the page, then returns a snapshot — use it " +
 	"after an action that loads content. tabs works the panel's tabs: op list, new (blank; navigate afterwards), select or " +
-	"close a tab by its number (as list numbers them, from 1); actions apply to the selected tab. Console errors from the " +
-	"page are included in snapshots."
+	"close a tab by its number (as list numbers them, from 1); actions apply to the selected tab. resize sets the page's " +
+	"viewport in CSS pixels (width 320-1920, height 240-1920) to see a layout at phone or desktop size; the next snapshot " +
+	"and screenshot use it. emulate sets a device preset (iphone, ipad, android, desktop): its viewport, touch input and " +
+	"mobile user agent. drag presses on ref and releases on the ref in to (sliders, sortable lists). click takes button " +
+	"(left, right, middle) and double. upload sets the files (absolute paths on the server) of a file input ref. network " +
+	"lists the requests the page made since its last navigation (status, method, type, size), optionally only those whose " +
+	"URL contains filter. Console errors from the page are included in snapshots."
 
 // browserScreenshotDescription is the rest of it, appended only for a model
 // that can see the picture it would get back (DefinitionWithoutImages).
 const browserScreenshotDescription = " screenshot captures the panel as a picture " +
-	"you can see — reach for it when text isn't enough (a layout, a chart, a canvas, why something looks wrong); it's " +
+	"you can see (with ref: just that element; with full_page: the whole scrollable page) — reach for it when text isn't enough (a layout, a chart, a canvas, why something looks wrong); it's " +
 	"slower and costs far more tokens than a snapshot, so use snapshot for structure and screenshot to actually look."
 
 func (t *BrowserTool) Description() string {
@@ -91,17 +97,26 @@ func (t *BrowserTool) RequiresPermission(argsJSON []byte) bool {
 // keys case-insensitively, a JS client doesn't, and forwarding the raw args
 // would let {"url":evil,"Url":localhost} pass as localhost here.
 type browserArgs struct {
-	Action     string `json:"action"`
-	URL        string `json:"url,omitempty"`
-	Ref        string `json:"ref,omitempty"`
-	Text       string `json:"text,omitempty"`
-	Submit     bool   `json:"submit,omitempty"`
-	Key        string `json:"key,omitempty"`
-	Direction  string `json:"direction,omitempty"`
-	Expression string `json:"expression,omitempty"`
-	Ms         int    `json:"ms,omitempty"`
-	Op         string `json:"op,omitempty"`
-	Tab        int    `json:"tab,omitempty"`
+	Action     string   `json:"action"`
+	URL        string   `json:"url,omitempty"`
+	Ref        string   `json:"ref,omitempty"`
+	Text       string   `json:"text,omitempty"`
+	Submit     bool     `json:"submit,omitempty"`
+	Key        string   `json:"key,omitempty"`
+	Direction  string   `json:"direction,omitempty"`
+	Expression string   `json:"expression,omitempty"`
+	Ms         int      `json:"ms,omitempty"`
+	Op         string   `json:"op,omitempty"`
+	Tab        int      `json:"tab,omitempty"`
+	To         string   `json:"to,omitempty"`
+	Button     string   `json:"button,omitempty"`
+	Double     bool     `json:"double,omitempty"`
+	FullPage   bool     `json:"full_page,omitempty"`
+	Files      []string `json:"files,omitempty"`
+	Device     string   `json:"device,omitempty"`
+	Filter     string   `json:"filter,omitempty"`
+	Width      int      `json:"width,omitempty"`
+	Height     int      `json:"height,omitempty"`
 }
 
 // maxBrowserWaitMs keeps one wait inside the broker's browserTimeout (60s) with room for the snapshot.
@@ -151,6 +166,15 @@ func (t *BrowserTool) definition(actions []string, description string) ToolDefin
 			"ms":         map[string]any{"type": "integer", "description": "wait: milliseconds to pause (at most 30000); with text, how long to wait for it (default 10000)."},
 			"op":         map[string]any{"type": "string", "enum": []string{"list", "new", "select", "close"}, "description": "tabs: what to do."},
 			"tab":        map[string]any{"type": "integer", "description": "tabs select/close: the tab's number, from 1, as tabs list shows it."},
+			"to":         map[string]any{"type": "string", "description": "drag: the ref to drop on."},
+			"button":     map[string]any{"type": "string", "enum": []string{"left", "right", "middle"}, "description": "click: mouse button (default left)."},
+			"double":     map[string]any{"type": "boolean", "description": "click: double-click."},
+			"full_page":  map[string]any{"type": "boolean", "description": "screenshot: capture the whole scrollable page, not just the viewport."},
+			"files":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "upload: absolute paths of the files to attach (at most 10)."},
+			"device":     map[string]any{"type": "string", "enum": []string{"iphone", "ipad", "android", "desktop"}, "description": "emulate: the device preset."},
+			"filter":     map[string]any{"type": "string", "description": "network: only requests whose URL contains this."},
+			"width":      map[string]any{"type": "integer", "description": "resize: viewport width in CSS pixels (320-1920)."},
+			"height":     map[string]any{"type": "integer", "description": "resize: viewport height in CSS pixels (240-1920)."},
 		},
 		"required": []string{"action"},
 	}}
@@ -193,6 +217,16 @@ func (t *BrowserTool) ExecuteWithImages(ctx context.Context, execCtx ExecutionCo
 		return "", nil, fmt.Errorf("tabs needs op list, new, select or close")
 	case a.Action == "tabs" && (a.Op == "select" || a.Op == "close") && a.Tab < 1:
 		return "", nil, fmt.Errorf("tabs %s needs the tab's number, from 1", a.Op)
+	case a.Action == "resize" && (a.Width < 320 || a.Width > 1920 || a.Height < 240 || a.Height > 1920):
+		return "", nil, fmt.Errorf("resize needs width 320-1920 and height 240-1920")
+	case a.Action == "drag" && (a.Ref == "" || a.To == ""):
+		return "", nil, fmt.Errorf("drag needs ref and to, both from the latest snapshot")
+	case a.Action == "upload" && (a.Ref == "" || len(a.Files) == 0 || len(a.Files) > 10):
+		return "", nil, fmt.Errorf("upload needs a file input ref and 1-10 files")
+	case a.Action == "emulate" && !slices.Contains([]string{"iphone", "ipad", "android", "desktop"}, a.Device):
+		return "", nil, fmt.Errorf("emulate needs device iphone, ipad, android or desktop")
+	case a.Action == "click" && a.Button != "" && !slices.Contains([]string{"left", "right", "middle"}, a.Button):
+		return "", nil, fmt.Errorf("click button is left, right or middle")
 	case a.Action == "press" && a.Key == "":
 		return "", nil, fmt.Errorf("press needs a key")
 	case a.Action == "evaluate" && a.Expression == "":

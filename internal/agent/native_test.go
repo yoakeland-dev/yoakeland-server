@@ -80,7 +80,7 @@ func TestAgent_NativeTurnRecordsStepsResumesAndFlattens(t *testing.T) {
 	if st.Native == nil || st.Native.SessionID != "native-1" || st.Native.Cursor != st.History[3].ID {
 		t.Fatalf("native ref = %+v", st.Native)
 	}
-	if !native.answers[0].Allowed || native.turns[0].ResumeID != "" || native.turns[0].Prompt != "first" {
+	if !native.answers[0].Allowed || native.turns[0].ResumeID != "" || !strings.HasSuffix(native.turns[0].Prompt, "first") {
 		t.Fatalf("turn 1 = %+v, answer %+v", native.turns[0], native.answers[0])
 	}
 

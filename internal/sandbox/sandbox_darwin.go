@@ -171,6 +171,7 @@ type darwinPTYSession struct {
 func (p *darwinPTYSession) Read(b []byte) (int, error)  { return p.ptmx.Read(b) }
 func (p *darwinPTYSession) Write(b []byte) (int, error) { return p.ptmx.Write(b) }
 func (p *darwinPTYSession) Pid() int                    { return p.cmd.Process.Pid }
+func (p *darwinPTYSession) Foreground() (int, bool)     { return ttyForeground(p.ptmx) }
 
 func (p *darwinPTYSession) Resize(cols, rows int) error {
 	return pty.Setsize(p.ptmx, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})

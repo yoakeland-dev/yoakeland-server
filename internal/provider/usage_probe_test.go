@@ -122,3 +122,16 @@ func TestStreamedRateLimitMergesOntoProbe(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+// A rejected event means the window is spent even though no utilization comes with it, and its reset
+// may be in milliseconds; the server's usage-limit handling depends on both (cmd/yoakeland/limit.go).
+func TestParseClaudeRateLimitsRejected(t *testing.T) {
+	rl := parseClaudeRateLimits(json.RawMessage(`{"status":"rejected","rateLimitType":"five_hour","resetsAt":1790790203000}`))
+	if rl == nil || rl.FiveHour == nil || rl.FiveHour.UsedPct != 100 || rl.FiveHour.ResetsAt != unixRFC3339(1790790203) {
+		t.Fatalf("rejected = %+v", rl)
+	}
+	rl = parseClaudeRateLimits(json.RawMessage(`{"status":"allowed","rateLimitType":"five_hour","utilization":0.4,"resetsAt":1790790203}`))
+	if rl.FiveHour.UsedPct != 40 {
+		t.Fatalf("allowed = %+v", rl.FiveHour)
+	}
+}

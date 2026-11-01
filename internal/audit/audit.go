@@ -82,6 +82,9 @@ type Event struct {
 	Detail  map[string]any `json:"detail,omitempty"`
 }
 
+// SlowTool is how long a tool run takes before it is logged as slow.
+const SlowTool = 10 * time.Second
+
 const (
 	// DefaultMaxBytes is the size at which the current file is rotated.
 	DefaultMaxBytes = 5 << 20

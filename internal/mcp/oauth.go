@@ -28,7 +28,7 @@ import (
 // resource indicator (RFC 8707) binding the token to the one MCP server.
 //
 // The browser's redirect goes to a loopback address on the *client's* machine
-// (the daemon may be elsewhere), which hands the code back to the daemon; the
+// (the daemon may be elsewhere) or to the web client's own https page, which hands the code back to the daemon; the
 // daemon exchanges it, so a token only ever reaches the daemon.
 
 // tokenEntry is what is stored for one MCP server URL.
@@ -461,11 +461,13 @@ func randToken(n int) string {
 }
 
 // Begin starts a sign-in to serverURL and returns the page to open. redirect is
-// where the browser will send the code: a loopback http address.
+// where the browser will send the code: an https address (a web client's own
+// page) or a loopback http one. Only peers allowed to edit MCP servers get here.
 func (f *Flow) Begin(ctx context.Context, cfg ServerConfig, ch *errNeedsAuth, redirect string) (*Pending, string, error) {
 	ru, err := url.Parse(redirect)
-	if err != nil || ru.Scheme != "http" || !(ru.Hostname() == "localhost" || ru.Hostname() == "127.0.0.1" || ru.Hostname() == "::1" || ru.Hostname() == "[::1]") {
-		return nil, "", errors.New("the sign-in must come back to a local address")
+	loopback := err == nil && (ru.Hostname() == "localhost" || ru.Hostname() == "127.0.0.1" || ru.Hostname() == "::1" || ru.Hostname() == "[::1]")
+	if err != nil || ru.User != nil || ru.Fragment != "" || !(ru.Scheme == "https" && ru.Hostname() != "" || ru.Scheme == "http" && loopback) {
+		return nil, "", errors.New("the sign-in must come back to an https address or a local one")
 	}
 	md, scopes, err := f.discover(ctx, cfg.URL, ch)
 	if err != nil {

@@ -20,6 +20,7 @@ var remoteAllowed = eventSet(
 	protocol.EventSetModelOptions, protocol.EventSetModelRoles, protocol.EventOpenProject, protocol.EventListProjects,
 	// files (handleFileEnvelope)
 	protocol.EventListTree, protocol.EventReadFile, protocol.EventWriteFile, protocol.EventFsOp, protocol.EventListFiles,
+	protocol.EventArtifactEvent, protocol.EventLimitContinue, protocol.EventLimitDismiss,
 	protocol.EventListChanges, protocol.EventGetFileDiff, protocol.EventReadMedia, protocol.EventReadMediaChunk,
 	protocol.EventUploadBegin, protocol.EventUploadChunk, protocol.EventImportChatFiles,
 	// read-only views
@@ -28,8 +29,10 @@ var remoteAllowed = eventSet(
 	protocol.EventPing, protocol.EventPong, protocol.EventSetPresence, protocol.EventSetPeerName,
 	protocol.EventSetPeerAvatar, protocol.EventDismissNotification, protocol.EventMarkNotificationsRead,
 	protocol.EventSetNotifyPrefs,
+	// the server's browser can be watched, not driven (browser_control/input/nav stay out)
+	protocol.EventBrowserView, protocol.EventBrowserFrameAck,
 	// a terminal the owner opened can be watched, but not typed into or created
-	protocol.EventListTerminals, protocol.EventTerminalAttach, protocol.EventTerminalResize,
+	protocol.EventListTerminals, protocol.EventTerminalAttach, protocol.EventTerminalDetach, protocol.EventTerminalResize,
 )
 
 func eventSet(types ...protocol.EventType) map[protocol.EventType]bool {

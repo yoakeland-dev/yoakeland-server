@@ -50,6 +50,9 @@ type SessionState struct {
 	// Native is the CLI agent session this chat continues, if its last turn
 	// ran on one (agent/native.go) — persisted so a restart still resumes it.
 	Native *NativeSessionRef `json:"native,omitempty"`
+
+	// Todos is the model's todo list (todo_write / CLI TodoWrite), replaced whole on each change.
+	Todos *protocol.TodoListData `json:"todos,omitempty"`
 }
 
 type SessionStore interface {

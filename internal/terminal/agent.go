@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/sandbox"
 )
 
 // The agent's side of terminals: it opens ordinary tabs in its own chat (the
@@ -46,6 +47,11 @@ func (t *Terminal) scanMarks(data []byte) {
 		switch fields[0] {
 		case "A":
 			t.ready = true
+			if fg, ok := t.session.(sandbox.Foregrounder); ok && t.idlePgrp == 0 {
+				if pg, ok := fg.Foreground(); ok {
+					t.idlePgrp = pg
+				}
+			}
 		case "C":
 			t.busy = true
 		case "D":
@@ -78,7 +84,7 @@ type AgentState struct {
 func (t *Terminal) stateLocked() AgentState {
 	return AgentState{
 		ID: t.id, Name: t.name, Agent: t.agent, Status: t.status, ExitCode: t.exitCode,
-		Busy: t.busy, Finished: t.finished, LastExit: t.lastExit, Written: t.written,
+		Busy: t.busyLocked(), Finished: t.finished, LastExit: t.lastExit, Written: t.written,
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/artifact"
 	"yoakeland/internal/audit"
 	"yoakeland/internal/mcp"
 	"yoakeland/internal/normalizer"
@@ -120,11 +122,13 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		tool.NewBashTool(norm, sb),
 		tool.NewAskUserQuestionTool(),
 		tool.NewWritePlanTool(filepath.Join(dataDir, "plans")),
+		tool.NewTodoWriteTool(todoStore{sessStore}),
 		tool.NewTerminalStartTool(terminals),
 		tool.NewTerminalOutputTool(terminals),
 		tool.NewTerminalStopTool(terminals),
 		tool.NewBrowserTool(browser),
 		tool.NewReadChatTool(chatReader{sessStore}),
+		tool.NewArtifactLogsTool(artifact.Default),
 	}
 	braveKey := os.Getenv("BRAVE_API_KEY")
 	if braveKey == "" {
@@ -210,6 +214,7 @@ func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Me
 			Author:       m.AuthorName,
 			AuthorAvatar: m.AuthorAvatar,
 			Attachments:  m.Attachments,
+			Origin:       m.Origin,
 			Provider:     m.Provider,
 			Model:        m.Model,
 			CreatedAt:    m.CreatedAt,
@@ -496,6 +501,13 @@ func (r *ProjectRegistry) Terminals() []protocol.TerminalSummary {
 	return out
 }
 
+// DetachTerminals drops a closed connection from the terminals of every open project.
+func (r *ProjectRegistry) DetachTerminals(ipc *protocol.IPCStream) {
+	for _, pc := range r.open() {
+		pc.Terminals.DetachStream(ipc)
+	}
+}
+
 // installLocked (r.mu held) wires pc's sessions to the notification feed
 // and status hub, whichever are set. Safe to repeat.
 func (r *ProjectRegistry) installLocked(pc *ProjectContext) {
@@ -615,6 +627,7 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 		return nil, fmt.Errorf("chats dir: %w", err)
 	}
 	pruneChats(stateDir, chatsDir)
+	dropChatGhosts(known)
 	return &ProjectRegistry{
 		chatsDir:            chatsDir,
 		chatTier:            string(sandbox.NewSandbox(chatsDir, time.Second).Mode()),
@@ -692,6 +705,10 @@ func projectKey(root string) (string, error) {
 // Get returns the ProjectContext for root, opening (creating on-disk state
 // for) it on first use. Safe to call repeatedly for the same root.
 func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
+	if root == protocol.ChatProject {
+		// projectKey would resolve it against the daemon's cwd and invent a project there.
+		return nil, errors.New("a chat has no project path of its own; name the chat with sessionId")
+	}
 	key, err := projectKey(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolving project path %q: %w", root, err)
@@ -742,6 +759,58 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		logWarn("failed to record project %q in projects.json: %v", key, err)
 	}
 	return pc, nil
+}
+
+// dropChatGhosts forgets projects an older build recorded when "@chat" was resolved as a
+// relative path (<cwd>/@chat) instead of a chat's scratch root.
+func dropChatGhosts(known *projectstore.Store) {
+	list, err := known.List()
+	if err != nil {
+		return
+	}
+	for _, p := range list {
+		if filepath.Base(p.Path) == protocol.ChatProject {
+			_ = known.Remove(p.Path)
+		}
+	}
+}
+
+// chatSentinel points a "@chat" projectPath at the chat's scratch root, so every handler can
+// treat it as the ordinary project it is; list_sessions keeps "@chat" as the name of the
+// chat listing. Without a usable sessionId the sentinel stays, and Get refuses it.
+func (r *ProjectRegistry) chatSentinel(env *protocol.Envelope) {
+	if env.Type == protocol.EventListSessions {
+		return
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(env.Data, &m) != nil {
+		return
+	}
+	str := func(k string) (v string) {
+		for name, raw := range m {
+			if strings.EqualFold(name, k) {
+				_ = json.Unmarshal(raw, &v)
+			}
+		}
+		return
+	}
+	if str("projectPath") != protocol.ChatProject {
+		return
+	}
+	id := str("sessionId")
+	if id == "" {
+		id = env.SessionID
+	}
+	root, err := r.chatRoot(id)
+	if err != nil {
+		return
+	}
+	for name := range m {
+		if strings.EqualFold(name, "projectPath") {
+			m[name], _ = json.Marshal(root)
+		}
+	}
+	env.Data, _ = json.Marshal(m)
 }
 
 // Unbind removes sessionID's project binding, e.g. after the session is

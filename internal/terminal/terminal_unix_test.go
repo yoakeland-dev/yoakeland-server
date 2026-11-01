@@ -140,14 +140,15 @@ func TestManager_OpenRefusesPastTerminalCap(t *testing.T) {
 	sb := sandbox.NewSandbox(tempDir, 60*time.Second)
 	mgr := terminal.NewManager(sb, norm)
 	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{})
-	defer mgr.CloseSession("sess-cap")
-
+	// Spread over chats: one chat is capped lower (see maxUserTerminals).
 	for i := 0; i < 64; i++ {
-		if _, err := mgr.Open(context.Background(), ipc, "sess-cap", fmt.Sprintf("term-%d", i), "", 0, 0, nil); err != nil {
+		sess := fmt.Sprintf("sess-cap-%d", i/4)
+		defer mgr.CloseSession(sess)
+		if _, err := mgr.Open(context.Background(), ipc, sess, fmt.Sprintf("term-%d", i), "", 0, 0, nil); err != nil {
 			t.Fatalf("Open %d: %v", i, err)
 		}
 	}
-	if _, err := mgr.Open(context.Background(), ipc, "sess-cap", "term-over", "", 0, 0, nil); err == nil {
+	if _, err := mgr.Open(context.Background(), ipc, "sess-cap-over", "term-over", "", 0, 0, nil); err == nil {
 		t.Fatal("65th terminal opened, want refusal")
 	}
 }
@@ -171,17 +172,14 @@ func TestManager_ConcurrentRestartSpawnsOneShell(t *testing.T) {
 	norm, _ := normalizer.New(tempDir)
 	sb := &countingSandbox{Sandbox: sandbox.NewSandbox(tempDir, 60*time.Second)}
 	mgr := terminal.NewManager(sb, norm)
-	ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{})
 
-	if _, err := mgr.Open(context.Background(), ipc, "sess-1", "term-1", "", 0, 0, nil); err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if err := mgr.Write("sess-1", "term-1", []byte("exit\n")); err != nil {
-		t.Fatalf("Write: %v", err)
+	// The agent's tab: it runs under the sandbox this test counts spawns of (a person's doesn't).
+	if _, err := mgr.Start(context.Background(), "sess-1", "t", "", "exit"); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		st, err := mgr.State("sess-1", "term-1")
+		st, err := mgr.State("sess-1", "agent-1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -200,7 +198,7 @@ func TestManager_ConcurrentRestartSpawnsOneShell(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			peer := protocol.NewIPCStream(bytes.NewBuffer(nil), &syncBuffer{})
-			_, _ = mgr.Attach(context.Background(), peer, "sess-1", "term-1", 0, 0, true)
+			_, _ = mgr.Attach(context.Background(), peer, "sess-1", "agent-1", 0, 0, true)
 		}()
 	}
 	wg.Wait()

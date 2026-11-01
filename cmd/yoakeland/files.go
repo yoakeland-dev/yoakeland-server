@@ -167,7 +167,11 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		out := protocol.MediaInfoData{RequestID: d.RequestID, Path: d.Path}
 		pc, err := fileProject(deps, d.ProjectPath)
 		if err == nil {
-			err = readMediaInfo(pc.Root, d.Path, &out)
+			if abs, ok := attachedPath(pc, d.SessionID, d.Path); ok {
+				err = attachedMediaInfo(abs, &out)
+			} else {
+				err = readMediaInfo(pc.Root, d.Path, &out)
+			}
 		}
 		out.Error = errString(err)
 		reply(protocol.EventMediaInfo, out)
@@ -178,7 +182,11 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		out := protocol.MediaChunkData{RequestID: d.RequestID, Offset: d.Offset}
 		pc, err := fileProject(deps, d.ProjectPath)
 		if err == nil {
-			out.Data, out.Last, err = readMediaChunk(pc.Root, d.Path, d.Offset)
+			if abs, ok := attachedPath(pc, d.SessionID, d.Path); ok {
+				out.Data, out.Last, err = readAttachedChunk(abs, d.Offset)
+			} else {
+				out.Data, out.Last, err = readMediaChunk(pc.Root, d.Path, d.Offset)
+			}
 		}
 		out.Error = errString(err)
 		reply(protocol.EventMediaChunk, out)
@@ -398,6 +406,10 @@ func readMediaInfo(root, rel string, out *protocol.MediaInfoData) error {
 	}); err != nil {
 		return err
 	}
+	return fillMediaInfo(fi, mime, large, out)
+}
+
+func fillMediaInfo(fi os.FileInfo, mime string, large bool, out *protocol.MediaInfoData) error {
 	if !fi.Mode().IsRegular() {
 		return errors.New("is a folder or a special file")
 	}
@@ -411,6 +423,42 @@ func readMediaInfo(root, rel string, out *protocol.MediaInfoData) error {
 	out.Size = fi.Size()
 	out.Mime = mime
 	return nil
+}
+
+// attachedPath is the real path of rel when it is absolute and one of the
+// session's own attachments (or under an attached folder): a client viewing a
+// sent message reads its files back through read_media, whether they sit in the
+// project, in the upload store or elsewhere on the machine.
+func attachedPath(pc *ProjectContext, sessionID, rel string) (string, bool) {
+	if sessionID == "" || !filepath.IsAbs(rel) {
+		return "", false
+	}
+	ag := pc.Registry.Lookup(sessionID)
+	if ag == nil {
+		return "", false
+	}
+	return tool.ResolveAttached(rel, ag.Attachments())
+}
+
+func attachedMediaInfo(abs string, out *protocol.MediaInfoData) error {
+	mime, large := mediaMime(abs)
+	if mime == "" {
+		return errors.New("not a previewable type")
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	return fillMediaInfo(fi, mime, large, out)
+}
+
+func readAttachedChunk(abs string, offset int64) ([]byte, bool, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	return readChunk(f, offset)
 }
 
 // readMediaChunk reads one mediaChunkSize slice starting at offset, without
@@ -429,6 +477,10 @@ func readMediaChunk(root, rel string, offset int64) (data []byte, last bool, err
 		return nil, false, err
 	}
 	defer f.Close()
+	return readChunk(f, offset)
+}
+
+func readChunk(f *os.File, offset int64) (data []byte, last bool, err error) {
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return nil, false, err
 	}

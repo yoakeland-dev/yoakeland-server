@@ -180,6 +180,33 @@ func TestPairingTokenIsOneDevice(t *testing.T) {
 	}
 }
 
+// With nobody connected to approve, the code alone is the proof: a made-up one gets nothing, a
+// minted one is let in. No approver never means "admit whoever knocks".
+func TestPairingWithoutApproverNeedsAMintedCode(t *testing.T) {
+	deps, rc := startPairingServer(t)
+	if deps.peers.HasLocal() {
+		t.Fatal("test setup has an approver")
+	}
+	c := dialTLS(t, rc.ln.Addr().String())
+	defer c.Close()
+	b, _ := json.Marshal(protocol.Envelope{Type: protocol.EventAuth, Data: mustJSON(t, protocol.AuthData{Token: "never-minted", DeviceID: "dev"})})
+	_, _ = c.Write(append(b, '\n'))
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, _ := bufio.NewReader(c).ReadString('\n')
+	if strings.Contains(got, string(protocol.EventPeerList)) {
+		t.Fatalf("an unminted code was admitted: %s", got)
+	}
+
+	if err := deps.settings.AddPairingToken("phone", "minted", ""); err != nil {
+		t.Fatal(err)
+	}
+	c2 := dialTLS(t, rc.ln.Addr().String())
+	defer c2.Close()
+	if _, refused := signIn(t, c2, protocol.AuthData{Token: "minted", DeviceID: "dev"}); refused != "" {
+		t.Fatalf("minted code refused: %s", refused)
+	}
+}
+
 // With a desktop connected, a new device waits until it says yes; no, or silence, refuses it.
 func TestPairingNeedsApprovalWhenSomeoneCanGiveIt(t *testing.T) {
 	deps, rc := startPairingServer(t)

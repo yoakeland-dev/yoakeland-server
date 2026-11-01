@@ -244,10 +244,25 @@ func TestOAuthRedirectMustBeLocal(t *testing.T) {
 	f := newAuthFake(t)
 	auth, _ := NewAuthStore(t.TempDir(), "")
 	flow := NewFlow(auth)
-	for _, bad := range []string{"https://evil.example/cb", "http://evil.example:80/cb", "javascript:alert(1)", "http://localhost.evil.example/cb", ""} {
+	for _, bad := range []string{"http://evil.example:80/cb", "javascript:alert(1)", "http://localhost.evil.example/cb", "ftp://127.0.0.1/cb", "https:///cb", "https://u:p@app.example/cb", "https://app.example/cb#x", ""} {
 		if _, _, err := flow.Begin(context.Background(), ServerConfig{URL: f.srv.URL + "/mcp"}, nil, bad); err == nil {
 			t.Errorf("redirect %q must be refused", bad)
 		}
+	}
+}
+
+func TestOAuthRedirectMayBeHTTPS(t *testing.T) {
+	f := newAuthFake(t)
+	auth, _ := NewAuthStore(t.TempDir(), "")
+	flow := NewFlow(auth)
+	redirect := "https://app.example/oauth-callback"
+	_, authURL, err := flow.Begin(ctx5(t), ServerConfig{URL: f.srv.URL + "/mcp", OAuth: &OAuthConfig{ClientID: "mine"}}, nil, redirect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, _ := url.Parse(authURL)
+	if q.Query().Get("redirect_uri") != redirect || q.Query().Get("code_challenge_method") != "S256" || q.Query().Get("state") == "" {
+		t.Fatalf("authorization URL = %s", authURL)
 	}
 }
 

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+	"yoakeland/internal/projectstore"
 	"yoakeland/internal/protocol"
 )
 
@@ -123,5 +125,49 @@ func TestCopyFileRefusesEscapingSymlink(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(dst, "f")); err == nil {
 		t.Fatal("a file was created for the refused copy")
+	}
+}
+
+// "@chat" is a name for a chat's scratch root, never a path: Get must refuse it instead of
+// inventing <cwd>/@chat, and any handler's "@chat" projectPath resolves to the chat's root.
+func TestChatSentinelNeverBecomesAProject(t *testing.T) {
+	reg := newTestRegistry(t)
+	if _, err := reg.Get(protocol.ChatProject); err == nil {
+		t.Fatal("Get(@chat) opened a project")
+	}
+	env := &protocol.Envelope{Type: protocol.EventListFiles, SessionID: "chat-1", Data: json.RawMessage(`{"projectPath":"@chat"}`)}
+	reg.chatSentinel(env)
+	var d struct{ ProjectPath string }
+	if err := json.Unmarshal(env.Data, &d); err != nil || d.ProjectPath != filepath.Join(reg.chatsDir, "chat-1") {
+		t.Fatalf("sentinel not resolved: %s", env.Data)
+	}
+	if _, err := reg.Get(d.ProjectPath); err != nil {
+		t.Fatal(err)
+	}
+	list := &protocol.Envelope{Type: protocol.EventListSessions, SessionID: "chat-1", Data: json.RawMessage(`{"projectPath":"@chat"}`)}
+	reg.chatSentinel(list)
+	if string(list.Data) != `{"projectPath":"@chat"}` {
+		t.Fatalf("list_sessions must keep the sentinel: %s", list.Data)
+	}
+	for _, p := range reg.List() {
+		if filepath.Base(p) == protocol.ChatProject {
+			t.Fatalf("ghost project recorded: %s", p)
+		}
+	}
+}
+
+func TestDropChatGhosts(t *testing.T) {
+	dir := t.TempDir()
+	known, err := projectstore.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghost, real := filepath.Join(dir, "x", "@chat"), filepath.Join(dir, "real")
+	_ = known.Upsert(ghost)
+	_ = known.Upsert(real)
+	dropChatGhosts(known)
+	got, _ := known.List()
+	if len(got) != 1 || got[0].Path != real {
+		t.Fatalf("got %v", got)
 	}
 }

@@ -109,6 +109,19 @@ func (r *remoteControl) Start(ctx context.Context) error {
 	return nil
 }
 
+// Ports are the TCP ports the remote listener is serving on now (none while remote access is off).
+func (r *remoteControl) Ports() []uint16 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ln == nil {
+		return nil
+	}
+	if a, ok := r.ln.Addr().(*net.TCPAddr); ok {
+		return []uint16{uint16(a.Port)}
+	}
+	return nil
+}
+
 // RTCFingerprint is the SHA-256 fingerprint of the DTLS certificate WebRTC clients pin, in the
 // form an SDP carries (rtc.go). It goes into pairing codes next to the token. "" if the
 // certificate can't be made.

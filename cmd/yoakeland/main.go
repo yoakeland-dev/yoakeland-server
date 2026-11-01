@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -26,11 +27,13 @@ import (
 	"syscall"
 	"time"
 	"yoakeland/internal/agent"
+	"yoakeland/internal/artifact"
 	"yoakeland/internal/audit"
 	"yoakeland/internal/mcp"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/provider"
+	"yoakeland/internal/sched"
 	"yoakeland/internal/settings"
 	"yoakeland/internal/sockpath"
 	"yoakeland/internal/tlsca"
@@ -163,6 +166,7 @@ func main() {
 	peers := NewPeerRegistry()
 	browser := newBrowserBroker(peers)
 	projects.browser = browser
+	projects.browserMCP = newBrowserMCP(browser)
 	// Providers/credentials belong to whoever is running the server, not to
 	// any one project.
 	providerStore, err := provider.NewProviderStore(stateDir, masterKey)
@@ -261,6 +265,13 @@ func main() {
 
 	rc := &remoteControl{stateDir: stateDir, settings: settings}
 	rc.apply(settings.Remote())
+	if runtime.GOOS != "windows" {
+		// The server's own browser must not reach yoakeland's listeners.
+		browser.server = newServerBrowser(peers, stateDir, func() []uint16 {
+			return append(rc.Ports(), projects.browserMCP.port())
+		})
+		peers.OnDemote = func(id string) { _ = browser.server.setControl(id, false) }
+	}
 	deps := connDeps{
 		projects:           projects,
 		defaultProjectRoot: defaultProjectRoot,
@@ -279,6 +290,7 @@ func main() {
 		remote:             rc,
 		status:             hub,
 		browser:            browser,
+		sched:              sched.New(stateDir),
 		turnWG:             &sync.WaitGroup{},
 	}
 	rc.deps = deps
@@ -289,6 +301,8 @@ func main() {
 	shutdownServer = cancel
 
 	manifestCache.StartDailyRefresh(ctx)
+	startScheduler(ctx, deps)
+	rearmLimitHits(deps)
 	pricingCache.StartDailyRefresh(ctx)
 	hub.StartUsagePolling(ctx, providerStore)
 
@@ -689,6 +703,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 
 	sendServerIdentity(deps, peer)
 	_ = ipc.SendEvent(protocol.EventAutoGenerateTitle, "", "", "", protocol.AutoGenerateTitleData{Enabled: deps.settings.GetAutoGenerateTitle()})
+	_ = ipc.SendEvent(protocol.EventLimitAction, "", "", "", protocol.LimitActionData{Action: deps.settings.GetLimitAction()})
 	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
 	_ = ipc.SendEvent(protocol.EventNotifyPrefs, "", "", "", deps.settings.GetNotifyPrefs())
 	sendRuntimeState(ipc, deps, network)
@@ -916,7 +931,8 @@ type connDeps struct {
 	remote             *remoteControl
 	status             *statusHub
 	browser            *browserBroker
-	webRoot            string // "" serves no web UI
+	sched              *sched.Scheduler // turns the server starts itself (schedule.go); nil in tests that don't need it
+	webRoot            string           // "" serves no web UI
 
 	// turnWG, if non-nil, is Add(1)'d before every RunTurn goroutine is
 	// spawned and Done() when it returns. Production leaves this nil (the
@@ -935,6 +951,10 @@ type connDeps struct {
 // if non-nil, is called after every successfully read envelope (server mode
 // uses it to feed the heartbeat's liveness check).
 func serveConnection(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, onActivity func()) {
+	// A closed connection watches nothing: an idle shell it was the last viewer of is forgotten.
+	if deps.projects != nil {
+		defer deps.projects.DetachTerminals(ipc)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -1086,7 +1106,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 	}
-	if handleFileEnvelope(ipc, deps, env) {
+	deps.projects.chatSentinel(env)
+	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, env) || handleLimitEnvelope(ipc, deps, env) || handleArtifactEnvelope(ipc, deps, peerID, env) {
 		return
 	}
 	switch env.Type {
@@ -1120,6 +1141,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 
+		clearLimitOnSend(deps, sessID)
 		ag := pc.Registry.Get(ipc, sessID)
 		// Create the session's file before the turn goroutine starts, so the
 		// set_session_title a client pushes alongside a first message (SPEC.md
@@ -1145,7 +1167,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RunTurnWithTitleGeneration(turnCtx, sID, tID, prompt, autoGenerateTitle); err != nil {
 				logError("turn %s (session %s) failed: %v", tID, sID, err)
-				deps.notify.turnFailed(pc, sID, err)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -1417,29 +1439,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
-		cfg, ok := deps.providerStore.Get(data.ProviderName)
-		if !ok {
-			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("unknown provider %q", data.ProviderName),
-			})
+		if err := bindProvider(deps, pc, pc.Registry.Get(ipc, sessID), sessID, data.ProviderName, data.Model); err != nil {
+			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
-		built, err := provider.BuildProvider(cfg, data.Model, pc.Root)
-		if err != nil {
-			_ = ipc.SendEvent(protocol.EventError, sessID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to activate provider %q: %v", data.ProviderName, err),
-			})
-			return
-		}
-		if cli, ok := built.(*provider.CLISubprocessProvider); ok && deps.status != nil {
-			name := data.ProviderName
-			kind := string(cfg.Kind)
-			cli.OnRateLimits = func(rl protocol.ProviderRateLimits) {
-				rl.Kind = kind
-				deps.status.SetRateLimits(name, rl)
-			}
-		}
-		pc.Registry.Get(ipc, sessID).SetProvider(built, data.ProviderName)
 		providerSet := protocol.ProviderSetData{
 			SessionID:    sessID,
 			ProviderName: data.ProviderName,
@@ -1819,6 +1822,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Context:   ctxData,
 			Spend:     spend,
 		})
+		sendTodoList(ipc, data.SessionID, state)
 
 	case protocol.EventGetContextBreakdown:
 		var data protocol.GetContextBreakdownData
@@ -1951,6 +1955,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
+		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
 		author := resolveAuthor(deps, peerID, "", "")
 		turnCtx := agent.WithAuthor(ctx, author)
@@ -1968,7 +1973,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.EditMessage(turnCtx, sID, tID, msgID, content, autoGenerateTitle); err != nil {
 				logError("edit_message turn %s (session %s): %v", tID, sID, err)
-				deps.notify.turnFailed(pc, sID, err)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -1988,6 +1993,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			_ = ipc.SendEvent(protocol.EventError, data.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
+		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
 		author := resolveAuthor(deps, peerID, "", "")
 		turnCtx := agent.WithAuthor(ctx, author)
@@ -2001,7 +2007,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RetryMessage(turnCtx, sID, tID, msgID); err != nil {
 				logError("retry_message turn %s (session %s): %v", tID, sID, err)
-				deps.notify.turnFailed(pc, sID, err)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -2133,6 +2139,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		pc.Registry.Remove(data.SessionID)
+		if deps.sched != nil {
+			deps.sched.Forget(data.SessionID)
+		}
+		artifact.Default.Forget(data.SessionID)
 		pc.Terminals.CloseSession(data.SessionID)
 		provider.CloseNativeSessions(agent.NativeSessionKey(data.SessionID, pc.Root))
 		if err := pc.SessStore.Delete(data.SessionID); err != nil {
@@ -2192,6 +2202,19 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 
 	case protocol.EventListAudit:
 		handleListAudit(ipc, deps, env)
+
+	case protocol.EventListProcesses:
+		_ = ipc.SendEvent(protocol.EventProcessList, "", "", "", protocol.ProcessListData{
+			SampledAtMs: time.Now().UnixMilli(), Processes: readProcessTree(os.Getpid()),
+		})
+
+	case protocol.EventSignalProcess:
+		handleSignalProcess(ipc, network, env)
+
+	case protocol.EventListProblems:
+		handleListProblems(ipc, deps, network, env)
+	case protocol.EventReadLog:
+		handleReadLog(ipc, network)
 
 	case protocol.EventListNotifications:
 		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", protocol.NotificationListData{Notifications: deps.notify.List()})
@@ -2438,6 +2461,17 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		_ = ipc.SendEvent(protocol.EventTerminalSnapshot, sessID, env.TurnID, "", snap)
 
+	case protocol.EventTerminalDetach:
+		var data protocol.TerminalDetachData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return
+		}
+		pc, sessID, err := resolveTerminalSession(ipc, deps, env, data.SessionID, data.ProjectPath)
+		if err != nil {
+			return
+		}
+		pc.Terminals.Detach(ipc, sessID, data.TerminalID)
+
 	case protocol.EventTerminalInput:
 		var data protocol.TerminalInputData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
@@ -2497,6 +2531,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if json.Unmarshal(env.Data, &data) == nil {
 			deps.browser.Respond(peerID, data)
 		}
+
+	case protocol.EventBrowserView, protocol.EventBrowserFrameAck, protocol.EventBrowserControl, protocol.EventBrowserInput, protocol.EventBrowserNav:
+		deps.browser.serverEvent(ipc, peerID, env)
 
 	case protocol.EventListTerminals:
 		var data protocol.ListTerminalsData
@@ -2618,6 +2655,16 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			Codex:  agents["cli_codex"],
 			Agents: agents,
 		})
+
+	case protocol.EventListACPRegistry:
+		handleListACPRegistry(ctx, ipc, env)
+
+	case protocol.EventGetPairInfo:
+		var req struct {
+			RequestID string `json:"requestId"`
+		}
+		_ = json.Unmarshal(env.Data, &req)
+		_ = ipc.SendEvent(protocol.EventPairInfo, env.SessionID, env.TurnID, "", protocol.PairInfoData{RequestID: req.RequestID, Hosts: pairHosts()})
 
 	case protocol.EventPing:
 		var data protocol.PingData

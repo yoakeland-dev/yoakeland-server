@@ -371,6 +371,7 @@ type linuxPTYSession struct {
 func (p *linuxPTYSession) Read(b []byte) (int, error)  { return p.ptmx.Read(b) }
 func (p *linuxPTYSession) Write(b []byte) (int, error) { return p.ptmx.Write(b) }
 func (p *linuxPTYSession) Pid() int                    { return p.cmd.Process.Pid }
+func (p *linuxPTYSession) Foreground() (int, bool)     { return ttyForeground(p.ptmx) }
 
 func (p *linuxPTYSession) Resize(cols, rows int) error {
 	return pty.Setsize(p.ptmx, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})

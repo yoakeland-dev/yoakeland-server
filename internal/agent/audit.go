@@ -2,6 +2,7 @@ package agent
 
 import (
 	"strings"
+	"time"
 
 	"yoakeland/internal/audit"
 	"yoakeland/internal/permission"
@@ -48,6 +49,20 @@ func isPreset(rule *permission.Rule) bool {
 // auditExec records a tool that can change things (or reach out) being run.
 func (a *Agent) auditExec(session, tool, target string, mode Mode, via string) {
 	a.audit(audit.Event{Kind: audit.ToolExec, Session: session, Tool: tool, Target: target, Outcome: "run", Detail: map[string]any{"mode": string(mode), "via": via}})
+}
+
+// auditResult records how a tool run ended, but only when it failed or ran slow
+// (outcome "error" or "slow", with durationMs), so routine calls stay out of the log.
+func (a *Agent) auditResult(session, tool, target string, took time.Duration, execErr error) {
+	if execErr == nil && took < audit.SlowTool {
+		return
+	}
+	d := map[string]any{"durationMs": took.Milliseconds()}
+	outcome := "slow"
+	if execErr != nil {
+		outcome, d["error"] = "error", execErr.Error()
+	}
+	a.audit(audit.Event{Kind: audit.ToolExec, Session: session, Tool: tool, Target: target, Outcome: outcome, Detail: d})
 }
 
 // auditRule records a permission rule stored from an answer.

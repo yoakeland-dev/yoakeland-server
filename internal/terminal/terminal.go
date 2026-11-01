@@ -11,12 +11,16 @@
 // TerminalID), and deleting the chat tears all of them down — see
 // Manager.CloseSession, called from cmd/yoakeland's delete_session handler
 // and from project removal, so a terminal never outlives the chat that
-// opened it.
+// opened it. A person's tab also goes when nobody is attached and nothing runs
+// in it (see Manager.sweep), so one opened by mistake or left behind is forgotten;
+// the agent's tabs are never swept that way.
 package terminal
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -60,6 +64,13 @@ const (
 	// at most maxAgentTerminals live ones.
 	agentExitedTTL    = 15 * time.Minute
 	maxAgentTerminals = 8
+
+	// A person's tab is forgotten once nobody is watching it and nothing runs in it: it goes
+	// unattachedGrace after the last viewer detaches (long enough to survive a reload or a
+	// reconnect), checked every watchInterval. A chat holds at most maxUserTerminals.
+	unattachedGrace  = 3 * time.Second
+	watchInterval    = 500 * time.Millisecond
+	maxUserTerminals = 8
 )
 
 var (
@@ -105,6 +116,15 @@ type Terminal struct {
 	// doesn't carry it, so a program printing an escape sequence can't pass
 	// for the shell. Set per spawn.
 	markNonce string
+	// idlePgrp is the pty's foreground process group while the shell sat at a prompt (captured on
+	// the first prompt mark); the shell is running a command exactly when the foreground differs.
+	idlePgrp int
+	// tier is what this shell runs under (the Manager's sandbox, or sandbox.ModeHost for a person's).
+	tier string
+	// busyReported is the last busy value announced to clients; unattachedSince is when the last
+	// viewer left (zero while watched, busy, or the agent's).
+	busyReported    bool
+	unattachedSince time.Time
 
 	session sandbox.PTYSession
 
@@ -252,10 +272,26 @@ func (t *Terminal) snapshotLocked(sandboxTier string) *protocol.TerminalSnapshot
 		Sequence:    t.sequence,
 		ExitCode:    exitCode,
 		Label:       t.label,
-		SandboxTier: sandboxTier,
+		SandboxTier: cmp.Or(t.tier, sandboxTier),
 		Name:        t.name,
 		Agent:       t.agent,
+		Busy:        t.busyLocked(),
 	}
+}
+
+// busyLocked reports whether a command is running in the shell. The pty's foreground process
+// group is the truth when the platform can give it; otherwise the shell integration's C/D marks
+// are all there is. Callers hold t.mu.
+func (t *Terminal) busyLocked() bool {
+	if t.status != protocol.TerminalStatusRunning {
+		return false
+	}
+	if fg, ok := t.session.(sandbox.Foregrounder); ok && t.idlePgrp != 0 {
+		if pg, ok := fg.Foreground(); ok {
+			return pg != t.idlePgrp
+		}
+	}
+	return t.busy
 }
 
 // pump reads the pty until it hits EOF/error (the shell exited or the
@@ -353,6 +389,9 @@ type Manager struct {
 
 	// agentNetwork gates network access for agent-opened terminals only.
 	agentNetwork atomic.Bool
+
+	// watching is set while the sweep goroutine runs (see ensureWatcher).
+	watching atomic.Bool
 }
 
 // SetAgentNetwork sets whether terminals the agent opens (terminal_start)
@@ -431,6 +470,18 @@ func (m *Manager) open(ctx context.Context, stream *protocol.IPCStream, sessionI
 	if n >= maxTerminals {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("too many terminals open (max %d)", maxTerminals)
+	}
+	if name == "" {
+		mine := 0
+		for _, t := range m.terminals[sessionID] {
+			if !t.agent {
+				mine++
+			}
+		}
+		if mine >= maxUserTerminals {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("this chat already has %d terminals open (max %d)", mine, maxUserTerminals)
+		}
 	}
 	t := &Terminal{
 		sessionID: sessionID,
@@ -512,7 +563,20 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	// Later entries win, so this overrides the sandbox's PWD (the project root).
 	env = append(env, "PWD="+cwd)
 
-	session, err := m.sb.SpawnPTY(ctx, argv, env, cwd, cols, rows, network)
+	// A person's own terminal is their shell on their machine; only the agent's is sandboxed.
+	var session sandbox.PTYSession
+	var err error
+	tier := m.sandboxTier
+	if !agent {
+		session, err = sandbox.SpawnHostPTY(ctx, argv, env, cwd, cols, rows)
+		tier = string(sandbox.ModeHost)
+		if errors.Is(err, sandbox.ErrHostUnsupported) {
+			session, err, tier = nil, nil, m.sandboxTier
+		}
+	}
+	if session == nil && err == nil {
+		session, err = m.sb.SpawnPTY(ctx, argv, env, cwd, cols, rows, network)
+	}
 	if err != nil {
 		t.mu.Lock()
 		t.status = protocol.TerminalStatusError
@@ -524,12 +588,15 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	t.mu.Lock()
 	t.session = &onceClose{PTYSession: session}
 	t.markNonce = nonce
+	t.tier = tier
 	t.pid = session.Pid()
 	t.status = protocol.TerminalStatusRunning
 	t.exitCode = nil
 	t.label = filepath.Base(argv[0])
 	t.ready, t.busy = false, false
+	t.idlePgrp = 0
 	t.mu.Unlock()
+	m.ensureWatcher()
 
 	go func() {
 		t.pump()
@@ -540,6 +607,97 @@ func (m *Manager) spawn(ctx context.Context, t *Terminal) error {
 	}()
 	m.changed()
 	return nil
+}
+
+// Detach stops stream watching id, as when a client's drawer closes. The tab itself stays until
+// the sweep decides nobody needs it (see sweep).
+func (m *Manager) Detach(stream *protocol.IPCStream, sessionID, id string) {
+	if t, ok := m.get(sessionID, id); ok {
+		t.detach(stream)
+	}
+}
+
+// DetachStream detaches a closed connection from every terminal it was watching.
+func (m *Manager) DetachStream(stream *protocol.IPCStream) {
+	m.mu.Lock()
+	var all []*Terminal
+	for _, byID := range m.terminals {
+		for _, t := range byID {
+			all = append(all, t)
+		}
+	}
+	m.mu.Unlock()
+	for _, t := range all {
+		t.detach(stream)
+	}
+}
+
+func (t *Terminal) detach(stream *protocol.IPCStream) {
+	t.streams.Remove(stream)
+	t.dropOutputSubscriber(stream)
+}
+
+// ensureWatcher starts the goroutine that runs sweep every watchInterval while any terminal exists.
+func (m *Manager) ensureWatcher() {
+	if !m.watching.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		tick := time.NewTicker(watchInterval)
+		defer tick.Stop()
+		for range tick.C {
+			if m.sweep() {
+				continue
+			}
+			m.watching.Store(false)
+			// A terminal opened while the last sweep was finishing found the flag still set.
+			if m.sweep() && m.watching.CompareAndSwap(false, true) {
+				continue
+			}
+			return
+		}
+	}()
+}
+
+// sweep announces busy flips (through onChange, so every client's roster is current without
+// parsing output) and closes the tabs of a person that nothing watches and nothing runs in.
+// Reports whether any terminal is left to watch.
+func (m *Manager) sweep() bool {
+	m.mu.Lock()
+	var all []*Terminal
+	for _, byID := range m.terminals {
+		for _, t := range byID {
+			all = append(all, t)
+		}
+	}
+	m.mu.Unlock()
+
+	now := time.Now()
+	flipped := false
+	var forgotten []*Terminal
+	for _, t := range all {
+		t.mu.Lock()
+		busy := t.busyLocked()
+		if busy != t.busyReported {
+			t.busyReported, flipped = busy, true
+		}
+		switch {
+		case len(t.subs) > 0 || t.agent || busy:
+			t.unattachedSince = time.Time{}
+		case t.unattachedSince.IsZero():
+			t.unattachedSince = now
+		case now.Sub(t.unattachedSince) >= unattachedGrace:
+			forgotten = append(forgotten, t)
+		}
+		t.mu.Unlock()
+	}
+	for _, t := range forgotten {
+		_ = m.Close(t.sessionID, t.id) // announces itself; already closed by hand is fine
+	}
+	if flipped && len(forgotten) == 0 {
+		m.changed()
+	}
+	return len(all) > 0
 }
 
 // Input writes base64-encoded bytes to id's pty within sessionID's chat (see
@@ -646,6 +804,14 @@ type onceClose struct {
 	err  error
 }
 
+// Foreground forwards to the wrapped session when it can say (see sandbox.Foregrounder).
+func (o *onceClose) Foreground() (int, bool) {
+	if f, ok := o.PTYSession.(sandbox.Foregrounder); ok {
+		return f.Foreground()
+	}
+	return 0, false
+}
+
 func (o *onceClose) Close() error {
 	o.once.Do(func() { o.err = o.PTYSession.Close() })
 	return o.err
@@ -714,6 +880,7 @@ func summarize(terminals []*Terminal) []protocol.TerminalSummary {
 			SessionID:  t.sessionID,
 			Name:       t.name,
 			Agent:      t.agent,
+			Busy:       t.busyLocked(),
 		})
 		t.mu.Unlock()
 	}

@@ -165,3 +165,11 @@ func (t *FileReadTool) Definition() ToolDefinition {
 		},
 	}
 }
+
+// ResolveAttached reports the symlink-resolved path of an absolute rawPath that
+// is, or sits under, one of attached. It is the rule file_read applies, for
+// callers that serve an attachment back to a client.
+func ResolveAttached(rawPath string, attached []string) (string, bool) {
+	p, err := resolveAttached(rawPath, attached, errors.New("not attached"))
+	return p, err == nil
+}

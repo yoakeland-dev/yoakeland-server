@@ -205,7 +205,7 @@ func (a *Agent) newSubagent(parentToolCallID string, bound RoleBinding, explore 
 	}
 	child.mode = mode
 	child.systemPrompt = SubagentSystemPrompt
-	child.dropTools(SubagentToolName, "write_plan")
+	child.dropTools(SubagentToolName, "write_plan", "todo_write")
 	return child
 }
 

@@ -58,6 +58,9 @@ type Peer struct {
 type PeerRegistry struct {
 	mu    sync.Mutex
 	peers map[string]*Peer
+	// OnDemote, if set, is called (unlocked) for each connection a SetScope just made restricted,
+	// so what it held (the server browser's seat) is let go.
+	OnDemote func(peerID string)
 }
 
 func NewPeerRegistry() *PeerRegistry {
@@ -270,13 +273,22 @@ func (r *PeerRegistry) AtCredentialLimit(tokenName string) bool {
 func (r *PeerRegistry) SetScope(tokenName string, restricted bool) int {
 	r.mu.Lock()
 	n := 0
+	var demoted []string
 	for _, p := range r.peers {
 		if p.TokenName == tokenName {
+			if restricted && !p.Restricted {
+				demoted = append(demoted, p.ID)
+			}
 			p.Restricted = restricted
 			n++
 		}
 	}
 	r.mu.Unlock()
+	if r.OnDemote != nil {
+		for _, id := range demoted {
+			r.OnDemote(id)
+		}
+	}
 	if n > 0 {
 		r.Broadcast()
 	}
@@ -293,23 +305,35 @@ func (r *PeerRegistry) SetBrowserHost(id string, enabled bool) {
 }
 
 // BrowserHostFor picks the peer that runs sessionID's browser: a host that has this chat open,
-// else the newest local (unix socket) one. A remote peer never gets another chat's browser traffic
-// just by offering to host. It also returns the project that peer last opened, read under the
-// lock, since SetActivity writes it there.
+// else the newest local (unix socket) one, else the newest full-access remote one, so a chat
+// driven from a phone still gets a browser when the app is connected over TCP. A restricted
+// device never hosts. It also returns the project that peer last opened, read under the lock,
+// since SetActivity writes it there.
 func (r *PeerRegistry) BrowserHostFor(sessionID string) (*Peer, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var local *Peer
+	var local, remote *Peer
+	newest := func(best, p *Peer) *Peer {
+		if best == nil || p.ConnectedAt.After(best.ConnectedAt) {
+			return p
+		}
+		return best
+	}
 	for _, p := range r.peers {
-		if !p.BrowserHost {
+		if !p.BrowserHost || p.Restricted {
 			continue
 		}
 		if p.SessionID == sessionID {
 			return p, p.ProjectPath
 		}
-		if p.Network == "unix" && (local == nil || p.ConnectedAt.After(local.ConnectedAt)) {
-			local = p
+		if p.Network == "unix" {
+			local = newest(local, p)
+		} else {
+			remote = newest(remote, p)
 		}
+	}
+	if local == nil {
+		local = remote
 	}
 	if local == nil {
 		return nil, ""

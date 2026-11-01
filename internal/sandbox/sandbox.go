@@ -50,6 +50,13 @@ type PTYSession interface {
 	Pid() int
 }
 
+// Foregrounder is implemented by pty sessions that can name the process group
+// holding the terminal's foreground (tcgetpgrp). While a command runs it is the
+// command's group, and the shell's again once it returns to the prompt.
+type Foregrounder interface {
+	Foreground() (pgrp int, ok bool)
+}
+
 type Sandbox interface {
 	Mode() SandboxMode
 	// Execute runs argv inside the sandbox. extraEnv, if non-nil, is

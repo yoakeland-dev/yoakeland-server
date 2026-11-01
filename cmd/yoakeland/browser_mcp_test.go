@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"yoakeland/internal/artifact"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/tool"
 )
@@ -62,6 +63,23 @@ func TestBrowserMCP_ServesTheToolToItsChat(t *testing.T) {
 	_, shot := call(auth, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser","arguments":{"action":"screenshot"}}}`)
 	if relay.session != "chat-1" || relay.action != "screenshot" || !strings.Contains(toJSON(shot), `"type":"image"`) {
 		t.Fatalf("session=%q action=%q result=%v", relay.session, relay.action, shot)
+	}
+	// The two tools CLI agents lack: a todo list and an artifact's log.
+	if !strings.Contains(toJSON(list), `"name":"todo_write"`) || !strings.Contains(toJSON(list), `"name":"artifact_logs"`) {
+		t.Fatalf("tools/list lacks the light tools: %v", list)
+	}
+	_, todo := call(auth, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"todo_write","arguments":{"todos":[{"content":"a","status":"pending"}]}}}`)
+	if !strings.Contains(toJSON(todo), "updated (1 items)") {
+		t.Fatalf("todo_write = %v", todo)
+	}
+	_, badTodo := call(auth, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"todo_write","arguments":{"todos":[{"content":"a","status":"later"}]}}}`)
+	if !strings.Contains(toJSON(badTodo), `"isError":true`) {
+		t.Fatalf("a bad status should be a tool error: %v", badTodo)
+	}
+	artifact.Default.Add("chat-1", "m1#x", "error", "boom")
+	_, logs := call(auth, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"artifact_logs","arguments":{}}}`)
+	if !strings.Contains(toJSON(logs), "boom") {
+		t.Fatalf("artifact_logs = %v", logs)
 	}
 	_, bad := call(auth, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser","arguments":{"action":"select"}}}`)
 	if !strings.Contains(toJSON(bad), `"isError":true`) {

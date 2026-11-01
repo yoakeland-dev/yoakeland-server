@@ -207,7 +207,7 @@ func NativeTurnFromContext(ctx context.Context) *NativeTurn {
 
 // newNativeTurn decides resume-vs-fresh from a.native and builds the prompt.
 // history already ends with the user message this turn answers.
-func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []Message, canFork bool) *NativeTurn {
+func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []Message, canFork, needsNote bool) *NativeTurn {
 	nt := &NativeTurn{Mode: a.Mode(), SessionKey: NativeSessionKey(sessionID, a.projectRoot)}
 	last := len(history) - 1
 	for last >= 0 && history[last].Role != "user" {
@@ -227,6 +227,9 @@ func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []
 	}
 	if a.chat {
 		nt.FreshPrompt = NativeChatInstruction + nt.FreshPrompt
+	}
+	if needsNote {
+		nt.FreshPrompt = "[" + CLISystemNote + "]\n\n" + nt.FreshPrompt
 	}
 	nt.Prompt = nt.FreshPrompt
 	if ref != nil && ref.Provider == providerName && last > 0 {
@@ -367,6 +370,9 @@ func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID strin
 			return NativeAnswer{Allowed: true}, nil
 		}
 		req.Description = "Approve the plan"
+	} else if req.ToolName == "mcp__yoake-browser__"+tool.TodoToolName || req.ToolName == "mcp__yoake-browser__"+tool.ArtifactLogsToolName {
+		// Edits a list the user sees / reads a page's log: nothing to ask, in any mode.
+		return NativeAnswer{Allowed: true}, nil
 	} else {
 		// yoakeland's deny rules hold over a native agent too (autonomous
 		// excepted, like everywhere); its allow rules do not.

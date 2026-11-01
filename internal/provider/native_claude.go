@@ -433,6 +433,7 @@ func (p *CLISubprocessProvider) startClaude(nt *agent.NativeTurn, l claudeLaunch
 	if p.Model != "" {
 		args = append(args, "--model", p.Model)
 	}
+	args = append(args, "--append-system-prompt", agent.CLISystemNote)
 	if l.effort != "" {
 		args = append(args, "--effort", l.effort)
 	}
@@ -958,21 +959,32 @@ func parseClaudeRateLimits(raw json.RawMessage) *protocol.ProviderRateLimits {
 	}
 	var info struct {
 		window
+		// Status is "allowed", "allowed_warning" or "rejected": rejected means this window is spent
+		// whatever the utilization says (it is only sent for the other two).
+		Status         string            `json:"status"`
 		RateLimitType  string            `json:"rateLimitType"`
 		UnifiedWindows map[string]window `json:"unifiedWindows"`
 	}
 	if len(raw) == 0 || json.Unmarshal(raw, &info) != nil {
 		return nil
 	}
-	if len(info.UnifiedWindows) == 0 && info.Utilization != nil && info.RateLimitType != "" {
+	if len(info.UnifiedWindows) == 0 && info.RateLimitType != "" && (info.Utilization != nil || info.Status == "rejected") {
 		info.UnifiedWindows = map[string]window{info.RateLimitType: info.window}
 	}
 	rl := &protocol.ProviderRateLimits{}
 	for name, w := range info.UnifiedWindows {
-		if w.Utilization == nil {
+		rejected := info.Status == "rejected" && (name == info.RateLimitType || info.RateLimitType == "")
+		if w.Utilization == nil && !rejected {
 			continue
 		}
-		win := &protocol.RateLimitWindow{UsedPct: roundPct(*w.Utilization * 100), ResetsAt: unixRFC3339(w.ResetsAt)}
+		used := 100.0
+		if w.Utilization != nil && !rejected {
+			used = roundPct(*w.Utilization * 100)
+		}
+		if w.ResetsAt > 1e11 { // milliseconds in some versions, seconds in others
+			w.ResetsAt /= 1000
+		}
+		win := &protocol.RateLimitWindow{UsedPct: used, ResetsAt: unixRFC3339(w.ResetsAt)}
 		switch name {
 		case "five_hour":
 			rl.FiveHour = win

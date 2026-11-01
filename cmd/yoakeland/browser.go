@@ -20,9 +20,13 @@ import (
 // panel (the t3code pattern: the browser the user already sees is the one the
 // agent drives, rather than a hidden headless one). A client offers itself
 // with browser_host; each action goes to exactly one host as a
-// browser_request and waits for that host's browser_response.
+// browser_request and waits for that host's browser_response. With no such
+// client the action runs in the server's own browser (serverbrowser.go).
 type browserBroker struct {
 	peers *PeerRegistry
+	// server is the server's own headless browser, used when no desktop client hosts one; nil
+	// where Chrome can't run (Windows) or in tests.
+	server *serverBrowser
 
 	mu      sync.Mutex
 	pending map[string]*browserCall
@@ -98,7 +102,17 @@ func (b *browserBroker) Browse(ctx context.Context, sessionID, action string, ar
 	}
 	p, projectPath := b.peers.BrowserHostFor(sessionID)
 	if p == nil {
-		return tool.BrowserResult{}, errNoBrowserHost
+		if b.server == nil {
+			return tool.BrowserResult{}, errNoBrowserHost
+		}
+		b.approve(sessionID, action, args)
+		ctx, cancel := context.WithTimeout(ctx, browserTimeout)
+		defer cancel()
+		res, err := b.server.Browse(ctx, sessionID, action, args, browserGuard{b.blockCrossOrigin.Load(), b.allowedHosts(sessionID)})
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("the browser didn't answer within %s", browserTimeout)
+		}
+		return res, err
 	}
 	call := &browserCall{peerID: p.ID, done: make(chan protocol.BrowserResponseData, 1)}
 	reqID := "br-" + randomID()
@@ -157,6 +171,9 @@ func (b *browserBroker) DropPeer(peerID string) {
 	if b == nil {
 		return
 	}
+	if b.server != nil {
+		b.server.DropPeer(peerID)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for id, call := range b.pending {
@@ -167,4 +184,18 @@ func (b *browserBroker) DropPeer(peerID string) {
 			}
 		}
 	}
+}
+
+// serverEvent handles the browser_view/frame_ack/control/input/nav events of the server's browser.
+func (b *browserBroker) serverEvent(ipc *protocol.IPCStream, peerID string, env *protocol.Envelope) {
+	if b == nil || peerID == "" {
+		return
+	}
+	if b.server == nil {
+		if p, ok := b.peers.Get(peerID); ok && env.Type == protocol.EventBrowserView {
+			_ = p.ipc.SendEvent(protocol.EventBrowserState, "", "", "", protocol.BrowserStateData{Error: errNoServerBrows.Error(), Tabs: []protocol.BrowserTabInfo{}})
+		}
+		return
+	}
+	b.server.handle(ipc, peerID, env)
 }

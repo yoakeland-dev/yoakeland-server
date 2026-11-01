@@ -69,6 +69,10 @@ type Message struct {
 	// (SPEC.md §2a's conventions, devolved to whichever the client uses).
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
 
+	// Origin is set when the server, not a person, started the turn this user message opens
+	// (an artifact submit or a scheduled turn). Nil for a person.
+	Origin *protocol.Origin `json:"origin,omitempty"`
+
 	// Attachments are server-side paths this user message attached (see
 	// WithAttachments). They stay readable by file_read for the rest of the
 	// session, even outside the project root, and the model is told about
@@ -145,6 +149,19 @@ func WithAuthor(ctx context.Context, a Author) context.Context {
 	return context.WithValue(ctx, authorContextKey{}, a)
 }
 
+type originContextKey struct{}
+
+// WithOrigin marks the turn ctx runs as started by o rather than by a person; RunTurn stamps it
+// on the user message it adds.
+func WithOrigin(ctx context.Context, o protocol.Origin) context.Context {
+	return context.WithValue(ctx, originContextKey{}, &o)
+}
+
+func originFromContext(ctx context.Context) *protocol.Origin {
+	o, _ := ctx.Value(originContextKey{}).(*protocol.Origin)
+	return o
+}
+
 type attachmentsContextKey struct{}
 
 // WithAttachments attaches a user_prompt's attachment paths to ctx, consumed
@@ -170,7 +187,7 @@ func withAttachmentNotes(history []Message) []Message {
 		if out == nil {
 			out = append([]Message(nil), history...)
 		}
-		out[i].Content = m.Content + "\n\n[Attached files — read them with file_read using these exact absolute paths: " + strings.Join(m.Attachments, ", ") + "]"
+		out[i].Content = m.Content + "\n\n[Attached files — real files on disk that stay readable with file_read for the rest of this session, at these exact absolute paths: " + strings.Join(m.Attachments, ", ") + ". Copy one into the project if the work should keep it.]"
 	}
 	if out == nil {
 		return history
@@ -186,6 +203,13 @@ func (a *Agent) sessionAttachmentsLocked() []string {
 		paths = append(paths, m.Attachments...)
 	}
 	return paths
+}
+
+// Attachments is every path attached anywhere in the session's active history.
+func (a *Agent) Attachments() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessionAttachmentsLocked()
 }
 
 // AuthorFromContext returns the zero Author if none was attached.
@@ -381,10 +405,13 @@ var readOnlyTools = map[string]bool{
 	"file_read":         true,
 	"search":            true,
 	"ask_user_question": true,
+	"todo_write":        true, // only edits the todo list shown to the user
 	// Loading a skill reads files the user put in a skill folder, nothing more.
 	tool.SkillToolName: true,
 	// Reads another chat of the project the user named; changes nothing.
 	tool.ReadChatToolName: true,
+	// Reads what a page the model wrote has logged; in memory only.
+	tool.ArtifactLogsToolName: true,
 	// Not a mutation itself: its subagent runs read-only in these modes too
 	// (see newSubagent).
 	SubagentToolName: true,
@@ -953,11 +980,12 @@ var shellTools = map[string]bool{
 // exactly that call.
 func permissionTarget(toolName string, args json.RawMessage) string {
 	var a struct {
-		Command    string `json:"command"`
-		Input      string `json:"input"`
-		Expression string `json:"expression"`
-		Path       string `json:"path"`
-		Query      string `json:"query"`
+		Command    string   `json:"command"`
+		Input      string   `json:"input"`
+		Expression string   `json:"expression"`
+		Files      []string `json:"files"`
+		Path       string   `json:"path"`
+		Query      string   `json:"query"`
 		// Untagged like the browser tool's own args struct.
 		Action, URL string
 	}
@@ -972,6 +1000,9 @@ func permissionTarget(toolName string, args json.RawMessage) string {
 	case "browser":
 		if a.Action == "navigate" {
 			return urlHost(a.URL, args)
+		}
+		if a.Action == "upload" {
+			return strings.Join(a.Files, "\n")
 		}
 		return a.Expression
 	case "web_fetch":
@@ -1361,12 +1392,13 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 		AuthorName:   author.Name,
 		AuthorAvatar: author.Avatar,
 		Attachments:  attachmentsFromContext(parentCtx),
+		Origin:       originFromContext(parentCtx),
 		CreatedAt:    startTime,
 	})
 	a.mu.Unlock()
 	_ = a.getStream().SendEvent(protocol.EventUserMessage, sessionID, turnID, "", protocol.UserMessageData{
 		MessageID: userMessageID, Content: prompt, Attachments: attachmentsFromContext(parentCtx),
-		Author: author.Name, AuthorAvatar: author.Avatar,
+		Author: author.Name, AuthorAvatar: author.Avatar, Origin: originFromContext(parentCtx),
 	})
 
 	if isNewChat {
@@ -1704,7 +1736,10 @@ turn:
 				}
 			}
 			forker, _ := turnProvider.(NativeForker)
-			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist, forker != nil && forker.CanFork())
+			sk, _ := turnProvider.(interface{ SkillKind() string })
+			// Claude gets CLISystemNote as a real system prompt; every other agent gets it in its first prompt.
+			needsNote := sk == nil || sk.SkillKind() != "claude"
+			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist, forker != nil && forker.CanFork(), needsNote)
 			if src, ok := a.toolSource().(tool.AgentServerSource); ok {
 				nt.MCP = src.AgentServers()
 			}
@@ -1830,6 +1865,9 @@ turn:
 							Args:           chunk.ToolCall.Args,
 							NativeToolInfo: chunk.ToolCall.NativeToolInfo,
 						})
+						if chunk.ToolCall.Native {
+							a.recordTodos(a.sessionID, turnID, chunk.ToolCall)
+						}
 					}
 				case StreamChunkToolResult:
 					if r := chunk.ToolResult; r != nil {
@@ -2146,7 +2184,9 @@ turn:
 					editDiffs = []*diff.FileDiff{d}
 				}
 			}
+			execStart := time.Now()
 			output, images, execErr := runTool(turnCtx, toolImpl, execCtx, tc.Args)
+			a.auditResult(sessionID, tc.Name, target, time.Since(execStart), execErr)
 			truncatedOutput := a.contextManager.TruncateToolOutput(output)
 
 			if execErr != nil {

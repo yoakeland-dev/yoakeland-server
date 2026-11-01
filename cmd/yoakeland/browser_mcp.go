@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"yoakeland/internal/artifact"
+	"yoakeland/internal/protocol"
 
 	"yoakeland/internal/tool"
 )
@@ -40,14 +44,8 @@ func (m *browserMCP) serversFor(sessionID string) []tool.AgentServer {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.ln == nil {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			log.Printf("browser MCP: %v", err)
-			return nil
-		}
-		m.ln = ln
-		go func() { _ = http.Serve(ln, m) }()
+	if !m.listen() {
+		return nil
 	}
 	tok := m.token[sessionID]
 	if tok == "" {
@@ -62,6 +60,30 @@ func (m *browserMCP) serversFor(sessionID string) []tool.AgentServer {
 		Name: "yoake-browser", Type: "http", URL: "http://" + m.ln.Addr().String() + "/mcp",
 		Headers: map[string]string{"Authorization": "Bearer " + tok},
 	}}
+}
+
+// listen starts the loopback listener if it isn't up; m.mu is held.
+func (m *browserMCP) listen() bool {
+	if m.ln == nil {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			log.Printf("browser MCP: %v", err)
+			return false
+		}
+		m.ln = ln
+		go func() { _ = http.Serve(ln, m) }()
+	}
+	return true
+}
+
+// port is the listener's port, starting it if need be, so the server browser can be kept away from it.
+func (m *browserMCP) port() uint16 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.listen() {
+		return 0
+	}
+	return uint16(m.ln.Addr().(*net.TCPAddr).Port)
 }
 
 type rpcRequest struct {
@@ -120,14 +142,30 @@ func (m *browserMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		reply(map[string]any{}, nil)
 	case "tools/list":
-		d := m.tool.Definition()
-		reply(map[string]any{"tools": []any{map[string]any{"name": d.Name, "description": d.Description, "inputSchema": d.Parameters}}}, nil)
+		tools := []any{}
+		for _, d := range m.definitions() {
+			tools = append(tools, map[string]any{"name": d.Name, "description": d.Description, "inputSchema": d.Parameters})
+		}
+		reply(map[string]any{"tools": tools}, nil)
 	case "tools/call":
 		var p struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if json.Unmarshal(req.Params, &p) != nil || p.Name != "browser" {
+		if json.Unmarshal(req.Params, &p) != nil {
+			reply(nil, map[string]any{"code": -32602, "message": "bad params"})
+			return
+		}
+		if p.Name == tool.TodoToolName || p.Name == tool.ArtifactLogsToolName {
+			out, err := m.runLight(p.Name, sessionID, p.Arguments)
+			if err != nil {
+				reply(map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": err.Error()}}}, nil)
+				return
+			}
+			reply(map[string]any{"content": []any{map[string]any{"type": "text", "text": out}}}, nil)
+			return
+		}
+		if p.Name != "browser" {
 			reply(nil, map[string]any{"code": -32602, "message": "unknown tool"})
 			return
 		}
@@ -144,4 +182,30 @@ func (m *browserMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		reply(nil, map[string]any{"code": -32601, "message": "method not found"})
 	}
+}
+
+// MCPToolPrefix is how a CLI agent names this server's tools: mcp__<server>__<tool>.
+const mcpToolPrefix = "mcp__yoake-browser__"
+
+// definitions are the tools this server offers: the browser, and two that only exist for CLI agents
+// (an API model has them as its own tools): the todo list, and an artifact page's log. The agent
+// itself records a todo_write call it makes (agent.recordTodos); here it only has to succeed.
+func (m *browserMCP) definitions() []tool.ToolDefinition {
+	return []tool.ToolDefinition{
+		m.tool.Definition(),
+		tool.NewTodoWriteTool(nil).Definition(),
+		tool.NewArtifactLogsTool(artifact.Default).Definition(),
+	}
+}
+
+// runLight runs the two tools that need nothing from the browser.
+func (m *browserMCP) runLight(name, sessionID string, args json.RawMessage) (string, error) {
+	if name == tool.TodoToolName {
+		items, err := protocol.ParseTodoWrite(args)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("todo list updated (%d items)", len(items)), nil
+	}
+	return tool.NewArtifactLogsTool(artifact.Default).Execute(context.Background(), tool.ExecutionContext{SessionID: sessionID}, args)
 }

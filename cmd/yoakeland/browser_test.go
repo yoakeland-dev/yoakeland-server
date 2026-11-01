@@ -51,9 +51,13 @@ func TestBrowserBroker_HostChoiceAndSpoofing(t *testing.T) {
 	}
 	remote, remoteSc := browserPeer(t, peers, "tcp")
 	peers.SetBrowserHost(remote.ID, true)
-	// A remote host viewing another chat must not get this one's traffic.
-	if _, err := b.Browse(ctx, "s1", "snapshot", nil); err != errNoBrowserHost {
-		t.Fatalf("remote host not viewing s1 was used: %v", err)
+	// With nothing local, a full-access remote host serves a chat it isn't viewing.
+	go func() {
+		req := <-remoteSc
+		b.Respond(remote.ID, protocol.BrowserResponseData{RequestID: req.RequestID, Output: "remote"})
+	}()
+	if out, err := b.Browse(ctx, "s1", "snapshot", nil); err != nil || out.Output != "remote" {
+		t.Fatalf("remote fallback: %+v, %v", out, err)
 	}
 
 	local, localSc := browserPeer(t, peers, "unix")
@@ -68,7 +72,7 @@ func TestBrowserBroker_HostChoiceAndSpoofing(t *testing.T) {
 		t.Fatalf("local host: %+v, %v", out, err)
 	}
 
-	// A host with the chat open wins over the local fallback.
+	// A host with the chat open wins over the fallbacks.
 	peers.SetActivity(remote.ID, "s1", "")
 	go func() {
 		req := <-remoteSc
@@ -184,8 +188,8 @@ func TestBrowserBroker_SendsApprovedHosts(t *testing.T) {
 	}
 }
 
-// The browser goes to a host that has the chat open, else to the newest local host, never to a
-// remote host that merely has it open in its own view.
+// The browser goes to a host that has the chat open, else to the newest local host, else to a
+// full-access remote one; a restricted device never hosts.
 func TestBrowserHostFor(t *testing.T) {
 	reg := NewPeerRegistry()
 	add := func(network string) *Peer {
@@ -203,7 +207,15 @@ func TestBrowserHostFor(t *testing.T) {
 	if p, project := reg.BrowserHostFor("other"); p != local || project != "/local/proj" {
 		t.Fatalf("got %v %q, want the local host", p, project)
 	}
-	if p, _ := reg.BrowserHostFor("unknown"); p == remote {
-		t.Fatal("a remote host without the chat was chosen")
+	if p, _ := reg.BrowserHostFor("unknown"); p != local {
+		t.Fatal("a remote host beat the local one")
+	}
+	reg.SetBrowserHost(local.ID, false)
+	if p, _ := reg.BrowserHostFor("unknown"); p != remote {
+		t.Fatal("the only host, a full-access remote one, was not used")
+	}
+	reg.SetScope(remote.TokenName, true)
+	if p, _ := reg.BrowserHostFor("unknown"); p != nil {
+		t.Fatal("a restricted device was chosen to host")
 	}
 }
