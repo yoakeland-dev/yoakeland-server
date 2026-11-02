@@ -367,7 +367,6 @@ func listDirectory(path string) (string, []protocol.DirEntry, error) {
 type ProjectRegistry struct {
 	mu                  sync.Mutex
 	projects            map[string]*ProjectContext // key: canonicalized project root
-	locks               map[string]*os.File        // cross-server project locks, held while a project is open
 	sessionProject      map[string]string          // sessionID -> project key
 	defaultProvider     agent.ModelProvider
 	defaultProviderName string
@@ -633,7 +632,6 @@ func NewProjectRegistry(defaultProvider agent.ModelProvider, defaultProviderName
 		chatsDir:            chatsDir,
 		chatTier:            string(sandbox.NewSandbox(chatsDir, time.Second).Mode()),
 		projects:            make(map[string]*ProjectContext),
-		locks:               make(map[string]*os.File),
 		sessionProject:      make(map[string]string),
 		defaultProvider:     defaultProvider,
 		defaultProviderName: defaultProviderName,
@@ -723,16 +721,6 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		return pc, nil
 	}
 
-	if !r.isChat(key) {
-		lock, err := lockProject(key)
-		if err != nil {
-			return nil, err
-		}
-		if lock != nil {
-			r.locks[key] = lock
-		}
-	}
-
 	var browser tool.BrowserRelay
 	if r.browser != nil {
 		browser = r.browser
@@ -742,10 +730,6 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 	}
 	pc, err := newProjectContext(key, projectstore.DataDir(r.stateDir, key), r.defaultProvider, r.defaultProviderName, r.limits, r.disableBashUnsandboxed, browser, r.ext.skills)
 	if err != nil {
-		if lock := r.locks[key]; lock != nil {
-			lock.Close()
-			delete(r.locks, key)
-		}
 		return nil, err
 	}
 	if r.ext.mcpStore != nil {
@@ -857,10 +841,6 @@ func (r *ProjectRegistry) Remove(root string) error {
 	r.mu.Lock()
 	pc, ok := r.projects[key]
 	delete(r.projects, key)
-	if lock := r.locks[key]; lock != nil {
-		lock.Close()
-		delete(r.locks, key)
-	}
 	var boundSessions []string
 	for sessID, projKey := range r.sessionProject {
 		if projKey == key {

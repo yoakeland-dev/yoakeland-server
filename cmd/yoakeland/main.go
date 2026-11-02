@@ -51,12 +51,16 @@ const (
 // version is set at release time (-ldflags "-X main.version=0.1.1"); "dev" otherwise.
 var version = "dev"
 
+// serverLock is held for the life of the process (lockServer).
+var serverLock *os.File
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "pair" {
 		os.Exit(runPair(os.Args[2:]))
 	}
 	var projectDir string
 	var stateDir string
+	var importFrom string
 	var providerName string
 	var modelName string
 	var apiKey string
@@ -71,6 +75,7 @@ func main() {
 
 	flag.StringVar(&projectDir, "project", "", "Default project root, opened at startup and used for requests that don't name a projectPath. Kept for the -stdio spawn contract (yoake-client -bin \"yoakeland -project X\" sends no projectPath). A daemon's clients pass projectPath and use open_project, so don't set it there.")
 	flag.StringVar(&stateDir, "state-dir", sockpath.DefaultStateDir(), "Directory for server-level state not tied to one project: providers.json and the fallback unix socket path. Defaults to ~/.yoake (Linux), ~/Library/Application Support/yoake (macOS), or %AppData%\\yoake (Windows).")
+	flag.StringVar(&importFrom, "import-from", "", "Copy another server's state dir (projects, chats, providers and settings, not its identity or tokens) into a new -state-dir at startup. Without it, a first run at a terminal offers to copy the default state dir.")
 	flag.StringVar(&providerName, "provider", "auto", "DEPRECATED, seeds default_provider once (use register_provider + set_default_provider): 'anthropic', 'openai', 'openrouter', or 'auto'")
 	flag.StringVar(&modelName, "model", "", "DEPRECATED, seeds default_provider once (use set_default_provider): model name")
 	flag.StringVar(&apiKey, "api-key", "", "DEPRECATED, seeds default_provider once (use register_provider): API key. ANTHROPIC_API_KEY, OPENAI_API_KEY and OPENROUTER_API_KEY in the environment still pick a fallback default when none is configured")
@@ -98,6 +103,13 @@ func main() {
 	if canon, err := normalizer.CanonicalRoot(stateDir); err == nil {
 		normalizer.Hidden = []string{canon}
 	}
+	// An early build keeps its own data beside stable's unless told where; only then does it offer stable's.
+	if !setFlags["state-dir"] && strings.Contains(version, "-early") {
+		stateDir += "-early"
+	}
+	if !stdioMode {
+		offerImport(stateDir, importFrom, !setFlags["state-dir"] && strings.Contains(version, "-early"))
+	}
 	// Tokens and project paths live here; an older build may have made it 0755.
 	_ = os.MkdirAll(stateDir, 0o700)
 	_ = os.Chmod(stateDir, 0o700)
@@ -105,6 +117,11 @@ func main() {
 	initLogging(stateDir)
 
 	if !stdioMode {
+		var err error
+		if serverLock, err = lockServer(); err != nil {
+			fmt.Fprintln(os.Stderr, "yoakeland:", err)
+			os.Exit(1)
+		}
 		// stdio mode speaks the protocol over this process's own stdout, so
 		// the banner would corrupt the wire format — daemon mode only.
 		printBanner()
