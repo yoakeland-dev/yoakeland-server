@@ -260,7 +260,7 @@ func main() {
 	hub := newStatusHub(peers, stateDir)
 	projects.SetStatusHub(hub)
 	projects.SetDefaultSource(defaultProviderSource(settings, providerStore, hub))
-	uploads, err := NewUploadStore(stateDir)
+	uploads, err := NewUploadStore(stateDir, uploadRetention(settings.Runtime()))
 	if err != nil {
 		logFatal("failed to initialize upload store: %v", err)
 	}
@@ -268,6 +268,13 @@ func main() {
 	if canon, err := normalizer.CanonicalRoot(uploads.dir); err == nil {
 		normalizer.Uploads = canon
 	}
+	normalizer.TouchUpload = uploads.Touch
+	// Retention is a runtime setting: disabling it (0) stops the hourly prune
+	// without a restart. The store is created with the current value already.
+	settings.OnRuntimeChange(func(rs protocol.RuntimeSettings) {
+		uploads.SetRetention(uploadRetention(rs))
+	})
+	go uploads.PrunePeriodically(time.Hour)
 
 	// Pre-opened (failing fast on a bad path) only after everything a
 	// project's sessions read at creation exists.

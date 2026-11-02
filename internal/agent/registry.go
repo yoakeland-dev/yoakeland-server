@@ -344,6 +344,27 @@ func (r *Registry) Lookup(sessionID string) *Agent {
 	return r.sessions[sessionID]
 }
 
+// SessionAttachments is every path attached in sessionID's history: from the
+// live Agent when there is one, else from the persisted file, so a chat nobody
+// has opened since a restart still serves its attachments.
+func (r *Registry) SessionAttachments(sessionID string) []string {
+	if ag := r.Lookup(sessionID); ag != nil {
+		return ag.Attachments()
+	}
+	if r.sessionStore == nil {
+		return nil
+	}
+	state, err := r.sessionStore.Load(sessionID)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, m := range state.History {
+		paths = append(paths, m.Attachments...)
+	}
+	return paths
+}
+
 // Remove evicts sessionID's in-memory Agent, if one was ever created,
 // cancelling any turn it has in flight first. Callers still own deleting the
 // persisted session file separately (SessionStore.Delete) — this only drops

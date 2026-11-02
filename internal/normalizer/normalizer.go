@@ -22,8 +22,15 @@ var Hidden []string
 
 // Uploads is the store clients' attachments are copied into. It sits under a
 // Hidden dir, and is the one part of one that an attachment may point at.
-// Set once at startup, next to Hidden.
+// Set once at startup, next to Hidden. The tools only ever read from it:
+// write/edit resolve through ResolveAndValidatePath, which refuses Hidden
+// without Uploads' exemption.
 var Uploads string
+
+// TouchUpload, if set, is told when an attachment is read, so the upload
+// store can keep that content from being pruned for age. Set once at startup,
+// next to Uploads; a nil hook just means nothing tracks reads.
+var TouchUpload func(abs string)
 
 // HiddenIn returns the Hidden dirs strictly inside root.
 func HiddenIn(root string) []string {

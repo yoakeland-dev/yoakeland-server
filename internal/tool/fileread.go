@@ -88,6 +88,11 @@ func resolveAttached(rawPath string, attached []string, rootErr error) (string, 
 		}
 		rel, err := filepath.Rel(realA, real)
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			// The model read it, so it counts as used: the upload store
+			// won't age it out from under a chat that is still active.
+			if normalizer.TouchUpload != nil {
+				normalizer.TouchUpload(real)
+			}
 			return real, nil
 		}
 	}

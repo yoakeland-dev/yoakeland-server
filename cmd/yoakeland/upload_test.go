@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/protocol"
 )
@@ -54,6 +58,116 @@ func TestUploadStore_ChunkedDedupAndMismatch(t *testing.T) {
 	}
 	if _, ok := s.existing(bad.SHA256); ok {
 		t.Fatal("corrupted upload was stored")
+	}
+}
+
+// age moves an upload's pruning clock back, so a test needn't sleep a day.
+func age(t *testing.T, path string, d time.Duration) {
+	t.Helper()
+	old := time.Now().Add(-d)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func uploadText(t *testing.T, s *UploadStore, content string) string {
+	t.Helper()
+	begin := protocol.UploadBeginData{UploadID: "u1", Name: "notes.txt", Size: int64(len(content)), SHA256: shaHex([]byte(content))}
+	if path, done, err := s.Begin("p1", begin); err != nil {
+		t.Fatal(err)
+	} else if done {
+		return path
+	}
+	path, _, err := s.Chunk("p1", protocol.UploadChunkData{UploadID: "u1", Data: []byte(content)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestUploadStore_PruneSkipsReferencedAndTouched(t *testing.T) {
+	state := t.TempDir()
+	content := "referenced bytes"
+
+	// No session names it: age wins.
+	s, _ := NewUploadStore(state, time.Hour)
+	p := uploadText(t, s, content)
+	age(t, filepath.Dir(p), 2*time.Hour)
+	s.Prune()
+	if _, err := os.Stat(p); err == nil {
+		t.Fatal("an unreferenced upload past retention survived")
+	}
+
+	// A stored chat still lists it: age does not.
+	s, _ = NewUploadStore(state, time.Hour)
+	p = uploadText(t, s, content)
+	sessionDir := filepath.Join(state, "projects", "abc", "sessions")
+	_ = os.MkdirAll(sessionDir, 0o700)
+	body := `{"messages":[{"attachments":["` + p + `"]}]}`
+	if err := os.WriteFile(filepath.Join(sessionDir, "s.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	age(t, filepath.Dir(p), 2*time.Hour)
+	s.Prune()
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("prune deleted content a chat still references")
+	}
+
+	// Reading it (Touch) resets the clock.
+	_ = os.RemoveAll(sessionDir)
+	s, _ = NewUploadStore(state, time.Hour)
+	p = uploadText(t, s, content)
+	age(t, filepath.Dir(p), 2*time.Hour)
+	s.Touch(p)
+	s.Prune()
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("prune deleted an upload touched just now")
+	}
+
+	// Retention 0 disables pruning entirely.
+	s, _ = NewUploadStore(state, 0)
+	p = uploadText(t, s, content)
+	age(t, filepath.Dir(p), 365*24*time.Hour)
+	s.Prune()
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("retention 0 pruned")
+	}
+}
+
+func TestUploadStore_ThumbGeneratedOnceAndServed(t *testing.T) {
+	s, _ := NewUploadStore(t.TempDir())
+	// A 2x2 PNG is enough to prove the path is generated and cached.
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	begin := protocol.UploadBeginData{UploadID: "u1", Name: "shot.png", Size: int64(buf.Len()), SHA256: shaHex(buf.Bytes())}
+	if _, _, err := s.Begin("p1", begin); err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := s.Chunk("p1", protocol.UploadChunkData{UploadID: "u1", Data: buf.Bytes()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	th, ok := s.Thumb(p)
+	if !ok {
+		t.Fatal("no thumbnail generated")
+	}
+	if filepath.Ext(th) != ".jpg" || filepath.Dir(th) != filepath.Join(s.dir, thumbsDir) {
+		t.Fatalf("thumbnail at %s", th)
+	}
+	first, _ := os.Stat(th)
+	if _, ok := s.Thumb(p); !ok {
+		t.Fatal("second Thumb failed")
+	}
+	second, _ := os.Stat(th)
+	if !first.ModTime().Equal(second.ModTime()) {
+		t.Fatal("thumbnail regenerated instead of cached")
+	}
+	if _, ok := s.Thumb(filepath.Join(s.dir, "not-a-hash", "x.png")); ok {
+		t.Fatal("thumbnail for a path outside the store")
 	}
 }
 

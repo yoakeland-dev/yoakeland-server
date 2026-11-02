@@ -1457,6 +1457,11 @@ type RuntimeSettings struct {
 	PricingRefreshHours     int  `json:"pricingRefreshHours"`     // default 24
 	BrowserBlockCrossOrigin bool `json:"browserBlockCrossOrigin"` // default true
 
+	// UploadRetentionDays is how long an upload may sit unread and unreferenced
+	// before the store prunes it. 0 keeps uploads forever; a chat that still
+	// lists the path keeps it alive regardless of age.
+	UploadRetentionDays int `json:"uploadRetentionDays"` // default 30, 0 = forever
+
 	// AutoCompactTokens is the context size at which sessions compact
 	// themselves (SPEC.md §4g); 0 = the built-in 64,000. Still held under 90%
 	// of the model's window, and a session can override it. API providers
@@ -1534,6 +1539,10 @@ type FileRequestData struct {
 	BasePath   string `json:"basePath,omitempty"`
 	// read_media only: with an absolute Path, the session whose attachment it is.
 	SessionID string `json:"sessionId,omitempty"`
+	// read_media only: ask for a generated preview when the file is an image
+	// in the upload store. An undecodable one (video, WebP, a project file)
+	// falls back to the original, so a client may always ask.
+	Thumb bool `json:"thumb,omitempty"`
 }
 
 type TreeEntry struct {
@@ -1585,6 +1594,7 @@ type MediaChunkRequestData struct {
 	Path        string `json:"path"`
 	Offset      int64  `json:"offset"`
 	SessionID   string `json:"sessionId,omitempty"` // as on FileRequestData
+	Thumb       bool   `json:"thumb,omitempty"`     // as on FileRequestData
 }
 
 // MediaChunkData answers read_media_chunk. Last marks the final slice, so

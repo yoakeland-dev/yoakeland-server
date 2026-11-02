@@ -168,7 +168,7 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		pc, err := fileProject(deps, d.ProjectPath)
 		if err == nil {
 			if abs, ok := attachedPath(pc, d.SessionID, d.Path); ok {
-				err = attachedMediaInfo(abs, &out)
+				err = attachedMediaInfo(previewPath(deps.uploads, abs, d.Thumb), &out)
 			} else {
 				err = readMediaInfo(pc.Root, d.Path, &out)
 			}
@@ -183,7 +183,7 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		pc, err := fileProject(deps, d.ProjectPath)
 		if err == nil {
 			if abs, ok := attachedPath(pc, d.SessionID, d.Path); ok {
-				out.Data, out.Last, err = readAttachedChunk(abs, d.Offset)
+				out.Data, out.Last, err = readAttachedChunk(previewPath(deps.uploads, abs, d.Thumb), d.Offset)
 			} else {
 				out.Data, out.Last, err = readMediaChunk(pc.Root, d.Path, d.Offset)
 			}
@@ -433,11 +433,20 @@ func attachedPath(pc *ProjectContext, sessionID, rel string) (string, bool) {
 	if sessionID == "" || !filepath.IsAbs(rel) {
 		return "", false
 	}
-	ag := pc.Registry.Lookup(sessionID)
-	if ag == nil {
-		return "", false
+	return tool.ResolveAttached(rel, pc.Registry.SessionAttachments(sessionID))
+}
+
+// previewPath substitutes a generated thumbnail for a stored image when the
+// client asked for one. A video or a format Go can't decode keeps the
+// original, so callers never have to know which is which.
+func previewPath(uploads *UploadStore, abs string, want bool) string {
+	if !want {
+		return abs
 	}
-	return tool.ResolveAttached(rel, ag.Attachments())
+	if p, ok := uploads.Thumb(abs); ok {
+		return p
+	}
+	return abs
 }
 
 func attachedMediaInfo(abs string, out *protocol.MediaInfoData) error {

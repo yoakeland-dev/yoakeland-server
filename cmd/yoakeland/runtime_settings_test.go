@@ -30,7 +30,7 @@ func TestNormalizeRuntimeSettings_DefaultsAndClamps(t *testing.T) {
 	want := protocol.RuntimeSettings{
 		ExecTimeoutSec: 60, ExecOutputMaxBytes: 1 << 20, TerminalMemoryMaxMB: 2048, TerminalPidsMax: 512,
 		TerminalReadMaxChars: 12000, TerminalHistoryKB: 256, PoolIdleMinutes: 30, PricingRefreshHours: 24,
-		BrowserBlockCrossOrigin: true,
+		BrowserBlockCrossOrigin: true, UploadRetentionDays: 30,
 	}
 	if d != want {
 		t.Fatalf("defaults = %+v, want %+v", d, want)
