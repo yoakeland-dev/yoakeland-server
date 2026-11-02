@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,6 +21,11 @@ type SessionState struct {
 	Title      string     `json:"title,omitempty"`
 	Archived   bool       `json:"archived,omitempty"`
 	ArchivedAt *time.Time `json:"archivedAt,omitempty"`
+	// Settled is a retired field from an early build where "closed" was its own state
+	// beside archived. They are one concept now: archived. Kept so loadLocked can fold an
+	// early build's closed chats into the archived pile instead of resurrecting them.
+	Settled   bool       `json:"settled,omitempty"`
+	SettledAt *time.Time `json:"settledAt,omitempty"`
 	// LinkedSessionID pairs this session with another one for a split/sidebar
 	// layout (e.g. "session-main" paired with "session-scratch"). Purely a
 	// client layout hint — the backend never reads or acts on it.
@@ -113,7 +119,21 @@ func (s *DiskSessionStore) saveLocked(session *SessionState) error {
 	session.UpdatedAt = time.Now().UTC()
 	bytes, err := json.MarshalIndent(session, "", "  ")
 	if err != nil {
-		return err
+		// Marshal validates every raw JSON field it copies verbatim, so one
+		// unparseable value — a tool call's args, a replayed provider block —
+		// fails the whole write. Since it stays in memory, every later save
+		// would fail the same way: the chat would stop being saved without
+		// anything saying so. Repair a copy (rawjson.go) and write that rather
+		// than lose the conversation over one field.
+		writeErr := err
+		repaired, fixed := repairSessionState(session)
+		if fixed == 0 {
+			return writeErr
+		}
+		if bytes, err = json.MarshalIndent(repaired, "", "  "); err != nil {
+			return err
+		}
+		log.Printf("session %s: replaced %d unparseable JSON value(s) so it could be saved (%v)", session.SessionID, fixed, writeErr)
 	}
 
 	target, err := s.sessionFile(session.SessionID)
@@ -149,6 +169,16 @@ func (s *DiskSessionStore) loadLocked(sessionID string) (*SessionState, error) {
 	var state SessionState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("corrupted session data: %w", err)
+	}
+	// A chat closed by an early build that kept "closed" apart from "archived": the two are
+	// one state now, so it becomes archived rather than reappearing as active.
+	if state.Settled {
+		state.Archived = true
+		if state.ArchivedAt == nil {
+			state.ArchivedAt = state.SettledAt
+		}
+		state.Settled = false
+		state.SettledAt = nil
 	}
 	return &state, nil
 }

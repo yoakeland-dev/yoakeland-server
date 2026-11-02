@@ -1778,7 +1778,7 @@ turn:
 				Role:         "assistant",
 				Content:      assistantText,
 				Reasoning:    reasoningText,
-				ToolCalls:    segCalls,
+				ToolCalls:    saveableToolCalls(segCalls),
 				Provider:     providerName,
 				Model:        modelName,
 				CreatedAt:    time.Now(),
@@ -1862,7 +1862,7 @@ turn:
 						}
 						_ = a.streamFor(chunk.ToolCall.ParentToolCallID).SendEvent(protocol.EventToolCallRequested, a.sessionID, turnID, chunk.ToolCall.ID, protocol.ToolCallData{
 							Name:           chunk.ToolCall.Name,
-							Args:           chunk.ToolCall.Args,
+							Args:           wireArgs(chunk.ToolCall.Args),
 							NativeToolInfo: chunk.ToolCall.NativeToolInfo,
 						})
 						if chunk.ToolCall.Native {
@@ -1982,7 +1982,7 @@ turn:
 				Role:         "assistant",
 				Content:      assistantText,
 				Reasoning:    reasoningText,
-				ToolCalls:    append(toolCalls, segCalls...),
+				ToolCalls:    saveableToolCalls(append(toolCalls, segCalls...)),
 				Provider:     bound.ProviderName,
 				Model:        bound.Model,
 				CreatedAt:    time.Now(),
@@ -2230,7 +2230,7 @@ turn:
 			ID:           lastMessageID,
 			Role:         "assistant",
 			Content:      assistantText,
-			ToolCalls:    append(toolCalls, segCalls...),
+			ToolCalls:    saveableToolCalls(append(toolCalls, segCalls...)),
 			Provider:     providerName,
 			Model:        modelName,
 			CreatedAt:    time.Now(),
