@@ -642,12 +642,14 @@ A session's first `user_prompt` (above) may carry `autoGenerateTitle` (default `
 - Set `"autoGenerateTitle": false` on that first `user_prompt` to skip the model call entirely and go straight to the fallback (still delivered via `session_updated`) — e.g. for a client that always calls `set_session_title` itself and doesn't want the extra request.
 
 #### `set_session_archived`
-Sets or clears a session's archived flag, for a client-side "hide from the active list" without deleting anything.
+Sets or clears a session's archived flag: the user's own "hide this from the active list", without deleting anything. It is the only "closed" state there is — deliberately **not** implied by a finished turn, since a chat often needs several more prompts to finish the actual work.
 ```json
 {"type": "set_session_archived", "data": {"sessionId": "session-main", "archived": true}}
 ```
 - `sessionId`: required, same existence/resolution rules as `set_session_title`.
-- Response: `session_updated`.
+- Response: `session_updated`, broadcast to other peers.
+- Sending a `user_prompt` for an archived session clears the flag first, and that clearing is announced as its own `session_updated` before the turn starts — so a chat you talk to again comes back from any device, without the client remembering to un-archive it.
+- A client may also treat age as archiving (Yoakeland's default: 30 idle days, 0 = never); that is a client-side view over `updatedAt` and never writes this flag.
 
 #### `set_session_layout`
 Pairs (or unpairs) two sessions for a client-side split/sidebar layout — e.g. a main thread with a linked scratch thread shown alongside it. This is a pure layout hint: the backend only stores and echoes it back, never reads or acts on it itself.

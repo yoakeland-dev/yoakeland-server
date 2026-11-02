@@ -1175,6 +1175,19 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if err := pc.SessStore.Ensure(sessID); err != nil {
 			logError("session %s: could not create its session file: %v", sessID, err)
 		}
+		// Sending a message un-archives a chat: archiving is "hide this", and talking to it
+		// again clearly means unhide. Done here rather than in each client, so a phone and a
+		// desktop agree on what "reopened" means.
+		if cur, cerr := pc.SessStore.Load(sessID); cerr == nil && cur.Archived {
+			if reopened, uerr := pc.SessStore.UpdateExisting(sessID, func(st *agent.SessionState) error {
+				st.Archived = false
+				st.ArchivedAt = nil
+				return nil
+			}); uerr == nil {
+				_ = ipc.SendEvent(protocol.EventSessionUpdated, sessID, env.TurnID, "", sessionSummaryFrom(pc.Root, reopened))
+				deps.peers.BroadcastEvent(peerID, protocol.EventSessionUpdated, sessID, sessionSummaryFrom(pc.Root, reopened))
+			}
+		}
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
