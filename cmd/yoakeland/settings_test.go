@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"yoakeland/internal/protocol"
 )
 
@@ -254,5 +257,113 @@ func TestServerSettings_Icon(t *testing.T) {
 	}
 	if err := re.SetIcon(protocol.ServerIcon{}); err != nil || re.GetIcon() != nil {
 		t.Fatalf("empty icon should clear, got %+v (%v)", re.GetIcon(), err)
+	}
+}
+
+func writeServerJSON(t *testing.T, dir, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "server.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An old server.json (tokens with a Scope, no users) gains the owner and one person per
+// credential, and loading it again changes nothing.
+func TestServerSettings_MigratesToUsers(t *testing.T) {
+	dir := t.TempDir()
+	future := time.Now().Add(time.Hour).Unix()
+	past := time.Now().Add(-time.Hour).Unix()
+	writeServerJSON(t, dir, fmt.Sprintf(`{"serverId":"abc","token":"legacy-secret","tokens":{
+		"alice":{"token":"ta","email":"a@x.io","avatar":"😀"},
+		"phone":{"token":"tp","pairing":true,"expiresAt":%d,"deviceId":"d1"},
+		"promoted":{"token":"tq","pairing":true,"deviceId":"d2","scope":"full"},
+		"demoted":{"token":"tr","scope":"limited"},
+		"fresh":{"token":"tf","pairing":true,"expiresAt":%d},
+		"stale":{"token":"ts","pairing":true,"expiresAt":%d}}}`, future, future, past))
+
+	s, err := NewServerSettings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner, ok := s.Users[ownerID]; !ok || owner.Tier != TierFull {
+		t.Fatalf("owner = %+v, %v", owner, ok)
+	}
+	if _, ok := s.Tokens["stale"]; ok {
+		t.Fatal("an expired pairing token survived the load")
+	}
+	want := map[string]string{"alice": TierFull, "default": TierFull, "phone": TierLimited, "promoted": TierFull, "demoted": TierLimited, "fresh": TierLimited}
+	for name, tier := range want {
+		rec, ok := s.Tokens[name]
+		if !ok {
+			t.Fatalf("token %q missing", name)
+		}
+		u, ok := s.Users[rec.UserID]
+		if !ok || u.Name != name || u.Tier != tier {
+			t.Fatalf("token %q -> user %+v (found %v), want name %q tier %s", name, u, ok, name, tier)
+		}
+		if rec.Scope != "" {
+			t.Fatalf("token %q kept Scope %q", name, rec.Scope)
+		}
+	}
+	if a := s.Users[s.Tokens["alice"].UserID]; a.Email != "a@x.io" || a.Avatar != "😀" {
+		t.Fatalf("alice's email and avatar didn't move to her user: %+v", a)
+	}
+	if s.Tokens["alice"].Token != "ta" || s.Tokens["default"].Token != "legacy-secret" {
+		t.Fatal("a token value changed")
+	}
+
+	// Loading the migrated file again is a no-op: same users, same links.
+	before, _ := json.Marshal(s)
+	again, err := NewServerSettings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(again)
+	if string(before) != string(after) {
+		t.Fatalf("second load changed the file:\n%s\n%s", before, after)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "server.json"))
+	if strings.Contains(string(raw), `"scope"`) {
+		t.Fatal("scope is still written to server.json")
+	}
+	if len(again.Users) != len(want)+1 {
+		t.Fatalf("users = %d, want %d (credentials + owner)", len(again.Users), len(want)+1)
+	}
+}
+
+func TestServerSettings_PurgesExpiredPairingOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewServerSettings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddPairingToken("gone", "tg", ""); err != nil {
+		t.Fatal(err)
+	}
+	userID := s.Tokens["gone"].UserID
+	rec := s.Tokens["gone"]
+	rec.ExpiresAt = time.Now().Add(-time.Minute).Unix()
+	s.Tokens["gone"] = rec
+	u := s.Users[userID]
+	u.CreatedAt = rec.ExpiresAt - int64(PairingTTL/time.Second)
+	s.Users[userID] = u
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := NewServerSettings(dir)
+	if _, ok := again.Tokens["gone"]; ok {
+		t.Fatal("an expired unclaimed pairing token was kept on load")
+	}
+	if _, ok := again.Users[userID]; ok {
+		t.Fatal("the person made for that code was kept")
+	}
+}
+
+func TestServerSettings_SeedOwnerProfileOnce(t *testing.T) {
+	s, _ := NewServerSettings(t.TempDir())
+	s.SeedOwnerProfile("Ava", "🦊")
+	s.SeedOwnerProfile("Someone else", "🐻")
+	if o := s.Users[ownerID]; o.Name != "Ava" || o.Avatar != "🦊" {
+		t.Fatalf("owner = %+v, want the first report kept", o)
 	}
 }

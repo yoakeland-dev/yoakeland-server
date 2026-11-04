@@ -27,7 +27,7 @@ func TestImportStateCopiesDataNotIdentity(t *testing.T) {
 	write(filepath.Join(rec, "project.json"), `{"path":"`+chat+`/x"}`)
 	write(filepath.Join(from, "tls", "ca.key"), "secret")
 	write(filepath.Join(from, "providers.json"), "{}")
-	write(filepath.Join(from, "server.json"), `{"identity":"fish","serverId":"abc","runtime":{"x":1}}`)
+	write(filepath.Join(from, "server.json"), `{"identity":"fish","serverId":"abc","runtime":{"x":1},"users":{"owner":{"id":"owner","name":"Ava","tier":"full"}},"limitedDefaults":{"mcp_tools":true},"tokens":{"t":{"token":"secret"}}}`)
 
 	if !needsImport(to) {
 		t.Fatal("a missing dir needs import")
@@ -41,7 +41,7 @@ func TestImportStateCopiesDataNotIdentity(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(to, "tls")); err == nil {
 		t.Fatal("tls must not be copied")
 	}
-	if b, _ := os.ReadFile(filepath.Join(to, "server.json")); strings.Contains(string(b), "serverId") || !strings.Contains(string(b), "fish") {
+	if b, _ := os.ReadFile(filepath.Join(to, "server.json")); strings.Contains(string(b), "serverId") || strings.Contains(string(b), "secret") || !strings.Contains(string(b), "fish") || !strings.Contains(string(b), `"Ava"`) || !strings.Contains(string(b), "limitedDefaults") {
 		t.Fatalf("server.json: %s", b)
 	}
 	moved := filepath.Join(to, "projects", filepath.Base(projectstore.DataDir(to, filepath.Join(to, "chats", "c1"))), "project.json")

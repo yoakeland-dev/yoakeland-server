@@ -922,7 +922,7 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 	// The token's name is only the initial name for a device that has none yet (it is what the
 	// person typed when pairing it); a device that already knows who it is keeps that identity.
 	// The credential's own name stays in TokenName for revocation and the audit log.
-	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, rec.Restricted()
+	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, true // serveAccepted settles the tier once the credential is admitted
 	if who.Name == "" {
 		who.Name = resolvedName
 	}

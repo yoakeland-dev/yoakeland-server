@@ -29,17 +29,48 @@ type TokenRecord struct {
 	ExpiresAt int64  `json:"expiresAt,omitempty"` // unix seconds; 0 once claimed
 	DeviceID  string `json:"deviceId,omitempty"`
 
-	// Scope overrides the default tier: "full" or "limited". Empty means a pairing credential is
-	// limited (see remoteAllowed) and any other is full. Set with set_peer_scope or approve_pairing.
+	// UserID is the server-owned person this credential logs in as (see User). MaxTier, when set,
+	// caps the device below its person's tier; Deny lists capabilities taken away on this device.
+	UserID   string   `json:"userId,omitempty"`
+	MaxTier  string   `json:"maxTier,omitempty"`
+	Deny     []string `json:"deny,omitempty"`
+	LastSeen int64    `json:"lastSeen,omitempty"` // unix seconds, set on auth and on disconnect
+	PairedBy string   `json:"pairedBy,omitempty"` // user id of whoever created or approved it
+
+	// Scope is the pre-users tier ("full" or "limited"). It is only read on load, to migrate the
+	// credential into a User, and never written back.
 	Scope string `json:"scope,omitempty"`
 }
 
-// Restricted reports whether devices on this credential are held to remoteAllowed.
-func (r TokenRecord) Restricted() bool {
+// legacyRestricted is what Scope and Pairing meant before users existed.
+func (r TokenRecord) legacyRestricted() bool {
 	if r.Scope != "" {
 		return r.Scope == "limited"
 	}
 	return r.Pairing
+}
+
+// Tiers, lowest first.
+const (
+	TierLimited = "limited"
+	TierTrusted = "trusted"
+	TierFull    = "full"
+
+	ownerID = "owner"
+)
+
+// User is a person the server knows. A credential (device) logs in as one.
+type User struct {
+	ID        string         `json:"id"` // "owner" or "u-<random>"
+	Name      string         `json:"name"`
+	Avatar    string         `json:"avatar,omitempty"` // emoji or data URL, capped at maxAvatarLen
+	Email     string         `json:"email,omitempty"`
+	Tier      string         `json:"tier"`
+	Caps      map[string]any `json:"caps,omitempty"`      // only what differs from the tier default
+	AliasOf   string         `json:"aliasOf,omitempty"`   // set by merge_users; resolve before any use
+	Names     []string       `json:"names,omitempty"`     // earlier names, for matching old messages
+	CreatedBy string         `json:"createdBy,omitempty"` // user id
+	CreatedAt int64          `json:"createdAt"`
 }
 
 // PairingTTL is how long a pairing QR code works before anyone uses it.
@@ -58,6 +89,11 @@ type ServerSettings struct {
 	Identity string                 `json:"identity,omitempty"`
 	Icon     *protocol.ServerIcon   `json:"icon,omitempty"`
 	Tokens   map[string]TokenRecord `json:"tokens,omitempty"`
+
+	// Users are the people credentials log in as; LimitedDefaults overlays the Limited tier's
+	// default capabilities for everyone on it.
+	Users           map[string]User `json:"users,omitempty"`
+	LimitedDefaults map[string]any  `json:"limitedDefaults,omitempty"`
 
 	// ServerID is a stable identifier minted once, the first time this
 	// -state-dir is ever used, and never changed or exposed via any setter
@@ -125,6 +161,7 @@ func NewServerSettings(dir string) (*ServerSettings, error) {
 			}
 			logWarn("server settings: server.json failed to parse, moved to %s; starting empty: %v", aside, err)
 			s.Identity, s.Token, s.Tokens = "", "", map[string]TokenRecord{}
+			s.Users, s.LimitedDefaults = nil, nil
 			s.RuntimeState, s.RemoteState, s.DefaultProviderState = nil, nil, nil
 		}
 	}
@@ -139,6 +176,11 @@ func NewServerSettings(dir string) (*ServerSettings, error) {
 			s.Tokens[defaultTokenName] = TokenRecord{Token: s.Token}
 		}
 		s.Token = ""
+	}
+	if s.migrate() {
+		if err := s.save(); err != nil {
+			return nil, err
+		}
 	}
 	if s.Identity == "" {
 		if host, err := os.Hostname(); err == nil {
@@ -279,6 +321,12 @@ func (s *ServerSettings) LookupToken(token string) (name string, rec TokenRecord
 // already registered — rename is deliberately unsupported (revoke + re-add
 // instead), so there's no ambiguity about what "the same person" means.
 func (s *ServerSettings) AddToken(name, token, email string) error {
+	return s.AddTokenFor(name, token, email, "", "")
+}
+
+// AddTokenFor is AddToken for a credential that logs in as userID (made by pairedBy). With no
+// userID it makes a new full-tier user named after the token, as an unscoped credential always was.
+func (s *ServerSettings) AddTokenFor(name, token, email, userID, pairedBy string) error {
 	if name == "" {
 		return fmt.Errorf("token name is required")
 	}
@@ -287,12 +335,23 @@ func (s *ServerSettings) AddToken(name, token, email string) error {
 	if _, exists := s.Tokens[name]; exists {
 		return fmt.Errorf("a token named %q already exists", name)
 	}
-	s.Tokens[name] = TokenRecord{Token: token, Email: email}
+	if userID == "" {
+		u := s.newUserLocked(name, email, "", TierFull, pairedBy)
+		userID = u.ID
+	}
+	s.Tokens[name] = TokenRecord{Token: token, Email: email, UserID: userID, PairedBy: pairedBy}
 	return s.save()
 }
 
 // AddPairingToken is AddToken for a one-device pairing token (see TokenRecord).
 func (s *ServerSettings) AddPairingToken(name, token, email string) error {
+	return s.AddPairingTokenFor(name, token, email, "", "", "")
+}
+
+// AddPairingTokenFor is AddPairingToken for a credential that logs in as userID, with maxTier as
+// the device's ceiling (empty for none). With no userID it makes a new limited user named after
+// the token, as a pairing credential always was.
+func (s *ServerSettings) AddPairingTokenFor(name, token, email, userID, maxTier, pairedBy string) error {
 	if name == "" {
 		return fmt.Errorf("token name is required")
 	}
@@ -302,7 +361,12 @@ func (s *ServerSettings) AddPairingToken(name, token, email string) error {
 	if _, exists := s.Tokens[name]; exists {
 		return fmt.Errorf("a token named %q already exists", name)
 	}
-	s.Tokens[name] = TokenRecord{Token: token, Email: email, Pairing: true, ExpiresAt: time.Now().Add(PairingTTL).Unix()}
+	if userID == "" {
+		u := s.newUserLocked(name, email, "", TierLimited, pairedBy)
+		userID = u.ID
+	}
+	s.Tokens[name] = TokenRecord{Token: token, Email: email, Pairing: true, ExpiresAt: time.Now().Add(PairingTTL).Unix(),
+		UserID: userID, MaxTier: maxTier, PairedBy: pairedBy}
 	return s.save()
 }
 
@@ -336,14 +400,79 @@ func (s *ServerSettings) ClaimPairing(name, deviceID string) error {
 }
 
 // purgeExpiredLocked drops pairing tokens nobody used in time, so a QR code that was never
-// scanned doesn't linger as a credential.
-func (s *ServerSettings) purgeExpiredLocked() {
+// scanned doesn't linger as a credential. The person made for it goes too, if nothing else
+// uses them. Reports whether anything was dropped.
+func (s *ServerSettings) purgeExpiredLocked() bool {
 	now := time.Now().Unix()
+	dropped := false
 	for n, r := range s.Tokens {
 		if r.Pairing && r.DeviceID == "" && now > r.ExpiresAt {
 			delete(s.Tokens, n)
+			dropped = true
+			// ponytail: a person made for a code is recognised by its creation time matching the
+			// code's; an extra field would say it outright.
+			if u, ok := s.Users[r.UserID]; ok && u.ID != ownerID && u.CreatedAt >= r.ExpiresAt-int64(PairingTTL/time.Second)-2 && u.CreatedAt <= r.ExpiresAt && !s.userHasTokenLocked(u.ID) {
+				delete(s.Users, u.ID)
+			}
 		}
 	}
+	return dropped
+}
+
+func (s *ServerSettings) userHasTokenLocked(id string) bool {
+	for _, r := range s.Tokens {
+		if r.UserID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// newUserID is "u-" and 8 random bytes of hex.
+func newUserID() string { return "u-" + randomID() }
+
+// newUserLocked adds a person with a fresh id.
+func (s *ServerSettings) newUserLocked(name, email, avatar, tier, createdBy string) User {
+	id := newUserID()
+	for _, taken := s.Users[id]; taken; _, taken = s.Users[id] {
+		id = newUserID()
+	}
+	u := User{ID: id, Name: name, Email: email, Avatar: avatar, Tier: tier, CreatedBy: createdBy, CreatedAt: time.Now().Unix()}
+	if s.Users == nil {
+		s.Users = map[string]User{}
+	}
+	s.Users[id] = u
+	return u
+}
+
+// migrate brings an older server.json up to date, idempotently, and reports whether it changed
+// anything: expired pairing tokens go, the owner exists, and every credential without a person
+// gets its own (limited if it was restricted, else full). Token values are never touched.
+func (s *ServerSettings) migrate() bool {
+	changed := s.purgeExpiredLocked()
+	if s.Users == nil {
+		s.Users = map[string]User{}
+	}
+	if _, ok := s.Users[ownerID]; !ok {
+		s.Users[ownerID] = User{ID: ownerID, Tier: TierFull, CreatedAt: time.Now().Unix()}
+		changed = true
+	}
+	for n, r := range s.Tokens {
+		if r.UserID != "" && r.Scope == "" {
+			continue
+		}
+		if r.UserID == "" {
+			tier := TierFull
+			if r.legacyRestricted() {
+				tier = TierLimited
+			}
+			r.UserID = s.newUserLocked(n, r.Email, r.Avatar, tier, "").ID
+		}
+		r.Scope = ""
+		s.Tokens[n] = r
+		changed = true
+	}
+	return changed
 }
 
 // ListTokenNames returns every registered token's name/email/whether it has
@@ -355,7 +484,7 @@ func (s *ServerSettings) ListTokenNames() []TokenSummaryInternal {
 	s.purgeExpiredLocked()
 	out := make([]TokenSummaryInternal, 0, len(s.Tokens))
 	for n, r := range s.Tokens {
-		out = append(out, TokenSummaryInternal{Name: n, Email: r.Email, HasAvatar: r.Avatar != "", Restricted: r.Restricted()})
+		out = append(out, TokenSummaryInternal{Name: n, Email: r.Email, HasAvatar: r.Avatar != "", Restricted: s.tierOfLocked(r) != TierFull})
 	}
 	return out
 }
@@ -413,15 +542,25 @@ func (s *ServerSettings) SetTokenAvatar(name, avatar string) bool {
 	return true
 }
 
-// TokenRestricted reports whether credential name is held to remoteAllowed now.
+// TokenRestricted reports whether credential name is below the full tier now.
 func (s *ServerSettings) TokenRestricted(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.Tokens[name]
-	return !ok || rec.Restricted()
+	return !ok || s.tierOfLocked(rec) != TierFull
 }
 
-// SetTokenScope makes a credential full (unrestricted) or limited. False if no such credential.
+// tierOfLocked is min(user tier, device ceiling); a credential whose user is gone is limited.
+func (s *ServerSettings) tierOfLocked(rec TokenRecord) string {
+	u, ok := s.resolveUserLocked(rec.UserID)
+	if !ok {
+		return TierLimited
+	}
+	return minTier(u.Tier, rec.MaxTier)
+}
+
+// SetTokenScope is set_peer_scope for old clients: full makes the credential's person full and
+// lifts the device ceiling, otherwise the device is held to limited. False if no such credential.
 func (s *ServerSettings) SetTokenScope(name string, full bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -429,9 +568,14 @@ func (s *ServerSettings) SetTokenScope(name string, full bool) bool {
 	if !ok {
 		return false
 	}
-	rec.Scope = "limited"
 	if full {
-		rec.Scope = "full"
+		if u, ok := s.resolveUserLocked(rec.UserID); ok {
+			u.Tier = TierFull
+			s.Users[u.ID] = u
+		}
+		rec.MaxTier = ""
+	} else {
+		rec.MaxTier = TierLimited
 	}
 	s.Tokens[name] = rec
 	_ = s.save()

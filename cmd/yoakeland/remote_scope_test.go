@@ -57,16 +57,14 @@ func TestRemoteScope_DispatchRefuses(t *testing.T) {
 	}
 }
 
-func TestHandshake_PairingCredentialIsRestricted(t *testing.T) {
-	for _, tc := range []struct {
-		pairing bool
-	}{{true}, {false}} {
-		lookup := func(string) (string, TokenRecord, bool) { return "tok", TokenRecord{Pairing: tc.pairing}, true }
-		in := bytes.NewBufferString(`{"type":"auth","data":{"token":"x"}}` + "\n")
-		who, _, ok := handshake(protocol.NewIPCStream(in, &bytes.Buffer{}), "tcp", lookup)
-		if !ok || who.Restricted != tc.pairing {
-			t.Fatalf("pairing=%v: ok=%v restricted=%v", tc.pairing, ok, who.Restricted)
-		}
+// The handshake never grants a tier: the server settles it from the credential's person once the
+// connection is admitted, so until then a TCP device counts as restricted.
+func TestHandshake_StartsRestricted(t *testing.T) {
+	lookup := func(string) (string, TokenRecord, bool) { return "tok", TokenRecord{UserID: ownerID}, true }
+	in := bytes.NewBufferString(`{"type":"auth","data":{"token":"x"}}` + "\n")
+	who, _, ok := handshake(protocol.NewIPCStream(in, &bytes.Buffer{}), "tcp", lookup)
+	if !ok || !who.Restricted {
+		t.Fatalf("ok=%v restricted=%v", ok, who.Restricted)
 	}
 }
 
@@ -90,7 +88,7 @@ func TestSetPeerScope(t *testing.T) {
 	if deps.peers.IsRestricted(phone.ID) || remoteDenied(deps, "tcp", phone.ID, protocol.EventSaveMCPServer) {
 		t.Fatal("promotion did not take effect live")
 	}
-	if rec := deps.settings.Tokens["phone"]; rec.Restricted() {
+	if deps.settings.TokenRestricted("phone") {
 		t.Fatal("promotion was not persisted")
 	}
 	send(laptop, "tcp", false)

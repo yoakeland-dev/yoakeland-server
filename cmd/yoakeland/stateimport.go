@@ -20,7 +20,7 @@ import (
 var importedState = []string{"projects", "chats", "uploads", "snapshots", "providers.json", "mcp.json", "skills.json", "schedules.json", "projects.json", "spend.json", "usage.json"}
 
 // server.json settings carried over: the name and icon stay, but a copy is a separate server, so no serverId, tokens or remote listener.
-var importedSettings = []string{"identity", "icon", "autoGenerateTitle", "modelRoles", "notify", "runtime", "defaultProvider"}
+var importedSettings = []string{"identity", "icon", "autoGenerateTitle", "modelRoles", "notify", "runtime", "defaultProvider", "users", "limitedDefaults"}
 
 // Present in the target while a copy runs, so one cut short is redone rather than mistaken for a state dir.
 const importMarker = ".copying"
