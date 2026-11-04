@@ -184,7 +184,9 @@ type Access struct {
 }
 
 // localAccess is the owner on the local socket.
-func localAccess() Access { return Access{Tier: TierFull, Caps: allCaps(), UserID: ownerID, Local: true} }
+func localAccess() Access {
+	return Access{Tier: TierFull, Caps: allCaps(), UserID: ownerID, Local: true}
+}
 
 // Access resolves who a connection is. The local socket and -stdio are the owner. A TCP peer
 // takes its credential's person, held to the device's ceiling and denials; a credential or person
