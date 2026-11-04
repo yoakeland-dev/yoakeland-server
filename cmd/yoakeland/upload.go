@@ -143,7 +143,12 @@ func (s *UploadStore) Prune() {
 	if maxAge <= 0 {
 		return
 	}
-	referenced := s.referenced()
+	referenced, ok := s.referenced()
+	if !ok {
+		// A failed scan makes referenced uploads look unused; delete nothing.
+		logError("upload prune skipped: could not scan stored sessions")
+		return
+	}
 	entries, _ := os.ReadDir(s.dir)
 	for _, e := range entries {
 		if !sha256Hex.MatchString(e.Name()) || referenced[e.Name()] {
@@ -171,17 +176,26 @@ func (s *UploadStore) Prune() {
 // keep attachment absolute paths, so their JSON text carries the hash.
 // Scanning is bounded to <-state-dir>/projects (project and chat sessions
 // both live beneath it) and happens only during a prune.
-func (s *UploadStore) referenced() map[string]bool {
-	out := make(map[string]bool)
+// ok is false when any part of the scan failed.
+func (s *UploadStore) referenced() (out map[string]bool, ok bool) {
+	out = make(map[string]bool)
 	if s.stateDir == "" {
-		return out
+		return out, true
 	}
+	ok = true
 	_ = filepath.WalkDir(filepath.Join(s.stateDir, "projects"), func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".json") {
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) || d != nil {
+				ok = false
+			}
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(p, ".json") {
 			return nil
 		}
 		b, err := os.ReadFile(p)
 		if err != nil {
+			ok = false
 			return nil
 		}
 		for _, m := range sha256Anywhere.FindAll(b, -1) {
@@ -189,7 +203,7 @@ func (s *UploadStore) referenced() map[string]bool {
 		}
 		return nil
 	})
-	return out
+	return out, ok
 }
 
 // shaOf reports the content hash of a path inside an upload's directory.

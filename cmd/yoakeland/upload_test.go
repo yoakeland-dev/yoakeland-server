@@ -241,3 +241,20 @@ func TestUploadStore_PendingLimit(t *testing.T) {
 		t.Fatalf("%d temp files, want %d (a refused begin must not leave one)", len(left), maxPendingPerPeer+1)
 	}
 }
+
+func TestUploadStore_PruneSkipsWhenScanFails(t *testing.T) {
+	state := t.TempDir()
+	s, _ := NewUploadStore(state, time.Hour)
+	p := uploadText(t, s, "scan failure bytes")
+	age(t, filepath.Dir(p), 2*time.Hour)
+	sessionDir := filepath.Join(state, "projects", "abc", "sessions")
+	_ = os.MkdirAll(sessionDir, 0o700)
+	// A session file that can't be read (dangling link) makes the scan fail.
+	if err := os.Symlink(filepath.Join(state, "nope"), filepath.Join(sessionDir, "s.json")); err != nil {
+		t.Fatal(err)
+	}
+	s.Prune()
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("prune deleted an upload although the reference scan failed")
+	}
+}
