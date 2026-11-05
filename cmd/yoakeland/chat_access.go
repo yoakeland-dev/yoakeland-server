@@ -304,3 +304,14 @@ func (r *ProjectRegistry) ensureChat(store agent.SessionStore, sessionID, userID
 	}
 	return nil
 }
+
+// mayTouchNotifications reports whether acc may dismiss or mark read the notification id: one about
+// a chat needs that chat to be visible to them. An id nobody has is left alone either way.
+func (d connDeps) mayTouchNotifications(acc Access, id string) bool {
+	for _, n := range d.notify.List() {
+		if n.ID == id {
+			return n.SessionID == "" || d.mayViewChat(acc, n.SessionID)
+		}
+	}
+	return true
+}

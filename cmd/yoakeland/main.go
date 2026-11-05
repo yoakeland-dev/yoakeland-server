@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -228,6 +229,9 @@ func main() {
 	projects.mu.Lock()
 	projects.sameUser = settings.SameUser
 	projects.mu.Unlock()
+	peers.Sees = func(network, credential, sessionID string) bool {
+		return connDeps{projects: projects, settings: settings}.mayViewChat(settings.Access(network, credential), sessionID)
+	}
 
 	// Deprecated launch flags hand their value over once, then the stored
 	// setting rules (runtime_dispatch.go).
@@ -741,11 +745,11 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
 	_ = ipc.SendEvent(protocol.EventNotifyPrefs, "", "", "", deps.settings.GetNotifyPrefs())
 	sendRuntimeState(ipc, deps, network)
-	deps.status.SendPendingAsks(ipc)
+	deps.status.SendPendingAsks(peer)
 	for _, st := range deps.projects.GitStatuses() {
 		_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
 	}
-	deps.status.SendTerminals(ipc)
+	deps.status.SendTerminals(peer)
 
 	if pending != nil {
 		onActivity()
@@ -2301,7 +2305,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		handleReadLog(ipc)
 
 	case protocol.EventListNotifications:
-		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", protocol.NotificationListData{Notifications: deps.notify.List()})
+		var list any = protocol.NotificationListData{Notifications: deps.notify.List()}
+		if p, ok := deps.peers.Get(peerID); ok { // the notifications of chats this person may see
+			list, _ = deps.peers.forPeer(p, "", list)
+		}
+		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", list)
 
 	case protocol.EventGetUsage:
 		var data protocol.GetUsageData
@@ -2349,18 +2357,22 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventDismissNotification:
 		var data protocol.DismissNotificationData
 		_ = json.Unmarshal(env.Data, &data)
-		deps.notify.Dismiss(data.ID)
+		if deps.mayTouchNotifications(acc, data.ID) {
+			deps.notify.Dismiss(data.ID)
+		}
 
 	case protocol.EventMarkNotificationsRead:
 		var data protocol.MarkNotificationsReadData
 		_ = json.Unmarshal(env.Data, &data)
-		deps.notify.MarkRead(data.IDs...)
+		deps.notify.MarkRead(slices.DeleteFunc(slices.Clone(data.IDs), func(id string) bool { return !deps.mayTouchNotifications(acc, id) })...)
 
 	case protocol.EventSetPresence:
 		var data protocol.SetPresenceData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
 			return
 		}
+		// A person says which chats they are looking at; only chats they may see count.
+		data.SessionIDs = slices.DeleteFunc(slices.Clone(data.SessionIDs), func(id string) bool { return !deps.mayViewChat(acc, id) })
 		if deps.peers.SetPresence(peerID, data.SessionIDs, data.Focused, data.Visible) && data.Focused && data.Visible {
 			for _, id := range data.SessionIDs {
 				deps.notify.MarkSessionRead(id) // looking at a chat is reading it

@@ -66,6 +66,9 @@ type PeerRegistry struct {
 	OnDemote func(peerID string)
 	// UserName, if set, names a person for the roster (peer_list's userName).
 	UserName func(userID string) string
+	// Sees says whether the connection with this credential may be told about a chat's events.
+	// Unset, a TCP peer sees none: session events fail closed.
+	Sees func(network, credential, sessionID string) bool
 }
 
 func NewPeerRegistry() *PeerRegistry {
@@ -143,6 +146,7 @@ func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network stri
 		ipc:         ipc,
 	}
 
+	ipc.SetVisibility(func(sessionID string) bool { return r.canSee(p, sessionID) })
 	r.mu.Lock()
 	r.peers[id] = p
 	r.mu.Unlock()
@@ -442,7 +446,8 @@ func (r *PeerRegistry) Count() int {
 	return len(r.peers)
 }
 
-// BroadcastEvent pushes one event to every live peer except exceptPeerID —
+// BroadcastEvent pushes one event to every live peer except exceptPeerID, leaving out the peers who
+// may not see the chat it is about (the sessionID, or the one inside the payload; see forPeer) —
 // the requester, who already got its own direct response inline. This is
 // the live-sync half of chat-list/project-list consistency: any other
 // connection currently attached to this process learns about a mutation
@@ -460,7 +465,7 @@ func (r *PeerRegistry) BroadcastEvent(exceptPeerID string, eventType protocol.Ev
 	r.mu.Unlock()
 
 	for _, p := range peers {
-		_ = p.ipc.SendEvent(eventType, sessionID, "", "", data)
+		r.SendTo(p, eventType, sessionID, data)
 	}
 }
 

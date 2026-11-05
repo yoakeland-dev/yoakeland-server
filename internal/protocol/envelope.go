@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"yoakeland/internal/audit"
 	"yoakeland/internal/diff"
@@ -2723,6 +2724,29 @@ type IPCStream struct {
 	reader *bufio.Scanner
 	writer io.Writer
 	mu     sync.Mutex
+	// visible, if set, says whether this connection may be told about events of a chat. A
+	// StreamSet checks it for every event it fans out, so a session's turn stream, permission
+	// prompts and anything added later reach only the connections allowed to see that chat.
+	visible atomic.Pointer[func(sessionID string) bool]
+}
+
+// SetVisibility installs the check CanSee applies; nil allows every chat.
+func (s *IPCStream) SetVisibility(f func(sessionID string) bool) {
+	if f == nil {
+		s.visible.Store(nil)
+		return
+	}
+	s.visible.Store(&f)
+}
+
+// CanSee reports whether events of sessionID may be fanned out to this connection. An event with
+// no session is for everyone.
+func (s *IPCStream) CanSee(sessionID string) bool {
+	if sessionID == "" {
+		return true
+	}
+	f := s.visible.Load()
+	return f == nil || (*f)(sessionID)
 }
 
 // splitLineStrictLF is bufio.ScanLines with the CRLF tolerance removed:
