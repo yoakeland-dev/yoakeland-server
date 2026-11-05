@@ -117,6 +117,7 @@ type syncBuf struct {
 
 func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
 func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+func (s *syncBuf) Reset()                      { s.mu.Lock(); defer s.mu.Unlock(); s.b.Reset() }
 
 func startPairingServer(t *testing.T) (connDeps, *remoteControl) {
 	t.Helper()

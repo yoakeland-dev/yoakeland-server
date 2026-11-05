@@ -31,7 +31,11 @@ func TestACPRegistryAndPairInfoNeedFullAccess(t *testing.T) {
 	}{{"full access", false, true}, {"paired phone", true, false}} {
 		var out syncBuf
 		ipc := protocol.NewIPCStream(bytes.NewBuffer(nil), &out)
-		p := deps.peers.Add(ipc, &fakeCloser{}, "tcp", peerIdentity{Name: "web", DeviceType: "web", Restricted: c.restricted})
+		tier := TierFull
+		if c.restricted {
+			tier = TierLimited
+		}
+		p := addPersonOn(t, deps, tier, "", ipc)
 		for _, typ := range []protocol.EventType{protocol.EventListACPRegistry, protocol.EventGetPairInfo} {
 			handleEnvelope(context.Background(), ipc, deps, "tcp", p.ID, &protocol.Envelope{Type: typ, Data: json.RawMessage(`{"requestId":"r1"}`)})
 		}
@@ -43,7 +47,7 @@ func TestACPRegistryAndPairInfoNeedFullAccess(t *testing.T) {
 			if !strings.Contains(got, `"acp_registry"`) || !strings.Contains(got, `"package":"p"`) || strings.Contains(got, `"binary"`) || !strings.Contains(got, `"pair_info"`) || !strings.Contains(got, `"requestId":"r1"`) {
 				t.Errorf("%s: got %s", c.name, got)
 			}
-		} else if strings.Contains(got, `"acp_registry"`) || strings.Contains(got, `"pair_info"`) || strings.Count(got, "isn't available from a paired device") != 2 {
+		} else if strings.Contains(got, `"acp_registry"`) || strings.Contains(got, `"pair_info"`) || !strings.Contains(got, "list_acp_registry needs Full access") || !strings.Contains(got, "get_pair_info needs Trusted access") {
 			t.Errorf("%s: got %s", c.name, got)
 		}
 	}

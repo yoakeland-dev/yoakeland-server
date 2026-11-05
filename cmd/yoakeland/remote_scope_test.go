@@ -11,10 +11,35 @@ import (
 	"yoakeland/internal/protocol"
 )
 
+// addPerson adds a person of the given tier with one credential and a live TCP connection on it.
+// The name is unique per call.
+func addPerson(t *testing.T, deps connDeps, tier string) *Peer {
+	t.Helper()
+	return addPersonWith(t, deps, tier, "")
+}
+
+func addPersonWith(t *testing.T, deps connDeps, tier, maxTier string) *Peer {
+	t.Helper()
+	return addPersonOn(t, deps, tier, maxTier, protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}))
+}
+
+// addPersonOn is addPersonWith on a stream the test reads.
+func addPersonOn(t *testing.T, deps connDeps, tier, maxTier string, ipc *protocol.IPCStream) *Peer {
+	t.Helper()
+	s := deps.settings
+	s.mu.Lock()
+	u := s.newUserLocked("person-"+tier, "", "", tier, ownerID)
+	cred := "cred-" + u.ID
+	s.Tokens[cred] = TokenRecord{Token: "tok-" + u.ID, UserID: u.ID, MaxTier: maxTier}
+	s.mu.Unlock()
+	return deps.peers.Add(ipc, nopCloser{}, "tcp",
+		peerIdentity{Name: u.ID, TokenName: cred, Restricted: minTier(tier, maxTier) != TierFull, Tier: minTier(tier, maxTier), UserID: u.ID})
+}
+
 func TestRemoteScope(t *testing.T) {
 	deps := newTestDeps(t)
-	phone := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", DeviceType: "phone", Restricted: true})
-	person := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "laptop", DeviceType: "desktop"})
+	phone := addPerson(t, deps, TierLimited)
+	person := addPerson(t, deps, TierFull)
 
 	for _, tc := range []struct {
 		name    string
@@ -34,7 +59,11 @@ func TestRemoteScope(t *testing.T) {
 		{"an unlisted event is denied", "tcp", phone.ID, protocol.EventType("something_new"), true},
 		{"an unregistered tcp connection is denied", "tcp", "", protocol.EventSaveMCPServer, true},
 		{"a full credential is not restricted", "tcp", person.ID, protocol.EventSaveMCPServer, false},
+		{"an unlisted event is not refused to Full", "tcp", person.ID, protocol.EventType("something_new"), false},
 		{"the local socket is not restricted", "unix", "", protocol.EventSaveMCPServer, false},
+		{"remote access is local only, even for Full", "tcp", person.ID, protocol.EventSetRemoteAccess, true},
+		{"remote password is local only, even for Full", "tcp", person.ID, protocol.EventSetRemotePassword, true},
+		{"the local socket may set remote access", "unix", "", protocol.EventSetRemoteAccess, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := remoteDenied(deps, tc.network, tc.peer, tc.event); got != tc.denied {
@@ -47,12 +76,12 @@ func TestRemoteScope(t *testing.T) {
 // The gate must reach the handler path, not just the helper.
 func TestRemoteScope_DispatchRefuses(t *testing.T) {
 	deps := newTestDeps(t)
-	phone := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", Restricted: true})
+	phone := addPerson(t, deps, TierLimited)
 	out := &bytes.Buffer{}
 	in := bytes.NewBufferString(`{"type":"save_mcp_server","data":{}}` + "\n")
 	serveConnection(context.Background(), protocol.NewIPCStream(in, out), deps, "tcp", phone.ID, nil)
 	var env protocol.Envelope
-	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &env); err != nil || env.Type != protocol.EventError || !strings.Contains(string(env.Data), "isn't available from a paired device") {
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &env); err != nil || env.Type != protocol.EventError || !strings.Contains(string(env.Data), "save_mcp_server needs Full access") {
 		t.Fatalf("expected a refusal, got %q (%v)", out.String(), err)
 	}
 }
@@ -74,7 +103,7 @@ func TestSetPeerScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	phone := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", TokenName: "phone", Restricted: true})
-	laptop := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "laptop"})
+	laptop := addPerson(t, deps, TierFull)
 	send := func(from *Peer, network string, full bool) {
 		in := bytes.NewBufferString(`{"type":"set_peer_scope","data":{"peerId":"` + phone.ID + `","full":` + map[bool]string{true: "true", false: "false"}[full] + "}}\n")
 		serveConnection(context.Background(), protocol.NewIPCStream(in, &bytes.Buffer{}), deps, network, from.ID, nil)
@@ -112,10 +141,10 @@ func TestResolveAuthor_AvatarFallback(t *testing.T) {
 // A remote connection browses only inside projects open here, and can't remove one it doesn't know.
 func TestRemoteScope_ProjectBoundaries(t *testing.T) {
 	deps := newTestDeps(t)
-	person := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", DeviceType: "mobile", Restricted: true})
+	person := addPerson(t, deps, TierLimited)
 	outside := t.TempDir()
 	for _, tc := range []struct{ envelope, want string }{
-		{`{"type":"list_directory","data":{"path":"` + outside + `"}}`, "isn't available from a paired device"},
+		{`{"type":"list_directory","data":{"path":"` + outside + `"}}`, "list_directory needs Full access"},
 		{`{"type":"list_tree","data":{"projectPath":"` + outside + `"}}`, "isn't open on this server"},
 	} {
 		out := &bytes.Buffer{}
@@ -179,17 +208,17 @@ func TestRegisterToken_PairingTier(t *testing.T) {
 func TestServerIdentity_CarriesTier(t *testing.T) {
 	deps := newTestDeps(t)
 	var out bytes.Buffer
-	p := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &out), nopCloser{}, "tcp", peerIdentity{Name: "phone", Restricted: true})
+	p := addPersonOn(t, deps, TierTrusted, "", protocol.NewIPCStream(bytes.NewBuffer(nil), &out))
 	sendServerIdentity(deps, p)
-	if !strings.Contains(out.String(), `"restricted":true`) {
-		t.Fatalf("limited device not told its tier: %q", out.String())
+	if got := out.String(); !strings.Contains(got, `"restricted":true`) || !strings.Contains(got, `"tier":"trusted"`) || !strings.Contains(got, `"files_edit":true`) || !strings.Contains(got, `"browser":"off"`) {
+		t.Fatalf("trusted device not told its tier and caps: %q", got)
 	}
 }
 
 // A full-access remote device is the owner and may browse outside the open projects.
 func TestRemoteScope_FullAccessBrowsesAnywhere(t *testing.T) {
 	deps := newTestDeps(t)
-	laptop := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "laptop", DeviceType: "desktop"})
+	laptop := addPerson(t, deps, TierFull)
 	out := &bytes.Buffer{}
 	env := `{"type":"list_directory","data":{"path":"` + t.TempDir() + `"}}`
 	serveConnection(context.Background(), protocol.NewIPCStream(bytes.NewBufferString(env+"\n"), out), deps, "tcp", laptop.ID, nil)
@@ -202,8 +231,8 @@ func TestRemoteScope_FullAccessBrowsesAnywhere(t *testing.T) {
 // be asked to approve a pairing. A limited one can do neither.
 func TestFullRemoteDeviceManagesPeople(t *testing.T) {
 	deps := newTestDeps(t)
-	owner := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "owner", DeviceType: "desktop"})
-	phone := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", DeviceType: "phone", Restricted: true})
+	owner := addPerson(t, deps, TierFull)
+	phone := addPerson(t, deps, TierLimited)
 	run := func(from *Peer, env string) string {
 		out := &bytes.Buffer{}
 		serveConnection(context.Background(), protocol.NewIPCStream(bytes.NewBufferString(env+"\n"), out), deps, "tcp", from.ID, nil)
@@ -215,7 +244,7 @@ func TestFullRemoteDeviceManagesPeople(t *testing.T) {
 	if got := run(owner, `{"type":"list_tokens","data":{}}`); !strings.Contains(got, `"name":"mac"`) {
 		t.Fatalf("list_tokens: %q", got)
 	}
-	if got := run(phone, `{"type":"register_token","data":{"name":"x"}}`); !strings.Contains(got, "isn't available from a paired device") {
+	if got := run(phone, `{"type":"register_token","data":{"name":"x"}}`); !strings.Contains(got, "register_token needs Trusted access") {
 		t.Fatalf("limited device registered a token: %q", got)
 	}
 	if got := run(owner, `{"type":"remove_token","data":{"name":"mac"}}`); !strings.Contains(got, `"token_removed"`) {

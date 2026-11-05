@@ -1182,8 +1182,13 @@ type PeerInfo struct {
 	// The chat this connection last opened (get_session_history), if any.
 	SessionID   string `json:"sessionId,omitempty"`
 	ProjectPath string `json:"projectPath,omitempty"`
-	// Restricted: held to the paired-device allowlist (SPEC.md "Paired-device scope").
+	// Restricted: below the Full tier. Kept for old clients; Tier says which.
 	Restricted bool `json:"restricted,omitempty"`
+	// Tier is "limited", "trusted" or "full"; UserID and UserName are the person behind the
+	// credential ("owner" on the local socket). Name stays the device's.
+	Tier     string `json:"tier,omitempty"`
+	UserID   string `json:"userId,omitempty"`
+	UserName string `json:"userName,omitempty"`
 }
 
 // PeerListData is pushed to every connected peer whenever the connection
@@ -1402,8 +1407,14 @@ type ServerIdentityData struct {
 
 	// Restricted is true when this connection is held to the paired-device scope (SPEC.md
 	// "Paired-device scope"), so a client can say which tier it is on and why a screen is
-	// unavailable. Pushed again when the tier changes. Omitted for full access.
+	// unavailable. Pushed again when the tier changes. Omitted for full access. Kept for old
+	// clients: Tier says which tier.
 	Restricted bool `json:"restricted,omitempty"`
+	// Tier is this connection's tier ("limited", "trusted" or "full"; the local socket is full),
+	// and Caps its effective capabilities by name (SPEC.md "Tiers and permissions"). Both are
+	// pushed again when they change.
+	Tier string         `json:"tier,omitempty"`
+	Caps map[string]any `json:"caps,omitempty"`
 }
 
 // SetAutoGenerateTitleData sets the server-wide default applied to a first

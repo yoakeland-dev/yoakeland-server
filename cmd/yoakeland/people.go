@@ -127,3 +127,21 @@ func cleanUserName(n string) (string, error) {
 	}
 	return n, nil
 }
+
+// SetProviderOwner records who registered the provider name.
+func (s *ServerSettings) SetProviderOwner(name, userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ProviderOwners == nil {
+		s.ProviderOwners = map[string]string{}
+	}
+	s.ProviderOwners[name] = userID
+	_ = s.save()
+}
+
+// ProviderOwner is who registered the provider name ("" if a Full person or the owner did).
+func (s *ServerSettings) ProviderOwner(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ProviderOwners[name]
+}

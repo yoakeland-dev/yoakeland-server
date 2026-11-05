@@ -58,13 +58,7 @@ func recentWarnings() []loggedWarning {
 
 // handleListProblems answers list_problems. Local connections only: causes can
 // hold secrets. The audit read is capped at audit.MaxLimit tool runs (newest).
-func handleListProblems(ipc *protocol.IPCStream, deps connDeps, network string, env *protocol.Envelope) {
-	if network == "tcp" {
-		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{
-			Message: "list_problems isn't available from a paired device; do it on the computer running the server",
-		})
-		return
-	}
+func handleListProblems(ipc *protocol.IPCStream, deps connDeps, env *protocol.Envelope) {
 	events, _, err := deps.audit.Read(audit.Query{Kinds: []string{audit.ToolExec}, Limit: audit.MaxLimit})
 	if err != nil {
 		logWarn("list_problems: reading the audit log: %v", err)

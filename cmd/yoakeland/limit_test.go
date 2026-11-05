@@ -293,10 +293,11 @@ func TestLimitSettingAndAccess(t *testing.T) {
 	if deps.settings.SetLimitAction("nonsense") == nil {
 		t.Fatal("accepted a bad action")
 	}
-	if remoteAllowed[protocol.EventSetLimitAction] {
-		t.Error("a paired phone can change the limit setting")
-	}
-	if !remoteAllowed[protocol.EventLimitContinue] || !remoteAllowed[protocol.EventLimitDismiss] {
+	limited := addPerson(t, deps, TierLimited)
+	if remoteDenied(deps, "tcp", limited.ID, protocol.EventLimitContinue) || remoteDenied(deps, "tcp", limited.ID, protocol.EventLimitDismiss) {
 		t.Error("a paired phone must be able to answer the card")
+	}
+	if !remoteDenied(deps, "tcp", limited.ID, protocol.EventSetLimitAction) {
+		t.Error("a paired phone can change the limit setting")
 	}
 }

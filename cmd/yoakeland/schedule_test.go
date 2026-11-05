@@ -74,10 +74,10 @@ func TestScheduledTurnRunsWithOrigin(t *testing.T) {
 	}
 }
 
-func TestScheduleEventsAreOwnerOnly(t *testing.T) {
+func TestScheduleEventsNeedTrusted(t *testing.T) {
 	for _, e := range []protocol.EventType{protocol.EventScheduleTurn, protocol.EventListScheduled, protocol.EventCancelScheduled, protocol.EventPauseScheduled} {
-		if remoteAllowed[e] {
-			t.Errorf("%s is open to a restricted device", e)
+		if tierMay(TierLimited, e) || !tierMay(TierTrusted, e) {
+			t.Errorf("%s: limited may=%v trusted may=%v", e, tierMay(TierLimited, e), tierMay(TierTrusted, e))
 		}
 	}
 }
@@ -140,7 +140,7 @@ func TestArtifactEventRateAndAccess(t *testing.T) {
 	if ok != artifactEventsPerSec || !artifactAllow("rate-peer", now.Add(time.Second)) {
 		t.Fatalf("allowed %d in one second", ok)
 	}
-	if !remoteAllowed[protocol.EventArtifactEvent] {
+	if !tierMay(TierLimited, protocol.EventArtifactEvent) {
 		t.Error("a paired phone must be able to submit an artifact")
 	}
 }

@@ -94,6 +94,9 @@ type ServerSettings struct {
 	// default capabilities for everyone on it.
 	Users           map[string]User `json:"users,omitempty"`
 	LimitedDefaults map[string]any  `json:"limitedDefaults,omitempty"`
+	// ProviderOwners remembers who added each provider a non-Full person registered, so they
+	// may change only their own.
+	ProviderOwners map[string]string `json:"providerOwners,omitempty"`
 
 	// ServerID is a stable identifier minted once, the first time this
 	// -state-dir is ever used, and never changed or exposed via any setter
