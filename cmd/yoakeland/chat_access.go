@@ -214,6 +214,8 @@ func ownsChat(deps connDeps, acc Access, sessionID, projectPath string) bool {
 	switch {
 	case err != nil:
 		return false
+	case !found && reservedChatIDs[sessionID]:
+		return false // "default" is what handlers fall back to; until the owner makes it, it is theirs
 	case !found:
 		deps.projects.rememberOwner(sessionID, acc.UserID)
 		return true
@@ -229,6 +231,10 @@ func (d connDeps) mayViewChat(acc Access, sessionID string) bool {
 	owner, ok := d.projects.ownerOfSession(sessionID)
 	return ok && d.mayAct(acc, owner)
 }
+
+// reservedChatIDs are session ids the server itself falls back to. Nobody below Full can claim one
+// by naming it first: while it doesn't exist it is the owner's.
+var reservedChatIDs = map[string]bool{"default": true}
 
 // projectLevelChatEvents act on a project, not on one chat, when they name no chat; the others
 // fall back to the "default" chat as their handlers do.
