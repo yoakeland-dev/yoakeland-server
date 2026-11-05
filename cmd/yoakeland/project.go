@@ -178,7 +178,9 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 // Any real tier keeps them, whatever the setting. A remote peer's own
 // interactive terminal is not affected: that is the user, not the model.
 func (pc *ProjectContext) applyShellPolicy(disableWhenUnsandboxed bool) {
-	pc.Registry.SetShellDisabled(disableWhenUnsandboxed && pc.SandboxTier == string(sandbox.ModeLocalRestr))
+	unsandboxed := pc.SandboxTier == string(sandbox.ModeLocalRestr)
+	pc.Registry.SetShellDisabled(disableWhenUnsandboxed && unsandboxed)
+	pc.Registry.SetUnsandboxed(unsandboxed) // a turn policy needs the unsandboxed cap here, whatever that setting says
 }
 
 // toHistoryMessages converts a session's stored agent.Message history into
@@ -596,6 +598,22 @@ func (r *ProjectRegistry) open() []*ProjectContext {
 
 // Stats reports running turns across every open project, and how many
 // projects are open, for the heartbeat's server status.
+// CancelTurnsWhere cancels every running or queued turn, in every open project, started by an
+// actor match accepts, and returns how many.
+func (r *ProjectRegistry) CancelTurnsWhere(match func(agent.TurnActor) bool) int {
+	r.mu.Lock()
+	pcs := make([]*ProjectContext, 0, len(r.projects))
+	for _, pc := range r.projects {
+		pcs = append(pcs, pc)
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, pc := range pcs {
+		n += pc.Registry.CancelTurnsWhere(match)
+	}
+	return n
+}
+
 func (r *ProjectRegistry) Stats() (activeTurns, openProjects int) {
 	r.mu.Lock()
 	pcs := make([]*ProjectContext, 0, len(r.projects))

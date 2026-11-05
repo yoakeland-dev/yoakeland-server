@@ -145,3 +145,26 @@ func (s *ServerSettings) ProviderOwner(name string) string {
 	defer s.mu.Unlock()
 	return s.ProviderOwners[name]
 }
+
+// credentialLive reports whether the credential exists and its person still does.
+func (s *ServerSettings) credentialLive(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.Tokens[name]
+	if !ok {
+		return false
+	}
+	_, ok = s.resolveUserLocked(rec.UserID)
+	return ok
+}
+
+// AccessSnapshot is every credential's access now.
+func (s *ServerSettings) AccessSnapshot() map[string]Access {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]Access, len(s.Tokens))
+	for name := range s.Tokens {
+		out[name] = s.accessLocked(name)
+	}
+	return out
+}

@@ -40,6 +40,10 @@ type LimitHit struct {
 	// TooFar is set when the reset is more than a week away, which the server won't wait out by itself.
 	TooFar  bool   `json:"tooFar,omitempty"`
 	Message string `json:"message,omitempty"`
+	// UserID and Credential are who started the turn that hit the limit; its automatic continue
+	// runs as them.
+	UserID     string `json:"userId,omitempty"`
+	Credential string `json:"credential,omitempty"`
 }
 
 // LimitContinueData is limit_continue: continue this chat by itself once its limit resets.

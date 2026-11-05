@@ -1137,7 +1137,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 	}
 	deps.projects.chatSentinel(env)
-	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, env) || handleLimitEnvelope(ipc, deps, env) || handleArtifactEnvelope(ipc, deps, peerID, env) {
+	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
 		return
 	}
 	switch env.Type {
@@ -1198,7 +1198,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			deps.turnWG.Add(1)
 		}
 		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
-		turnCtx := agent.WithAttachments(agent.WithAuthor(ctx, author), data.Attachments)
+		turnCtx := agent.WithAttachments(agent.WithAuthor(deps.turnContext(ctx, network, peerID), author), data.Attachments)
+		who := deps.actorOf(network, peerID)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
 		if data.AutoGenerateTitle != nil {
 			autoGenerateTitle = *data.AutoGenerateTitle
@@ -1210,7 +1211,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RunTurnWithTitleGeneration(turnCtx, sID, tID, prompt, autoGenerateTitle); err != nil {
 				logError("turn %s (session %s) failed: %v", tID, sID, err)
-				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil, who)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -2020,7 +2021,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
 		author := resolveAuthor(deps, peerID, "", "")
-		turnCtx := agent.WithAuthor(ctx, author)
+		turnCtx := agent.WithAuthor(deps.turnContext(ctx, network, peerID), author)
+		who := deps.actorOf(network, peerID)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
 		if data.AutoGenerateTitle != nil {
 			autoGenerateTitle = *data.AutoGenerateTitle
@@ -2035,7 +2037,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.EditMessage(turnCtx, sID, tID, msgID, content, autoGenerateTitle); err != nil {
 				logError("edit_message turn %s (session %s): %v", tID, sID, err)
-				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil, who)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -2058,7 +2060,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
 		author := resolveAuthor(deps, peerID, "", "")
-		turnCtx := agent.WithAuthor(ctx, author)
+		turnCtx := agent.WithAuthor(deps.turnContext(ctx, network, peerID), author)
+		who := deps.actorOf(network, peerID)
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
@@ -2069,7 +2072,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RetryMessage(turnCtx, sID, tID, msgID); err != nil {
 				logError("retry_message turn %s (session %s): %v", tID, sID, err)
-				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil, who)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})

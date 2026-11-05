@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
 	"yoakeland/internal/sched"
 )
@@ -124,7 +125,7 @@ func limitErr(after string) error {
 
 func TestLimitHitAskRecordsButDoesNotArm(t *testing.T) {
 	deps, pc := limitDeps(t)
-	if !onLimitHit(deps, pc, "s1", "p", limitErr("2 hours"), nil) {
+	if !onLimitHit(deps, pc, "s1", "p", limitErr("2 hours"), nil, agent.TurnActor{}) {
 		t.Fatal("not recognised")
 	}
 	hit, ok := deps.sched.Hit("s1")
@@ -139,8 +140,8 @@ func TestLimitHitAskRecordsButDoesNotArm(t *testing.T) {
 func TestLimitHitContinueArmsOnceAndSurvivesARestart(t *testing.T) {
 	deps, pc := limitDeps(t)
 	_ = deps.settings.SetLimitAction(protocol.LimitActionContinue)
-	onLimitHit(deps, pc, "s1", "p", limitErr("2 hours"), nil)
-	onLimitHit(deps, pc, "s1", "p", limitErr("2 hours"), nil) // a second hit for the same chat
+	onLimitHit(deps, pc, "s1", "p", limitErr("2 hours"), nil, agent.TurnActor{})
+	onLimitHit(deps, pc, "s1", "p", limitErr("2 hours"), nil, agent.TurnActor{}) // a second hit for the same chat
 	auto, ok := deps.sched.AutoFor("s1")
 	if !ok || auto.Trigger.Kind != protocol.TriggerLimitReset || auto.Origin.Label != protocol.OriginLabelLimit || auto.NextRunAtMs < time.Now().Add(119*time.Minute).UnixMilli() {
 		t.Fatalf("auto = %+v", auto)
@@ -168,7 +169,7 @@ func TestLimitHitEstimatesAndGivesUp(t *testing.T) {
 	deps, pc := limitDeps(t)
 	_ = deps.settings.SetLimitAction(protocol.LimitActionContinue)
 	noTime := errors.New("claude: You've hit your weekly limit")
-	onLimitHit(deps, pc, "s1", "p", noTime, nil)
+	onLimitHit(deps, pc, "s1", "p", noTime, nil, agent.TurnActor{})
 	h, _ := deps.sched.Hit("s1")
 	if !h.Estimated || time.UnixMilli(h.ResetsAtMs).Sub(time.Now()) > 6*time.Minute {
 		t.Fatalf("first guess = %+v", h)
@@ -185,7 +186,7 @@ func TestLimitHitEstimatesAndGivesUp(t *testing.T) {
 		}
 		deps.sched.Tick() // the continue starts: no longer waiting
 		o := a.Origin
-		onLimitHit(deps, pc, "s1", "p", noTime, &o)
+		onLimitHit(deps, pc, "s1", "p", noTime, &o, agent.TurnActor{})
 		h, _ := deps.sched.Hit("s1")
 		return h
 	}
@@ -205,7 +206,7 @@ func TestLimitHitEstimatesAndGivesUp(t *testing.T) {
 	// An explicit try-again starts over.
 	ipc := protocol.NewIPCStream(nil, io.Discard)
 	raw, _ := json.Marshal(protocol.LimitContinueData{SessionID: "s1"})
-	handleLimitEnvelope(ipc, deps, &protocol.Envelope{Type: protocol.EventLimitContinue, Data: raw})
+	handleLimitEnvelope(ipc, deps, "unix", "", &protocol.Envelope{Type: protocol.EventLimitContinue, Data: raw})
 	h2, _ := deps.sched.Hit("s1")
 	a, armed := deps.sched.AutoFor("s1")
 	if !armed || h2.GaveUp || h2.Attempt != 0 || a.Attempt != 0 {
@@ -216,7 +217,7 @@ func TestLimitHitEstimatesAndGivesUp(t *testing.T) {
 func TestLimitTooFarIsNotWaitedOut(t *testing.T) {
 	deps, pc := limitDeps(t)
 	_ = deps.settings.SetLimitAction(protocol.LimitActionContinue)
-	onLimitHit(deps, pc, "s1", "p", limitErr("30 days"), nil)
+	onLimitHit(deps, pc, "s1", "p", limitErr("30 days"), nil, agent.TurnActor{})
 	h, _ := deps.sched.Hit("s1")
 	if !h.TooFar {
 		t.Fatalf("hit = %+v", h)
@@ -226,7 +227,7 @@ func TestLimitTooFarIsNotWaitedOut(t *testing.T) {
 	}
 	ipc := protocol.NewIPCStream(nil, io.Discard)
 	raw, _ := json.Marshal(protocol.LimitContinueData{SessionID: "s1"})
-	handleLimitEnvelope(ipc, deps, &protocol.Envelope{Type: protocol.EventLimitContinue, Data: raw})
+	handleLimitEnvelope(ipc, deps, "unix", "", &protocol.Envelope{Type: protocol.EventLimitContinue, Data: raw})
 	if _, armed := deps.sched.AutoFor("s1"); armed {
 		t.Fatal("limit_continue armed one a month out")
 	}
@@ -235,7 +236,7 @@ func TestLimitTooFarIsNotWaitedOut(t *testing.T) {
 func TestPickingUpTheChatEndsTheLimitHit(t *testing.T) {
 	deps, pc := limitDeps(t)
 	_ = deps.settings.SetLimitAction(protocol.LimitActionContinue)
-	onLimitHit(deps, pc, "s1", "p", limitErr("1 hour"), nil)
+	onLimitHit(deps, pc, "s1", "p", limitErr("1 hour"), nil, agent.TurnActor{})
 	clearLimitOnSend(deps, "s1")
 	if _, ok := deps.sched.Hit("s1"); ok {
 		t.Fatal("hit stayed after the person wrote in the chat")
