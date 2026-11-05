@@ -23,6 +23,7 @@ func tierMay(tier string, t protocol.EventType) bool {
 	if tier == TierFull {
 		acc.Caps = allCaps()
 	}
+	acc.Caps.OthersChats = true // whose chat it is has tests of its own
 	ok, _ := checkEvent(connDeps{}, acc, &protocol.Envelope{Type: t})
 	return ok
 }

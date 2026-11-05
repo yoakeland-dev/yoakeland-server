@@ -43,7 +43,7 @@ func startScheduler(ctx context.Context, deps connDeps) {
 		}
 		ag := pc.Registry.Get(sink, t.SessionID)
 		restoreBinding(deps, pc, ag, t.SessionID)
-		if err := pc.SessStore.Ensure(t.SessionID); err != nil {
+		if err := deps.projects.ensureChat(pc.SessStore, t.SessionID, t.CreatorUserID); err != nil {
 			logError("session %s: could not create its session file: %v", t.SessionID, err)
 		}
 		turnID := fmt.Sprintf("%s-r%d-%d", t.ID, t.Runs+1, time.Now().UnixMilli())

@@ -1138,7 +1138,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 	}
 	deps.projects.chatSentinel(env)
-	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handlePeopleEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
+	if handleFileEnvelope(ipc, deps, acc, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handlePeopleEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
 		return
 	}
 	switch env.Type {
@@ -1179,7 +1179,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// §3.1's title-is-a-client-concern rule) finds a session to rename
 		// instead of racing the turn's own first write and being rejected as
 		// "not found". The turn appends the prompt to this file a moment later.
-		if err := pc.SessStore.Ensure(sessID); err != nil {
+		if err := deps.projects.ensureChat(pc.SessStore, sessID, acc.UserID); err != nil {
 			logError("session %s: could not create its session file: %v", sessID, err)
 		}
 		// Sending a message un-archives a chat: archiving is "hide this", and talking to it

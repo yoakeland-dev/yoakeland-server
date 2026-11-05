@@ -91,7 +91,7 @@ var fileWriteMu sync.Mutex
 
 // handleFileEnvelope serves the explorer, editor and diff requests (SPEC.md
 // §3.1 "Project files"). It reports whether env was one of them.
-func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.Envelope) bool {
+func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, acc Access, env *protocol.Envelope) bool {
 	reply := func(t protocol.EventType, payload any) {
 		_ = ipc.SendEvent(t, env.SessionID, env.TurnID, "", payload)
 	}
@@ -168,7 +168,11 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		pc, err := fileProject(deps, d.ProjectPath)
 		if err == nil {
 			if abs, ok := attachedPath(pc, d.SessionID, d.Path); ok {
-				err = attachedMediaInfo(previewPath(deps.uploads, abs, d.Thumb), &out)
+				if !ownsChat(deps, acc, d.SessionID, d.ProjectPath) {
+					err = errAttachmentNotYours
+				} else {
+					err = attachedMediaInfo(previewPath(deps.uploads, abs, d.Thumb), &out)
+				}
 			} else {
 				err = readMediaInfo(pc.Root, d.Path, &out)
 			}
@@ -183,7 +187,11 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 		pc, err := fileProject(deps, d.ProjectPath)
 		if err == nil {
 			if abs, ok := attachedPath(pc, d.SessionID, d.Path); ok {
-				out.Data, out.Last, err = readAttachedChunk(previewPath(deps.uploads, abs, d.Thumb), d.Offset)
+				if !ownsChat(deps, acc, d.SessionID, d.ProjectPath) {
+					err = errAttachmentNotYours
+				} else {
+					out.Data, out.Last, err = readAttachedChunk(previewPath(deps.uploads, abs, d.Thumb), d.Offset)
+				}
 			} else {
 				out.Data, out.Last, err = readMediaChunk(pc.Root, d.Path, d.Offset)
 			}
@@ -208,6 +216,10 @@ func handleFileEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.En
 	}
 	return true
 }
+
+// errAttachmentNotYours refuses an attachment of a chat the sender doesn't own. Project media read
+// by project path stays open to everyone who can read the project's files.
+var errAttachmentNotYours = errors.New("that attachment belongs to a chat that isn't this person's")
 
 func errString(err error) string {
 	if err == nil {

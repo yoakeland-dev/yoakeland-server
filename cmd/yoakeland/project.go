@@ -370,6 +370,7 @@ type ProjectRegistry struct {
 	mu                  sync.Mutex
 	projects            map[string]*ProjectContext // key: canonicalized project root
 	sessionProject      map[string]string          // sessionID -> project key
+	owners              map[string]string          // sessionID -> the user who owns the chat (chat_access.go)
 	defaultProvider     agent.ModelProvider
 	defaultProviderName string
 	// limits is the one soft round/spend limit holder every project's sessions

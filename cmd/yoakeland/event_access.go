@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -45,7 +44,7 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventGetSessionHistory: own, protocol.EventGetContextBreakdown: own, protocol.EventSetSessionTitle: own,
 	protocol.EventSetSessionArchived: own, protocol.EventSetSessionLayout: own, protocol.EventDeleteSession: own,
 	protocol.EventListSnapshots: own, protocol.EventRestoreSnapshot: own,
-	protocol.EventReadMedia: own, protocol.EventReadMediaChunk: own,
+	protocol.EventReadMedia: anyone, protocol.EventReadMediaChunk: anyone, // project media is open; an attachment needs its chat: the handler
 	protocol.EventListSessions:       anyone, // filtered to the sender's chats by the handler
 	protocol.EventSetMode:            own,    // and the mode itself is checked by the handler
 	protocol.EventSetWebToolsEnabled: own, protocol.EventSetModelOptions: own,
@@ -56,7 +55,7 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventListProjects: anyone, protocol.EventOpenProject: anyone, // known projects only, for anyone below Full
 	protocol.EventListTree: anyone, protocol.EventReadFile: anyone, protocol.EventListFiles: anyone,
 	protocol.EventListChanges: anyone, protocol.EventGetFileDiff: anyone, protocol.EventListPermissionRules: anyone,
-	protocol.EventUploadBegin: anyone, protocol.EventUploadChunk: anyone, protocol.EventImportChatFiles: anyone,
+	protocol.EventUploadBegin: anyone, protocol.EventUploadChunk: anyone, protocol.EventImportChatFiles: own, // the files of a chat: its owner's
 	protocol.EventWriteFile: needCap(CapFilesEdit), protocol.EventFsOp: needCap(CapFilesEdit),
 
 	// presence and housekeeping
@@ -107,12 +106,6 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventSetRemoteAccess: {min: tierLocal}, protocol.EventSetRemotePassword: {min: tierLocal},
 }
 
-// ownsChat reports whether the connection may act on the chat sessionID: it owns it, has the
-// others_chats cap, or is Full. Chats don't carry an owner yet, so for now everyone owns every
-// chat; the next stage (chat ownership) implements this, and the "own chat" rows above already
-// call it.
-func ownsChat(deps connDeps, acc Access, sessionID string) bool { return true }
-
 // checkEvent decides whether the connection with acc may send env. A refusal names what is missing.
 // The local socket and -stdio (acc.Local) may send anything; the handler answers an unknown event.
 func checkEvent(deps connDeps, acc Access, env *protocol.Envelope) (ok bool, why string) {
@@ -132,7 +125,7 @@ func checkEvent(deps connDeps, acc Access, env *protocol.Envelope) (ok bool, why
 		return false, tierNeeded(t, req.min)
 	case req.cap != "" && !acc.Caps.Has(req.cap):
 		return false, fmt.Sprintf("%s isn't allowed for this person", t)
-	case req.ownChat && !ownsChat(deps, acc, envSessionID(env)):
+	case req.ownChat && !ownsEnvelope(deps, acc, env):
 		return false, fmt.Sprintf("%s isn't allowed for this person: it isn't their chat", t)
 	}
 	return true, ""
@@ -142,22 +135,13 @@ func tierNeeded(t protocol.EventType, tier string) string {
 	return fmt.Sprintf("%s needs %s access", t, strings.ToUpper(tier[:1])+tier[1:])
 }
 
-// remoteDenied reports whether the connection peerID on network may not send t at all.
+// remoteDenied reports whether the connection peerID on network may not send t at all: whose chat
+// it is aside, which depends on the envelope.
 func remoteDenied(deps connDeps, network, peerID string, t protocol.EventType) bool {
-	ok, _ := checkEvent(deps, deps.accessFor(network, peerID), &protocol.Envelope{Type: t})
+	acc := deps.accessFor(network, peerID)
+	acc.Caps.OthersChats = true
+	ok, _ := checkEvent(deps, acc, &protocol.Envelope{Type: t})
 	return !ok
-}
-
-// envSessionID is the chat an envelope is about: its sessionId, else the one in its payload.
-func envSessionID(env *protocol.Envelope) string {
-	if env.SessionID != "" {
-		return env.SessionID
-	}
-	var d struct {
-		SessionID string `json:"sessionId"`
-	}
-	_ = json.Unmarshal(env.Data, &d)
-	return d.SessionID
 }
 
 // modeAllowed reports whether acc may put a chat in mode. Autonomous and auto need the autonomous
