@@ -36,6 +36,10 @@ type TokenRecord struct {
 	Deny     []string `json:"deny,omitempty"`
 	LastSeen int64    `json:"lastSeen,omitempty"` // unix seconds, set on auth and on disconnect
 	PairedBy string   `json:"pairedBy,omitempty"` // user id of whoever created or approved it
+	// DeviceType and DeviceName are what the device last called itself, so an offline device can
+	// still be told apart in the people list.
+	DeviceType string `json:"deviceType,omitempty"`
+	DeviceName string `json:"deviceName,omitempty"`
 
 	// Scope is the pre-users tier ("full" or "limited"). It is only read on load, to migrate the
 	// credential into a User, and never written back.
@@ -320,57 +324,62 @@ func (s *ServerSettings) LookupToken(token string) (name string, rec TokenRecord
 	return "", TokenRecord{}, false
 }
 
-// AddToken registers a new named credential. name must be non-empty and not
-// already registered — rename is deliberately unsupported (revoke + re-add
-// instead), so there's no ambiguity about what "the same person" means.
+// AddToken registers a new named credential for a new full-tier person named after it, as an
+// unscoped credential always was. name must be non-empty and not already registered: rename is
+// deliberately unsupported (revoke + re-add instead).
 func (s *ServerSettings) AddToken(name, token, email string) error {
-	return s.AddTokenFor(name, token, email, "", "")
+	_, err := s.AddCredential(NewCredential{Name: name, Token: token, Email: email, NewUserTier: TierFull})
+	return err
 }
 
-// AddTokenFor is AddToken for a credential that logs in as userID (made by pairedBy). With no
-// userID it makes a new full-tier user named after the token, as an unscoped credential always was.
-func (s *ServerSettings) AddTokenFor(name, token, email, userID, pairedBy string) error {
-	if name == "" {
-		return fmt.Errorf("token name is required")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.Tokens[name]; exists {
-		return fmt.Errorf("a token named %q already exists", name)
-	}
-	if userID == "" {
-		u := s.newUserLocked(name, email, "", TierFull, pairedBy)
-		userID = u.ID
-	}
-	s.Tokens[name] = TokenRecord{Token: token, Email: email, UserID: userID, PairedBy: pairedBy}
-	return s.save()
-}
-
-// AddPairingToken is AddToken for a one-device pairing token (see TokenRecord).
+// AddPairingToken is AddToken for a one-device pairing token (see TokenRecord), for a new limited
+// person named after it.
 func (s *ServerSettings) AddPairingToken(name, token, email string) error {
-	return s.AddPairingTokenFor(name, token, email, "", "", "")
+	_, err := s.AddCredential(NewCredential{Name: name, Token: token, Email: email, Pairing: true, NewUserTier: TierLimited})
+	return err
 }
 
-// AddPairingTokenFor is AddPairingToken for a credential that logs in as userID, with maxTier as
-// the device's ceiling (empty for none). With no userID it makes a new limited user named after
-// the token, as a pairing credential always was.
-func (s *ServerSettings) AddPairingTokenFor(name, token, email, userID, maxTier, pairedBy string) error {
-	if name == "" {
-		return fmt.Errorf("token name is required")
+// NewCredential describes a credential to add. UserID is an existing person to log in as; when
+// empty a new person called NewUserName (default: the credential's name) at NewUserTier is made.
+// MaxTier is the device ceiling ("" for none). By is the person who made it.
+type NewCredential struct {
+	Name, Token, Email string
+	Pairing            bool
+	UserID             string
+	NewUserName        string
+	NewUserTier        string
+	MaxTier            string
+	By                 string
+}
+
+// AddCredential registers c and returns the id of the person it logs in as. A name that is taken
+// fails before anything is created.
+func (s *ServerSettings) AddCredential(c NewCredential) (string, error) {
+	if c.Name == "" {
+		return "", fmt.Errorf("token name is required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.purgeExpiredLocked()
-	if _, exists := s.Tokens[name]; exists {
-		return fmt.Errorf("a token named %q already exists", name)
+	if _, exists := s.Tokens[c.Name]; exists {
+		return "", fmt.Errorf("a token named %q already exists", c.Name)
 	}
+	userID := c.UserID
 	if userID == "" {
-		u := s.newUserLocked(name, email, "", TierLimited, pairedBy)
-		userID = u.ID
+		name := c.NewUserName
+		if name == "" {
+			name = c.Name
+		}
+		userID = s.newUserLocked(name, c.Email, "", c.NewUserTier, c.By).ID
+	} else if _, ok := s.resolveUserLocked(userID); !ok {
+		return "", s.errUnknownUser(userID)
 	}
-	s.Tokens[name] = TokenRecord{Token: token, Email: email, Pairing: true, ExpiresAt: time.Now().Add(PairingTTL).Unix(),
-		UserID: userID, MaxTier: maxTier, PairedBy: pairedBy}
-	return s.save()
+	rec := TokenRecord{Token: c.Token, Email: c.Email, UserID: userID, MaxTier: c.MaxTier, PairedBy: c.By}
+	if c.Pairing {
+		rec.Pairing, rec.ExpiresAt = true, time.Now().Add(PairingTTL).Unix()
+	}
+	s.Tokens[c.Name] = rec
+	return userID, s.save()
 }
 
 // ClaimPairing binds a pairing token to the first device that uses it. It fails for a token that

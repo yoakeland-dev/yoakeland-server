@@ -44,7 +44,8 @@ func runPair(args []string) int {
 		return 1
 	}
 	name := "pair-" + id[:6]
-	data, _ := json.Marshal(protocol.RegisterTokenData{Name: name, Pairing: true, Full: !*phone})
+	// Whoever can run this on the server owns it: the device is theirs, limited if it is a phone.
+	data, _ := json.Marshal(protocol.RegisterTokenData{Name: name, Pairing: true, User: "me", Full: !*phone})
 	req, _ := json.Marshal(protocol.Envelope{Type: protocol.EventRegisterToken, Data: data})
 	fmt.Fprintf(conn, "%s\n", req)
 

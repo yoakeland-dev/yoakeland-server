@@ -38,6 +38,7 @@ type Peer struct {
 	Restricted  bool   // below the Full tier; kept in step with the credential by SyncAccess, read through IsRestricted
 	Tier        string // TierFull on the local socket; settled from the credential's person for TCP
 	UserID      string // the person this connection acts as
+	accessSig   string // a fingerprint of the capabilities last sent to the device, to notice a change
 	SessionID   string // last chat opened, see SetActivity
 	ProjectPath string
 	Network     string // "unix" or "tcp"
@@ -255,7 +256,7 @@ func (r *PeerRegistry) Get(id string) (*Peer, bool) {
 	return p, ok
 }
 
-// IsRestricted reports whether id is held to remoteAllowed. Unknown peers count as restricted.
+// IsRestricted reports whether id is below the Full tier. Unknown peers count as restricted.
 func (r *PeerRegistry) IsRestricted(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -281,21 +282,21 @@ func (r *PeerRegistry) AtCredentialLimit(tokenName string) bool {
 // SyncAccess re-reads every TCP connection's tier and person with access (credential -> tier,
 // user) and broadcasts the roster if anything changed. It returns the connections that changed, so
 // the caller can tell them their new tier, and, separately, those that just lost the Full tier.
-func (r *PeerRegistry) SyncAccess(access func(credential string) (tier, userID string)) (changed []*Peer) {
+func (r *PeerRegistry) SyncAccess(access func(credential string) (tier, userID, sig string)) (changed []*Peer) {
 	r.mu.Lock()
 	var demoted []string
 	for _, p := range r.peers {
 		if p.Network != "tcp" {
 			continue
 		}
-		tier, userID := access(p.TokenName)
-		if tier == p.Tier && userID == p.UserID {
+		tier, userID, sig := access(p.TokenName)
+		if tier == p.Tier && userID == p.UserID && sig == p.accessSig {
 			continue
 		}
 		if tier != TierFull && !p.Restricted {
 			demoted = append(demoted, p.ID)
 		}
-		p.Tier, p.UserID, p.Restricted = tier, userID, tier != TierFull
+		p.Tier, p.UserID, p.Restricted, p.accessSig = tier, userID, tier != TierFull, sig
 		changed = append(changed, p)
 	}
 	r.mu.Unlock()
@@ -463,25 +464,34 @@ func (r *PeerRegistry) BroadcastEvent(exceptPeerID string, eventType protocol.Ev
 	}
 }
 
+// canApprove reports whether p could answer a pairing made by the person pairedBy: the local
+// socket, a Full device, or the Trusted person who made it.
+func canApprove(p *Peer, pairedBy string) bool {
+	return p.Network == "unix" || !p.Restricted || (p.Tier == TierTrusted && pairedBy != "" && p.UserID == pairedBy)
+}
+
 // HasLocal reports whether any client is connected that could approve a pairing: one on the local
 // socket or a full-access remote device (a server used only remotely has no other).
-func (r *PeerRegistry) HasLocal() bool {
+func (r *PeerRegistry) HasLocal() bool { return r.HasApprover("") }
+
+// HasApprover is HasLocal, also counting the Trusted person pairedBy who made the pairing.
+func (r *PeerRegistry) HasApprover(pairedBy string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, p := range r.peers {
-		if p.Network == "unix" || !p.Restricted {
+		if canApprove(p, pairedBy) {
 			return true
 		}
 	}
 	return false
 }
 
-// BroadcastLocal sends an event to the peers that could approve a pairing (see HasLocal).
-func (r *PeerRegistry) BroadcastLocal(eventType protocol.EventType, data any) {
+// BroadcastApprovers sends an event to the peers that could approve a pairing (see HasApprover).
+func (r *PeerRegistry) BroadcastApprovers(pairedBy string, eventType protocol.EventType, data any) {
 	r.mu.Lock()
 	var peers []*Peer
 	for _, p := range r.peers {
-		if p.Network == "unix" || !p.Restricted {
+		if canApprove(p, pairedBy) {
 			peers = append(peers, p)
 		}
 	}

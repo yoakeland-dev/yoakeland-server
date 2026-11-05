@@ -876,7 +876,7 @@ func TestSeatReclaimed(t *testing.T) {
 	peers.OnDemote = func(id string) { _ = s.setControl(id, false) }
 	_ = s.setControl(p.ID, true)
 	s.input1(p.ID, protocol.BrowserInputData{Kind: "mouse", Type: "down", Button: "left", X: &x, Y: &y})
-	peers.SyncAccess(func(string) (string, string) { return TierLimited, "u" })
+	peers.SyncAccess(func(string) (string, string, string) { return TierLimited, "u", "" })
 	if s.ctl.who != "" {
 		t.Errorf("seat kept by a demoted device: %+v", s.ctl)
 	}
@@ -886,7 +886,7 @@ func TestSeatReclaimed(t *testing.T) {
 	peers.OnDemote = nil
 	q := holder("tok2")
 	_ = s.setControl(q.ID, true)
-	peers.SyncAccess(func(string) (string, string) { return TierLimited, "u" })
+	peers.SyncAccess(func(string) (string, string, string) { return TierLimited, "u", "" })
 	if st := s.stateFor(q); st.YouControl || st.Controller != "" {
 		t.Errorf("state still shows the demoted holder: %+v", st)
 	}

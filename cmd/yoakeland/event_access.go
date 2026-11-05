@@ -83,7 +83,12 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventListTokens: trusted, protocol.EventGetPairInfo: trusted, protocol.EventRegisterToken: trusted,
 	protocol.EventRemoveToken: trusted, protocol.EventApprovePairing: trusted,
 
+	// people: what a Trusted sender may do is narrowed by the handler (their own and the people they added)
+	protocol.EventListPeople: trusted,
+
 	// owner powers
+	protocol.EventSetUserPermissions: full, protocol.EventSetDeviceRestrict: full, protocol.EventSetLimitedDefaults: full,
+	protocol.EventMergeUsers: full, protocol.EventMoveDevice: full, protocol.EventRemoveUser: full,
 	protocol.EventRemoveProvider: full, protocol.EventSetDefaultProvider: full, protocol.EventOAuthStart: full,
 	protocol.EventOAuthComplete: full, protocol.EventSetModelRoles: full, protocol.EventDetectCLI: full,
 	protocol.EventListACPRegistry: full, protocol.EventDisconnectPeer: full, protocol.EventSetPeerScope: full,

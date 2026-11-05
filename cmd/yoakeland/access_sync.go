@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 
 	"yoakeland/internal/agent"
 	"yoakeland/internal/provider"
@@ -25,9 +26,10 @@ func (d connDeps) cliProviderNames() []string {
 // syncPeerAccess re-reads every TCP connection's tier from its credential's person, so a change
 // applies at once, and tells each device whose tier or person changed.
 func (d connDeps) syncPeerAccess() []*Peer {
-	changed := d.peers.SyncAccess(func(cred string) (string, string) {
+	changed := d.peers.SyncAccess(func(cred string) (string, string, string) {
 		a := d.settings.Access("tcp", cred)
-		return a.Tier, a.UserID
+		sig, _ := json.Marshal(a.Caps.ToMap(nil))
+		return a.Tier, a.UserID, string(sig)
 	})
 	for _, p := range changed {
 		sendServerIdentity(d, p)

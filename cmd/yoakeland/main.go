@@ -224,6 +224,7 @@ func main() {
 		logFatal("failed to initialize server settings: %v", err)
 	}
 	reloadRoles(projects.roles, providerStore, settings)
+	peers.UserName = settings.UserName
 
 	// Deprecated launch flags hand their value over once, then the stored
 	// setting rules (runtime_dispatch.go).
@@ -697,8 +698,8 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 		// An approval may have changed the tier since the credential was looked up.
 		acc := deps.settings.Access(network, who.TokenName)
 		who.Restricted, who.Tier, who.UserID = !acc.Full(), acc.Tier, acc.UserID
-		deps.settings.TouchToken(who.TokenName)
-		defer deps.settings.TouchToken(who.TokenName)
+		deps.settings.TouchToken(who.TokenName, who.DeviceType, who.Name)
+		defer deps.settings.TouchToken(who.TokenName, "", "")
 	}
 	if network == "unix" {
 		deps.settings.SeedOwnerProfile(cleanName(who.Name), who.Avatar)
@@ -1137,7 +1138,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 	}
 	deps.projects.chatSentinel(env)
-	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
+	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handlePeopleEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
 		return
 	}
 	switch env.Type {
@@ -2816,6 +2817,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		target, ok := deps.peers.Get(data.PeerID)
+		before := deps.accessSnapshot()
 		switch {
 		case !ok:
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: fmt.Sprintf("unknown peer %q", data.PeerID)})
@@ -2824,7 +2826,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		case !deps.settings.SetTokenScope(target.TokenName, data.Full):
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: "that credential no longer exists"})
 		default:
-			deps.syncPeerAccess() // applies at once and tells each changed device its new tier
+			deps.enforceAccessChange(before) // applies at once, tells each changed device its tier, and stops what a demotion no longer allows
+			deps.broadcastPeople()
 			deps.record(ipc, peerID, audit.Event{Kind: audit.PeerScope, Target: target.TokenName, Outcome: "ok", Detail: map[string]any{"full": data.Full}})
 		}
 		return
@@ -2956,95 +2959,6 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			}
 		}()
 
-	case protocol.EventApprovePairing:
-		// The event table lets only the local socket and the right tiers get here.
-		var data protocol.ApprovePairingData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Credential == "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed approve_pairing payload (credential is required)",
-			})
-			return
-		}
-		if data.Allow {
-			deps.settings.SetTokenScope(data.Credential, data.Full)
-		}
-		deps.pairings.answer(data.Credential, data.Allow)
-
-	case protocol.EventRegisterToken:
-		// The event table lets only the local socket and the right tiers get here.
-		var data protocol.RegisterTokenData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed register_token payload (name is required)",
-			})
-			return
-		}
-		token, err := generateAuthToken()
-		if err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to generate token: %v", err),
-			})
-			return
-		}
-		add := deps.settings.AddToken
-		if data.Pairing {
-			add = deps.settings.AddPairingToken
-		}
-		if err := add(data.Name, token, data.Email); err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: err.Error(),
-			})
-			return
-		}
-		if data.Pairing && data.Full {
-			deps.settings.SetTokenScope(data.Name, true)
-		}
-		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenAdd, Target: data.Name, Outcome: "ok", Detail: map[string]any{"full": data.Pairing && data.Full}}) // the name, never the token
-		// Best-effort: a client can still pair by pasting the CA separately
-		// (or doesn't need one at all, on an operator-supplied cert) if this
-		// fails, so a CA read error shouldn't fail token registration itself.
-		caPem, _ := deps.remote.CAPEM()
-		_ = ipc.SendEvent(protocol.EventTokenRegistered, env.SessionID, env.TurnID, "", protocol.TokenRegisteredData{
-			Name:  data.Name,
-			Token: token,
-			Email: data.Email,
-			CaPem: caPem,
-
-			RTCFingerprint: deps.remote.RTCFingerprint(),
-		})
-
-	case protocol.EventListTokens:
-		// The event table lets only the local socket and the right tiers get here.
-		summaries := deps.settings.ListTokenNames()
-		out := make([]protocol.TokenSummary, len(summaries))
-		for i, s := range summaries {
-			out[i] = protocol.TokenSummary{Name: s.Name, Email: s.Email, HasAvatar: s.HasAvatar, Restricted: s.Restricted}
-		}
-		_ = ipc.SendEvent(protocol.EventTokenList, env.SessionID, env.TurnID, "", protocol.TokenListData{Tokens: out})
-
-	case protocol.EventRemoveToken:
-		// The event table lets only the local socket and the right tiers get here.
-		var data protocol.RemoveTokenData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed remove_token payload (name is required)",
-			})
-			return
-		}
-		if _, err := deps.settings.RemoveToken(data.Name); err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to remove token: %v", err),
-			})
-			return
-		}
-		// Revocation should actually end the session, not just block the next
-		// handshake — otherwise someone already connected on this credential
-		// stays connected until they happen to disconnect on their own.
-		dropped := deps.peers.DisconnectByToken(data.Name)
-		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenRemove, Target: data.Name, Outcome: "ok", Detail: map[string]any{"disconnected": dropped}})
-		_ = ipc.SendEvent(protocol.EventTokenRemoved, env.SessionID, env.TurnID, "", protocol.TokenRemovedData{
-			Name: data.Name,
-		})
 	default:
 		// Not an event this server handles (a newer or older client, or a typo): say so, or the
 		// client waits for a reply that never comes. Explicit no-ops such as pong are cases above.

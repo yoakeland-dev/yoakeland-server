@@ -2,6 +2,7 @@ package sched
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -216,5 +217,26 @@ func TestBlockedMayCallBackIntoTheScheduler(t *testing.T) {
 	}
 	if len(f.ran) != 1 {
 		t.Fatal("did not run")
+	}
+}
+
+func TestRunReturningErrCancelledCancelsTheEntry(t *testing.T) {
+	s := New(t.TempDir())
+	s.Run = func(protocol.ScheduledTurn, func()) error { return fmt.Errorf("%w: gone", ErrCancelled) }
+	e, err := s.AddAs(protocol.ScheduleTurnData{SessionID: "s", Text: "x", Trigger: protocol.ScheduleTrigger{Kind: protocol.TriggerNow}}, "u-1", "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.CreatorUserID != "u-1" || e.CreatorCredential != "phone" {
+		t.Fatalf("creator not stored: %+v", e)
+	}
+	s.Tick()
+	got, _ := s.Get(e.ID)
+	if got.Status != protocol.ScheduleCancelled || got.Runs != 0 || got.NextRunAtMs != 0 {
+		t.Fatalf("entry = %+v", got)
+	}
+	s.Tick()
+	if got, _ = s.Get(e.ID); got.Status != protocol.ScheduleCancelled {
+		t.Fatalf("a cancelled entry ran again: %+v", got)
 	}
 }

@@ -1275,9 +1275,17 @@ type RegisterTokenData struct {
 	// device that uses it, and (with a local client connected to say yes)
 	// waits for approval before that first use.
 	Pairing bool `json:"pairing,omitempty"`
-	// Full, with Pairing, makes the code grant full access instead of the paired-device scope:
+	// Full, with Pairing, makes the code grant full access instead of Limited:
 	// for pairing another computer rather than a phone.
 	Full bool `json:"full,omitempty"`
+	// User says whose device this is: "me" (the sender's own person), "new" (a new person, named
+	// NewUserName, or after the token), or an existing person's id (local socket only). Empty
+	// means "new" for a pairing code, as an old client sends it. Tier is the new person's tier and
+	// MaxTier the device's ceiling; nobody can grant more than their own tier.
+	User        string `json:"user,omitempty"`
+	NewUserName string `json:"newUserName,omitempty"`
+	Tier        string `json:"tier,omitempty"`
+	MaxTier     string `json:"maxTier,omitempty"`
 }
 
 // PairingRequestData is pushed to local-socket and full-access peers when a device presents a
@@ -1287,6 +1295,9 @@ type PairingRequestData struct {
 	Name       string `json:"name,omitempty"`
 	DeviceType string `json:"deviceType,omitempty"`
 	IP         string `json:"ip,omitempty"`
+	// UserName and Tier are whose device this will be and the access it gets.
+	UserName string `json:"userName,omitempty"`
+	Tier     string `json:"tier,omitempty"`
 }
 
 // RestartServerData asks the daemon to shut down so whatever started it can start it again (the
@@ -1307,7 +1318,7 @@ type ServerRestartData struct {
 type ApprovePairingData struct {
 	Credential string `json:"credential"`
 	Allow      bool   `json:"allow"`
-	Full       bool   `json:"full,omitempty"` // approve with full access instead of the paired-device scope
+	Full       bool   `json:"full,omitempty"` // approve with full access instead of Limited
 }
 
 // SetPeerScopeData promotes (Full) or demotes the device behind PeerID. It applies to the
@@ -1327,10 +1338,12 @@ type SetPeerScopeData struct {
 // server rather than an operator-supplied cert whose issuer the client's own
 // OS trust store already covers.
 type TokenRegisteredData struct {
-	Name  string `json:"name"`
-	Token string `json:"token"`
-	Email string `json:"email,omitempty"`
-	CaPem string `json:"caPem,omitempty"`
+	Name string `json:"name"`
+	// UserID is the person the credential logs in as.
+	UserID string `json:"userId,omitempty"`
+	Token  string `json:"token"`
+	Email  string `json:"email,omitempty"`
+	CaPem  string `json:"caPem,omitempty"`
 	// RTCFingerprint is the DTLS certificate fingerprint a WebRTC client (a browser on any origin)
 	// pins in place of a CA: SDP form, uppercase colon-separated SHA-256 (SPEC.md §2a).
 	RTCFingerprint string `json:"rtcFp,omitempty"`
@@ -1342,8 +1355,11 @@ type TokenSummary struct {
 	Name      string `json:"name"`
 	Email     string `json:"email,omitempty"`
 	HasAvatar bool   `json:"hasAvatar"`
-	// Restricted: devices on this credential are held to the paired-device scope.
+	// Restricted: devices on this credential are below the Full tier. Tier says which.
 	Restricted bool `json:"restricted,omitempty"`
+	// UserID is the person the credential logs in as; Tier the device's effective tier.
+	UserID string `json:"userId,omitempty"`
+	Tier   string `json:"tier,omitempty"`
 }
 
 type TokenListData struct {
@@ -1405,7 +1421,7 @@ type ServerIdentityData struct {
 	// never flagged.
 	Version string `json:"version,omitempty"`
 
-	// Restricted is true when this connection is held to the paired-device scope (SPEC.md
+	// Restricted is true when this connection is below the Full tier (SPEC.md
 	// "Paired-device scope"), so a client can say which tier it is on and why a screen is
 	// unavailable. Pushed again when the tier changes. Omitted for full access. Kept for old
 	// clients: Tier says which tier.

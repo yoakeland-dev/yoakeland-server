@@ -60,7 +60,7 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 		if who.DeviceID == "" {
 			return errors.New("this app is too old to pair; update it")
 		}
-		if d.pairings != nil && d.peers.HasLocal() {
+		if d.pairings != nil && d.peers.HasApprover(rec.PairedBy) {
 			ch := make(chan bool, 1)
 			d.pairings.mu.Lock()
 			// One waiter per code. A second device holding the same code is refused instead of
@@ -77,8 +77,10 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 				d.pairings.mu.Unlock()
 			}()
 			_ = ipc.SendEvent(protocol.EventPairingPending, "", "", "", struct{}{})
-			d.peers.BroadcastLocal(protocol.EventPairingRequest, protocol.PairingRequestData{
+			acc := d.settings.Access("tcp", who.TokenName)
+			d.peers.BroadcastApprovers(rec.PairedBy, protocol.EventPairingRequest, protocol.PairingRequestData{
 				Credential: who.TokenName, Name: who.Name, DeviceType: who.DeviceType, IP: ip,
+				UserName: d.settings.UserName(acc.UserID), Tier: acc.Tier,
 			})
 			select {
 			case allow := <-ch:

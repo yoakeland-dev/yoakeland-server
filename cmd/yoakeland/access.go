@@ -216,18 +216,27 @@ func (s *ServerSettings) accessLocked(credential string) Access {
 		a.Caps = allCaps()
 		return a
 	}
+	a.Caps = computeCaps(tier, u.Caps, s.LimitedDefaults, rec.Deny)
+	return a
+}
+
+// computeCaps is the capabilities of a person at tier: the tier's defaults, overlaid with
+// limitedDefaults (Limited only) and then the person's own overlay, minus what a device denies.
+func computeCaps(tier string, userCaps, limitedDefaults map[string]any, deny []string) Caps {
+	if tier == TierFull {
+		return allCaps()
+	}
 	caps := tierDefaults(tier)
 	if tier == TierLimited {
-		maps.Copy(caps, s.LimitedDefaults)
+		maps.Copy(caps, limitedDefaults)
 	}
-	maps.Copy(caps, u.Caps)
-	for _, name := range rec.Deny {
+	maps.Copy(caps, userCaps)
+	for _, name := range deny {
 		if _, known := caps[name]; known {
 			caps[name] = offValue(name)
 		}
 	}
-	a.Caps = capsFromMap(caps)
-	return a
+	return capsFromMap(caps)
 }
 
 // AtLeast reports whether a is at tier t or above.

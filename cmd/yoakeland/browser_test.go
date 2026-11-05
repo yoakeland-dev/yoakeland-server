@@ -214,7 +214,7 @@ func TestBrowserHostFor(t *testing.T) {
 	if p, _ := reg.BrowserHostFor("unknown"); p != remote {
 		t.Fatal("the only host, a full-access remote one, was not used")
 	}
-	reg.SyncAccess(func(string) (string, string) { return TierLimited, "u" })
+	reg.SyncAccess(func(string) (string, string, string) { return TierLimited, "u", "" })
 	if p, _ := reg.BrowserHostFor("unknown"); p != nil {
 		t.Fatal("a restricted device was chosen to host")
 	}
