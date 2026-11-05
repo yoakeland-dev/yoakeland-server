@@ -290,6 +290,8 @@ A device paired as "me" is capped at `limited` unless the sender asks otherwise.
 
 **Identity.** Attribution comes from the sender's person. `auth`'s `name`/`avatar` and `set_peer_name`/`set_peer_avatar` are device labels and never change the person. Only `set_profile` does, so a device reconnecting can't overwrite a profile. A client takes its profile from `server_identity`'s `user`; its local settings only fill a person who has none. The owner's empty name and picture are filled once from the first local-socket `auth` that reports them.
 
+**Migrating a 0.1.7 `server.json`.** On load, idempotently: every credential without a person gets one (Limited if it was a pairing token without `scope: full`, else Full), except the original `default` token, which is the owner's. A history message from before `authorId` is placed by its author name, or else by its picture (an emoji places no one), and a placed message's own data-URL picture is dropped from the reply because `profiles` carries it once.
+
 ### Settings mutations broadcast to every peer, not just the sender
 
 A `set_*` request's confirmation event (`mode_set`, `web_tools_enabled_set`, `provider_set`, `model_options_set`, `provider_registered`, `provider_removed`, `favorite_models_set`) is sent **both** back to the requesting connection *and*, via the same `peers.BroadcastEvent` mechanism `session_updated`/`session_deleted`/`project_list` already use (§3.2), to every other live peer — server-wide, not filtered by whether that peer has the affected session/project open (the client is expected to ignore an event for a `sessionId`/`projectPath` it doesn't currently care about, the same way it already does for `session_updated`). This is what makes a mode change, provider swap, or web-tools toggle made on one device visible on another device watching the same session or project live, without polling.
@@ -978,6 +980,11 @@ Edits your own person: the name and picture every chat shows for you. Any tier. 
 {"type": "set_profile", "data": {"name": "aveline", "avatar": "🐣"}}
 ```
 - Response: `profile_updated` to every peer. The person's own devices also get a new `server_identity`.
+- A picture sent as an image data URL (png, jpeg, gif or webp) is stored once in the upload bucket and the person's `avatar` becomes `upload:<sha256>`; an emoji stays as it is. Pruning never deletes a picture a person has. Servers that stored data URLs move them into the bucket at start.
+
+#### `get_avatar`
+
+Any tier. `{"avatar": "upload:<sha256>"}` → `avatar_data` `{"avatar", "data"}`, `data` being the picture as a data URL (absent when there is none). The picture never changes under its hash, so clients keep it.
 
 #### `set_peer_avatar`
 Sets *this* connection's own avatar — same self-only shape as `set_peer_name`, for updating the picture chosen at connect time (`auth`'s `avatar`, §2a) without reconnecting.
