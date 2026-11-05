@@ -62,7 +62,7 @@ func (d connDeps) peopleFor(acc Access) protocol.PeopleData {
 			continue
 		}
 		p := protocol.PeoplePerson{
-			ID: id, Name: u.Name, Avatar: u.Avatar, Tier: u.Tier, Caps: u.Caps, CreatedBy: u.CreatedBy,
+			ID: id, Name: u.Name, Avatar: u.Avatar, Names: u.Names, Tier: u.Tier, Caps: u.Caps, CreatedBy: u.CreatedBy,
 			EffectiveCaps: computeCaps(u.Tier, u.Caps, limited, nil).ToMap(cli), Devices: []protocol.PeopleDevice{},
 		}
 		for cred, rec := range tokens {
@@ -107,7 +107,8 @@ func handlePeopleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerI
 	switch env.Type {
 	case protocol.EventListPeople, protocol.EventSetUserPermissions, protocol.EventSetDeviceRestrict, protocol.EventSetLimitedDefaults,
 		protocol.EventMergeUsers, protocol.EventMoveDevice, protocol.EventRemoveUser,
-		protocol.EventRegisterToken, protocol.EventListTokens, protocol.EventRemoveToken, protocol.EventApprovePairing:
+		protocol.EventRegisterToken, protocol.EventListTokens, protocol.EventRemoveToken, protocol.EventApprovePairing,
+		protocol.EventSetProfile:
 	default:
 		return false
 	}
@@ -127,6 +128,28 @@ func handlePeopleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerI
 	switch env.Type {
 	case protocol.EventListPeople:
 		_ = ipc.SendEvent(protocol.EventPeople, env.SessionID, env.TurnID, "", deps.peopleFor(acc))
+
+	case protocol.EventSetProfile:
+		// Your own person only, and only when asked: a device's name and picture never get here.
+		var d protocol.SetProfileData
+		if json.Unmarshal(env.Data, &d) != nil {
+			bad()
+			return true
+		}
+		prof, err := deps.settings.SetProfile(acc.UserID, d.Name, d.Avatar)
+		if err != nil {
+			fail("set_profile: %v", err)
+			return true
+		}
+		deps.auditUser(ipc, peerID, prof.ID, map[string]any{"profile": true, "name": d.Name != nil, "avatar": d.Avatar != nil})
+		deps.peers.BroadcastEvent("", protocol.EventProfileUpdated, "", protocol.ProfileUpdatedData(prof))
+		for _, p := range deps.peers.All() { // the person's own devices learn it as their identity
+			if p.UserID == prof.ID {
+				sendServerIdentity(deps, p)
+			}
+		}
+		deps.peers.Broadcast() // peer_list names the person
+		deps.broadcastPeople()
 
 	case protocol.EventSetUserPermissions:
 		var d protocol.SetUserPermissionsData

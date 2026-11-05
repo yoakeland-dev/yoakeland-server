@@ -132,16 +132,15 @@ func TestAgent_FailedTurnPersistsPrompt(t *testing.T) {
 	}
 }
 
-// The sender's name and avatar are stored with the message, so a transcript
-// repainted from server history still shows who wrote it — an avatar has no
-// other source once the sending client's own settings are out of the picture.
-func TestAgent_PersistsAuthorNameAndAvatar(t *testing.T) {
+// The sender's id and name are stored with the message, and the picture is not: it is looked up
+// by id, so a changed picture shows on every message. The live user_message carries the current one.
+func TestAgent_PersistsAuthorIDAndNameButNotAvatar(t *testing.T) {
 	provider := &ScriptedProvider{turns: [][]agent.ModelStreamChunk{
 		{{Kind: agent.StreamChunkDelta, Delta: "hi"}},
 	}}
 	ag, sessStore, _ := testAgent(t, provider)
 
-	ctx := agent.WithAuthor(context.Background(), agent.Author{Name: "aveline", Avatar: "🐣"})
+	ctx := agent.WithAuthor(context.Background(), agent.Author{ID: "u-1", Name: "aveline", Avatar: "🐣"})
 	if err := ag.RunTurn(ctx, "session-author", "turn-1", "hello"); err != nil {
 		t.Fatalf("turn failed: %v", err)
 	}
@@ -153,10 +152,10 @@ func TestAgent_PersistsAuthorNameAndAvatar(t *testing.T) {
 	if len(state.History) == 0 {
 		t.Fatalf("no history stored")
 	}
-	if state.History[0].AuthorName != "aveline" || state.History[0].AuthorAvatar != "🐣" {
-		t.Fatalf("stored author = %q/%q, want aveline/🐣", state.History[0].AuthorName, state.History[0].AuthorAvatar)
+	if m := state.History[0]; m.AuthorID != "u-1" || m.AuthorName != "aveline" || m.AuthorAvatar != "" {
+		t.Fatalf("stored author = %q/%q/%q, want u-1/aveline and no avatar", m.AuthorID, m.AuthorName, m.AuthorAvatar)
 	}
-	if state.History[1].AuthorName != "" || state.History[1].AuthorAvatar != "" {
+	if state.History[1].AuthorName != "" || state.History[1].AuthorID != "" || state.History[1].AuthorAvatar != "" {
 		t.Fatalf("assistant message carries an author: %+v", state.History[1])
 	}
 }

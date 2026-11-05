@@ -1039,38 +1039,26 @@ func sessionWriteError(sessionID, verb string, err error) string {
 	return fmt.Sprintf("failed to %s session: %v", verb, err)
 }
 
-// resolveAuthor determines who to attribute a new user message (and any git
-// commits its tool calls make) to. A connection signed in with a token shows
-// the name and picture its device reports (falling back to the token's name),
-// but commits are signed with the credential's name and email, which the
-// device doesn't choose. Failing that, a client may self-report via
-// authorName/authorAvatar — the local unix socket has no credential to
-// attribute to (file permissions are its boundary), so this is the only way
-// a message from it is ever attributed, and without it the transcript has no
-// sender to render. A client (or event, like retry_message, which carries
-// neither field) that declares nothing is stored unattributed rather than
-// rejected. Shared by user_prompt, edit_message, and retry_message.
-func resolveAuthor(deps connDeps, peerID, authorName, authorAvatar string) agent.Author {
-	if name, avatar, credential, email, ok := deps.peers.Author(peerID); ok && credential != "" {
-		// A picture the device never managed to register (a lost set_peer_avatar) still shows if
-		// it sends one with the prompt; the name stays the credential's, which the device can't choose.
-		if avatar == "" && len(authorAvatar) <= maxAvatarLen {
-			avatar = authorAvatar
-		}
-		return agent.Author{Name: name, Avatar: avatar, Email: email, Credential: credential}
+// resolveAuthor determines who to attribute a new user message (and any git commits its tool calls
+// make) to: the person behind the sending connection, whatever the device calls itself. The local
+// socket is the owner. Their name, picture and email are the person's own; a device's name and
+// picture are labels for the device and never reach a message. The one thing taken from the client
+// is a name for an owner who has none yet, so a fresh install's first messages aren't anonymous.
+// Shared by user_prompt, steer_turn, edit_message and retry_message.
+func resolveAuthor(deps connDeps, peerID, authorName string) agent.Author {
+	userID, credential := ownerID, ""
+	if p, ok := deps.peers.Get(peerID); ok {
+		userID, credential = deps.accessFor(p.Network, peerID).UserID, p.TokenName
 	}
-	if authorName != "" || authorAvatar != "" {
-		avatar := authorAvatar
-		// Cosmetic, so an oversized one is dropped rather than failing the
-		// prompt — same rule the peer registry applies to `auth` (§2a). It's
-		// stored per message, so a huge data URL would also be duplicated
-		// across a whole session file.
-		if len(avatar) > maxAvatarLen {
-			avatar = ""
-		}
-		return agent.Author{Name: authorName, Avatar: avatar}
+	u, ok := deps.settings.ResolveUser(userID)
+	if !ok {
+		return agent.Author{}
 	}
-	return agent.Author{}
+	name := u.Name
+	if name == "" && u.ID == ownerID {
+		name = cleanName(authorName)
+	}
+	return agent.Author{ID: u.ID, Name: name, Avatar: u.Avatar, Email: u.Email, Credential: credential}
 }
 
 // recoverTurnPanic catches a panic from a turn goroutine (user_prompt/
@@ -1123,11 +1111,19 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 }
 
 // sendServerIdentity tells p who this server is and which tier p is on.
+// userInfo is the person behind acc, for server_identity; nil when there is none.
+func userInfo(deps connDeps, acc Access) *protocol.ProfileInfo {
+	if p, ok := deps.settings.Profile(acc.UserID); ok {
+		return &p
+	}
+	return nil
+}
+
 func sendServerIdentity(deps connDeps, p *Peer) {
 	acc := deps.accessFor(p.Network, p.ID)
 	_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{
 		Identity: deps.settings.GetIdentity(), Icon: deps.settings.GetIcon(), ServerID: deps.settings.GetServerID(), Version: version,
-		Restricted: !acc.Full(), Tier: acc.Tier, Caps: acc.Caps.ToMap(deps.cliProviderNames()),
+		Restricted: !acc.Full(), Tier: acc.Tier, Caps: acc.Caps.ToMap(deps.cliProviderNames()), User: userInfo(deps, acc),
 	})
 }
 
@@ -1205,7 +1201,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
-		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
+		author := resolveAuthor(deps, peerID, data.AuthorName)
 		turnCtx := agent.WithAttachments(agent.WithAuthor(deps.turnContext(ctx, network, peerID), author), data.Attachments)
 		who := deps.actorOf(network, peerID)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
@@ -1326,7 +1322,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		// Accepted, the running turn records the message and says steer_accepted; refused,
 		// the client sends it as a prompt of its own, which waits its turn.
-		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
+		author := resolveAuthor(deps, peerID, data.AuthorName)
 		if err := pc.Registry.Get(ipc, sessID).Steer(turnID, data.Prompt, author); err != nil {
 			_ = ipc.SendEvent(protocol.EventSteerRejected, sessID, turnID, "", protocol.SteerResultData{Prompt: data.Prompt, Reason: err.Error()})
 		}
@@ -1895,13 +1891,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			mode = string(ag.Mode())
 		} // a session with no persisted history yet isn't an error — it just has none
 		ctxData, spend := pc.Registry.SessionReport(data.SessionID, history)
-		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
+		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", deps.withProfiles(toHistoryMessages(history, branches), protocol.SessionHistoryData{
 			SessionID: data.SessionID,
-			Messages:  toHistoryMessages(history, branches),
 			Mode:      mode,
 			Context:   ctxData,
 			Spend:     spend,
-		})
+		}))
 		sendTodoList(ipc, data.SessionID, state)
 
 	case protocol.EventGetContextBreakdown:
@@ -2037,7 +2032,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
-		author := resolveAuthor(deps, peerID, "", "")
+		author := resolveAuthor(deps, peerID, "")
 		turnCtx := agent.WithAuthor(deps.turnContext(ctx, network, peerID), author)
 		who := deps.actorOf(network, peerID)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
@@ -2076,7 +2071,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
-		author := resolveAuthor(deps, peerID, "", "")
+		author := resolveAuthor(deps, peerID, "")
 		turnCtx := agent.WithAuthor(deps.turnContext(ctx, network, peerID), author)
 		who := deps.actorOf(network, peerID)
 		if deps.turnWG != nil {
@@ -2122,12 +2117,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			branches = state.Branches
 		}
 		ctxData, spend := pc.Registry.SessionReport(data.SessionID, history)
-		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
+		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", deps.withProfiles(toHistoryMessages(history, branches), protocol.SessionHistoryData{
 			SessionID: data.SessionID,
-			Messages:  toHistoryMessages(history, branches),
 			Context:   ctxData,
 			Spend:     spend,
-		})
+		}))
 
 	case protocol.EventSetSessionTitle:
 		var data protocol.SetSessionTitleData

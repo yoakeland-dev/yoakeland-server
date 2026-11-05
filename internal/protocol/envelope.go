@@ -970,6 +970,10 @@ type HistoryMessage struct {
 	// sender had a resolved (token-backed) identity; empty otherwise.
 	Author string `json:"author,omitempty"`
 
+	// AuthorID is the person who sent it. The name and picture to show come from Profiles on
+	// session_history; Author and AuthorAvatar are what was stored with the message.
+	AuthorID string `json:"authorId,omitempty"`
+
 	// AuthorAvatar is that sender's picture, stored with the message so it
 	// survives a reload — either a short emoji glyph or a data URL, whichever
 	// the sending client uses (SPEC.md §2a's avatar conventions). Omitted for
@@ -1101,6 +1105,10 @@ type SessionHistoryData struct {
 	// Context is omitted for a session with no messages.
 	Context *ContextData `json:"context,omitempty"`
 	Spend   *SpendData   `json:"spend,omitempty"`
+	// Profiles holds each author in Messages once, by authorId, as they are now. A message from
+	// before authorId existed gets one here when its author name matches a person's current or
+	// earlier name; any other keeps the name and picture it was stored with.
+	Profiles map[string]ProfileInfo `json:"profiles,omitempty"`
 }
 
 // OpenProjectData validates and lazily initializes a project (its own
@@ -1432,6 +1440,8 @@ type ServerIdentityData struct {
 	// pushed again when they change.
 	Tier string         `json:"tier,omitempty"`
 	Caps map[string]any `json:"caps,omitempty"`
+	// User is the person this connection acts as. A client takes its profile from here.
+	User *ProfileInfo `json:"user,omitempty"`
 }
 
 // SetAutoGenerateTitleData sets the server-wide default applied to a first
@@ -2146,18 +2156,11 @@ type UserPromptData struct {
 	ProjectPath       string `json:"projectPath,omitempty"`
 	AutoGenerateTitle *bool  `json:"autoGenerateTitle,omitempty"`
 
-	// AuthorName/AuthorAvatar are the sender's own display name and picture,
-	// persisted with the stored user message so a transcript repainted from
-	// session_history still shows who wrote it (an avatar is not otherwise
-	// recoverable: it exists only in the sending client's settings).
-	//
-	// A token-authenticated TCP sender is shown under the name its device
-	// reports and AuthorName is ignored for it; its commits use the credential's
-	// name (SPEC.md §2a). For the unix
-	// socket — the local case, where file permissions are the boundary and
-	// there's no credential to attribute to — this is the only source, which is
-	// why it's accepted rather than ignored as it was when only token-backed
-	// senders could be named.
+	// AuthorName and AuthorAvatar are what an older client says about its sender. The message is
+	// attributed to the person behind the connection (the owner, on the local socket), with the
+	// name and picture the server holds for them: AuthorAvatar is ignored, and AuthorName is used
+	// only for an owner who has no name yet. A client takes its profile from server_identity and
+	// changes it with set_profile.
 	AuthorName   string `json:"authorName,omitempty"`
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
 
@@ -2256,8 +2259,9 @@ type UserMessageData struct {
 	MessageID    string   `json:"messageId"`
 	Content      string   `json:"content"`
 	Attachments  []string `json:"attachments,omitempty"`
+	AuthorID     string   `json:"authorId,omitempty"`
 	Author       string   `json:"author,omitempty"`
-	AuthorAvatar string   `json:"authorAvatar,omitempty"`
+	AuthorAvatar string   `json:"authorAvatar,omitempty"` // the sender's current picture
 	// Origin is set when the server started the turn (see Origin); a person's message has none.
 	Origin *Origin `json:"origin,omitempty"`
 }

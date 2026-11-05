@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"yoakeland/internal/protocol"
 )
 
 func tierRank(t string) int {
@@ -388,4 +390,52 @@ func (s *ServerSettings) view() (users map[string]User, tokens map[string]TokenR
 		tokens[n] = r
 	}
 	return users, tokens, maps.Clone(s.LimitedDefaults)
+}
+
+// maxEarlierNames bounds User.Names, which only exists so old messages keep matching.
+const maxEarlierNames = 32
+
+// SetProfile changes a person's own name and picture (nil leaves one alone). A name they leave
+// behind is kept in Names, and a name they take back leaves it. userID may be an alias; the person
+// it stands for is edited.
+func (s *ServerSettings) SetProfile(userID string, name, avatar *string) (protocol.ProfileInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.resolveUserLocked(userID)
+	if !ok {
+		return protocol.ProfileInfo{}, s.errUnknownUser(userID)
+	}
+	if name != nil {
+		n, err := cleanUserName(*name)
+		if err != nil {
+			return protocol.ProfileInfo{}, err
+		}
+		if n != u.Name {
+			names := slices.DeleteFunc(slices.Clone(u.Names), func(e string) bool { return e == n })
+			if u.Name != "" && !slices.Contains(names, u.Name) {
+				names = append(names, u.Name)
+			}
+			if len(names) > maxEarlierNames {
+				names = names[len(names)-maxEarlierNames:]
+			}
+			u.Name, u.Names = n, names
+		}
+	}
+	if avatar != nil {
+		if len(*avatar) > maxAvatarLen {
+			return protocol.ProfileInfo{}, fmt.Errorf("avatar too large")
+		}
+		u.Avatar = *avatar
+	}
+	s.Users[u.ID] = u
+	if err := s.save(); err != nil {
+		return protocol.ProfileInfo{}, err
+	}
+	return protocol.ProfileInfo{ID: u.ID, Name: u.Name, Avatar: u.Avatar}, nil
+}
+
+// Profile is the name and picture of the person id stands for.
+func (s *ServerSettings) Profile(id string) (protocol.ProfileInfo, bool) {
+	u, ok := s.ResolveUser(id)
+	return protocol.ProfileInfo{ID: u.ID, Name: u.Name, Avatar: u.Avatar}, ok
 }

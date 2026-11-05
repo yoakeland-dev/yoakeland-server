@@ -59,7 +59,7 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventWriteFile: needCap(CapFilesEdit), protocol.EventFsOp: needCap(CapFilesEdit),
 
 	// presence and housekeeping
-	protocol.EventSetPresence: anyone, protocol.EventSetPeerName: anyone, protocol.EventSetPeerAvatar: anyone,
+	protocol.EventSetPresence: anyone, protocol.EventSetPeerName: anyone, protocol.EventSetPeerAvatar: anyone, protocol.EventSetProfile: anyone,
 	protocol.EventSetNotifyPrefs: anyone, protocol.EventListNotifications: anyone, protocol.EventDismissNotification: anyone,
 	protocol.EventMarkNotificationsRead: anyone, protocol.EventPing: anyone, protocol.EventPong: anyone,
 	protocol.EventAuth:          anyone,                // only meaningful as the first frame; later it falls to "unknown event"

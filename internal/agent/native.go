@@ -597,7 +597,7 @@ func (a *Agent) recordSteers(sessionID, turnID string, flush func()) {
 		flush()
 		a.mu.Lock()
 		id := a.nextMessageIDLocked()
-		a.history = append(a.history, Message{ID: id, Role: "user", Content: s.text, AuthorName: s.author.Name, AuthorAvatar: s.author.Avatar, CreatedAt: s.at})
+		a.history = append(a.history, Message{ID: id, Role: "user", Content: s.text, AuthorName: s.author.Name, AuthorID: s.author.ID, CreatedAt: s.at})
 		a.mu.Unlock()
 		_ = a.getStream().SendEvent(protocol.EventSteerAccepted, sessionID, turnID, "", protocol.SteerResultData{Prompt: s.text, MessageID: id})
 	}

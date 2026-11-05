@@ -260,5 +260,5 @@ func (d connDeps) authorOfActor(who agent.TurnActor) agent.Author {
 	if !ok {
 		return agent.Author{}
 	}
-	return agent.Author{Name: u.Name, Avatar: u.Avatar, Email: u.Email, Credential: who.Credential}
+	return agent.Author{ID: u.ID, Name: u.Name, Avatar: u.Avatar, Email: u.Email, Credential: who.Credential}
 }

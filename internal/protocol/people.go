@@ -13,7 +13,27 @@ const (
 	EventMergeUsers         EventType = "merge_users"
 	EventMoveDevice         EventType = "move_device"
 	EventRemoveUser         EventType = "remove_user"
+	EventSetProfile         EventType = "set_profile"
+	EventProfileUpdated     EventType = "profile_updated"
 )
+
+// ProfileInfo is a person as a chat shows them: a name and a picture (an emoji or a data URL).
+// ID is set where the profile isn't keyed by it (server_identity, profile_updated).
+type ProfileInfo struct {
+	ID     string `json:"id,omitempty"`
+	Name   string `json:"name"`
+	Avatar string `json:"avatar,omitempty"`
+}
+
+// SetProfileData is set_profile: change your own name and picture. Each is applied only when set.
+// It edits the person, not the device (set_peer_name and set_peer_avatar do that).
+type SetProfileData struct {
+	Name   *string `json:"name,omitempty"`
+	Avatar *string `json:"avatar,omitempty"`
+}
+
+// ProfileUpdatedData is profile_updated, sent to every peer when a person changes their profile.
+type ProfileUpdatedData = ProfileInfo
 
 // SetUserPermissionsData is set_user_permissions. Tier and Caps are each applied only when set;
 // Caps replaces the person's whole overlay (only what differs from the tier default). The owner
@@ -75,6 +95,7 @@ type PeoplePerson struct {
 	ID            string         `json:"id"`
 	Name          string         `json:"name"`
 	Avatar        string         `json:"avatar,omitempty"`
+	Names         []string       `json:"names,omitempty"` // earlier names, which old messages still match
 	Tier          string         `json:"tier"`
 	Caps          map[string]any `json:"caps,omitempty"`
 	EffectiveCaps map[string]any `json:"effectiveCaps"`

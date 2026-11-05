@@ -62,11 +62,13 @@ type Message struct {
 	// messages, which have no human author.
 	AuthorName string `json:"author,omitempty"`
 
-	// AuthorAvatar is that sender's picture, stored alongside the name so it
-	// survives a reload: a client renders it from local settings for its own
-	// live messages, but a transcript repainted from get_session_history has
-	// nothing else to draw from. Either a short emoji glyph or a data URL
-	// (SPEC.md §2a's conventions, devolved to whichever the client uses).
+	// AuthorID is the user who sent it. The name above is only a snapshot of what they were
+	// called then; who they are now, picture included, is looked up by this id.
+	AuthorID string `json:"authorId,omitempty"`
+
+	// AuthorAvatar is the picture an older message was stored with, before pictures were looked
+	// up by AuthorID. New messages don't store one, so a changed picture shows everywhere; an old
+	// message keeps its own when its author can't be matched to a user.
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
 
 	// Origin is set when the server, not a person, started the turn this user message opens
@@ -124,20 +126,22 @@ type Message struct {
 // care about attribution keeps working unchanged with the zero value (no
 // message attribution, no git-author env injection).
 type Author struct {
+	// ID is the user the sender acts as; Name, Email and Avatar are that user's own.
+	ID     string
 	Name   string
 	Email  string
-	Avatar string
-	// Credential is the registered token's name when the sender signed in with
-	// one. Git commits use it rather than Name, which a device chooses itself.
+	Avatar string // shown on live events; never stored with the message
+	// Credential is the registered token's name when the sender signed in with one.
 	Credential string
 }
 
-// GitName is what a commit made on this author's turn is signed with.
+// GitName is what a commit made on this author's turn is signed with: the user's name, else the
+// name of the credential they came in on.
 func (a Author) GitName() string {
-	if a.Credential != "" {
-		return a.Credential
+	if a.Name != "" {
+		return a.Name
 	}
-	return a.Name
+	return a.Credential
 }
 
 type authorContextKey struct{}
@@ -1416,19 +1420,19 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	isNewChat := len(a.history) == 0
 	userMessageID := a.nextMessageIDLocked()
 	a.history = append(a.history, Message{
-		ID:           userMessageID,
-		Role:         "user",
-		Content:      prompt,
-		AuthorName:   author.Name,
-		AuthorAvatar: author.Avatar,
-		Attachments:  attachmentsFromContext(parentCtx),
-		Origin:       originFromContext(parentCtx),
-		CreatedAt:    startTime,
+		ID:          userMessageID,
+		Role:        "user",
+		Content:     prompt,
+		AuthorName:  author.Name,
+		AuthorID:    author.ID,
+		Attachments: attachmentsFromContext(parentCtx),
+		Origin:      originFromContext(parentCtx),
+		CreatedAt:   startTime,
 	})
 	a.mu.Unlock()
 	_ = a.getStream().SendEvent(protocol.EventUserMessage, sessionID, turnID, "", protocol.UserMessageData{
 		MessageID: userMessageID, Content: prompt, Attachments: attachmentsFromContext(parentCtx),
-		Author: author.Name, AuthorAvatar: author.Avatar, Origin: originFromContext(parentCtx),
+		AuthorID: author.ID, Author: author.Name, AuthorAvatar: author.Avatar, Origin: originFromContext(parentCtx),
 	})
 
 	if isNewChat {
@@ -2388,13 +2392,13 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 	userMessageID := a.nextMessageIDLocked()
 	attachments := a.history[idx].Attachments // an edit rewrites the text, not what was attached
 	a.history = append(a.history[:idx:idx], Message{
-		ID:           userMessageID,
-		Role:         "user",
-		Content:      content,
-		AuthorName:   author.Name,
-		AuthorAvatar: author.Avatar,
-		Attachments:  attachments,
-		CreatedAt:    startTime,
+		ID:          userMessageID,
+		Role:        "user",
+		Content:     content,
+		AuthorName:  author.Name,
+		AuthorID:    author.ID,
+		Attachments: attachments,
+		CreatedAt:   startTime,
 	})
 	a.mu.Unlock()
 

@@ -126,18 +126,6 @@ func TestSetPeerScope(t *testing.T) {
 	}
 }
 
-func TestResolveAuthor_AvatarFallback(t *testing.T) {
-	deps := newTestDeps(t)
-	p := deps.peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &bytes.Buffer{}), nopCloser{}, "tcp", peerIdentity{Name: "phone", TokenName: "phone"})
-	if a := resolveAuthor(deps, p.ID, "x", "🦊"); a.Name != "phone" || a.Avatar != "🦊" {
-		t.Fatalf("no registered avatar: got %+v", a)
-	}
-	deps.peers.SetAvatar(p.ID, "data:image/png;base64,AA")
-	if a := resolveAuthor(deps, p.ID, "x", "🦊"); a.Avatar != "data:image/png;base64,AA" {
-		t.Fatalf("registered avatar should win: got %+v", a)
-	}
-}
-
 // A remote connection browses only inside projects open here, and can't remove one it doesn't know.
 func TestRemoteScope_ProjectBoundaries(t *testing.T) {
 	deps := newTestDeps(t)

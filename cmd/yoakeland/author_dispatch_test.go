@@ -11,11 +11,11 @@ import (
 	"yoakeland/internal/provider"
 )
 
-// A prompt's declared sender has to reach the stored message and come back out
-// through session_history, since that's the only path a repainted transcript
-// has for an avatar: it exists nowhere but the sending client's own settings.
+// A prompt's sender is the person behind the connection (the owner, on the local socket): the
+// message stores their id and name, and session_history gives their current picture in profiles.
 func TestServeConnection_PromptAuthorRoundTripsThroughHistory(t *testing.T) {
 	deps := newTestDeps(t)
+	deps.settings.SeedOwnerProfile("aveline", "🐣")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -33,7 +33,7 @@ func TestServeConnection_PromptAuthorRoundTripsThroughHistory(t *testing.T) {
 	})
 	promptLine := envelopeJSON(t, protocol.EventUserPrompt, protocol.UserPromptData{
 		Prompt: "who am i", SessionID: "session-author",
-		AuthorName: "aveline", AuthorAvatar: "🐣",
+		AuthorName: "someone else", AuthorAvatar: "🦊", // what the client says about itself doesn't count
 	})
 	runDispatchWaiting(t, deps, registerLine, setLine, promptLine)
 
@@ -50,18 +50,21 @@ func TestServeConnection_PromptAuthorRoundTripsThroughHistory(t *testing.T) {
 		t.Fatalf("session_history came back with no messages")
 	}
 	first := data.Messages[0]
-	if first.Role != "user" || first.Author != "aveline" || first.AuthorAvatar != "🐣" {
-		t.Fatalf("first history message = %+v, want the sender's name and avatar", first)
+	if first.Role != "user" || first.Author != "aveline" || first.AuthorID != ownerID || first.AuthorAvatar != "" {
+		t.Fatalf("first history message = %+v, want the owner's id and name and no stored avatar", first)
+	}
+	if p := data.Profiles[ownerID]; p.Name != "aveline" || p.Avatar != "🐣" || len(data.Profiles) != 1 {
+		t.Fatalf("profiles = %+v, want the owner once, with their current picture", data.Profiles)
 	}
 	for _, m := range data.Messages[1:] {
-		if m.Author != "" || m.AuthorAvatar != "" {
+		if m.Author != "" || m.AuthorAvatar != "" || m.AuthorID != "" {
 			t.Fatalf("assistant/tool message carries an author: %+v", m)
 		}
 	}
 }
 
-// An oversized avatar is cosmetic, so it's dropped rather than failing the
-// prompt — the message is still stored, just without a picture.
+// A picture a client sends with a prompt is never stored (oversized or not), and it doesn't fail
+// the prompt: the message is still stored with the sender's id and name.
 func TestServeConnection_OversizedPromptAvatarIsDroppedNotRejected(t *testing.T) {
 	deps := newTestDeps(t)
 	pc, err := deps.projects.Get(deps.defaultProjectRoot)
@@ -116,7 +119,7 @@ func TestServeConnection_OversizedPromptAvatarIsDroppedNotRejected(t *testing.T)
 	if user.AuthorName != "aveline" {
 		t.Fatalf("author name = %q, want it kept", user.AuthorName)
 	}
-	if user.AuthorAvatar != "" {
-		t.Fatalf("oversized avatar was stored (%d bytes), want it dropped", len(user.AuthorAvatar))
+	if user.AuthorAvatar != "" || user.AuthorID != ownerID {
+		t.Fatalf("stored author = %q/%d bytes of avatar, want the owner and no avatar", user.AuthorID, len(user.AuthorAvatar))
 	}
 }
