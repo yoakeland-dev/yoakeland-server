@@ -84,7 +84,9 @@ func (s *ServerSettings) SeedOwnerProfile(name, avatar string) {
 		u.Name, changed = name, true
 	}
 	if u.Avatar == "" && avatar != "" && len(avatar) <= maxAvatarLen {
-		u.Avatar, changed = avatar, true
+		if a, err := s.storeAvatarLocked(avatar); err == nil {
+			u.Avatar, changed = a, true
+		}
 	}
 	if changed {
 		s.Users[ownerID] = u
@@ -425,7 +427,11 @@ func (s *ServerSettings) SetProfile(userID string, name, avatar *string) (protoc
 		if len(*avatar) > maxAvatarLen {
 			return protocol.ProfileInfo{}, fmt.Errorf("avatar too large")
 		}
-		u.Avatar = *avatar
+		a, err := s.storeAvatarLocked(*avatar)
+		if err != nil {
+			return protocol.ProfileInfo{}, err
+		}
+		u.Avatar = a
 	}
 	s.Users[u.ID] = u
 	if err := s.save(); err != nil {
@@ -438,4 +444,44 @@ func (s *ServerSettings) SetProfile(userID string, name, avatar *string) (protoc
 func (s *ServerSettings) Profile(id string) (protocol.ProfileInfo, bool) {
 	u, ok := s.ResolveUser(id)
 	return protocol.ProfileInfo{ID: u.ID, Name: u.Name, Avatar: u.Avatar}, ok
+}
+
+// storeAvatarLocked puts a picture into the upload bucket and returns the avatar value that
+// names it; an emoji, or anything while no bucket is attached, is kept as given.
+func (s *ServerSettings) storeAvatarLocked(a string) (string, error) {
+	return s.avatars.PutAvatar(a)
+}
+
+// UseAvatarStore attaches the upload bucket and moves every picture still stored as a data URL
+// into it, once and idempotently. A picture that can't be stored stays as it is.
+func (s *ServerSettings) UseAvatarStore(u *UploadStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.avatars = u
+	changed := false
+	for id, usr := range s.Users {
+		if !strings.HasPrefix(usr.Avatar, "data:") {
+			continue
+		}
+		if a, err := u.PutAvatar(usr.Avatar); err == nil && a != usr.Avatar {
+			usr.Avatar = a
+			s.Users[id], changed = usr, true
+		}
+	}
+	if changed {
+		_ = s.save()
+	}
+}
+
+// AvatarHashes are the bucket hashes people's avatars name, so pruning keeps them.
+func (s *ServerSettings) AvatarHashes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, u := range s.Users {
+		if h := avatarHash(u.Avatar); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }

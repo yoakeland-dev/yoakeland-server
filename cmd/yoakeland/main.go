@@ -268,10 +268,11 @@ func main() {
 	hub := newStatusHub(peers, stateDir)
 	projects.SetStatusHub(hub)
 	projects.SetDefaultSource(defaultProviderSource(settings, providerStore, hub))
-	uploads, err := NewUploadStore(stateDir, uploadRetention(settings.Runtime()))
+	uploads, err := newUploadStore(stateDir, settings.AvatarHashes, uploadRetention(settings.Runtime()))
 	if err != nil {
 		logFatal("failed to initialize upload store: %v", err)
 	}
+	settings.UseAvatarStore(uploads)
 	// Canonical like Hidden: attachments are compared with symlinks resolved.
 	if canon, err := normalizer.CanonicalRoot(uploads.dir); err == nil {
 		normalizer.Uploads = canon

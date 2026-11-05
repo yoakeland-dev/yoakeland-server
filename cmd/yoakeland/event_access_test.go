@@ -33,7 +33,7 @@ func tierMay(tier string, t protocol.EventType) bool {
 // can send and must have a row in eventAccess. Adding a constant fails this test until it is
 // listed here or in the table.
 var outboundEvents = map[string]bool{
-	"side_answer": true, "message_summary": true, "steer_accepted": true, "steer_rejected": true,
+	"side_answer": true, "avatar_data": true, "message_summary": true, "steer_accepted": true, "steer_rejected": true,
 	"schedule_list": true, "schedule_fired": true, "limit_action": true, "chat_files_imported": true,
 	"user_message": true, "browser_request": true, "browser_frame": true, "browser_state": true,
 	"mcp_servers": true, "mcp_oauth_url": true, "mcp_import_candidates": true, "skills": true, "skill_detail": true,

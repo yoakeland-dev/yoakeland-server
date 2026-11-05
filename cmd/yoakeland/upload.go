@@ -59,6 +59,9 @@ type UploadStore struct {
 	pending   map[string]*pendingUpload // peerID + "/" + uploadID
 	retention time.Duration             // 0 keeps everything
 	touched   map[string]time.Time      // sha -> last mtime bump, throttles Touch
+	// refs names content hashes kept alive by something other than a chat, such as a person's
+	// picture. Nil means none.
+	refs func() []string
 }
 
 type pendingUpload struct {
@@ -74,6 +77,12 @@ type pendingUpload struct {
 // (0 = keep forever) is the runtime setting; without one it defaults to
 // uploadMaxAge.
 func NewUploadStore(stateDir string, retention ...time.Duration) (*UploadStore, error) {
+	return newUploadStore(stateDir, nil, retention...)
+}
+
+// newUploadStore is NewUploadStore with refs set before the first prune, so what refs names
+// survives that prune too.
+func newUploadStore(stateDir string, refs func() []string, retention ...time.Duration) (*UploadStore, error) {
 	dir := filepath.Join(stateDir, "uploads")
 	// Any .tmp left behind belongs to a connection from a previous process.
 	_ = os.RemoveAll(filepath.Join(dir, ".tmp"))
@@ -89,6 +98,7 @@ func NewUploadStore(stateDir string, retention ...time.Duration) (*UploadStore, 
 		pending:   make(map[string]*pendingUpload),
 		retention: uploadMaxAge,
 		touched:   make(map[string]time.Time),
+		refs:      refs,
 	}
 	if len(retention) > 0 {
 		s.retention = retention[0]
@@ -203,6 +213,11 @@ func (s *UploadStore) referenced() (out map[string]bool, ok bool) {
 		}
 		return nil
 	})
+	if ok && s.refs != nil {
+		for _, h := range s.refs() {
+			out[h] = true
+		}
+	}
 	return out, ok
 }
 

@@ -102,6 +102,9 @@ type ServerSettings struct {
 	// may change only their own.
 	ProviderOwners map[string]string `json:"providerOwners,omitempty"`
 
+	// avatars holds the pictures people's avatars name; nil keeps them as data URLs.
+	avatars *UploadStore
+
 	// ServerID is a stable identifier minted once, the first time this
 	// -state-dir is ever used, and never changed or exposed via any setter
 	// — unlike Identity (a mutable display name), its only value is that it
@@ -459,7 +462,8 @@ func (s *ServerSettings) newUserLocked(name, email, avatar, tier, createdBy stri
 
 // migrate brings an older server.json up to date, idempotently, and reports whether it changed
 // anything: expired pairing tokens go, the owner exists, and every credential without a person
-// gets its own (limited if it was restricted, else full). Token values are never touched.
+// gets its own (limited if it was restricted, else full), except the original default token, which
+// is the owner's. Token values are never touched.
 func (s *ServerSettings) migrate() bool {
 	changed := s.purgeExpiredLocked()
 	if s.Users == nil {
@@ -472,6 +476,19 @@ func (s *ServerSettings) migrate() bool {
 	for n, r := range s.Tokens {
 		if r.UserID != "" && r.Scope == "" {
 			continue
+		}
+		if r.UserID == "" && n == defaultTokenName && !r.legacyRestricted() {
+			// The original single token is the owner's own: from before there were people,
+			// whoever held it was acting as them.
+			r.UserID = ownerID
+			o := s.Users[ownerID]
+			if o.Email == "" {
+				o.Email = r.Email
+			}
+			if o.Avatar == "" && len(r.Avatar) <= maxAvatarLen {
+				o.Avatar = r.Avatar
+			}
+			s.Users[ownerID] = o
 		}
 		if r.UserID == "" {
 			tier := TierFull

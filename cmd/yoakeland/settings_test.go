@@ -291,7 +291,7 @@ func TestServerSettings_MigratesToUsers(t *testing.T) {
 	if _, ok := s.Tokens["stale"]; ok {
 		t.Fatal("an expired pairing token survived the load")
 	}
-	want := map[string]string{"alice": TierFull, "default": TierFull, "phone": TierLimited, "promoted": TierFull, "demoted": TierLimited, "fresh": TierLimited}
+	want := map[string]string{"alice": TierFull, "phone": TierLimited, "promoted": TierFull, "demoted": TierLimited, "fresh": TierLimited}
 	for name, tier := range want {
 		rec, ok := s.Tokens[name]
 		if !ok {
@@ -307,6 +307,9 @@ func TestServerSettings_MigratesToUsers(t *testing.T) {
 	}
 	if a := s.Users[s.Tokens["alice"].UserID]; a.Email != "a@x.io" || a.Avatar != "😀" {
 		t.Fatalf("alice's email and avatar didn't move to her user: %+v", a)
+	}
+	if s.Tokens["default"].UserID != ownerID {
+		t.Fatalf("the original default token should be the owner's, got %q", s.Tokens["default"].UserID)
 	}
 	if s.Tokens["alice"].Token != "ta" || s.Tokens["default"].Token != "legacy-secret" {
 		t.Fatal("a token value changed")
@@ -326,7 +329,7 @@ func TestServerSettings_MigratesToUsers(t *testing.T) {
 	if strings.Contains(string(raw), `"scope"`) {
 		t.Fatal("scope is still written to server.json")
 	}
-	if len(again.Users) != len(want)+1 {
+	if len(again.Users) != len(want)+1 { // credentials with a person of their own, plus the owner
 		t.Fatalf("users = %d, want %d (credentials + owner)", len(again.Users), len(want)+1)
 	}
 }

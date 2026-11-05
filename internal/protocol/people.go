@@ -15,6 +15,8 @@ const (
 	EventRemoveUser         EventType = "remove_user"
 	EventSetProfile         EventType = "set_profile"
 	EventProfileUpdated     EventType = "profile_updated"
+	EventGetAvatar          EventType = "get_avatar"
+	EventAvatarData         EventType = "avatar_data"
 )
 
 // ProfileInfo is a person as a chat shows them: a name and a picture (an emoji or a data URL).
@@ -110,4 +112,17 @@ type PeopleData struct {
 	LimitedDefaults map[string]any            `json:"limitedDefaults"`
 	TierDefaults    map[string]map[string]any `json:"tierDefaults"`
 	CLIProviders    []string                  `json:"cliProviders"`
+}
+
+// GetAvatarData is get_avatar: fetch the picture an "upload:<sha256>" avatar names.
+type GetAvatarData struct {
+	Avatar string `json:"avatar"`
+}
+
+// AvatarDataData is avatar_data, the reply: the same avatar value, and the picture as a data URL
+// (empty when the server has no such picture). A picture never changes under its hash, so a
+// client may keep it for good.
+type AvatarDataData struct {
+	Avatar string `json:"avatar"`
+	Data   string `json:"data,omitempty"`
 }

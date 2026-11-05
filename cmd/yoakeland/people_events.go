@@ -108,7 +108,7 @@ func handlePeopleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerI
 	case protocol.EventListPeople, protocol.EventSetUserPermissions, protocol.EventSetDeviceRestrict, protocol.EventSetLimitedDefaults,
 		protocol.EventMergeUsers, protocol.EventMoveDevice, protocol.EventRemoveUser,
 		protocol.EventRegisterToken, protocol.EventListTokens, protocol.EventRemoveToken, protocol.EventApprovePairing,
-		protocol.EventSetProfile:
+		protocol.EventSetProfile, protocol.EventGetAvatar:
 	default:
 		return false
 	}
@@ -128,6 +128,15 @@ func handlePeopleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerI
 	switch env.Type {
 	case protocol.EventListPeople:
 		_ = ipc.SendEvent(protocol.EventPeople, env.SessionID, env.TurnID, "", deps.peopleFor(acc))
+
+	case protocol.EventGetAvatar:
+		var d protocol.GetAvatarData
+		if json.Unmarshal(env.Data, &d) != nil || avatarHash(d.Avatar) == "" {
+			bad()
+			return true
+		}
+		data, _ := deps.uploads.AvatarDataURL(d.Avatar)
+		_ = ipc.SendEvent(protocol.EventAvatarData, env.SessionID, env.TurnID, "", protocol.AvatarDataData{Avatar: d.Avatar, Data: data})
 
 	case protocol.EventSetProfile:
 		// Your own person only, and only when asked: a device's name and picture never get here.
