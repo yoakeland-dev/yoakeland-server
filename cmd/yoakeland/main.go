@@ -658,11 +658,13 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	// A stranger presenting a wrong credential is what the audit log wants;
 	// one that just connects and goes away is not.
 	badCredential := false
+	var tried string
 	var tokenRec TokenRecord
 	if lookupToken != nil {
 		inner := lookupToken
 		lookupToken = func(token string) (string, TokenRecord, bool) {
 			name, rec, found := inner(token)
+			tried = token
 			badCredential = badCredential || !found
 			tokenRec = rec
 			return name, rec, found
@@ -690,7 +692,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if !ok {
 		if badCredential {
-			deps.recordAuthFail(remoteIP(conn, network), network, "unknown credential")
+			deps.recordAuthFailTried(remoteIP(conn, network), network, "unknown credential", &tried)
 		}
 		return
 	}

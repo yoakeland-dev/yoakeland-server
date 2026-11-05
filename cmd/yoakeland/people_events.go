@@ -410,8 +410,8 @@ func handleRegisterToken(ipc *protocol.IPCStream, deps connDeps, network, peerID
 	}
 	u, _ := deps.settings.ResolveUser(userID)
 	deps.record(ipc, peerID, audit.Event{Kind: audit.TokenAdd, Target: d.Name, Outcome: "ok", Detail: map[string]any{
-		"user": userID, "tier": u.Tier, "maxTier": c.MaxTier, "pairing": d.Pairing,
-	}}) // the name, never the token
+		"user": userID, "tier": u.Tier, "maxTier": c.MaxTier, "pairing": d.Pairing, "tokenFp": tokenFP(token),
+	}}) // the name and a fingerprint, never the token
 	deps.broadcastPeople()
 	// Best-effort: a client can still pair by pasting the CA separately (or doesn't need one at
 	// all, on an operator-supplied cert) if this fails.

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"slices"
 	"sync"
@@ -128,6 +130,19 @@ var authFails authFailLimiter
 // recordAuthFail logs a TCP client that was refused: a bad credential, or a pairing code that is
 // expired, used, declined or unanswered (reason says which).
 func (d connDeps) recordAuthFail(ip, network, reason string) {
+	d.recordAuthFailTried(ip, network, reason, nil)
+}
+
+// tokenFP is a short fingerprint of a credential, safe to log: enough to tell whether the token a
+// device presented is the one that was minted for it (compare with token_add's tokenFp), and not
+// enough to guess it.
+func tokenFP(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:4])
+}
+
+// recordAuthFailTried is recordAuthFail for a refused credential, noting what was presented.
+func (d connDeps) recordAuthFailTried(ip, network, reason string, tried *string) {
 	if d.audit == nil {
 		return
 	}
@@ -142,6 +157,9 @@ func (d connDeps) recordAuthFail(ip, network, reason string) {
 	}
 	if skipped > 0 {
 		detail["alsoRejected"] = skipped
+	}
+	if tried != nil {
+		detail["tokenLen"], detail["tokenFp"] = len(*tried), tokenFP(*tried)
 	}
 	if len(detail) > 0 {
 		e.Detail = detail
