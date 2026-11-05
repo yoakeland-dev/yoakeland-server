@@ -99,7 +99,11 @@ func (s *ServerSettings) TouchToken(name, deviceType, deviceName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if rec, ok := s.Tokens[name]; ok {
-		rec.LastSeen = time.Now().Unix()
+		now := time.Now().Unix()
+		// A bare touch (a disconnect) a moment after the last one isn't worth rewriting the file
+		// for; the new time is kept and written with the next change.
+		quiet := deviceType == "" && deviceName == "" && now-rec.LastSeen < touchSaveEvery
+		rec.LastSeen = now
 		if deviceType != "" {
 			rec.DeviceType = deviceType
 		}
@@ -107,9 +111,14 @@ func (s *ServerSettings) TouchToken(name, deviceType, deviceName string) {
 			rec.DeviceName = deviceName
 		}
 		s.Tokens[name] = rec
-		_ = s.save()
+		if !quiet {
+			_ = s.save()
+		}
 	}
 }
+
+// touchSaveEvery is how many seconds a bare TouchToken must be after the last before it saves.
+const touchSaveEvery = 60
 
 func (s *ServerSettings) userNameLocked(id string) string {
 	if u, ok := s.resolveUserLocked(id); ok {

@@ -36,6 +36,7 @@ func dialTLS(t *testing.T, addr string) net.Conn {
 // binding the literal default in a test would collide with a real server.
 func TestRemoteControl_StartStopTogglesListener(t *testing.T) {
 	deps := newTestDeps(t)
+	quiesceOnCleanup(t, deps)
 	rc := &remoteControl{addr: "127.0.0.1:0", stateDir: t.TempDir(), settings: deps.settings, deps: deps}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -75,6 +76,7 @@ func TestRemoteControl_StartStopTogglesListener(t *testing.T) {
 // restart (or a second Start) keeps using the same one.
 func TestRemoteControl_StartGeneratesAndPersistsToken(t *testing.T) {
 	deps := newTestDeps(t)
+	quiesceOnCleanup(t, deps)
 	rc := &remoteControl{addr: "127.0.0.1:0", stateDir: t.TempDir(), settings: deps.settings, deps: deps}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,6 +103,10 @@ func TestRemoteControl_StartGeneratesAndPersistsToken(t *testing.T) {
 	if _, err := conn.Write(append(raw, '\n')); err != nil {
 		t.Fatalf("write auth: %v", err)
 	}
+	// Don't end the test mid-handshake: wait until the server has taken the connection in.
+	for deadline := time.Now().Add(2 * time.Second); len(deps.peers.All()) == 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // TestRemoteControl_Stop_DropsAlreadyConnectedPeers guards SPEC.md's
@@ -111,6 +117,7 @@ func TestRemoteControl_StartGeneratesAndPersistsToken(t *testing.T) {
 // context being cancelled, so it stayed open indefinitely.
 func TestRemoteControl_Stop_DropsAlreadyConnectedPeers(t *testing.T) {
 	deps := newTestDeps(t)
+	quiesceOnCleanup(t, deps)
 	rc := &remoteControl{addr: "127.0.0.1:0", stateDir: t.TempDir(), settings: deps.settings, deps: deps}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,6 +174,7 @@ func TestRemoteControl_Stop_DropsAlreadyConnectedPeers(t *testing.T) {
 // real certificate-verifying handshake against it.
 func TestRemoteControl_AutoCA_ClientTrustsOnlyThatCA(t *testing.T) {
 	deps := newTestDeps(t)
+	quiesceOnCleanup(t, deps)
 	stateDir := t.TempDir()
 	rc := &remoteControl{addr: "127.0.0.1:0", stateDir: stateDir, settings: deps.settings, deps: deps}
 
@@ -225,4 +233,18 @@ func TestServeAccepted_DropsSilentUnauthenticatedConn(t *testing.T) {
 	if n := len(preAuthSlots); n != 0 {
 		t.Fatalf("%d pre-auth slots still held", n)
 	}
+}
+
+// quiesceOnCleanup waits, when the test ends, for the connection handlers it started to finish.
+// A handler records the device's last-seen time as it exits, which writes server.json, and that
+// must not land in a temp directory the test framework is already deleting. Registered first, so
+// it runs after the test's own cleanups (which stop the listener) and before the directories go.
+func quiesceOnCleanup(t *testing.T, deps connDeps) {
+	t.Helper()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for len(deps.peers.All()) > 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
 }
