@@ -152,3 +152,21 @@ func TestSessionEventsReachOnlyThoseWhoMaySeeTheChat(t *testing.T) {
 		t.Error("others_chats didn't let the chat's events through")
 	}
 }
+
+// A registry nobody wired a visibility check into tells a TCP peer nothing about any chat.
+func TestSessionEventsFailClosedWithoutACheck(t *testing.T) {
+	peers := NewPeerRegistry()
+	var tcpOut, localOut syncBuf
+	peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &tcpOut), nopCloser{}, "tcp", peerIdentity{Name: "p", TokenName: "c", Tier: TierLimited})
+	peers.Add(protocol.NewIPCStream(bytes.NewBuffer(nil), &localOut), nopCloser{}, "unix", peerIdentity{Name: "pc"})
+	tcpOut.Reset()
+	localOut.Reset()
+	peers.BroadcastEvent("", protocol.EventSessionUpdated, "s1", protocol.SessionSummary{SessionID: "s1"})
+	peers.BroadcastEvent("", protocol.EventPendingAsks, "", protocol.PendingAsksData{Asks: []protocol.PendingAsk{{SessionID: "s1", ToolCallID: "tc"}}})
+	if strings.Contains(tcpOut.String(), "s1") || strings.Contains(tcpOut.String(), "tc") {
+		t.Errorf("a peer was told about a chat: %s", tcpOut.String())
+	}
+	if !strings.Contains(localOut.String(), "session_updated") || !strings.Contains(localOut.String(), `"toolCallId":"tc"`) {
+		t.Errorf("the local socket missed events: %s", localOut.String())
+	}
+}

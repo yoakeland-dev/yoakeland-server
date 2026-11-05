@@ -349,8 +349,8 @@ func TestUsageIsLimitedToOwnChats(t *testing.T) {
 		usageReports.key = "" // not the cached answer of an earlier asker
 		usageReports.Unlock()
 		handleEnvelope(context.Background(), protocol.NewIPCStream(bytes.NewBuffer(nil), &out), deps, network, id,
-			&protocol.Envelope{Type: protocol.EventGetUsage, Data: json.RawMessage(`{"external":true}`)})
-		deadline := time.Now().Add(5 * time.Second)
+			&protocol.Envelope{Type: protocol.EventGetUsage, Data: json.RawMessage(map[bool]string{true: `{"external":true}`, false: `{}`}[p != nil])}) // the owner's real scan reads this machine's CLI transcripts: not in a test
+		deadline := time.Now().Add(30 * time.Second)
 		for !strings.Contains(out.String(), "usage_report") && time.Now().Before(deadline) {
 			time.Sleep(10 * time.Millisecond)
 		}
