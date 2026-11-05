@@ -46,7 +46,7 @@ func turnPolicyFor(acc Access) *agent.TurnPolicy {
 	return &agent.TurnPolicy{
 		Commands: acc.Caps.CommandsSandboxed, Unsandboxed: acc.Caps.CommandsUnsandboxed, Autonomous: acc.Caps.Autonomous,
 		FilesEdit: acc.Caps.FilesEdit, MCP: acc.Caps.MCPTools, Browser: acc.Caps.Browser == browserUse,
-		AllowCLI: acc.Caps.AllowCLI, UserID: acc.UserID,
+		AllowCLI: acc.Caps.AllowCLI, UserID: acc.UserID, OthersChats: acc.Caps.OthersChats,
 	}
 }
 

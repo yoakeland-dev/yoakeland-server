@@ -32,7 +32,7 @@ func startScheduler(ctx context.Context, deps connDeps) {
 		// Everyone below Full sees only the schedules they armed.
 		all := deps.sched.List("")
 		for _, p := range deps.peers.All() {
-			_ = p.ipc.SendEvent(protocol.EventScheduleList, "", "", "", visibleSchedules(all, deps.accessFor(p.Network, p.ID)))
+			_ = p.ipc.SendEvent(protocol.EventScheduleList, "", "", "", visibleSchedules(deps, all, deps.accessFor(p.Network, p.ID)))
 		}
 	}
 	deps.sched.Blocked = func(t protocol.ScheduledTurn) bool { return scheduleBlocked(deps, t) }
@@ -112,11 +112,21 @@ func limitsSpent(rl protocol.ProviderRateLimits, now time.Time) bool {
 }
 
 // visibleSchedules is the schedule list as acc may see it: everything for Full and the owner, else
-// only the entries they armed. An entry from before users belongs to the owner.
-func visibleSchedules(list protocol.ScheduleListData, acc Access) protocol.ScheduleListData {
+// only the entries they armed. An entry from before users belongs to the owner. The chats stopped
+// at a usage limit are listed only for the chats acc may see, and without whose credential started
+// the turn.
+func visibleSchedules(deps connDeps, list protocol.ScheduleListData, acc Access) protocol.ScheduleListData {
 	if acc.Full() {
 		return list
 	}
+	hits := make([]protocol.LimitHit, 0, len(list.LimitHits))
+	for _, h := range list.LimitHits {
+		if deps.mayViewChat(acc, h.SessionID) {
+			h.Credential = ""
+			hits = append(hits, h)
+		}
+	}
+	list.LimitHits = hits
 	mine := make([]protocol.ScheduledTurn, 0, len(list.Schedules))
 	for _, t := range list.Schedules {
 		if t.CreatorUserID != "" && t.CreatorUserID == acc.UserID {
@@ -155,12 +165,17 @@ func handleScheduleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, pee
 		if d.SessionID == "" {
 			d.SessionID = env.SessionID
 		}
+		// The turn it starts is a message in that chat: only its owner may add one.
+		if !ownsChat(deps, acc, d.SessionID, d.ProjectPath) {
+			fail("schedule_turn isn't allowed for this person: it isn't their chat")
+			return true
+		}
 		who := deps.actorOf(network, peerID)
 		_, err = deps.sched.AddAs(d, who.UserID, who.Credential)
 	case protocol.EventListScheduled:
 		var d protocol.ListScheduledData
 		_ = json.Unmarshal(env.Data, &d)
-		_ = ipc.SendEvent(protocol.EventScheduleList, d.SessionID, env.TurnID, "", visibleSchedules(deps.sched.List(d.SessionID), acc))
+		_ = ipc.SendEvent(protocol.EventScheduleList, d.SessionID, env.TurnID, "", visibleSchedules(deps, deps.sched.List(d.SessionID), acc))
 		return true
 	case protocol.EventCancelScheduled:
 		var d protocol.CancelScheduledData

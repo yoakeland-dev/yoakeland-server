@@ -166,6 +166,21 @@ func (r *ProjectRegistry) ownerOfSession(sessionID string) (owner string, ok boo
 	return "", false
 }
 
+// same reports whether the user ids a and b are one person; without settings wired in, only
+// equal ids are.
+func (r *ProjectRegistry) same(a, b string) bool {
+	if r == nil {
+		return a == b
+	}
+	r.mu.Lock()
+	f := r.sameUser
+	r.mu.Unlock()
+	if f == nil {
+		return a == b
+	}
+	return f(a, b)
+}
+
 // SameUser reports whether the user ids a and b are one person, following merges. A person who no
 // longer exists is only themselves.
 func (s *ServerSettings) SameUser(a, b string) bool {

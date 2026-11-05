@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"yoakeland/internal/agent"
 	"yoakeland/internal/projectstore"
@@ -260,14 +261,12 @@ func TestChatOwnershipEdgeCases(t *testing.T) {
 func TestOwnTurnsAreControlledByThePerson(t *testing.T) {
 	deps, _, root := policyDeps(t)
 	var phoneOut, pcOut, otherOut syncBuf
-	phone := addDeviceOf(t, deps, deps.settings.Users[ownerID].ID, TierLimited, &phoneOut)
-	pc := addDeviceOf(t, deps, ownerID, "", &pcOut)
-	if accP := deps.accessFor("tcp", phone.ID); accP.Full() || accP.UserID != ownerID {
-		t.Fatalf("the phone is %+v", accP)
-	}
-	// A real person on both devices (not the owner), so the chat isn't the owner's by default.
 	alice := addPerson(t, deps, TierFull)
 	phone2 := addDeviceOf(t, deps, alice.UserID, TierLimited, &phoneOut)
+	desktop := addDeviceOf(t, deps, alice.UserID, "", &pcOut)
+	if deps.accessFor("tcp", phone2.ID).Full() || !deps.accessFor("tcp", desktop.ID).Full() {
+		t.Fatal("the phone should be Limited and the desktop Full")
+	}
 	other := addPersonOn(t, deps, TierLimited, "", protocol.NewIPCStream(bytes.NewBuffer(nil), &otherOut))
 
 	sendAs(t, deps, phone2, envOf(protocol.EventUserPrompt, "s1", protocol.UserPromptData{Prompt: "go", SessionID: "s1", ProjectPath: root}))
@@ -288,11 +287,179 @@ func TestOwnTurnsAreControlledByThePerson(t *testing.T) {
 		if out := sendAs(t, deps, other, e); !notTheirChat(out) {
 			t.Errorf("%s: another person was allowed: %q", e.Type, out)
 		}
-		for name, p := range map[string]*Peer{"the Limited phone": phone2, "the person's Full desktop": addDeviceOf(t, deps, alice.UserID, "", &pcOut)} {
+		for name, p := range map[string]*Peer{"the Limited phone": phone2, "the person's Full desktop": desktop} {
 			if out := sendAs(t, deps, p, e); notTheirChat(out) {
 				t.Errorf("%s: %s was refused: %q", e.Type, name, out)
 			}
 		}
 	}
-	_ = pc
+}
+
+func hasSession(out, id string) bool { return strings.Contains(out, `"sessionId":"`+id+`"`) }
+
+// list_sessions holds only the sender's own chats, in a project and among the project-less chats.
+func TestListSessionsIsFilteredToOwnChats(t *testing.T) {
+	deps, _, root := policyDeps(t)
+	a := addPerson(t, deps, TierLimited)
+	sendAs(t, deps, nil, envOf(protocol.EventUserPrompt, "s-o", protocol.UserPromptData{Prompt: "hi", SessionID: "s-o", ProjectPath: root}))
+	sendAs(t, deps, a, envOf(protocol.EventUserPrompt, "s-a", protocol.UserPromptData{Prompt: "hi", SessionID: "s-a", ProjectPath: root}))
+	sendAs(t, deps, nil, envOf(protocol.EventUserPrompt, "c-o", protocol.UserPromptData{Prompt: "hi", SessionID: "c-o", ProjectPath: protocol.ChatProject}))
+	sendAs(t, deps, a, envOf(protocol.EventUserPrompt, "c-a", protocol.UserPromptData{Prompt: "hi", SessionID: "c-a", ProjectPath: protocol.ChatProject}))
+
+	for _, project := range []string{root, protocol.ChatProject} {
+		mine, theirs := "s-a", "s-o"
+		if project == protocol.ChatProject {
+			mine, theirs = "c-a", "c-o"
+		}
+		got := sendAs(t, deps, a, envOf(protocol.EventListSessions, "", protocol.ListSessionsData{ProjectPath: project}))
+		if !hasSession(got, mine) || hasSession(got, theirs) {
+			t.Errorf("%s: a Limited person's list = %s", project, got)
+		}
+		all := sendAs(t, deps, nil, envOf(protocol.EventListSessions, "", protocol.ListSessionsData{ProjectPath: project}))
+		if !hasSession(all, mine) || !hasSession(all, theirs) {
+			t.Errorf("%s: the owner's list = %s", project, all)
+		}
+	}
+}
+
+// get_usage counts a Limited person's own chats only, never the deleted chats' totals or other
+// tools' transcripts; Trusted and Full count everyone's.
+func TestUsageIsLimitedToOwnChats(t *testing.T) {
+	deps, _, root := policyDeps(t)
+	a := addPerson(t, deps, TierLimited)
+	trusted := addPerson(t, deps, TierTrusted)
+	store := projectStore(t, deps)
+	spend := func(id, owner string, usd float64) {
+		msg := agent.Message{ID: "m2", Role: "assistant", Provider: "p", Model: "m", CreatedAt: time.Now(), Usage: &protocol.UsageData{InputTokens: 10, OutputTokens: 5, CostUSD: usd}}
+		if err := store.Save(&agent.SessionState{SessionID: id, OwnerID: owner, CreatedAt: time.Now(), History: []agent.Message{msg}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spend("u-a", a.UserID, 1)
+	spend("u-o", "", 5) // no owner on the file: the owner's
+	_ = root
+
+	total := func(p *Peer) float64 {
+		var out syncBuf
+		network, id := "unix", ""
+		if p != nil {
+			network, id = "tcp", p.ID
+		}
+		usageReports.Lock()
+		usageReports.key = "" // not the cached answer of an earlier asker
+		usageReports.Unlock()
+		handleEnvelope(context.Background(), protocol.NewIPCStream(bytes.NewBuffer(nil), &out), deps, network, id,
+			&protocol.Envelope{Type: protocol.EventGetUsage, Data: json.RawMessage(`{"external":true}`)})
+		deadline := time.Now().Add(5 * time.Second)
+		for !strings.Contains(out.String(), "usage_report") && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		var env protocol.Envelope
+		if err := json.Unmarshal([]byte(strings.TrimSpace(strings.SplitN(out.String(), "\n", 2)[0])), &env); err != nil {
+			t.Fatalf("no usage report: %q", out.String())
+		}
+		var rep protocol.UsageReportData
+		_ = json.Unmarshal(env.Data, &rep)
+		sum := 0.0
+		for _, r := range rep.Rows {
+			sum += r.CostUSD
+		}
+		return sum
+	}
+	if got := total(a); got != 1 {
+		t.Errorf("a Limited person's spend = %v, want 1", got)
+	}
+	if got := total(trusted); got != 6 {
+		t.Errorf("a Trusted person's spend = %v, want 6", got)
+	}
+	if got := total(nil); got != 6 {
+		t.Errorf("the owner's spend = %v, want 6", got)
+	}
+}
+
+// An attachment is read only through its own chat; project media by path stays open to anyone who
+// can read the project.
+func TestReadMediaChecksTheAttachmentsChat(t *testing.T) {
+	deps, _, root := policyDeps(t)
+	a := addPerson(t, deps, TierLimited)
+	pic := filepath.Join(root, "pic.png")
+	if err := os.WriteFile(pic, []byte("\x89PNG\r\n\x1a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sendAs(t, deps, nil, envOf(protocol.EventUserPrompt, "s-o", protocol.UserPromptData{Prompt: "see", SessionID: "s-o", ProjectPath: root, Attachments: []string{pic}}))
+
+	read := func(p *Peer, typ protocol.EventType, path, session string) string {
+		return sendAs(t, deps, p, envOf(typ, "", map[string]any{"requestId": "r", "projectPath": root, "path": path, "sessionId": session}))
+	}
+	for _, typ := range []protocol.EventType{protocol.EventReadMedia, protocol.EventReadMediaChunk} {
+		if out := read(nil, typ, pic, "s-o"); strings.Contains(out, `"error":"`) {
+			t.Errorf("%s: the chat's owner was refused: %s", typ, out)
+		}
+		if out := read(a, typ, pic, "s-o"); !strings.Contains(out, "isn't this person's") {
+			t.Errorf("%s: someone else read an attachment: %s", typ, out)
+		}
+		if out := read(a, typ, "pic.png", ""); strings.Contains(out, `"error":"`) {
+			t.Errorf("%s: project media by path was refused: %s", typ, out)
+		}
+	}
+}
+
+// Usage-limit cards list only the chats the viewer may see, and never whose credential started the turn.
+func TestLimitHitsInTheScheduleAreFiltered(t *testing.T) {
+	deps, _, root := policyDeps(t)
+	a := addPerson(t, deps, TierTrusted)
+	sendAs(t, deps, nil, envOf(protocol.EventUserPrompt, "s-o", protocol.UserPromptData{Prompt: "hi", SessionID: "s-o", ProjectPath: root}))
+	sendAs(t, deps, a, envOf(protocol.EventUserPrompt, "s-a", protocol.UserPromptData{Prompt: "hi", SessionID: "s-a", ProjectPath: root}))
+	deps.sched.SetHit(protocol.LimitHit{SessionID: "s-o", Credential: "owner-phone"}, true)
+	deps.sched.SetHit(protocol.LimitHit{SessionID: "s-a", Credential: "a-phone"}, true)
+
+	got := visibleSchedules(deps, deps.sched.List(""), deps.accessFor("tcp", a.ID))
+	if len(got.LimitHits) != 1 || got.LimitHits[0].SessionID != "s-a" || got.LimitHits[0].Credential != "" {
+		t.Errorf("a Trusted person sees %+v", got.LimitHits)
+	}
+	if all := visibleSchedules(deps, deps.sched.List(""), localAccess()); len(all.LimitHits) != 2 {
+		t.Errorf("the owner sees %+v", all.LimitHits)
+	}
+	// And the schedule itself can't put a message in someone else's chat.
+	out := sendAs(t, deps, a, envOf(protocol.EventScheduleTurn, "", protocol.ScheduleTurnData{SessionID: "s-o", ProjectPath: root, Text: "x", Trigger: protocol.ScheduleTrigger{Kind: protocol.TriggerNow}}))
+	if !notTheirChat(out) {
+		t.Errorf("schedule_turn into someone else's chat: %q", out)
+	}
+}
+
+// read_chat reads another chat only for the person who owns it (or with others_chats); the
+// owner's own turns read anything in the project.
+func TestReadChatFollowsThePolicysUser(t *testing.T) {
+	deps, _, root := policyDeps(t)
+	a := addPerson(t, deps, TierLimited)
+	b := addPerson(t, deps, TierLimited)
+	sendAs(t, deps, nil, envOf(protocol.EventUserPrompt, "s-o", protocol.UserPromptData{Prompt: "secret plan", SessionID: "s-o", ProjectPath: root}))
+	sendAs(t, deps, a, envOf(protocol.EventUserPrompt, "s-a", protocol.UserPromptData{Prompt: "my notes", SessionID: "s-a", ProjectPath: root}))
+	pc, _ := deps.projects.Get(root)
+
+	read := func(ctx context.Context, id string) error {
+		_, _, err := pc.chats.ReadChat(ctx, id)
+		return err
+	}
+	policyOf := func(p *Peer) context.Context {
+		return agent.WithTurnPolicy(context.Background(), turnPolicyFor(deps.accessFor("tcp", p.ID)))
+	}
+	if err := read(policyOf(a), "s-a"); err != nil {
+		t.Errorf("a person can't read their own chat: %v", err)
+	}
+	if err := read(policyOf(a), "s-o"); err == nil {
+		t.Error("a Limited person's agent read the owner's chat")
+	}
+	if err := read(policyOf(b), "s-a"); err == nil {
+		t.Error("a Limited person's agent read another person's chat")
+	}
+	if err := read(context.Background(), "s-o"); err != nil {
+		t.Errorf("the owner's turn can't read: %v", err)
+	}
+	if err := read(agent.WithTurnPolicy(context.Background(), &agent.TurnPolicy{UserID: b.UserID, OthersChats: true}), "s-o"); err != nil {
+		t.Errorf("others_chats should read: %v", err)
+	}
+	if err := read(agent.WithTurnPolicy(context.Background(), &agent.TurnPolicy{}), "s-a"); err == nil {
+		t.Error("a policy with no person read a chat")
+	}
 }

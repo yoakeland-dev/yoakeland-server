@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,15 +49,28 @@ type ProjectContext struct {
 	Permissions *permission.Engine
 	// MCP runs the project's MCP servers; nil when MCP could not be opened.
 	MCP *mcp.Manager
+
+	chats *chatReader
 }
 
-// chatReader lets the read_chat tool read the project's other sessions.
-type chatReader struct{ store agent.SessionStore }
+// chatReader lets the read_chat tool read the project's other sessions, as the person whose turn
+// asks: one started by someone below Full reads only their own chats (the policy's UserID), unless
+// they have the others_chats cap.
+type chatReader struct {
+	store agent.SessionStore
+	// reg says whether two user ids are one person (ProjectRegistry.sameUser).
+	reg *ProjectRegistry
+}
 
-func (r chatReader) ReadChat(id string) (string, []tool.ChatTurn, error) {
+func (r *chatReader) ReadChat(ctx context.Context, id string) (string, []tool.ChatTurn, error) {
 	st, err := r.store.Load(id)
 	if err != nil {
 		return "", nil, err
+	}
+	if p := agent.TurnPolicyFrom(ctx); p != nil && !p.OthersChats {
+		if p.UserID == "" || !r.reg.same(stateOwner(st), p.UserID) {
+			return "", nil, fmt.Errorf("not this person's chat")
+		}
 	}
 	var turns []tool.ChatTurn
 	for _, m := range st.History {
@@ -72,6 +86,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 	if err != nil {
 		return nil, fmt.Errorf("normalizer: %w", err)
 	}
+	chats := &chatReader{}
 
 	// The folder name is a hash; this says which project it is.
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
@@ -99,6 +114,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		return nil, fmt.Errorf("session store: %w", err)
 	}
 
+	chats.store = sessStore
 	sb := sandbox.NewSandbox(norm.ProjectRoot, 60*time.Second)
 	if sb.Mode() == sandbox.ModeLocalRestr {
 		logWarnDetail(
@@ -127,7 +143,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		tool.NewTerminalOutputTool(terminals),
 		tool.NewTerminalStopTool(terminals),
 		tool.NewBrowserTool(browser),
-		tool.NewReadChatTool(chatReader{sessStore}),
+		tool.NewReadChatTool(chats),
 		tool.NewArtifactLogsTool(artifact.Default),
 	}
 	braveKey := os.Getenv("BRAVE_API_KEY")
@@ -167,6 +183,7 @@ func newProjectContext(root, dataDir string, defaultProvider agent.ModelProvider
 		SettingsStore: settingsStore,
 		Terminals:     terminals,
 		Permissions:   permEngine,
+		chats:         chats,
 	}
 	pc.applyShellPolicy(disableBashUnsandboxed)
 	return pc, nil
@@ -371,6 +388,7 @@ type ProjectRegistry struct {
 	projects            map[string]*ProjectContext // key: canonicalized project root
 	sessionProject      map[string]string          // sessionID -> project key
 	owners              map[string]string          // sessionID -> the user who owns the chat (chat_access.go)
+	sameUser            func(a, b string) bool     // whether two user ids are one person (set by main); nil: equal ids
 	defaultProvider     agent.ModelProvider
 	defaultProviderName string
 	// limits is the one soft round/spend limit holder every project's sessions
@@ -760,6 +778,7 @@ func (r *ProjectRegistry) Get(root string) (*ProjectContext, error) {
 		pc.Registry.SetNativeServers(r.browserMCP.serversFor)
 	}
 	pc.Permissions.SetGlobal(permission.OpenGlobal(r.stateDir))
+	pc.chats.reg = r
 	r.projects[key] = pc
 	r.installLocked(pc)
 	pc.Registry.SetChat(r.isChat(key))
@@ -1075,7 +1094,10 @@ func (r *ProjectRegistry) chatRoot(sessionID string) (string, error) {
 
 // ListChats is every project-less chat's session, read straight from disk so
 // listing doesn't open a ProjectContext per chat.
-func (r *ProjectRegistry) ListChats() []protocol.SessionSummary {
+func (r *ProjectRegistry) ListChats() []protocol.SessionSummary { return r.ListChatsWhere(nil) }
+
+// ListChatsWhere is ListChats leaving out the chats whose owner keep refuses (nil keeps all).
+func (r *ProjectRegistry) ListChatsWhere(keep func(owner string) bool) []protocol.SessionSummary {
 	entries, _ := os.ReadDir(r.chatsDir)
 	out := []protocol.SessionSummary{}
 	for _, e := range entries {
@@ -1096,6 +1118,10 @@ func (r *ProjectRegistry) ListChats() []protocol.SessionSummary {
 			if err != nil {
 				// Left out of the list, so the chat vanishes from every client: say why.
 				logWarn("list chats: skipping unreadable session %s in %s: %v", id, e.Name(), err)
+				continue
+			}
+			r.rememberOwner(id, stateOwner(st))
+			if keep != nil && !keep(stateOwner(st)) {
 				continue
 			}
 			sum := sessionSummaryFrom(filepath.Join(r.chatsDir, e.Name()), st)

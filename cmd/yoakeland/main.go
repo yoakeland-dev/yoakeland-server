@@ -225,6 +225,9 @@ func main() {
 	}
 	reloadRoles(projects.roles, providerStore, settings)
 	peers.UserName = settings.UserName
+	projects.mu.Lock()
+	projects.sameUser = settings.SameUser
+	projects.mu.Unlock()
 
 	// Deprecated launch flags hand their value over once, then the stored
 	// setting rules (runtime_dispatch.go).
@@ -1792,11 +1795,16 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListSessions:
 		var data protocol.ListSessionsData
 		_ = json.Unmarshal(env.Data, &data)
+		// Below Full (or the others_chats cap) the list holds only the sender's own chats.
+		var mine func(owner string) bool
+		if !acc.Local && !acc.Full() && !acc.Caps.OthersChats {
+			mine = func(owner string) bool { return deps.mayAct(acc, owner) }
+		}
 
 		if data.ProjectPath == protocol.ChatProject {
 			_ = ipc.SendEvent(protocol.EventSessionList, env.SessionID, env.TurnID, "", protocol.SessionListData{
 				ProjectPath: protocol.ChatProject,
-				Sessions:    deps.projects.ListChats(),
+				Sessions:    deps.projects.ListChatsWhere(mine),
 				SandboxTier: deps.projects.chatTier,
 			})
 			return
@@ -1836,6 +1844,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if err != nil {
 				// Left out of the list, so the chat vanishes from every client: say why.
 				logWarn("list_sessions: skipping unreadable session %s in %s: %v", id, pc.Root, err)
+				continue
+			}
+			deps.projects.rememberOwner(id, stateOwner(state))
+			if mine != nil && !mine(stateOwner(state)) {
 				continue
 			}
 			summaries = append(summaries, sessionSummaryFrom(pc.Root, state))
@@ -2317,9 +2329,17 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			// External scans read other tools' session files on this host (their folders and titles): the
 			// owner's view, so a limited remote device never gets them.
 			external := data.External && deps.accessFor(network, peerID).Full()
-			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), external)
+			// A Limited person sees the spend of their own chats; Trusted and Full see everyone's.
+			// Whoever isn't Full never sees what the CLIs' own transcripts hold.
+			var mine func(owner string) bool
+			who := ""
+			if a := deps.accessFor(network, peerID); !a.Local && !a.AtLeast(TierTrusted) && !a.Caps.OthersChats {
+				mine = func(owner string) bool { return deps.mayAct(a, owner) }
+				who = a.UserID
+			}
+			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), external, who)
 			out := cachedUsageReport(key, func() protocol.UsageReportData {
-				return buildUsageReport(deps.projects.stateDir, kinds, since, external, price)
+				return buildUsageReportFor(deps.projects.stateDir, kinds, since, external, price, mine)
 			})
 			out.Accounts = usageAccounts(deps.providerStore)
 			out.RequestID = data.RequestID

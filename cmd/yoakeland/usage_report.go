@@ -31,6 +31,7 @@ type usageSessionFile struct {
 	CreatedAt time.Time               `json:"createdAt"`
 	Title     string                  `json:"title"`
 	Archived  bool                    `json:"archived"`
+	OwnerID   string                  `json:"ownerId"`
 	History   []usageMsg              `json:"history"`
 	Branches  map[string][][]usageMsg `json:"branches"`
 	Native    *struct {
@@ -51,6 +52,7 @@ type usageParsed struct {
 	sess   protocol.UsageSession
 	recs   []usageRec
 	native string // the CLI's own session id, for a chat run on a CLI agent
+	owner  string // the user who owns the chat
 }
 
 // usageFiles caches each session file's records by mtime and size, so a
@@ -78,7 +80,10 @@ func parseUsageSession(path string, fi os.FileInfo, projectPath string) *usagePa
 	if f.SessionID == "" {
 		f.SessionID = strings.TrimSuffix(filepath.Base(path), ".json")
 	}
-	p := &usageParsed{mod: fi.ModTime(), size: fi.Size(),
+	if f.OwnerID == "" {
+		f.OwnerID = ownerID
+	}
+	p := &usageParsed{mod: fi.ModTime(), size: fi.Size(), owner: f.OwnerID,
 		sess: protocol.UsageSession{ID: f.SessionID, Title: f.Title, ProjectPath: projectPath, Archived: f.Archived}}
 	var walk func(msgs []usageMsg, seen map[string]bool)
 	walk = func(msgs []usageMsg, seen map[string]bool) {
@@ -148,6 +153,12 @@ func cachedUsageReport(key string, build func() protocol.UsageReportData) protoc
 // then with external the CLIs' own transcripts. providerKinds maps
 // registered provider names to their kind.
 func buildUsageReport(stateDir string, providerKinds map[string]string, since time.Time, external bool, price usagePricer) protocol.UsageReportData {
+	return buildUsageReportFor(stateDir, providerKinds, since, external, price, nil)
+}
+
+// buildUsageReportFor is buildUsageReport counting only the chats whose owner keep accepts (nil
+// counts all). A filtered report leaves out the spend of deleted chats, whose owner is unknown.
+func buildUsageReportFor(stateDir string, providerKinds map[string]string, since time.Time, external bool, price usagePricer, keep func(owner string) bool) protocol.UsageReportData {
 	out := protocol.UsageReportData{Sessions: []protocol.UsageSession{}, Providers: []protocol.UsageProvider{}, Models: []string{}, Rows: []protocol.UsageRow{}, Accounts: []protocol.UsageAccount{}}
 	dirs, _ := filepath.Glob(filepath.Join(stateDir, "projects", "*"))
 	dirs = append([]string{stateDir}, dirs...)
@@ -226,11 +237,17 @@ func buildUsageReport(stateDir string, providerKinds map[string]string, since ti
 			if p.native != "" {
 				native[p.native] = true
 			}
+			if keep != nil && !keep(p.owner) {
+				continue
+			}
 			for _, r := range p.recs {
 				add(r.hour, p.sess, r.provider, providerKinds[r.provider], r.model, 1, r.u, r.ms)
 			}
 		}
 		// usage.json outlives a deleted session's file.
+		if keep != nil {
+			continue
+		}
 		if b, err := os.ReadFile(filepath.Join(dir, "usage.json")); err == nil {
 			var uj struct {
 				Sessions map[string]protocol.UsageData `json:"sessions"`

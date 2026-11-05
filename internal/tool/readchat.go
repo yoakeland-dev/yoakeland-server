@@ -18,7 +18,7 @@ type ChatTurn struct {
 // session store in internal/agent, which imports this package, so the project
 // wiring supplies the reader.
 type ChatReader interface {
-	ReadChat(id string) (title string, turns []ChatTurn, err error)
+	ReadChat(ctx context.Context, id string) (title string, turns []ChatTurn, err error)
 }
 
 // ReadChatToolName is how the model reads a chat the user mentioned.
@@ -67,7 +67,7 @@ func (t *ReadChatTool) Definition() ToolDefinition {
 // RequiresPermission is false: the user named the chat, and reading it changes nothing.
 func (t *ReadChatTool) RequiresPermission([]byte) bool { return false }
 
-func (t *ReadChatTool) Execute(_ context.Context, ec ExecutionContext, argsJSON []byte) (string, error) {
+func (t *ReadChatTool) Execute(ctx context.Context, ec ExecutionContext, argsJSON []byte) (string, error) {
 	var args struct {
 		Chat  string `json:"chat"`
 		Query string `json:"query"`
@@ -85,7 +85,7 @@ func (t *ReadChatTool) Execute(_ context.Context, ec ExecutionContext, argsJSON 
 	if id == ec.SessionID {
 		return "", fmt.Errorf("that is this chat; it is already above")
 	}
-	title, turns, err := t.reader.ReadChat(id)
+	title, turns, err := t.reader.ReadChat(ctx, id)
 	if err != nil {
 		return "", fmt.Errorf("no chat with that ID in this project")
 	}

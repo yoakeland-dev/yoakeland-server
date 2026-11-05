@@ -27,6 +27,9 @@ type TurnPolicy struct {
 	// nil allows none.
 	AllowCLI func(providerName string) bool
 	UserID   string
+	// OthersChats lets the turn read chats the sender doesn't own (the others_chats cap); without
+	// it read_chat is held to the sender's own chats.
+	OthersChats bool
 }
 
 type turnPolicyKey struct{}
