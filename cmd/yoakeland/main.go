@@ -1245,6 +1245,17 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 				return
 			}
+			// Below Full a snapshot is restored only through the chat it was taken in, one the
+			// sender owns: a snapshot with no recorded chat (older ones) can't be tied to anyone.
+			if !acc.Full() {
+				snap, gErr := pc.SnapStore.GetSnapshot(data.SnapshotID)
+				if env.SessionID == "" || gErr != nil || snap.SessionID != env.SessionID {
+					_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+						Message: "restore_snapshot isn't allowed for this person: the snapshot isn't from this chat",
+					})
+					return
+				}
+			}
 			if rErr := pc.SnapStore.RestoreSnapshot(data.SnapshotID, pc.Root); rErr != nil {
 				deps.record(ipc, peerID, audit.Event{Kind: audit.SnapshotRestore, Project: pc.Root, Session: env.SessionID, Target: data.SnapshotID, Outcome: "error", Detail: map[string]any{"error": rErr.Error()}})
 				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -2464,6 +2475,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListSnapshots:
 		var data protocol.ListSnapshotsData
 		_ = json.Unmarshal(env.Data, &data)
+		// Below Full the list is one chat's snapshots, a chat the sender owns (the table checked it).
+		onlyChat := ""
+		if !acc.Full() {
+			if onlyChat = env.SessionID; onlyChat == "" {
+				_ = ipc.SendEvent(protocol.EventError, "", env.TurnID, "", protocol.ErrorData{Message: "list_snapshots isn't allowed for this person without a chat"})
+				return
+			}
+		}
 
 		projectPath := data.ProjectPath
 		if projectPath == "" {
@@ -2496,6 +2515,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		summaries := make([]protocol.SnapshotSummary, 0, len(snaps))
 		for _, snap := range snaps {
+			if onlyChat != "" && snap.SessionID != onlyChat {
+				continue
+			}
 			files := make([]string, 0, len(snap.Files))
 			for rel := range snap.Files {
 				files = append(files, filepath.ToSlash(rel))

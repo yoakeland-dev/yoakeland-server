@@ -43,7 +43,7 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventArtifactEvent:     own,
 	protocol.EventGetSessionHistory: own, protocol.EventGetContextBreakdown: own, protocol.EventSetSessionTitle: own,
 	protocol.EventSetSessionArchived: own, protocol.EventSetSessionLayout: own, protocol.EventDeleteSession: own,
-	protocol.EventListSnapshots: own, protocol.EventRestoreSnapshot: own,
+	protocol.EventListSnapshots: own, protocol.EventRestoreSnapshot: {cap: CapFilesEdit, ownChat: true}, // and the snapshot must be the chat's: the handler
 	protocol.EventReadMedia: anyone, protocol.EventReadMediaChunk: anyone, // project media is open; an attachment needs its chat: the handler
 	protocol.EventListSessions:       anyone, // filtered to the sender's chats by the handler
 	protocol.EventSetMode:            own,    // and the mode itself is checked by the handler

@@ -232,9 +232,7 @@ func (d connDeps) mayViewChat(acc Access, sessionID string) bool {
 
 // projectLevelChatEvents act on a project, not on one chat, when they name no chat; the others
 // fall back to the "default" chat as their handlers do.
-var projectLevelChatEvents = map[protocol.EventType]bool{
-	protocol.EventSetWebToolsEnabled: true, protocol.EventListSnapshots: true, protocol.EventRestoreSnapshot: true,
-}
+var projectLevelChatEvents = map[protocol.EventType]bool{}
 
 // envChats lists every chat an envelope might act on, and every project path it names. Handlers
 // differ on which of the envelope's sessionId and the payload's they use (and on case: JSON
