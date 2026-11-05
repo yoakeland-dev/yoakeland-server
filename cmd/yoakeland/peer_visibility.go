@@ -40,6 +40,9 @@ func (r *PeerRegistry) forPeer(p *Peer, sessionID string, data any) (out any, ok
 		}
 		d.Terminals = terms
 		return d, true
+	case protocol.PingData:
+		d.Status = statusForPeer(r, p, d.Status)
+		return d, true
 	case protocol.NotificationListData:
 		list := make([]protocol.Notification, 0, len(d.Notifications))
 		for _, n := range d.Notifications {
@@ -58,4 +61,15 @@ func (r *PeerRegistry) SendTo(p *Peer, eventType protocol.EventType, sessionID s
 	if data, ok := r.forPeer(p, sessionID, data); ok {
 		_ = p.ipc.SendEvent(eventType, sessionID, "", "", data)
 	}
+}
+
+// statusForPeer is a server status as p may read it: the server-wide spend totals and the owner's
+// subscription usage are for Trusted and up, so a Limited person's status bar has neither.
+func statusForPeer(r *PeerRegistry, p *Peer, st *protocol.ServerStatus) *protocol.ServerStatus {
+	if st == nil || tierRank(tierOrFull(p)) >= tierRank(TierTrusted) {
+		return st
+	}
+	cp := *st
+	cp.Spend, cp.RateLimits = nil, nil
+	return &cp
 }

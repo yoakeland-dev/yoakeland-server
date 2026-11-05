@@ -735,7 +735,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 
 	hbCtx, stopHeartbeat := context.WithCancel(ctx)
 	defer stopHeartbeat()
-	status := func() *protocol.ServerStatus { return serverStatus(deps) }
+	status := func() *protocol.ServerStatus { return statusForPeer(deps.peers, peer, serverStatus(deps)) }
 	go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
 	onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
 
@@ -2354,7 +2354,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			out := cachedUsageReport(key, func() protocol.UsageReportData {
 				return buildUsageReportFor(deps.projects.stateDir, kinds, since, external, price, mine)
 			})
-			out.Accounts = usageAccounts(deps.providerStore)
+			// Account balances belong to the owner's API keys: Trusted and up only.
+			if a := deps.accessFor(network, peerID); a.Local || a.AtLeast(TierTrusted) {
+				out.Accounts = usageAccounts(deps.providerStore)
+			} else {
+				out.Accounts = []protocol.UsageAccount{}
+			}
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)
 		}()
