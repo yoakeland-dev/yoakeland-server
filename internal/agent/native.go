@@ -208,7 +208,7 @@ func NativeTurnFromContext(ctx context.Context) *NativeTurn {
 // newNativeTurn decides resume-vs-fresh from a.native and builds the prompt.
 // history already ends with the user message this turn answers.
 func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []Message, canFork, needsNote bool) *NativeTurn {
-	nt := &NativeTurn{Mode: a.Mode(), SessionKey: NativeSessionKey(sessionID, a.projectRoot)}
+	nt := &NativeTurn{Mode: a.turnMode(), SessionKey: NativeSessionKey(sessionID, a.projectRoot)}
 	last := len(history) - 1
 	for last >= 0 && history[last].Role != "user" {
 		last--
@@ -362,7 +362,16 @@ func nativeTarget(req NativeAsk) string {
 // askNativePermission turns a native agent's permission ask into the same
 // permission_request flow yoakeland's own tools use, gated by mode.
 func (a *Agent) askNativePermission(ctx context.Context, sessionID, turnID string, req NativeAsk) (NativeAnswer, error) {
-	mode := a.Mode()
+	mode := a.turnMode()
+	// A tool the turn's policy withholds is refused outright, never put to the user: an approval
+	// can't raise a policy. (Native agents run their own bash; only a listed agent gets this far.)
+	a.mu.Lock()
+	pol, unsandboxed := a.policy, a.unsandboxed
+	a.mu.Unlock()
+	if pol.blocks(req.ToolName, unsandboxed) || (req.Tool != "" && pol.blocks(req.Tool, unsandboxed)) {
+		a.auditAuto(sessionID, nativeTool(req), nativeTarget(req), "deny", mode, nil, "turn_policy")
+		return NativeAnswer{Feedback: "not allowed for the person who started this turn"}, nil
+	}
 	if req.Plan != "" {
 		a.recordPlan(sessionID, turnID, req.ToolCallID, req.Plan)
 		if mode == ModeAutonomous {

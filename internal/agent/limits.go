@@ -59,6 +59,12 @@ func isShellTool(name string) bool {
 // toolUnavailableMessage explains to the model why a tool it called is not
 // allowed right now.
 func (a *Agent) toolUnavailableMessage(name string) string {
+	a.mu.Lock()
+	pol, unsandboxed := a.policy, a.unsandboxed
+	a.mu.Unlock()
+	if pol.blocks(name, unsandboxed) {
+		return fmt.Sprintf("tool %s isn't allowed for the person who started this turn", name)
+	}
 	if a.ShellDisabled() && isShellTool(name) {
 		return fmt.Sprintf("tool %s is disabled: this project has no sandbox, and the server withholds shell access without one", name)
 	}

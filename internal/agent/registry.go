@@ -27,6 +27,7 @@ type Registry struct {
 	limits          *Limits
 	webToolsEnabled bool
 	shellDisabled   bool
+	unsandboxed     bool
 	defaultSource   func(projectRoot string) (ModelProvider, string) // preferred over provider (SetDefaultSource)
 	eventTap        func(protocol.EventType, string, string, any)
 	hooks           Hooks
@@ -295,6 +296,7 @@ func (r *Registry) Get(stream *protocol.IPCStream, sessionID string) *Agent {
 	ag.SetLimits(r.limits)
 	ag.SetWebToolsEnabled(r.webToolsEnabled)
 	ag.SetShellDisabled(r.shellDisabled)
+	ag.unsandboxed = r.unsandboxed
 	ag.roles, ag.projectRoot, ag.chat = r.roles, r.projectRoot, r.chat
 	ag.source, ag.skillSrc = r.source, r.skillSrc
 	ag.nativeServers = r.nativeServers
