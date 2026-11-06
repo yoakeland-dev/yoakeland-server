@@ -75,6 +75,9 @@ type User struct {
 	Names     []string       `json:"names,omitempty"`     // earlier names, for matching old messages
 	CreatedBy string         `json:"createdBy,omitempty"` // user id
 	CreatedAt int64          `json:"createdAt"`
+	// NameFromDevice marks a person made for a pairing code nobody named: their first device's name
+	// becomes theirs, and until then they aren't listed.
+	NameFromDevice bool `json:"nameFromDevice,omitempty"`
 }
 
 // PairingTTL is how long a pairing QR code works before anyone uses it.
@@ -373,7 +376,12 @@ func (s *ServerSettings) AddCredential(c NewCredential) (string, error) {
 		if name == "" {
 			name = c.Name
 		}
-		userID = s.newUserLocked(name, c.Email, "", c.NewUserTier, c.By).ID
+		u := s.newUserLocked(name, c.Email, "", c.NewUserTier, c.By)
+		userID = u.ID
+		if c.Pairing && c.NewUserName == "" {
+			u.NameFromDevice = true
+			s.Users[u.ID] = u
+		}
 	} else if _, ok := s.resolveUserLocked(userID); !ok {
 		return "", s.errUnknownUser(userID)
 	}
@@ -535,10 +543,12 @@ type TokenSummaryInternal struct {
 func (s *ServerSettings) RemoveToken(name string) (existed bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, existed = s.Tokens[name]; !existed {
+	rec, existed := s.Tokens[name]
+	if !existed {
 		return false, nil
 	}
 	delete(s.Tokens, name)
+	s.dropUnclaimedPersonLocked(rec.UserID)
 	return true, s.save()
 }
 
@@ -549,8 +559,46 @@ func (s *ServerSettings) RemoveUnclaimedPairing(name string) {
 	defer s.mu.Unlock()
 	if rec, ok := s.Tokens[name]; ok && rec.Pairing && rec.DeviceID == "" {
 		delete(s.Tokens, name)
+		s.dropUnclaimedPersonLocked(rec.UserID)
 		_ = s.save()
 	}
+}
+
+// dropUnclaimedPersonLocked removes a person made for a code that no device ever used.
+func (s *ServerSettings) dropUnclaimedPersonLocked(userID string) {
+	if u, ok := s.Users[userID]; ok && u.NameFromDevice && !s.userHasTokenLocked(userID) {
+		delete(s.Users, userID)
+	}
+}
+
+// TakeDeviceName gives a person waiting for one the name and picture their first device sent. A
+// device that sent no name leaves the placeholder, which can be changed later. It reports a change.
+func (s *ServerSettings) TakeDeviceName(credential, name, avatar string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.Users[s.Tokens[credential].UserID]
+	if !ok || !u.NameFromDevice {
+		return false
+	}
+	u.NameFromDevice = false
+	if n, err := cleanUserName(name); err == nil {
+		u.Name = n
+	}
+	if u.Avatar == "" && avatar != "" && len(avatar) <= maxAvatarLen {
+		if a, err := s.storeAvatarLocked(avatar); err == nil {
+			u.Avatar = a
+		}
+	}
+	s.Users[u.ID] = u
+	_ = s.save()
+	return true
+}
+
+// NameWaitingForDevice reports whether a person takes their name from their first device.
+func (s *ServerSettings) NameWaitingForDevice(userID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Users[userID].NameFromDevice
 }
 
 // SetTokenAvatar persists an avatar against a named token so it survives

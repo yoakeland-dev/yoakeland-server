@@ -78,9 +78,13 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 			}()
 			_ = ipc.SendEvent(protocol.EventPairingPending, "", "", "", struct{}{})
 			acc := d.settings.Access("tcp", who.TokenName)
+			userName := d.settings.UserName(acc.UserID)
+			if d.settings.NameWaitingForDevice(acc.UserID) {
+				userName = cleanName(who.Name)
+			}
 			d.peers.BroadcastApprovers(rec.PairedBy, protocol.EventPairingRequest, protocol.PairingRequestData{
 				Credential: who.TokenName, Name: who.Name, DeviceType: who.DeviceType, IP: ip,
-				UserName: d.settings.UserName(acc.UserID), Tier: acc.Tier,
+				UserName: userName, Tier: acc.Tier,
 			})
 			select {
 			case allow := <-ch:
@@ -94,5 +98,11 @@ func (d connDeps) admitPairing(ipc *protocol.IPCStream, who peerIdentity, rec To
 			}
 		}
 	}
-	return d.settings.ClaimPairing(who.TokenName, who.DeviceID)
+	if err := d.settings.ClaimPairing(who.TokenName, who.DeviceID); err != nil {
+		return err
+	}
+	if rec.DeviceID == "" && d.settings.TakeDeviceName(who.TokenName, who.Name, who.Avatar) {
+		d.broadcastPeople()
+	}
+	return nil
 }
