@@ -101,6 +101,39 @@ func TestClassifyLimit(t *testing.T) {
 	}
 }
 
+// opencode's free plan: it says so in its own words, and gives the wait as bare
+// seconds ("Retry in ~20005s - attempt 1"). Before this it was only a weak
+// phrase with no reset time, so the turn failed as a plain error and no
+// continue could be armed.
+func TestClassifyLimitOpenCodeFreePlan(t *testing.T) {
+	now := time.Now()
+	for _, msg := range []string{
+		"opencode: Free usage limit reached.",
+		"opencode: Free usage exceeded, subscribe to Go. Retry in ~20005s - attempt 1",
+		"opencode: AI.Error: Free usage limit reached.",
+	} {
+		got, est, ok := classifyLimit(errors.New(msg), protocol.ProviderRateLimits{}, now, time.UTC)
+		if !ok {
+			t.Errorf("%q was missed", msg)
+			continue
+		}
+		if strings.Contains(msg, "20005s") {
+			if est {
+				t.Errorf("%q: the wait was given, so the reset isn't a guess", msg)
+			}
+			if d := got.Sub(now); d < 20004*time.Second || d > 20006*time.Second {
+				t.Errorf("%q: reset in %s, want ~20005s", msg, d)
+			}
+		} else if !est {
+			t.Errorf("%q: no reset was given, so it has to be estimated", msg)
+		}
+	}
+	// A free plan running out is strong on its own: it isn't a passing throttle.
+	if _, est, ok := classifyLimit(errors.New("Free usage exceeded"), protocol.ProviderRateLimits{}, now, time.UTC); !ok || !est {
+		t.Fatalf("strong with no time: %v %v", est, ok)
+	}
+}
+
 func limitDeps(t *testing.T) (connDeps, *ProjectContext) {
 	t.Helper()
 	settings, err := NewServerSettings(t.TempDir())
@@ -300,3 +333,21 @@ func TestLimitSettingAndAccess(t *testing.T) {
 		t.Error("a paired phone must be able to answer the card")
 	}
 }
+
+// A silent ACP agent says it is a usage limit by type, with no reset to read; an absurd
+// retry figure is clamped to "too far" instead of overflowing.
+func TestClassifyLimit_TypedAndHugeRetry(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	if _, est, ok := classifyLimit(silentLimit{}, protocol.ProviderRateLimits{}, now, time.UTC); !ok || !est {
+		t.Fatalf("typed limit: estimated=%v ok=%v", est, ok)
+	}
+	at, found := parseLimitReset("Retry in ~9000000000000s", now, time.UTC)
+	if !found || at.Sub(now) < limitMaxWait {
+		t.Fatalf("huge retry = %v (found %v), want past limitMaxWait", at, found)
+	}
+}
+
+type silentLimit struct{}
+
+func (silentLimit) Error() string    { return "went quiet" }
+func (silentLimit) UsageLimit() bool { return true }

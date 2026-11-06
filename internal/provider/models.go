@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +69,23 @@ func openAICapabilities(id string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// mediumEffortModels are the OpenAI reasoning models whose own documented
+// default is "medium" and which accept it. Not a prefix match like
+// openAIReasoningModels: gpt-5-pro takes only "high", gpt-5.1 and later default to
+// "none", gpt-5-chat and o1-mini take no effort at all.
+var mediumEffortModels = regexp.MustCompile(`^(o1|o3|o3-mini|o4-mini|gpt-5|gpt-5-mini|gpt-5-nano)(-\d{4}-\d{2}-\d{2})?$`)
+
+// defaultReasoningEffort is the level sent when the user hasn't chosen one, for
+// a model that is known to take "medium" (see mediumEffortModels). It exists so
+// the request never goes out with the field missing for an endpoint that
+// requires a reasoning level; any other model is sent nothing at all.
+func defaultReasoningEffort(id string) string {
+	if mediumEffortModels.MatchString(id) {
+		return "medium"
+	}
+	return ""
 }
 
 // ListModels queries the models available through cfg's own credential

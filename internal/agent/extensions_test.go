@@ -26,6 +26,8 @@ type scriptedModel struct {
 	tools   [][]string
 	systems []string
 	history [][]agent.Message
+	// skillEnum is the names the skill tool's definition allowed on the latest request.
+	skillEnum []string
 }
 
 func (m *scriptedModel) StreamTurn(_ context.Context, h []agent.Message, defs []tool.ToolDefinition, system string) (<-chan agent.ModelStreamChunk, <-chan error) {
@@ -34,6 +36,13 @@ func (m *scriptedModel) StreamTurn(_ context.Context, h []agent.Message, defs []
 	var names []string
 	for _, d := range defs {
 		names = append(names, d.Name)
+		if d.Name == tool.SkillToolName {
+			if p, ok := d.Parameters["properties"].(map[string]any); ok {
+				if n, ok := p["name"].(map[string]any); ok {
+					m.skillEnum, _ = n["enum"].([]string)
+				}
+			}
+		}
 	}
 	m.tools, m.systems, m.history = append(m.tools, names), append(m.systems, system), append(m.history, append([]agent.Message(nil), h...))
 	c, e := make(chan agent.ModelStreamChunk, 8), make(chan error, 1)
@@ -301,7 +310,7 @@ func TestSkills_ModelOnlyHiddenFromTheListWhenUserOnly(t *testing.T) {
 	}
 }
 
-func TestSkills_UserMentionLoadsTheSkillAsAToolCall(t *testing.T) {
+func TestSkills_UserMentionLoadsTheSkillInlineOnTheUsersMessage(t *testing.T) {
 	fs := &fakeSkills{list: []skills.Skill{reviewSkill()}, docs: map[string]tool.SkillDoc{"review": {Name: "review", Dir: "/skills/review", Body: "Check every changed file."}}}
 	model := &scriptedModel{turns: [][]agent.ModelStreamChunk{say("on it")}}
 	ag, out := skillAgent(t, model, fs)
@@ -313,16 +322,28 @@ func TestSkills_UserMentionLoadsTheSkillAsAToolCall(t *testing.T) {
 	for _, m := range h {
 		roles = append(roles, m.Role)
 	}
-	if strings.Join(roles, ",") != "user,assistant,tool" {
-		t.Fatalf("history sent to the model = %v (the named skill is loaded as a tool exchange)", roles)
+	// The skill reaches the model as text on the user's own turn — the way a
+	// CLI agent gets it — never as a tool_use/tool_result pair no provider
+	// produced: that pair is the one thing in a history a provider's own rules
+	// can reject (Anthropic refuses a thinking-enabled request whose assistant
+	// turn carries a tool_use with no thinking block, and any provider refuses
+	// a call to a tool it wasn't offered). History itself stays untouched: the
+	// $name chip the transcript shows is the record of the load.
+	if strings.Join(roles, ",") != "user" {
+		t.Fatalf("history sent to the model = %v (the named skill is loaded inline, not as a tool exchange)", roles)
 	}
-	if h[1].ToolCalls[0].Name != "skill" || !strings.Contains(h[2].Content, "Check every changed file.") {
-		t.Fatalf("history = %+v", h)
+	for _, m := range h {
+		if len(m.ToolCalls) > 0 {
+			t.Fatalf("a tool call reached the model: %+v", m.ToolCalls)
+		}
 	}
-	if !strings.Contains(out.String(), `"tool_call_requested"`) || strings.Count(out.String(), `"tool_call_requested"`) != 1 {
-		t.Fatalf("exactly one skill should have loaded: %s", out.String())
+	if !strings.Contains(h[0].Content, "Check every changed file.") {
+		t.Fatalf("the skill's instructions never reached the model: %q", h[0].Content)
 	}
-	if h[0].Content != "please $review the diff, it costs $5 and lives in $HOME and $nothere" {
+	if ev := out.String(); strings.Contains(ev, `"tool_call_requested"`) || strings.Contains(ev, `"tool_result"`) {
+		t.Fatalf("no fabricated exchange should exist any more: %s", ev)
+	}
+	if !strings.Contains(h[0].Content, "please $review the diff, it costs $5 and lives in $HOME and $nothere") {
 		t.Fatalf("the user's message is kept as typed: %q", h[0].Content)
 	}
 }
@@ -394,5 +415,20 @@ func TestSkills_ContextBreakdownSizesMCPAndSkillsApart(t *testing.T) {
 	}
 	if keys[protocol.CtxMCP] == 0 || keys[protocol.CtxSkills] == 0 {
 		t.Fatalf("categories = %+v", b.Categories)
+	}
+}
+
+// The skill tool's name is limited to the skills the model may load.
+func TestSkills_ToolNameIsAnEnumOfModelSkills(t *testing.T) {
+	hidden := reviewSkill()
+	hidden.Name, hidden.DisableModelInvocation = "private", true
+	fs := &fakeSkills{list: []skills.Skill{reviewSkill(), hidden}}
+	model := &scriptedModel{turns: [][]agent.ModelStreamChunk{say("ok")}}
+	ag, _ := skillAgent(t, model, fs)
+	if err := ag.RunTurn(context.Background(), "s", "t", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.skillEnum) != 1 || model.skillEnum[0] != "review" {
+		t.Fatalf("enum = %v, want just review", model.skillEnum)
 	}
 }

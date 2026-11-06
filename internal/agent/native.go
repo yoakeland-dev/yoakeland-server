@@ -295,10 +295,12 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
-// flattenNativeTools rewrites native tool steps as plain assistant text, for
-// a provider that isn't the agent that ran them: an API model can't be sent
-// tool_use blocks for tools it was never offered (Anthropic rejects them),
-// and a different CLI agent has its own tool names anyway.
+// flattenNativeTools rewrites the calls a native agent ran itself — which the
+// model never made — as plain assistant text, for a provider that isn't the one
+// that ran them: an API model can't be sent tool_use blocks for tools it was
+// never offered (Anthropic rejects them), a thinking-enabled Anthropic request
+// rejects a final assistant turn that starts with a tool_use instead of a
+// thinking block, and a different CLI agent has its own tool names anyway.
 func flattenNativeTools(history []Message) []Message {
 	native := map[string]bool{}
 	for _, m := range history {

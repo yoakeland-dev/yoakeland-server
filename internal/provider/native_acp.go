@@ -466,6 +466,32 @@ type acpTurn struct {
 	// (upstream #17505); the channel, re-armed before each wait, signals that
 	// one arrived while the turn was waiting for it.
 	usageChanged chan struct{}
+	// activity is signalled by anything the agent sends (an update, a
+	// permission request), so a turn waiting on the prompt can tell an agent
+	// that is working quietly from one that has stopped answering altogether
+	// (see silenceWatch).
+	activity chan struct{}
+}
+
+// touch records that the agent said something.
+func (t *acpTurn) touch() {
+	select {
+	case t.activity <- struct{}{}:
+	default:
+	}
+}
+
+// busy reports whether the agent has a tool call open and unfinished, which is
+// a reason to be quiet that isn't a reason to give up on it.
+func (t *acpTurn) busy() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id := range t.calls {
+		if !t.done[id] {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *acpTurn) seenAnything() bool { return t.seen.Load() }
@@ -531,6 +557,7 @@ func (a *acpLive) onNotify(method string, params json.RawMessage) {
 	if t == nil {
 		return
 	}
+	t.touch()
 	if t.sub != nil && n.SessionID != "" && n.SessionID != a.rootSession() {
 		// A subagent's own session: like Claude's Task, only its tool calls are
 		// shown (under the spawn call); its text and usage are not.
@@ -663,6 +690,7 @@ func (a *acpLive) onRequest(conn *rpcConn, id json.RawMessage, method string, pa
 		conn.respond(id, map[string]any{"outcome": map[string]string{"outcome": "cancelled"}})
 		return
 	}
+	t.touch()
 	t.request(conn, id, method, params)
 }
 
@@ -764,7 +792,7 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 	}
 
 	t := &acpTurn{a: a, ctx: ctx, nt: nt, emit: emit, sub: acpSubagentHooks[p.Kind], calls: map[string]*acpToolCall{}, done: map[string]bool{},
-		kids: map[string]string{}, pending: map[string][]json.RawMessage{}, cost: -1, usageChanged: make(chan struct{}, 1)}
+		kids: map[string]string{}, pending: map[string][]json.RawMessage{}, cost: -1, usageChanged: make(chan struct{}, 1), activity: make(chan struct{}, 1)}
 	a.setTurn(t)
 	defer a.setTurn(nil)
 
@@ -849,6 +877,24 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 		issued  = make(chan struct{}, 1)
 		over    atomic.Bool
 	)
+	// stopPrompts tells the agent to stop and waits up to grace for every prompt
+	// sent so far to be answered, so the next turn can't overlap one on this
+	// process. The agent is killed if it doesn't answer in that time.
+	stopPrompts := func(grace time.Duration) {
+		conn.notify("session/cancel", map[string]string{"sessionId": sess.SessionID})
+		deadline := time.After(grace)
+		pmu.Lock()
+		open := append([]chan promptResult(nil), prompts...)
+		pmu.Unlock()
+		for _, ch := range open {
+			select {
+			case <-ch:
+			case <-deadline:
+				a.close()
+				return
+			}
+		}
+	}
 	sendPrompt := func(text string) {
 		ch := make(chan promptResult, 1)
 		pmu.Lock()
@@ -882,6 +928,13 @@ func (p *CLISubprocessProvider) runACPOnce(ctx context.Context, spec cliSpec, nt
 			return nil
 		})
 	}
+	// Silence: an agent that hits its plan's usage limit (opencode is the one
+	// that does this) stops answering and retries the rejected request in the
+	// background, on its own schedule, telling its client nothing at all — no
+	// update, no error, no prompt response. Left alone, the turn would wait
+	// forever. Anything the agent says resets the clock.
+	silence := newSilenceWatch()
+	defer silence.Stop()
 	var res promptResult
 wait:
 	for {
@@ -893,20 +946,19 @@ wait:
 				break wait
 			}
 		case <-issued:
-		case <-ctx.Done():
-			conn.notify("session/cancel", map[string]string{"sessionId": sess.SessionID})
-			deadline := time.After(10 * time.Second)
-			pmu.Lock()
-			open := append([]chan promptResult(nil), prompts...)
-			pmu.Unlock()
-			for _, ch := range open {
-				select {
-				case <-ch:
-				case <-deadline:
-					a.close()
-					return ctx.Err()
-				}
+			silence.hear()
+		case <-t.activity:
+			silence.hear()
+		case <-silence.C():
+			if !silence.expired(t.busy()) {
+				continue
 			}
+			// The agent isn't going to answer this prompt, so waiting out a
+			// long grace for it would only add to the user's wait.
+			stopPrompts(2 * time.Second)
+			return &acpSilentError{binary: spec.Binary, quiet: acpSilenceTimeout, limit: p.Kind == CLIKindOpenCode}
+		case <-ctx.Done():
+			stopPrompts(10 * time.Second)
 			return ctx.Err()
 		}
 	}

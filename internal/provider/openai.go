@@ -53,6 +53,16 @@ func (p *OpenAICompatibleProvider) getReasoningEffort() string {
 	return v
 }
 
+// requestEffort is what the request carries: the level the user picked, or the
+// model's own documented default when they haven't picked one (a reasoning
+// model whose request omits the field is rejected outright by some endpoints).
+func (p *OpenAICompatibleProvider) requestEffort() string {
+	if e := p.getReasoningEffort(); e != "" {
+		return e
+	}
+	return defaultReasoningEffort(p.Model)
+}
+
 func (p *OpenAICompatibleProvider) ModelName() string { return p.Model }
 
 // SupportsImages implements agent.VisionProvider: whether this model gets a
@@ -314,7 +324,7 @@ func (p *OpenAICompatibleProvider) StreamTurn(
 			Tools:           openAITools,
 			Stream:          true,
 			StreamOptions:   &openAIStreamOptions{IncludeUsage: true},
-			ReasoningEffort: p.getReasoningEffort(),
+			ReasoningEffort: p.requestEffort(),
 			MaxTokens:       maxTokens,
 		}
 		// Only agent turns (they carry tools) are worth caching; a one-off

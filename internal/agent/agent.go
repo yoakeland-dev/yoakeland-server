@@ -1052,7 +1052,7 @@ func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 	// The skill tool is only worth its definition when there is a skill to load.
 	hideSkill := a.tools[tool.SkillToolName] != nil && !a.skillsAvailable()
 	if webEnabled && !shellOff && !hideSkill && vision {
-		return a.withSourceDefs(base, mode)
+		return a.withSkillNames(a.withSourceDefs(base, mode))
 	}
 	filtered := make([]tool.ToolDefinition, 0, len(base))
 	for _, def := range base {
@@ -1061,7 +1061,7 @@ func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 		}
 		filtered = append(filtered, a.defForVision(def, vision))
 	}
-	return a.withSourceDefs(filtered, mode)
+	return a.withSkillNames(a.withSourceDefs(filtered, mode))
 }
 
 // defForVision gives an image-capable tool the definition to offer a model
@@ -1654,12 +1654,17 @@ func (a *Agent) runGenerationLoop(parentCtx context.Context, turnID string, star
 		nt       *NativeTurn
 	)
 	_, isNative := turnProvider.(NativeAgent)
+	var (
+		haveSkills []skills.Skill
+		readSkill  func(string) string
+	)
 	if !isNative {
 		// What the project's skills are, once per turn like the instructions (see
-		// requestSuffix); and any the user named with $name, loaded as if the
-		// model had asked for them.
-		instructions += skills.Listing(a.skillsFor(turnProvider))
-		a.preloadSkills(turnID, bound)
+		// requestSuffix). Any the user named with $name reach the model with the
+		// request view (withNamedSkills below), read once per turn.
+		haveSkills = a.skillsFor(turnProvider)
+		instructions += skills.Listing(haveSkills)
+		readSkill = a.skillReader()
 	}
 
 	// emptyLengthRetries caps how many times a round-trip that produced no
@@ -1757,8 +1762,14 @@ turn:
 			}
 			a.mu.Lock()
 			activeContext = contextView(a.history, prefixKey)
+			carried := carriedSkills(a.history, haveSkills)
 			a.mu.Unlock()
+			// The request view: native agent steps flattened to text, empty
+			// assistants dropped, attachments noted, then the skills the
+			// conversation named put where it first brought them in (and old
+			// fabricated pairs folded onto that message the same way).
 			activeContext = withAttachmentNotes(dropEmptyAssistants(flattenNativeTools(activeContext)))
+			activeContext = withNamedSkills(activeContext, haveSkills, carried, readSkill)
 			streamCtx = WithRequestHints(turnCtx, RequestHints{CacheKey: sessionID, AdvisorModel: a.advisorModel(bound), ServerWebSearch: a.serverWebSearchAllowed()})
 		}
 

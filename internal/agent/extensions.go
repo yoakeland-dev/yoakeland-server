@@ -2,12 +2,10 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"regexp"
 	"strings"
 	"time"
 
-	"yoakeland/internal/protocol"
 	"yoakeland/internal/skills"
 	"yoakeland/internal/tool"
 )
@@ -211,59 +209,6 @@ func mentionedSkills(text string, have []skills.Skill) []string {
 		}
 	}
 	return out
-}
-
-// maxPreloaded bounds how many skills one message can load up front.
-const maxPreloaded = 5
-
-// preloadSkills loads the skills the user named with $name into the turn as if
-// the model had called the skill tool for each, so the call and its result show
-// in the chat and stay in the history. Only for a model API: a CLI agent is
-// told through SkillPrompt instead.
-func (a *Agent) preloadSkills(turnID string, bound RoleBinding) {
-	have := a.skillsFor(bound.Provider)
-	if len(have) == 0 {
-		return
-	}
-	a.mu.Lock()
-	var text string
-	// Only right after a fresh user message: a retry keeps the earlier preload
-	// in history, which would otherwise be loaded a second time.
-	if n := len(a.history); n > 0 && a.history[n-1].Role == "user" {
-		text = a.history[n-1].Content
-	}
-	a.mu.Unlock()
-	names := mentionedSkills(text, have)
-	if len(names) > maxPreloaded {
-		names = names[:maxPreloaded]
-	}
-	if len(names) == 0 {
-		return
-	}
-	a.mu.Lock()
-	loader, ok := a.skillSrc.(tool.SkillLoader)
-	a.mu.Unlock()
-	if !ok {
-		return
-	}
-	for i, name := range names {
-		args, _ := json.Marshal(map[string]string{"name": name})
-		tc := ToolCall{ID: "skill_" + turnID + "_" + string(rune('a'+i)), Name: tool.SkillToolName, Args: args}
-		a.mu.Lock()
-		a.history = append(a.history, Message{
-			ID: a.nextMessageIDLocked(), Role: "assistant", ToolCalls: []ToolCall{tc},
-			Provider: bound.ProviderName, Model: bound.Model, CreatedAt: time.Now(),
-		})
-		sessID := a.sessionID
-		a.mu.Unlock()
-		_ = a.getStream().SendEvent(protocol.EventToolCallRequested, sessID, turnID, tc.ID, protocol.ToolCallData{Name: tc.Name, Args: tc.Args})
-		doc, err := loader.LoadSkill(name, true)
-		if err != nil {
-			a.recordToolResult(turnID, tc, "", err.Error())
-			continue
-		}
-		a.recordToolResult(turnID, tc, tool.FormatSkill(doc), "")
-	}
 }
 
 // skillPromptFor rewrites a user message for a CLI agent that takes skills its

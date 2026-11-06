@@ -32,7 +32,7 @@ const (
 // limitStrong are phrases that only a spent subscription says; limitWeak could also be a passing
 // per-minute throttle, so they count only when the provider's own numbers or the message show a reset.
 var (
-	limitStrong = regexp.MustCompile(`(?i)usage limit|(?:opus|sonnet|fable|haiku|session|weekly|daily|monthly|5-hour) limit reached|(?:hit|reached|exceeded) your (?:\w+[ -])?limit|(?:5-hour|five-hour|weekly|daily|monthly|session) limit|out of (?:usage|credits|messages)`)
+	limitStrong = regexp.MustCompile(`(?i)usage limit|(?:opus|sonnet|fable|haiku|session|weekly|daily|monthly|5-hour) limit reached|(?:hit|reached|exceeded) your (?:\w+[ -])?limit|(?:5-hour|five-hour|weekly|daily|monthly|session) limit|out of (?:usage|credits|messages)|free (?:usage|plan) (?:limit|exceeded)`)
 	// limitNot are limits that are not the subscription running out (the Claude CLI words several this
 	// way): a context window, concurrency, a budget set by the person, the usage page being throttled.
 	limitNot  = regexp.MustCompile(`(?i)not your usage limit|context (?:window |length )?limit|concurren|budget limit|fast limit|subagent limit|device limit|token limit|size limit|character limit|max(?:imum)? (?:output )?tokens`)
@@ -45,6 +45,9 @@ var (
 	reIn    = regexp.MustCompile(`(?i)\b(?:in|after)\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m)\b\s*(?:and\s+|,\s*)?)+)`)
 	reUnit  = regexp.MustCompile(`(?i)(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m)\b`)
 	reClock = regexp.MustCompile(`(?i)(?:resets?|try again|available again|renews?)\s*(?:at|on|around)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
+	// reRetrySecs is a wait given in bare seconds, the way opencode's free-plan limit words it:
+	// "Retry in ~20005s - attempt 1".
+	reRetrySecs = regexp.MustCompile(`(?i)retry(?:ing)?\s+(?:in|after)\s*~?\s*(\d+)\s*s(?:ec(?:onds?)?)?\b`)
 )
 
 // parseLimitReset reads the time a limit message says it ends at: Claude's "|<unix seconds>", an RFC
@@ -60,6 +63,14 @@ func parseLimitReset(msg string, now time.Time, loc *time.Location) (time.Time, 
 			if t, err := time.Parse(layout, m); err == nil {
 				return t, true
 			}
+		}
+	}
+	if m := reRetrySecs.FindStringSubmatch(msg); m != nil {
+		if sec, err := strconv.ParseInt(m[1], 10, 64); err == nil && sec > 0 {
+			// Past the longest wait the caller marks it too far; the clamp only keeps an
+			// absurd figure from overflowing the Duration.
+			d := time.Duration(min(sec, int64(limitMaxWait/time.Second)+1)) * time.Second
+			return now.Add(d), true
 		}
 	}
 	if m := reIn.FindStringSubmatch(msg); m != nil {
@@ -144,6 +155,12 @@ func limitBackoff(attempt int) time.Duration {
 func classifyLimit(err error, rl protocol.ProviderRateLimits, now time.Time, loc *time.Location) (resetsAt time.Time, estimated, ok bool) {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return
+	}
+	// A provider that knows it is a usage limit says so itself (an ACP agent that
+	// went silent), with no reset to read.
+	var typed interface{ UsageLimit() bool }
+	if errors.As(err, &typed) && typed.UsageLimit() {
+		return time.Time{}, true, true
 	}
 	msg := err.Error()
 	if limitNot.MatchString(msg) {

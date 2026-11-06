@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/provider"
 )
@@ -40,6 +41,84 @@ func TestAnthropicProvider_SetModelOptions_SetsThinkingBudget(t *testing.T) {
 	}
 	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(4096) {
 		t.Errorf("unexpected thinking block: %+v", thinking)
+	}
+}
+
+// TestProviders_AlwaysSendAReasoningLevel guards the other half: a request an
+// endpoint that insists on a reasoning level would reject must never go out
+// with the field missing. Nobody picked a level in either case here, so each
+// provider sends its model's own documented default.
+func TestProviders_AlwaysSendAReasoningLevel(t *testing.T) {
+	capture := func(t *testing.T, done string, run func(baseURL string)) map[string]any {
+		t.Helper()
+		req := make(chan map[string]any, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			req <- b
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(done))
+		}))
+		t.Cleanup(srv.Close)
+		run(srv.URL)
+		select {
+		case b := <-req:
+			return b
+		case <-time.After(5 * time.Second):
+			t.Fatal("no request reached the server")
+			return nil
+		}
+	}
+
+	const anthropicDone, openAIDone = "event: message_stop\ndata: {}\n\n", "data: [DONE]\n\n"
+
+	// Anthropic: an adaptive-thinking model, no effort picked.
+	got := capture(t, anthropicDone, func(baseURL string) {
+		p := provider.NewAnthropic("k", "claude-opus-4-7")
+		p.BaseURL = baseURL
+		c, e := p.StreamTurn(context.Background(), nil, nil, "")
+		for range c {
+		}
+		if err := <-e; err != nil {
+			t.Fatalf("StreamTurn: %v", err)
+		}
+	})
+	oc, _ := got["output_config"].(map[string]any)
+	if oc == nil || oc["effort"] != "high" {
+		t.Fatalf("output_config = %+v, want the model's own default effort", got["output_config"])
+	}
+
+	// An OpenAI reasoning family, no effort picked.
+	got = capture(t, openAIDone, func(baseURL string) {
+		p := provider.NewOpenAI("k", "gpt-5")
+		p.BaseURL = baseURL
+		c, e := p.StreamTurn(context.Background(), nil, nil, "")
+		for range c {
+		}
+		if err := <-e; err != nil {
+			t.Fatalf("StreamTurn: %v", err)
+		}
+	})
+	if got["reasoning_effort"] != "medium" {
+		t.Fatalf("reasoning_effort = %v, want the model's own default", got["reasoning_effort"])
+	}
+
+	// A model nobody can vouch for is still sent nothing at all — and so is a
+	// reasoning model whose own levels don't include "medium" (gpt-5-pro takes only "high").
+	for _, id := range []string{"some-local-model", "gpt-5-pro", "gpt-5.1", "o1-mini", "gpt-5-chat-latest"} {
+		got = capture(t, openAIDone, func(baseURL string) {
+			p := provider.NewOpenAI("k", id)
+			p.BaseURL = baseURL
+			c, e := p.StreamTurn(context.Background(), nil, nil, "")
+			for range c {
+			}
+			if err := <-e; err != nil {
+				t.Fatalf("StreamTurn: %v", err)
+			}
+		})
+		if v, ok := got["reasoning_effort"]; ok {
+			t.Fatalf("%s: reasoning_effort = %v, want none sent", id, v)
+		}
 	}
 }
 

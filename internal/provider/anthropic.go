@@ -77,6 +77,12 @@ var legacyThinkingModel = regexp.MustCompile(`^claude-(3|haiku|(opus|sonnet)-4(-
 
 func adaptiveThinking(model string) bool { return !legacyThinkingModel.MatchString(model) }
 
+// defaultAnthropicEffort is the level sent when the user hasn't chosen one, on
+// a model that takes effort: Anthropic's own documented default ("most Claude
+// models default to high effort"), so a request never goes out with the field
+// missing.
+const defaultAnthropicEffort = "high"
+
 // effortBudget maps an effort level onto a thinking budget, for the legacy
 // models that only take a budget — so one effort picker works everywhere.
 var effortBudget = map[string]int{"low": 2048, "medium": 8192, "high": 16384, "xhigh": 24576, "max": 32000}
@@ -429,15 +435,22 @@ func (p *AnthropicProvider) StreamTurn(
 		// cache), with effort as the depth control; "summarized" streams
 		// readable reasoning instead of empty blocks. Older models only take
 		// a fixed budget, which an effort level maps onto.
+		//
+		// The effort is always sent on an adaptive model, never left out when
+		// the user hasn't picked one: "high" is the model's own documented
+		// default, so this changes nothing for Claude, but it keeps the field
+		// present for an endpoint or gateway that insists on a level (a 400
+		// "effort is required" is not a failure the user can act on from here).
 		maxTokens := 32000
 		var thinking *anthropicThinking
 		var outputConfig *anthropicOutputConfig
 		effort, budget := p.getEffort(), int(p.thinkingBudget.Load())
 		if adaptiveThinking(p.Model) {
 			thinking = &anthropicThinking{Type: "adaptive", Display: "summarized"}
-			if effort != "" {
-				outputConfig = &anthropicOutputConfig{Effort: effort}
+			if effort == "" {
+				effort = defaultAnthropicEffort
 			}
+			outputConfig = &anthropicOutputConfig{Effort: effort}
 		} else {
 			maxTokens = 8192
 			if b, ok := effortBudget[effort]; ok {

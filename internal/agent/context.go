@@ -331,6 +331,7 @@ const summaryOpening = "[The conversation so far was summarized to save context.
 //     after the last compaction — Anthropic rejects a thinking block whose
 //     conversation prefix changed, and only lets blocks go from the front.
 func contextView(history []Message, prefixKey string) []Message {
+	skillResults := skillResultIDs(history)
 	start, clearIdx, lastCompaction := 0, -1, -1
 	summary := ""
 	for i, m := range history {
@@ -357,7 +358,7 @@ func contextView(history []Message, prefixKey string) []Message {
 		if m.Role == "compaction" {
 			continue
 		}
-		if i < clearIdx {
+		if i < clearIdx && !(m.Role == "tool" && skillResults[m.ToolCallID]) {
 			m = stubbed(m)
 		}
 		if i < lastCompaction {
@@ -381,6 +382,16 @@ func contextView(history []Message, prefixKey string) []Message {
 		}
 	}
 	return out
+}
+
+// lastSummary is the index of the latest summary compaction in history, or -1.
+func lastSummary(history []Message) int {
+	for i := len(history) - 1; i >= 0; i-- {
+		if m := history[i]; m.Role == "compaction" && m.Compaction != nil && m.Compaction.Kind == CompactionSummary {
+			return i
+		}
+	}
+	return -1
 }
 
 // pairToolCalls gives every API tool call in view a tool result. A turn that
