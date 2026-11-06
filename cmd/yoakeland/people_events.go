@@ -58,7 +58,7 @@ func (d connDeps) peopleFor(acc Access) protocol.PeopleData {
 		out.LimitedDefaults = map[string]any{}
 	}
 	for id, u := range users {
-		if u.AliasOf != "" || !manages(acc, users, id) {
+		if u.AliasOf != "" || u.NameFromDevice || !manages(acc, users, id) {
 			continue
 		}
 		p := protocol.PeoplePerson{
