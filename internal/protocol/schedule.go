@@ -82,6 +82,10 @@ type ScheduledTurn struct {
 	Attempt int `json:"attempt,omitempty"`
 	// Error is why the last run didn't start, if it didn't.
 	Error string `json:"error,omitempty"`
+	// CreatorUserID and CreatorCredential say who armed it; it runs as them, with the access they
+	// have when it is due. Both empty (an entry from before users) means the owner.
+	CreatorUserID     string `json:"creatorUserId,omitempty"`
+	CreatorCredential string `json:"creatorCredential,omitempty"`
 }
 
 // ScheduleTurnData is schedule_turn: arm a turn. Origin defaults to a plain scheduled one.

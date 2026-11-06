@@ -202,13 +202,95 @@ A client identifies which conversation it wants with `sessionId` on `user_prompt
 - A subscription lasts for the lifetime of the underlying connection — closing the connection (or the process crashing) drops it; there's no explicit "unsubscribe" call, since there's nothing to opt back into by leaving one session's view open.
 
 ### Peer registry & remote-access settings
-Every live connection (unix and TCP alike; `-stdio`'s single pipe never registers one) is a **peer** — see `peer_list` (§3.2) for the full roster shape, `set_peer_name`/`set_peer_avatar` for a peer updating its own profile, and `disconnect_peer` for force-closing another one. `disconnect_peer` has no extra permission check beyond having completed the handshake at all: any peer may disconnect any other, since everyone past that point already shares the one trust boundary (unix file perms, or the single shared TCP token) — there's no per-user identity yet to scope it more tightly against.
+Every live connection (unix and TCP alike; `-stdio`'s single pipe never registers one) is a **peer** — see `peer_list` (§3.2) for the full roster shape, `set_peer_name`/`set_peer_avatar` for a peer updating its own profile, and `disconnect_peer` for force-closing another one. `disconnect_peer` needs Full access or the local socket.
 
 A peer's name/avatar aren't fixed at connect time: `set_peer_name`/`set_peer_avatar` update them live (e.g. when the user changes their profile in Settings after already being connected), and every peer sees the change on the next `peer_list` push — a client's own profile UI and its peer-list row for itself should be driven by the same underlying state, not kept as two separate copies.
 
 `set_remote_access` and `set_remote_password` (§3.1) are **local-socket-only** — sent over TCP (even with a full-access credential) or over `-stdio`, both are rejected with `error`, since a remote peer shouldn't be able to grant itself continued remote access or rotate the credential that controls it. `server_identity`/`set_server_identity` (a display name for the server itself, persisted under `-state-dir`) has no such restriction — it's not a security boundary, just a label.
 
-**Paired-device scope.** A credential made with `pairing: true` (a phone) is restricted: over TCP the server answers only the events in an allowlist (`remote_scope.go`) — chat and its controls, models and projects, file access, uploads, read-only views, presence — and refuses everything else with `error` ("isn't available from a paired device"). An event added later is therefore owner-only until it is listed. Not available to a paired device: providers and keys, MCP servers, skills, runtime and server settings, permission-rule changes, `terminal_open`/`terminal_input`, `list_directory`, `remove_project`, `disconnect_peer`, the audit log. The local socket and non-pairing named credentials are not restricted. The tier belongs to the credential and can be changed (v2.35): `set_peer_scope` promotes or demotes it, and `approve_pairing` can grant full access up front (`full: true`). A paired device can also *watch* the server's own browser (`browser_view`, `browser_frame_ack`, §3.1) but not operate it. `peer_list` marks restricted devices with `restricted: true`. **Which tier a code grants:** the code and PIN a server prints on its own console grant **full** access (whoever can read the console owns the server, and a headless server has no desktop to approve a pairing); a code made by a client with `register_token` `{pairing: true}` is limited unless it also sends `full: true` (pairing another computer rather than a phone). A desktop that is connected still asks to approve either one. The server tells each connection its tier with `restricted: true` on `server_identity`, on connect and again when `set_peer_scope` changes it.
+What each connection may do depends on its person and tier: see "People, tiers and permissions" below.
+
+### People, tiers and permissions *(v2.36)*
+
+There are no accounts with passwords. A device's credential is its login, and each credential points at a **person** (`users` in `server.json`). The local socket and `-stdio` are always the person `owner`, at tier `full`. A credential or person that can't be resolved gets tier `limited` with every cap off.
+
+**Tiers**, lowest first. The test for the line: could this power let someone act as the owner on the computer? If so, it is Full only.
+- **`limited`:** works in projects already on the server. New people start here.
+- **`trusted`:** also helps run the server, with no access to the machine.
+- **`full`:** the same as the owner on this computer, except for `set_remote_access` and `set_remote_password`, which stay local-socket-only.
+
+**Caps** adjust a Limited or Trusted person. Admin powers are never caps; they change with the tier. A Full person has every cap on.
+
+| Cap | Default | Meaning |
+|---|---|---|
+| `files_edit` | on | Edit project files directly and through the agent. Off: only modes `read_only` and `plan` |
+| `commands_sandboxed` | on | `bash` and `terminal_*` agent tools on a project with a real sandbox |
+| `commands_unsandboxed` | off | The same on a `local_restricted_fallback` project |
+| `autonomous` | on | Modes `autonomous` and `auto`, only while the turn's commands are in a real sandbox |
+| `cli` | `[]` | Registered provider names of the CLI agents this person may use |
+| `mcp_tools` | off | MCP tools on their turns |
+| `browser` | `off` | `off`, `watch` (see the server's browser) or `use` (also the agent's browser tool) |
+| `terminals_watch` | off | Watch terminals. Not tied to a chat: it covers every terminal |
+| `processes` | on | `list_processes`, with `command` stripped below Full |
+| `others_chats` | off | See and work in chats they don't own |
+
+**Effective permissions** are read on every request, so a change applies at once:
+`tier = min(person.tier, credential.maxTier)`. At `full`, every cap is on. Otherwise caps are the tier's defaults, then `limitedDefaults` (Limited only), then the person's `caps`, minus the credential's `deny`. **A device can only have less than its person.** Nobody can grant more than their own effective tier.
+
+**Event access** is one table, `eventAccess` in `event_access.go`. An inbound event missing from it is refused below Full, so a new event is owner-only until it is listed. Refusals read `<event> needs Trusted access`, `<event> needs Full access`, `<event> isn't allowed for this person`, or, for a chat, `...: it isn't their chat`.
+
+| Events | Limited | Trusted | Full |
+|---|---|---|---|
+| `user_prompt`, `edit_message`, `retry_message`, `switch_branch`, `compact_context`, `side_question`, `summarize_message`, `steer_turn`, `cancel_turn`, `cancel_subagent`, `permission_response`, `ask_user_answer`, `approve_plan`, `limit_continue`, `limit_dismiss`, `artifact_event`, `get_session_history`, `get_context_breakdown`, `set_session_title`, `set_session_archived`, `set_session_layout`, `delete_session`, `set_model_options`, `import_chat_files` | own chat | own chat | yes |
+| `list_sessions` | own chats | own chats | all |
+| `set_mode` | own chat; `autonomous`/`auto` need the cap; without `files_edit` only `read_only`/`plan` | same | yes |
+| `set_provider` | own chat; API-key providers or those in `cli` | same | yes |
+| `list_snapshots` | a chat they own; only its snapshots | same | yes |
+| `restore_snapshot` | `files_edit`, a chat they own, and a snapshot from that chat. A snapshot with no recorded chat is Full only | same | yes |
+| `read_media`, `read_media_chunk` | project media; an attachment only from their own chat | same | yes |
+| `set_favorite_models`, `list_providers`, `list_models`, `list_projects`, `open_project` (known projects only), `list_tree`, `read_file`, `list_files`, `list_git_changes`, `get_file_diff`, `list_permission_rules`, `upload_*`, `list_skills`, `get_skill` | yes | yes | yes |
+| `write_file`, `fs_op` | `files_edit` | `files_edit` | yes |
+| `set_presence` (chats they can see), `set_peer_name`, `set_peer_avatar`, `set_profile`, `set_notify_prefs`, `list_notifications`, `dismiss_notification`, `mark_notifications_read` (chats they can see), `ping`, `pong` | yes | yes | yes |
+| `get_usage` | own chats' spend, no `Accounts`, no `external` | all spend, no `external` | all |
+| `list_processes` | `processes` | `processes` | yes |
+| `list_terminals`, `terminal_attach/detach/resize` | `terminals_watch` | `terminals_watch` | yes |
+| `browser_view`, `browser_frame_ack` | `browser` is `watch` or `use` | same | yes |
+| `set_web_tools_enabled` (project-wide), `set_skill_enabled`, `set_server_identity`, `set_auto_generate_title`, `restart_server`, `signal_process`, `list_problems`, `read_log` | no | yes | yes |
+| `schedule_turn` | no | a chat they own | yes |
+| `list_scheduled`, `cancel_scheduled`, `pause_scheduled` | no | their own schedules; pausing all is Full only | yes |
+| `register_provider` | no | new API-key providers only; may edit or remove only their own. Never a CLI or custom-command provider | yes |
+| `list_people`, `list_tokens`, `get_pair_info`, `register_token`, `remove_token`, `approve_pairing` | no | limited to people they created, see Pairing | yes |
+| `set_user_permissions`, `set_device_restrictions`, `set_limited_defaults`, `merge_users`, `move_device`, `remove_user`, `disconnect_peer`, `set_peer_scope`, `remove_provider`, `set_default_provider`, OAuth, `set_model_roles`, `detect_cli`, `list_acp_registry`, permission-rule writes, MCP events, `set_runtime_settings`, `set_limit_action`, `list_audit`, `list_directory`, `remove_project`, opening an unknown folder, `terminal_open/input/close`, `browser_control/input/nav`, `browser_host`, `browser_response` | no | no | yes |
+| `set_remote_access`, `set_remote_password` | no | no | local socket only |
+
+`ping` status drops `Spend` and `RateLimits` below Trusted.
+
+**Turn policy.** What the agent may do depends on who started the turn, not on who watches it. Every path that starts a turn carries its sender's policy: `user_prompt`, `edit_message`, `retry_message`, `artifact_event`, `limit_continue`, scheduled turns, and subagents through their parent. An owner or Full sender has no policy, which means unrestricted.
+- A blocked tool is left out of the tool list and refused if called anyway, without asking for permission. An approval can't raise a policy.
+- `bash` and `terminal_*` need `commands_sandboxed` on a project with a real sandbox, or `commands_unsandboxed` on `local_restricted_fallback`. `mcp__*` tools need `mcp_tools`. The `browser` tool needs `browser: use`.
+- The mode belongs to the chat, and someone else may have set it. If the policy forbids `autonomous`/`auto`, or commands aren't sandboxed, the turn runs as `read_write` without changing the stored mode. Without `files_edit` it runs as `read_only`.
+- A turn whose provider is a CLI agent not in `cli` fails before it starts, with an `error` naming the provider. That covers a subagent or model role that resolves to one. Tool-less calls such as title generation are exempt.
+- A CLI agent runs under the owner's login and outside yoakeland's sandbox, so the `cli` cap should be granted knowingly.
+- Revoking or lowering access cancels that person's running turns. A scheduled turn runs as its creator, with the access they have when it comes due, and is cancelled if they are gone. A schedule with no recorded creator runs as `owner`.
+
+**Chats.** A session stores `ownerId`, set when it is first created. No owner means `owner`. The id `default` can't be claimed below Full. A person acts on a chat they own, or with `others_chats`, or at Full. The check covers every chat an envelope names (the envelope's `sessionId`, the payload's `sessionId` and `linkedSessionId`), and an unreadable session is refused.
+
+Session events only reach peers who may see that chat, filtered where they fan out: the turn stream, `BroadcastEvent`, notifications, `pending_asks` and `terminal_index`. A TCP peer with no visibility check sees no session events. `read_chat` follows the turn's person.
+
+**Pairing** (`register_token`):
+
+| Sender | `user: "me"` | `user: "new"` | An existing person's id | Tier they can grant |
+|---|---|---|---|---|
+| Local socket | `owner` | yes | yes | any |
+| Full | self | yes | no | any |
+| Trusted | no | yes | no | `limited` |
+| Limited | no | no | no | none |
+
+A device paired as "me" is capped at `limited` unless the sender asks otherwise. The console code and PIN pair as `owner` at `full`. A Trusted sender sees and revokes only people they created, plus themselves, and approves only pairings they created.
+
+**Identity.** Attribution comes from the sender's person. `auth`'s `name`/`avatar` and `set_peer_name`/`set_peer_avatar` are device labels and never change the person. Only `set_profile` does, so a device reconnecting can't overwrite a profile. A client takes its profile from `server_identity`'s `user`; its local settings only fill a person who has none. The owner's empty name and picture are filled once from the first local-socket `auth` that reports them.
+
+**Migrating a 0.1.7 `server.json`.** On load, idempotently: every credential without a person gets one (Limited if it was a pairing token without `scope: full`, else Full), except the original `default` token, which is the owner's. A history message from before `authorId` is placed by its author name, or else by its picture (an emoji places no one), and a placed message's own data-URL picture is dropped from the reply because `profiles` carries it once.
 
 ### Settings mutations broadcast to every peer, not just the sender
 
@@ -821,7 +903,7 @@ Manage the Model Context Protocol servers whose tools the model can call (§4h).
   - **`scan_mcp_imports`** reads, never writes, a fixed list of files and answers the requester only with `mcp_import_candidates` (§3.2), echoing `requestId`. It starts nothing and runs nothing it finds. The list (each best effort; a file that is missing, unreadable or not in the expected shape is skipped and named in `problems`): Claude Code `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set; the top-level `mcpServers` and the ones kept for `projectPath`), Claude Desktop's `claude_desktop_config.json`, Codex `$CODEX_HOME/config.toml` or `~/.codex/config.toml` (`[mcp_servers.*]`), Cursor `~/.cursor/mcp.json`, Gemini CLI `~/.gemini/settings.json` (`mcpServers`; `httpUrl` is streamable HTTP, `url` is SSE), Kimi `~/.kimi/mcp.json`, Grok Build `$GROK_HOME/config.toml` or `~/.grok/config.toml` (`[mcp_servers.*]`), OpenCode `~/.config/opencode/opencode.json` (`mcp`), Amp `~/.config/amp/settings.json` (`amp.mcpServers`), Pi `~/.pi/agent/mcp.json` and Oh My Pi `~/.omp/agent/mcp.json` (`mcpServers`). DeepSeek Harness is not read: its servers live in a plugin entry of a profile's `cordis.patch.yml`. A Codex bearer token or header kept in an environment variable becomes a `${VAR}` reference. Each file is read at most 256 KB (4 MB for `~/.claude.json`, which also holds Claude Code's history), through an `os.Root` on its folder, so a symlink cannot point elsewhere; the same limits apply as for `.mcp.json`. A project's own `.mcp.json` is not scanned: it already reaches the user as a pending project server. Each file is read at most 256 KB (4 MB for `~/.claude.json`, which also holds Claude Code's history), through an `os.Root` on its folder, so a symlink cannot point elsewhere; the same limits apply as for `.mcp.json`.
   - **`import_mcp_servers`** copies the chosen candidates into the user's own servers (`<state-dir>/mcp.json`) and answers with `mcp_servers` like any other MCP request. `id` is from the last scan. The server **re-reads the source file** and converts the entry itself, so secrets (env and header values, `oauth.clientSecret`) are copied file to file and never cross the connection; the client only ever saw them as `redacted`. If the entry no longer matches what the scan reported (the file changed), it is refused with `error` and nothing is saved: scan again. `name` is optional (default `suggestedName`); a name another of the user's servers has, or one outside the name rule, is refused. All-or-nothing: if any item is refused, none is saved.
   - **What an import does and does not carry.** `type`, `command`, `args`, `env`, `cwd`, `url`, `headers` and `timeoutMs` are converted into `config` (a Codex or OpenCode entry is mapped to the same shape); `${NAME}` references are kept as written. `agents` is **never** set, so an import is not handed to a coding-agent CLI unless the user turns that on afterwards; `disabledTools` is dropped (the tool names are another tool's). Anything the server cannot convert (a transport it does not speak, an OAuth setup it cannot read) is reported on the candidate as `unsupported` and cannot be imported. Importing does not edit or remove the source entry.
-  - Local socket and unrestricted credentials only (not a paired device, see Paired-device scope under Peer registry): it reads only the files above and returns only redacted entries. Each import is one `mcp_server` audit event per server (§6) with `detail.importedFrom` set to the `source`; a scan is not audited.
+  - Local socket and unrestricted credentials only (not a paired device, see "People, tiers and permissions"): it reads only the files above and returns only redacted entries. Each import is one `mcp_server` audit event per server (§6) with `detail.importedFrom` set to the `source`; a scan is not audited.
 
 #### Skills: `list_skills`, `set_skill_enabled`, `get_skill` *(v2.28)*
 Agent Skills (https://agentskills.io): folders holding a `SKILL.md` that teach the model one kind of task (§4h). They are read **in place** from the folders other tools already use, so a skill written for Claude Code or Codex needs no import.
@@ -835,7 +917,7 @@ Agent Skills (https://agentskills.io): folders holding a `SKILL.md` that teach t
 - A skill is a folder with `SKILL.md`: YAML frontmatter with `name`, `description` (≤ 1024 characters), optional `license`, `compatibility`, `allowed-tools`, `argument-hint`, `disable-model-invocation` and `user-invocable`; then the instructions. The reader is lenient about what other tools wrote: a name outside the standard's form (lowercase letters, digits, hyphens), one that differs from the folder, or a missing description (the first paragraph stands in) still loads with a `warnings` entry; a name that cannot be used at all (more than 64 characters, or characters outside letters, digits and `. _ : -`), an unreadable file, or text that is not UTF-8 leaves the skill out and is reported in `problems`. Limits: 500 skills, 256 KB per file read, 64 KB of instructions, 100 supporting files listed three folders deep. Symlinks are followed only to a folder that is still a skill folder and are read through an `os.Root`, so a skill cannot reach outside its own folder.
 
 #### `list_audit` *(v2.31)*
-Reads a page of the server's audit log (§6): what was approved or refused, what ran, which settings and credentials changed, who connected. Newest first. Any authenticated peer may ask over the local socket or TCP, except a paired device (phone), which is refused.
+Reads a page of the server's audit log (§6): what was approved or refused, what ran, which settings and credentials changed, who connected. Newest first. Full access or the local socket.
 ```json
 {"type": "list_audit", "data": {"requestId": "r1", "limit": 50, "kinds": ["perm_decision", "perm_auto"], "sessionId": "session-main", "before": 412}}
 ```
@@ -893,6 +975,18 @@ Renames *this* connection's own peer entry — there's no target `peerId`, a pee
 - Response: no direct ack — every peer (including the renamer) sees the change on the next `peer_list` push. `error` if this connection has no registered peer (only possible on a transport that skips peer registration, currently none of unix/TCP).
 - A connection authenticated with a token (`register_token`) may rename itself too; the credential's own name (what `list_tokens` and the audit log show, and what `remove_token` takes) is unaffected.
 
+#### `set_profile` *(v2.36)*
+Edits your own person: the name and picture every chat shows for you. Any tier. Audited. `error` for an empty name or an oversized avatar (same cap as `set_peer_avatar`). The old name is kept in `names`, so old messages still match.
+```json
+{"type": "set_profile", "data": {"name": "aveline", "avatar": "🐣"}}
+```
+- Response: `profile_updated` to every peer. The person's own devices also get a new `server_identity`.
+- A picture sent as an image data URL (png, jpeg, gif or webp) is stored once in the upload bucket and the person's `avatar` becomes `upload:<sha256>`; an emoji stays as it is. Pruning never deletes a picture a person has. Servers that stored data URLs move them into the bucket at start.
+
+#### `get_avatar`
+
+Any tier. `{"avatar": "upload:<sha256>"}` → `avatar_data` `{"avatar", "data"}`, `data` being the picture as a data URL (absent when there is none). The picture never changes under its hash, so clients keep it.
+
 #### `set_peer_avatar`
 Sets *this* connection's own avatar — same self-only shape as `set_peer_name`, for updating the picture chosen at connect time (`auth`'s `avatar`, §2a) without reconnecting.
 ```json
@@ -917,11 +1011,60 @@ Force-closes another live connection. See "Peer registry & remote-access setting
 - Response: no direct ack on success — the disconnected peer drops off the next `peer_list` push. `error` if `peerId` isn't a live peer.
 
 #### `set_peer_scope` *(v2.35)*
-Promotes (`full: true`) or demotes a device to the paired-device scope. It changes the device's whole credential, takes effect on its live connections at once, persists, and is audited (`peer_scope`). Only the local socket and full-access credentials may send it (it is not in the paired-device allowlist), so a device can demote itself but a limited one can't promote itself. `error` for an unknown peer or a local-socket peer (always full).
+Promotes (`full: true`) or demotes a device to the paired-device scope. It changes the device's whole credential, takes effect on its live connections at once, persists, and is audited (`peer_scope`). Only the local socket and full-access credentials may send it (it is not in the paired-device allowlist), so a device can demote itself but a limited one can't promote itself. `error` for an unknown peer or a local-socket peer (always full). *(v2.36)* Kept for old clients: `full: true` makes the credential's person Full and clears the device's ceiling, `full: false` caps the device at `limited`. New clients use `set_user_permissions` and `set_device_restrictions`.
 ```json
 {"type": "set_peer_scope", "data": {"peerId": "a1b2c3d4", "full": true}}
 ```
 - Response: none directly; every peer gets a `peer_list` with the new `restricted` flag.
+
+#### `list_people` *(v2.36)*
+Trusted access or above. A Trusted sender gets the people they created, plus themselves.
+```json
+{"type": "list_people", "data": {}}
+```
+- Response: `people`.
+
+#### `set_user_permissions` *(v2.36)*
+Full access or the local socket. Sets a person's tier and caps. `caps` replaces the person's overlay, so send only what differs from the defaults. `owner` can't be changed. Lowering access cancels their running turns.
+```json
+{"type": "set_user_permissions", "data": {"userId": "u-1a2b", "tier": "trusted", "caps": {"mcp_tools": true, "cli": ["my-claude"]}}}
+```
+- Response: `people` to everyone who may read it.
+
+#### `set_device_restrictions` *(v2.36)*
+Full access or the local socket. Limits one device below its person. It works whether or not the device is online. `maxTier` is empty for no ceiling; `deny` lists caps turned off on this device.
+```json
+{"type": "set_device_restrictions", "data": {"credential": "sam-phone", "maxTier": "limited", "deny": ["files_edit"]}}
+```
+- Response: `people`.
+
+#### `set_limited_defaults` *(v2.36)*
+Full access or the local socket. What Limited people get unless overridden. Send only what differs from the tier's defaults.
+```json
+{"type": "set_limited_defaults", "data": {"caps": {"terminals_watch": true}}}
+```
+- Response: `people`.
+
+#### `merge_users` *(v2.36)*
+Full access or the local socket. Makes `from` an alias of `into`: credentials move, earlier names are kept, and old messages follow. `owner` can't be `from`.
+```json
+{"type": "merge_users", "data": {"from": "u-1a2b", "into": "owner"}}
+```
+- Response: `people`.
+
+#### `move_device` *(v2.36)*
+Full access or the local socket. Moves a credential to another person. The device gets that person's chats and access.
+```json
+{"type": "move_device", "data": {"credential": "sam-phone", "userId": "u-1a2b"}}
+```
+- Response: `people`.
+
+#### `remove_user` *(v2.36)*
+Full access or the local socket. Revokes the person's credentials, disconnects them and cancels their turns. Their chats and messages stay. `owner` can't be removed.
+```json
+{"type": "remove_user", "data": {"userId": "u-1a2b"}}
+```
+- Response: `people`.
 
 #### `set_remote_access`
 Opens or closes the optional TCP listener live, without restarting the process. **Local-socket-only** — `error` if sent over TCP.
@@ -943,12 +1086,13 @@ Rotates the TCP listener's shared auth token, persisted under `-state-dir` so it
 - Response: `remote_password_set` on success, `error` on failure or if sent over TCP.
 
 #### `register_token`
-Mints a new **named**, per-person TCP auth credential — an alternative to sharing the one `set_remote_password` secret among everyone who connects remotely. **Local socket or full-access credential** — a limited (paired) device gets `error`, same rationale as `set_remote_password`: minting a new credential is an admin action.
+Mints a new **named**, per-person TCP auth credential — an alternative to sharing the one `set_remote_password` secret among everyone who connects remotely. Trusted access or above; see Pairing under "People, tiers and permissions".
 ```json
 {"type": "register_token", "data": {"name": "aveline", "email": "aveline@example.com"}}
 ```
 - `name`: required, must not already be registered (including the implicit `"default"` token that `set_remote_password` manages) — `error` on a duplicate. Fixed for the life of the credential: there's no rename, by design — revoke it (`remove_token`) and register a new name instead, so "which person is this" never has two possible answers mid-flight.
 - `pairing`: optional. Marks a one-device token for a phone about to scan a QR code (what "Pair a phone" and the terminal QR make). Unused, it expires after 10 minutes and is removed. The first device that signs in with it (its `auth` `deviceId` is required) is bound to it for good; any other device is refused as "already used". If a local-socket client or a full-access remote device is connected, that first sign-in also waits up to 60 seconds for it to approve: the server sends the connecting device `pairing_pending` and local peers `pairing_request` `{credential, name, deviceType, ip}`, and a local client or full-access remote device answers with `approve_pairing` `{credential, allow}` (a limited device gets `error`). With no such client connected nothing waits: the code itself, which only the owner can mint (`register_token`, or the server's console), is what lets the first device in. Declined, or unanswered, the device is refused and the token removed (unless another device has claimed it meanwhile). While one device waits on a code, a second device presenting the same code is refused as "already waiting" and leaves the first one's prompt alone.
+- `user`, `newUserName`, `tier`, `maxTier` *(v2.36)*: optional. `user` says whose device this is: `"me"`, `"new"` (named `newUserName`, at `tier`), or an existing person's id. `maxTier` is the device's ceiling. A pairing code with no `user`, as old clients send, means `new`, named after the token, `limited` unless `full: true`. Who may ask for what is under "People, tiers and permissions". Trusted access or above.
 - `email`: optional, used only to seed `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` on a `bash` call this identity's turn makes (see `tool_call_requested`'s git-attribution note below) — a `<name>@yoake.local` placeholder is used if omitted.
 - Once this token authenticates a TCP `auth` handshake, its `name` is that connection's peer name *only if the client reports none*: it is the initial name for a device being set up, and a device that already has an identity (`name`/`avatar` in the `auth` frame) keeps it. The avatar likewise falls back to the one cached against the token via `set_peer_avatar` (§3.1) when the client sends none. The credential's name stays the token's handle for `list_tokens`, `remove_token` and the audit log, whatever the peer calls itself.
 - Response: `token_registered`, carrying the newly generated token — **shown only this once**, the same "reveal at creation, scrub afterward" pattern as any other bearer credential. Copy it somewhere before disconnecting; there's no way to retrieve it again short of `remove_token` + `register_token` a replacement.
@@ -958,11 +1102,11 @@ Enumerates every registered named token (plus the implicit `"default"` one), wit
 - Response: `token_list`.
 
 #### `remove_token`
-Revokes one named credential — idempotent, like `remove_provider`: removing a name that's already gone still succeeds, since (like a provider credential, unlike a session id) there's no meaningful distinction between "never existed" and "already revoked." **Local-socket-only.** Local socket or full-access credential.
+Revokes one named credential — idempotent, like `remove_provider`: removing a name that's already gone still succeeds, since (like a provider credential, unlike a session id) there's no meaningful distinction between "never existed" and "already revoked." Full access or the local socket; a Trusted sender only for people they created or their own credentials.
 ```json
 {"type": "remove_token", "data": {"name": "aveline"}}
 ```
-- Anyone still connected under that token at the moment it's removed keeps their current connection (same "no forced disconnect" behavior as `set_remote_password`'s rotation) — only the *next* `auth` handshake with that token is rejected.
+- Anyone connected under that token is disconnected at once, and any turn they started is cancelled.
 - Response: `token_removed`, echoing `name` back.
 
 #### `set_server_identity`
@@ -1057,21 +1201,21 @@ Ends a terminal permanently — kills the shell if still running and drops the t
 ```json
 {"type": "list_processes", "data": {}}
 ```
-- Response: `process_list`. Local connections only (denied to TCP peers: command lines can hold secrets).
+- Response: `process_list`. Needs the `processes` cap. `command` is stripped below Full, since command lines can hold secrets.
 
 #### `signal_process`
 Sends `SIGINT` or `SIGKILL` to one process in the server's own process tree (a terminal, CLI agent, MCP server or tool command). Nothing else can be signaled.
 ```json
 {"type": "signal_process", "data": {"pid": 123, "signal": "SIGINT"}}
 ```
-- Response: `process_signaled`. Local connections only (denied to TCP peers, as `list_processes`). The tree is walked when the request arrives. The server's own pid and any pid outside its tree are refused, as is any signal other than `SIGINT` or `SIGKILL`. On Windows `SIGINT` is refused and `SIGKILL` kills.
+- Response: `process_signaled`. Trusted access or above. The tree is walked when the request arrives. The server's own pid and any pid outside its tree are refused, as is any signal other than `SIGINT` or `SIGKILL`. On Windows `SIGINT` is refused and `SIGKILL` kills.
 
 #### `list_problems`
 Asks for the server's recent problems: failed and slow tool runs, and recent warnings.
 ```json
 {"type": "list_problems", "data": {}}
 ```
-- Response: `problem_list`. Local connections only (causes can hold secrets).
+- Response: `problem_list`. Trusted access or above. Causes are redacted, since they can hold secrets.
 
 #### `list_terminals`
 Enumerates every open terminal (tab) in one chat session — what a client repaints that chat's tab strip from on open, resolved the same way `get_session_history` is.
@@ -1130,7 +1274,7 @@ A person driving the tabs: `{"action": "navigate", "url": "https://example.com"}
 ---
 
 #### `schedule_turn`
-Arms a turn the server will start itself: the same turn a `user_prompt` makes, queued behind a running one, stopping at permission prompts until a client answers, with its user message stamped with an `origin` (below). Owner-only (not available to a paired device).
+Arms a turn the server will start itself: the same turn a `user_prompt` makes, queued behind a running one, stopping at permission prompts until a client answers, with its user message stamped with an `origin` (below). Trusted access or above, on a chat the sender owns. The turn runs as its creator (see "People, tiers and permissions").
 ```json
 {"type": "schedule_turn", "data": {"sessionId": "s1", "projectPath": "/p", "text": "check the deploy", "trigger": {"kind": "at", "atMs": 1760000000000}}}
 ```
@@ -1155,7 +1299,7 @@ When a turn fails with a subscription usage limit (a CLI agent's "usage limit re
 What an ```` ```artifact ```` page (§3.2 `model_delta` text; the client shows it in a sandboxed frame) tells the server. `data`: `{sessionId, projectPath?, artifactId, kind, data, messageId?}`. `artifactId` is chosen by the client and stable for a given message (the client uses `<messageId>#<n>`). `data` is any JSON ≤ 64 KiB.
 - `kind: "submit"`: the user acted in the page. The server schedules a `now` turn whose text is the page's data, marked `origin: {kind: "artifact", artifactId}`, so the model answers it. At most 50 submits per artifact.
 - `kind: "log"` / `"error"`: console output and uncaught errors, kept in memory (200 entries of 4 KiB per artifact, the 50 newest artifacts per chat) for the `artifact_logs` tool; not a turn.
-- At most 20 events a second per connection; the excess is dropped silently. **Allowed for a restricted paired device**: it is chat input, like a typed message. The native agent's `artifact_logs` tool (`{artifactId?}`, default the chat's latest artifact) needs no permission and is available in read-only modes.
+- At most 20 events a second per connection; the excess is dropped silently. Allowed at any tier on a chat the sender owns: it is chat input, like a typed message. The native agent's `artifact_logs` tool (`{artifactId?}`, default the chat's latest artifact) needs no permission and is available in read-only modes.
 
 ### 3.2 Outbound Events (Backend → Frontend)
 
@@ -1340,7 +1484,7 @@ A mid-turn reading of how full the model's context window is, sent as the provid
 *UI Action*: update the context ring/meter against the running turn; treat `turn_completed.context` as the authoritative final value (it always comes, this might not).
 
 #### `user_message` *(v2.35)*
-A user turn's prompt, sent to every connection watching the session right after the server records it, so a device that didn't send it can show it. `data` is `{messageId, content, attachments?, author?, authorAvatar?}`. `get_session_history` now also subscribes the asking connection to the session's live events (as sending a prompt always did), so a device that merely has the chat open receives this and the turn's `model_delta` stream.
+A user turn's prompt, sent to every connection watching the session right after the server records it, so a device that didn't send it can show it. `data` is `{messageId, content, attachments?, authorId?, author?, authorAvatar?}`, with the sender's current name and picture. `get_session_history` now also subscribes the asking connection to the session's live events (as sending a prompt always did), so a device that merely has the chat open receives this and the turn's `model_delta` stream.
 *UI Action*: add the message and a reply placeholder unless one with that `messageId` or `turnId` is already there (the sender has it). Also create the reply placeholder when a `model_delta` arrives for a turn with none.
 
 #### `steer_accepted` / `steer_rejected` *(v2.22)*
@@ -1645,7 +1789,8 @@ Response to `get_session_history`.
 - `author`: who actually sent this message. Set on a `user` message from a sender that identified itself — a token-authenticated TCP peer (`register_token`'s named ones, or the legacy shared `"default"` — §3.1), whose display name is what its device reports, or a client that declared `authorName` on its `user_prompt` (§3.1), which is what the local unix socket relies on since it has no credential to attribute to. Omitted for assistant/tool messages (no human author) and for a `user` message whose sender identified itself as nothing. *UI Action*: render as e.g. "aveline: ..." in a shared session; fall back to a generic label (or nothing) when absent, don't treat its absence as an error.
 - `attachments` *(v2.14)*: the server-side paths a `user` message attached (§3.1 `user_prompt`). Omitted when there are none. *UI Action*: render them as file chips under the message.
 - `images` *(v2.33)*: the pictures a `tool` message carried back from the call (§3.2 `tool_result`'s `images`) — the same `{mimeType, data, width?, height?}` shape, base64 `data` with no `data:` prefix; today only the `browser` tool's `screenshot` action (§4e) produces them. Omitted when there are none, which is every other message. *UI Action*: redraw them with that message, so a transcript repainted after a reload shows the screenshot the agent actually took instead of a tool call with no visible result.
-- `authorAvatar`: that sender's picture, stored alongside the name — either a short emoji glyph or a data URL, whichever the sending client uses (§2a's avatar conventions). Omitted for assistant/tool messages and for a sender that never set one. *UI Action*: render it next to the message; fall back to a placeholder avatar client-side when absent, don't treat its absence as an error. Store it with the message rather than looking it up from the live peer roster: `peer_list` is per-connection and gone after a reload, whereas this is what a repainted transcript has to draw from.
+- `authorId` *(v2.36)*: the person who sent it, a key into `session_history`'s `profiles` (`{id: {name, avatar}}`, each author once, as they are now). An older message with no `authorId` gets one when its `author` exactly matches one person's current or earlier name; the file is not rewritten. Otherwise it keeps its stored name and picture.
+- `authorAvatar`: on messages stored before v2.36 only. That sender's picture, stored alongside the name — either a short emoji glyph or a data URL, whichever the sending client uses (§2a's avatar conventions). Omitted for assistant/tool messages and for a sender that never set one. *UI Action*: render it next to the message; fall back to a placeholder avatar client-side when absent, don't treat its absence as an error. Store it with the message rather than looking it up from the live peer roster: `peer_list` is per-connection and gone after a reload, whereas this is what a repainted transcript has to draw from.
 
 #### `project_opened`
 Confirms `open_project`.
@@ -1864,13 +2009,16 @@ Pushed to **every** connected peer whenever the connection roster changes (conne
   }
 }
 ```
+`tier`, `userId`, `userName` *(v2.36)*: the connection's tier and person; `name` stays the device's label. `restricted` stays for old clients, true below Full.
+
 *UI Action*: Render the full peer/connection list from `data.peers` on every push — it's always the complete current roster, not a diff. `credential` is the name of the token the connection signed in with (omitted on the local socket): unlike `name`, which the device chooses, it is what the audit log and git commits use, so a client should show it wherever "which device is this" matters. `credential` is the name of the token the connection signed in with (omitted on the local socket): unlike `name`, which the device chooses, it is what the audit log and git commits use, so a client should show it wherever "which device is this" matters. `deviceId` is the stable id the client sent in `auth` (omitted if it sent none): the same device keeps it across reconnects and across servers, so a client groups rows by it. `sessionId`/`projectPath` are the chat that connection last opened (its latest `get_session_history`), omitted until it opens one. `you` is the receiving connection's own `peerId` (so each peer gets a slightly different push), for telling your own row apart; older servers omit it. `ip` is empty for a unix-socket peer (no meaningful remote address). `avatar` is omitted entirely for a peer that never set one (render a fallback/initials avatar client-side, don't treat absence as an error). `peerId` is per-**connection**, not per-user: two tabs/devices from the same person are two separate rows, each independently renameable/disconnectable.
 
 #### `server_identity`
 Pushed to a peer right after it connects, and to every peer whenever `set_server_identity` changes it.
 ```json
-{"type": "server_identity", "data": {"identity": "aveline's living room", "icon": {"name": "ghost", "hue": 210}, "serverId": "a1b2c3d4e5f6...", "version": "0.1.1"}}
+{"type": "server_identity", "data": {"identity": "aveline's living room", "icon": {"name": "ghost", "hue": 210}, "serverId": "a1b2c3d4e5f6...", "version": "0.1.1", "tier": "limited", "caps": {"files_edit": true}, "user": {"id": "u-1a2b", "name": "Sam", "avatar": "🦊"}}}
 ```
+- `tier`, `caps`, `user` *(v2.36)*: this connection's tier, effective caps and person. `restricted` stays for old clients, true below Full.
 - `icon`: how to draw this server's avatar, chosen by an operator via `set_server_identity` and the same on every client; omitted until one is picked. Without `icon.name` draw initials; without `icon.hue` derive a colour from `serverId`.
 - `version`: the release this binary was built from, or `dev` for a local build. A client compares it with the latest release to flag an out-of-date server; a missing value (older server) counts as out of date, a non-numeric one never does.
 - `identity`: a mutable display name — *UI Action*: show this as the server's display name (e.g. in a connection list or title bar) rather than a raw address.
@@ -1934,6 +2082,19 @@ Response to `list_tokens`. Never carries a raw token value — same scrubbing as
 }
 ```
 *UI Action*: Populate a "people with access" settings list, each row offering a revoke (`remove_token`) action. The implicit `"default"` entry is the `set_remote_password` credential — present even if no one has ever called `register_token`.
+
+#### `people` *(v2.36)*
+The people this reader may manage, with their devices. Pushed whenever they change. Never carries a token value.
+```json
+{"type": "people", "data": {
+  "users": [{"id": "u-1a2b", "name": "Sam", "avatar": "🦊", "names": ["sammy"], "tier": "limited", "caps": {"browser": "watch"}, "effectiveCaps": {"files_edit": true, "browser": "watch", "cli": []}, "createdBy": "owner",
+    "devices": [{"credential": "sam-phone", "deviceType": "web", "deviceName": "Sam's phone", "maxTier": "", "deny": ["files_edit"], "lastSeen": 1793845000, "pairedBy": "owner", "online": true}]}],
+  "limitedDefaults": {}, "tierDefaults": {"limited": {}, "trusted": {}, "full": {}}, "cliProviders": ["my-claude"]
+}}
+```
+
+#### `profile_updated` *(v2.36)*
+A person's name or picture changed. `data` is `{id, name, avatar?}`. Sent to every peer. *UI Action*: redraw that person's messages.
 
 #### `token_removed`
 Response to a successful `remove_token`, echoing `name` back.

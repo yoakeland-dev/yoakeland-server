@@ -14,11 +14,14 @@ import (
 )
 
 type SessionState struct {
-	SessionID  string     `json:"sessionId"`
-	CreatedAt  time.Time  `json:"createdAt"`
-	UpdatedAt  time.Time  `json:"updatedAt"`
-	History    []Message  `json:"history"`
-	Title      string     `json:"title,omitempty"`
+	SessionID string    `json:"sessionId"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	History   []Message `json:"history"`
+	Title     string    `json:"title,omitempty"`
+	// OwnerID is the user who created the chat (PLAN_PERMISSIONS "Chats"). A session with none
+	// belongs to the owner.
+	OwnerID    string     `json:"ownerId,omitempty"`
 	Archived   bool       `json:"archived,omitempty"`
 	ArchivedAt *time.Time `json:"archivedAt,omitempty"`
 	// Settled is a retired field from an early build where "closed" was its own state
@@ -76,6 +79,9 @@ type SessionStore interface {
 	// Ensure creates an empty session file if there isn't one, and does nothing
 	// if there is.
 	Ensure(sessionID string) error
+	// EnsureOwned is Ensure, stamping a file it creates with ownerID. An existing session keeps
+	// its owner.
+	EnsureOwned(sessionID, ownerID string) error
 }
 
 // ErrSessionNotFound distinguishes "this id has no persisted file yet" from a
@@ -239,7 +245,10 @@ func (s *DiskSessionStore) update(sessionID string, mutate func(*SessionState) e
 // same connection — the set_session_title a client pushes alongside a first
 // message — finds a session that exists instead of racing the turn's own first
 // write and being rejected as "not found" (SPEC.md §3.1).
-func (s *DiskSessionStore) Ensure(sessionID string) error {
+func (s *DiskSessionStore) Ensure(sessionID string) error { return s.EnsureOwned(sessionID, "") }
+
+// EnsureOwned is Ensure for a session created on behalf of ownerID.
+func (s *DiskSessionStore) EnsureOwned(sessionID, ownerID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -250,6 +259,7 @@ func (s *DiskSessionStore) Ensure(sessionID string) error {
 	}
 	return s.saveLocked(&SessionState{
 		SessionID: sessionID,
+		OwnerID:   ownerID,
 		CreatedAt: time.Now().UTC(),
 		History:   make([]Message, 0),
 	})

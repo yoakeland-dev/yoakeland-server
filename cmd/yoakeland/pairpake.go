@@ -173,10 +173,10 @@ func (d connDeps) pairWithPIN(ipc *protocol.IPCStream, conn net.Conn, who peerId
 		return errPairFailed
 	}
 	name := "pin-" + suffix[:6]
-	if err := d.settings.AddPairingToken(name, token, ""); err != nil {
+	// The PIN is only ever printed on the server's console, so whoever has it is the owner.
+	if _, err := d.settings.AddCredential(NewCredential{Name: name, Token: token, Pairing: true, UserID: ownerID, By: ownerID}); err != nil {
 		return errPairFailed
 	}
-	d.settings.SetTokenScope(name, true) // the PIN is only ever printed on the server's console
 	_, rec, _ := d.settings.LookupToken(token)
 	who.TokenName = name
 	if err := d.admitPairing(ipc, who, rec, remoteIP(conn, "tcp")); err != nil {

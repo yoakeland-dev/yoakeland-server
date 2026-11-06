@@ -133,8 +133,18 @@ func (s *Scheduler) changed() {
 	}
 }
 
-// Add validates and arms a turn, returning the stored entry.
+// ErrCancelled is what a Run returns to cancel the entry it was given instead of recording a
+// failure: its creator no longer exists, or the entry can't run any more.
+var ErrCancelled = errors.New("cancelled")
+
+// Add arms a turn that runs as the owner. See AddAs.
 func (s *Scheduler) Add(d protocol.ScheduleTurnData) (protocol.ScheduledTurn, error) {
+	return s.AddAs(d, "", "")
+}
+
+// AddAs validates and arms a turn made by userID on credential (both empty: the owner, as an
+// entry from before users), returning the stored entry.
+func (s *Scheduler) AddAs(d protocol.ScheduleTurnData, userID, credential string) (protocol.ScheduledTurn, error) {
 	text := strings.TrimSpace(d.Text)
 	switch {
 	case d.SessionID == "":
@@ -148,6 +158,7 @@ func (s *Scheduler) Add(d protocol.ScheduleTurnData) (protocol.ScheduledTurn, er
 	t := protocol.ScheduledTurn{
 		SessionID: d.SessionID, ProjectPath: d.ProjectPath, Text: d.Text, Trigger: d.Trigger,
 		Status: protocol.SchedulePending, CreatedAtMs: now.UnixMilli(),
+		CreatorUserID: userID, CreatorCredential: credential,
 	}
 	t.Origin = protocol.Origin{Kind: protocol.OriginScheduled}
 	if d.Origin != nil && (d.Origin.Kind == protocol.OriginArtifact || d.Origin.Kind == protocol.OriginScheduled) {
@@ -389,7 +400,11 @@ func (s *Scheduler) fire(t protocol.ScheduledTurn) bool {
 	if cur == nil {
 		return true
 	}
-	if err != nil {
+	if errors.Is(err, ErrCancelled) {
+		delete(s.active, t.ID)
+		cur.Error = err.Error()
+		cur.Status, cur.NextRunAtMs = protocol.ScheduleCancelled, 0
+	} else if err != nil {
 		delete(s.active, t.ID)
 		cur.Error = err.Error()
 		cur.Runs++

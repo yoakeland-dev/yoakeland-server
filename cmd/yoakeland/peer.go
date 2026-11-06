@@ -35,7 +35,10 @@ type Peer struct {
 	TokenName   string
 	Email       string
 	DeviceID    string
-	Restricted  bool   // limited to remoteAllowed events; changes with set_peer_scope, read through IsRestricted
+	Restricted  bool   // below the Full tier; kept in step with the credential by SyncAccess, read through IsRestricted
+	Tier        string // TierFull on the local socket; settled from the credential's person for TCP
+	UserID      string // the person this connection acts as
+	accessSig   string // a fingerprint of the capabilities last sent to the device, to notice a change
 	SessionID   string // last chat opened, see SetActivity
 	ProjectPath string
 	Network     string // "unix" or "tcp"
@@ -58,9 +61,14 @@ type Peer struct {
 type PeerRegistry struct {
 	mu    sync.Mutex
 	peers map[string]*Peer
-	// OnDemote, if set, is called (unlocked) for each connection a SetScope just made restricted,
+	// OnDemote, if set, is called (unlocked) for each connection a SyncAccess just made restricted,
 	// so what it held (the server browser's seat) is let go.
 	OnDemote func(peerID string)
+	// UserName, if set, names a person for the roster (peer_list's userName).
+	UserName func(userID string) string
+	// Sees says whether the connection with this credential may be told about a chat's events.
+	// Unset, a TCP peer sees none: session events fail closed.
+	Sees func(network, credential, sessionID string) bool
 }
 
 func NewPeerRegistry() *PeerRegistry {
@@ -72,7 +80,8 @@ func NewPeerRegistry() *PeerRegistry {
 type peerIdentity struct {
 	Name, DeviceType, Avatar, DeviceID string
 	TokenName, Email                   string              // set only for a named TCP token
-	Restricted                         bool                // a pairing (phone) credential: see remoteAllowed
+	Restricted                         bool                // below the Full tier
+	Tier, UserID                       string              // settled by serveAccepted once the credential is admitted
 	pake                               *protocol.PakeStart // set when the first frame asked to pair with a PIN (pairpake.go); the connection never becomes a peer
 }
 
@@ -107,6 +116,9 @@ func cleanName(s string) string {
 // rather than failing the connection over what's cosmetic.
 func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network string, who peerIdentity) *Peer {
 	id := randomID()
+	if network != "tcp" {
+		who.Tier, who.UserID, who.Restricted = TierFull, ownerID, false
+	}
 	who.Name = cleanName(who.Name)
 	if who.Name == "" {
 		who.Name = cleanName(who.DeviceType + "-" + id[:6])
@@ -127,11 +139,14 @@ func (r *PeerRegistry) Add(ipc *protocol.IPCStream, conn io.Closer, network stri
 		TokenName:   who.TokenName,
 		Email:       who.Email,
 		Restricted:  who.Restricted,
+		Tier:        who.Tier,
+		UserID:      who.UserID,
 		Network:     network,
 		conn:        conn,
 		ipc:         ipc,
 	}
 
+	ipc.SetVisibility(func(sessionID string) bool { return r.canSee(p, sessionID) })
 	r.mu.Lock()
 	r.peers[id] = p
 	r.mu.Unlock()
@@ -245,7 +260,7 @@ func (r *PeerRegistry) Get(id string) (*Peer, bool) {
 	return p, ok
 }
 
-// IsRestricted reports whether id is held to remoteAllowed. Unknown peers count as restricted.
+// IsRestricted reports whether id is below the Full tier. Unknown peers count as restricted.
 func (r *PeerRegistry) IsRestricted(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -268,20 +283,25 @@ func (r *PeerRegistry) AtCredentialLimit(tokenName string) bool {
 	return n >= maxConnsPerToken
 }
 
-// SetScope applies a tier change to every live connection on credential tokenName and broadcasts
-// the roster. Returns how many connections changed.
-func (r *PeerRegistry) SetScope(tokenName string, restricted bool) int {
+// SyncAccess re-reads every TCP connection's tier and person with access (credential -> tier,
+// user) and broadcasts the roster if anything changed. It returns the connections that changed, so
+// the caller can tell them their new tier, and, separately, those that just lost the Full tier.
+func (r *PeerRegistry) SyncAccess(access func(credential string) (tier, userID, sig string)) (changed []*Peer) {
 	r.mu.Lock()
-	n := 0
 	var demoted []string
 	for _, p := range r.peers {
-		if p.TokenName == tokenName {
-			if restricted && !p.Restricted {
-				demoted = append(demoted, p.ID)
-			}
-			p.Restricted = restricted
-			n++
+		if p.Network != "tcp" {
+			continue
 		}
+		tier, userID, sig := access(p.TokenName)
+		if tier == p.Tier && userID == p.UserID && sig == p.accessSig {
+			continue
+		}
+		if tier != TierFull && !p.Restricted {
+			demoted = append(demoted, p.ID)
+		}
+		p.Tier, p.UserID, p.Restricted, p.accessSig = tier, userID, tier != TierFull, sig
+		changed = append(changed, p)
 	}
 	r.mu.Unlock()
 	if r.OnDemote != nil {
@@ -289,10 +309,10 @@ func (r *PeerRegistry) SetScope(tokenName string, restricted bool) int {
 			r.OnDemote(id)
 		}
 	}
-	if n > 0 {
+	if len(changed) > 0 {
 		r.Broadcast()
 	}
-	return n
+	return changed
 }
 
 // SetBrowserHost records whether id offers its browser panel to the agent.
@@ -426,7 +446,8 @@ func (r *PeerRegistry) Count() int {
 	return len(r.peers)
 }
 
-// BroadcastEvent pushes one event to every live peer except exceptPeerID —
+// BroadcastEvent pushes one event to every live peer except exceptPeerID, leaving out the peers who
+// may not see the chat it is about (the sessionID, or the one inside the payload; see forPeer) —
 // the requester, who already got its own direct response inline. This is
 // the live-sync half of chat-list/project-list consistency: any other
 // connection currently attached to this process learns about a mutation
@@ -444,29 +465,38 @@ func (r *PeerRegistry) BroadcastEvent(exceptPeerID string, eventType protocol.Ev
 	r.mu.Unlock()
 
 	for _, p := range peers {
-		_ = p.ipc.SendEvent(eventType, sessionID, "", "", data)
+		r.SendTo(p, eventType, sessionID, data)
 	}
+}
+
+// canApprove reports whether p could answer a pairing made by the person pairedBy: the local
+// socket, a Full device, or the Trusted person who made it.
+func canApprove(p *Peer, pairedBy string) bool {
+	return p.Network == "unix" || !p.Restricted || (p.Tier == TierTrusted && pairedBy != "" && p.UserID == pairedBy)
 }
 
 // HasLocal reports whether any client is connected that could approve a pairing: one on the local
 // socket or a full-access remote device (a server used only remotely has no other).
-func (r *PeerRegistry) HasLocal() bool {
+func (r *PeerRegistry) HasLocal() bool { return r.HasApprover("") }
+
+// HasApprover is HasLocal, also counting the Trusted person pairedBy who made the pairing.
+func (r *PeerRegistry) HasApprover(pairedBy string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, p := range r.peers {
-		if p.Network == "unix" || !p.Restricted {
+		if canApprove(p, pairedBy) {
 			return true
 		}
 	}
 	return false
 }
 
-// BroadcastLocal sends an event to the peers that could approve a pairing (see HasLocal).
-func (r *PeerRegistry) BroadcastLocal(eventType protocol.EventType, data any) {
+// BroadcastApprovers sends an event to the peers that could approve a pairing (see HasApprover).
+func (r *PeerRegistry) BroadcastApprovers(pairedBy string, eventType protocol.EventType, data any) {
 	r.mu.Lock()
 	var peers []*Peer
 	for _, p := range r.peers {
-		if p.Network == "unix" || !p.Restricted {
+		if canApprove(p, pairedBy) {
 			peers = append(peers, p)
 		}
 	}
@@ -494,6 +524,9 @@ func (r *PeerRegistry) Broadcast() {
 			SessionID:   p.SessionID,
 			ProjectPath: p.ProjectPath,
 			Restricted:  p.Restricted,
+			Tier:        tierOrFull(p),
+			UserID:      p.UserID,
+			UserName:    userName(r.UserName, p.UserID),
 		})
 		peers = append(peers, p)
 	}
@@ -560,4 +593,22 @@ func randomID() string {
 		return hex.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))
 	}
 	return hex.EncodeToString(buf)
+}
+
+// tierOrFull is p's tier; a connection nobody settled (the local socket) is the owner.
+func tierOrFull(p *Peer) string {
+	if p.Network != "tcp" || p.Tier == "" && !p.Restricted {
+		return TierFull
+	}
+	if p.Tier == "" {
+		return TierLimited
+	}
+	return p.Tier
+}
+
+func userName(f func(string) string, id string) string {
+	if f == nil || id == "" {
+		return ""
+	}
+	return f(id)
 }

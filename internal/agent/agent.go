@@ -62,11 +62,13 @@ type Message struct {
 	// messages, which have no human author.
 	AuthorName string `json:"author,omitempty"`
 
-	// AuthorAvatar is that sender's picture, stored alongside the name so it
-	// survives a reload: a client renders it from local settings for its own
-	// live messages, but a transcript repainted from get_session_history has
-	// nothing else to draw from. Either a short emoji glyph or a data URL
-	// (SPEC.md §2a's conventions, devolved to whichever the client uses).
+	// AuthorID is the user who sent it. The name above is only a snapshot of what they were
+	// called then; who they are now, picture included, is looked up by this id.
+	AuthorID string `json:"authorId,omitempty"`
+
+	// AuthorAvatar is the picture an older message was stored with, before pictures were looked
+	// up by AuthorID. New messages don't store one, so a changed picture shows everywhere; an old
+	// message keeps its own when its author can't be matched to a user.
 	AuthorAvatar string `json:"authorAvatar,omitempty"`
 
 	// Origin is set when the server, not a person, started the turn this user message opens
@@ -124,20 +126,22 @@ type Message struct {
 // care about attribution keeps working unchanged with the zero value (no
 // message attribution, no git-author env injection).
 type Author struct {
+	// ID is the user the sender acts as; Name, Email and Avatar are that user's own.
+	ID     string
 	Name   string
 	Email  string
-	Avatar string
-	// Credential is the registered token's name when the sender signed in with
-	// one. Git commits use it rather than Name, which a device chooses itself.
+	Avatar string // shown on live events; never stored with the message
+	// Credential is the registered token's name when the sender signed in with one.
 	Credential string
 }
 
-// GitName is what a commit made on this author's turn is signed with.
+// GitName is what a commit made on this author's turn is signed with: the user's name, else the
+// name of the credential they came in on.
 func (a Author) GitName() string {
-	if a.Credential != "" {
-		return a.Credential
+	if a.Name != "" {
+		return a.Name
 	}
-	return a.Name
+	return a.Credential
 }
 
 type authorContextKey struct{}
@@ -435,11 +439,16 @@ type Agent struct {
 	mode             Mode
 	webToolsEnabled  bool
 	shellDisabled    bool // bash and terminal_* withheld (SetShellDisabled)
-	permEngine       *permission.Engine
-	snapshotStore    snapshot.SnapshotStore
-	sessionStore     SessionStore
-	contextManager   *ContextManager
-	usageStore       *UsageStore
+	unsandboxed      bool // this project's commands have no sandbox (Registry.SetUnsandboxed)
+	// policy is the running turn's rules, set while it holds the turn slot (lockTurn) and under
+	// mu; nil is unrestricted. A subagent gets its parent's.
+	policy         *TurnPolicy
+	turnActors     map[string]TurnActor // who started each running or queued turn, by turn id
+	permEngine     *permission.Engine
+	snapshotStore  snapshot.SnapshotStore
+	sessionStore   SessionStore
+	contextManager *ContextManager
+	usageStore     *UsageStore
 
 	// limits are the soft round and spend limits, shared server-wide and read
 	// live (limits.go). Never nil.
@@ -564,6 +573,14 @@ func (h Hooks) asksChanged() {
 // withdrawn. release ends the turn: it gives the slot back.
 func (a *Agent) lockTurn(ctx context.Context, sessionID, turnID string) (context.Context, func(), bool) {
 	tctx, cancel := context.WithCancel(ctx)
+	a.mu.Lock()
+	a.turnActors[turnID] = turnActorFrom(ctx)
+	a.mu.Unlock()
+	forget := func() {
+		a.mu.Lock()
+		delete(a.turnActors, turnID)
+		a.mu.Unlock()
+	}
 	got := false
 	select {
 	case a.turnSlot <- struct{}{}:
@@ -590,16 +607,20 @@ func (a *Agent) lockTurn(ctx context.Context, sessionID, turnID string) (context
 	}
 	if !got {
 		cancel()
+		forget()
 		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("cancelled", protocol.UsageData{}, time.Now(), "", ""))
 		return nil, nil, false
 	}
 	a.mu.Lock()
 	a.activeTurnCancels[turnID] = cancel
+	a.policy = TurnPolicyFrom(ctx)
 	a.mu.Unlock()
 	_ = a.getStream().SendEvent(protocol.EventTurnStarted, sessionID, turnID, "", protocol.TurnStartedData{})
 	return tctx, func() {
 		a.mu.Lock()
 		delete(a.activeTurnCancels, turnID)
+		delete(a.turnActors, turnID)
+		a.policy = nil
 		a.mu.Unlock()
 		cancel()
 		a.unlockTurn()
@@ -731,6 +752,7 @@ func NewAgent(
 		nativeRemember:    make(map[string]bool),
 		nativeRuleID:      make(map[string]string),
 		subagents:         make(map[string]*Agent),
+		turnActors:        make(map[string]TurnActor),
 	}
 }
 
@@ -1039,10 +1061,11 @@ var webToolNames = map[string]bool{
 // picture.
 func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 	a.mu.Lock()
-	mode := a.mode
+	mode := a.effectiveModeLocked()
 	base := a.toolDefsForModeLocked()
 	webEnabled := a.webToolsEnabled
 	shellOff := a.shellDisabled
+	pol, unsandboxed := a.policy, a.unsandboxed
 	a.mu.Unlock()
 
 	// Whether the model can look at a picture decides whether screenshot is
@@ -1051,17 +1074,17 @@ func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 
 	// The skill tool is only worth its definition when there is a skill to load.
 	hideSkill := a.tools[tool.SkillToolName] != nil && !a.skillsAvailable()
-	if webEnabled && !shellOff && !hideSkill && vision {
-		return a.withSkillNames(a.withSourceDefs(base, mode))
+	if webEnabled && !shellOff && !hideSkill && vision && pol == nil {
+		return a.withSkillNames(a.withSourceDefs(base, mode, pol))
 	}
 	filtered := make([]tool.ToolDefinition, 0, len(base))
 	for _, def := range base {
-		if (!webEnabled && webToolNames[def.Name]) || (shellOff && isShellTool(def.Name)) || (hideSkill && def.Name == tool.SkillToolName) {
+		if (!webEnabled && webToolNames[def.Name]) || (shellOff && isShellTool(def.Name)) || (hideSkill && def.Name == tool.SkillToolName) || pol.blocks(def.Name, unsandboxed) {
 			continue
 		}
 		filtered = append(filtered, a.defForVision(def, vision))
 	}
-	return a.withSkillNames(a.withSourceDefs(filtered, mode))
+	return a.withSkillNames(a.withSourceDefs(filtered, mode, pol))
 }
 
 // defForVision gives an image-capable tool the definition to offer a model
@@ -1090,7 +1113,10 @@ func (a *Agent) providerSeesImages() bool {
 
 // withSourceDefs adds the source's tools (MCP) after the fixed ones, in the
 // order the source gives them, which is stable so the prompt prefix caches.
-func (a *Agent) withSourceDefs(base []tool.ToolDefinition, mode Mode) []tool.ToolDefinition {
+func (a *Agent) withSourceDefs(base []tool.ToolDefinition, mode Mode, pol *TurnPolicy) []tool.ToolDefinition {
+	if pol != nil && !pol.MCP {
+		return base // the source's tools are MCP tools
+	}
 	extra := a.sourceDefs(mode)
 	if len(extra) == 0 {
 		return base
@@ -1101,7 +1127,7 @@ func (a *Agent) withSourceDefs(base []tool.ToolDefinition, mode Mode) []tool.Too
 // toolDefsForModeLocked returns the precomputed slice for the current mode.
 // Caller must hold a.mu.
 func (a *Agent) toolDefsForModeLocked() []tool.ToolDefinition {
-	switch a.mode {
+	switch a.effectiveModeLocked() {
 	case ModeReadOnly:
 		return a.toolDefsReadOnly
 	case ModePlan:
@@ -1117,10 +1143,15 @@ func (a *Agent) toolDefsForModeLocked() []tool.ToolDefinition {
 // mid-turn).
 func (a *Agent) isToolAllowedInMode(name string) bool {
 	a.mu.Lock()
-	mode := a.mode
+	mode := a.effectiveModeLocked()
 	webEnabled := a.webToolsEnabled
 	shellOff := a.shellDisabled
+	pol, unsandboxed := a.policy, a.unsandboxed
 	a.mu.Unlock()
+
+	if pol.blocks(name, unsandboxed) {
+		return false
+	}
 
 	if webToolNames[name] && !webEnabled {
 		return false
@@ -1134,6 +1165,9 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 	if _, fixed := a.tools[name]; !fixed && name != SubagentToolName {
 		// A tool from the source: offered in read-only and plan modes only when
 		// its server calls it read-only.
+		if pol != nil && !pol.MCP {
+			return false
+		}
 		t, ok := a.lookupTool(name)
 		return ok && offeredByMode(t, mode)
 	}
@@ -1156,7 +1190,7 @@ func (a *Agent) serverWebSearchAllowed() bool {
 	if !a.isToolAllowedInMode("web_search") {
 		return false
 	}
-	mode := a.Mode()
+	mode := a.turnMode()
 	if mode == ModeAutonomous {
 		return true
 	}
@@ -1169,7 +1203,7 @@ func (a *Agent) activeSystemPrompt() string {
 	if a.systemPrompt != "" {
 		return a.systemPrompt
 	}
-	if a.Mode() == ModePlan {
+	if a.turnMode() == ModePlan {
 		return PlanSystemPrompt
 	}
 	if a.chat {
@@ -1386,19 +1420,19 @@ func (a *Agent) RunTurnWithTitleGeneration(parentCtx context.Context, sessionID,
 	isNewChat := len(a.history) == 0
 	userMessageID := a.nextMessageIDLocked()
 	a.history = append(a.history, Message{
-		ID:           userMessageID,
-		Role:         "user",
-		Content:      prompt,
-		AuthorName:   author.Name,
-		AuthorAvatar: author.Avatar,
-		Attachments:  attachmentsFromContext(parentCtx),
-		Origin:       originFromContext(parentCtx),
-		CreatedAt:    startTime,
+		ID:          userMessageID,
+		Role:        "user",
+		Content:     prompt,
+		AuthorName:  author.Name,
+		AuthorID:    author.ID,
+		Attachments: attachmentsFromContext(parentCtx),
+		Origin:      originFromContext(parentCtx),
+		CreatedAt:   startTime,
 	})
 	a.mu.Unlock()
 	_ = a.getStream().SendEvent(protocol.EventUserMessage, sessionID, turnID, "", protocol.UserMessageData{
 		MessageID: userMessageID, Content: prompt, Attachments: attachmentsFromContext(parentCtx),
-		Author: author.Name, AuthorAvatar: author.Avatar, Origin: originFromContext(parentCtx),
+		AuthorID: author.ID, Author: author.Name, AuthorAvatar: author.Avatar, Origin: originFromContext(parentCtx),
 	})
 
 	if isNewChat {
@@ -1435,6 +1469,15 @@ func (a *Agent) beginTurn(sessionID, turnID string, startTime time.Time) (RoleBi
 	if bound.Provider == nil {
 		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("no_provider", protocol.UsageData{}, startTime, "", ""))
 		return RoleBinding{}, fmt.Errorf("session %s has no provider; call register_provider and set_provider first", sessionID)
+	}
+	// A CLI agent runs its own tools outside yoakeland's control, so a turn started by someone it
+	// isn't listed for never reaches it. This covers a plan role that resolves to one too.
+	a.mu.Lock()
+	pol := a.policy
+	a.mu.Unlock()
+	if _, native := bound.Provider.(NativeAgent); native && !pol.allowsCLI(bound.ProviderName) {
+		_ = a.getStream().SendEvent(protocol.EventTurnCompleted, sessionID, turnID, "", a.buildTurnCompletedData("cli_not_allowed", protocol.UsageData{}, startTime, "", ""))
+		return RoleBinding{}, cliRefusal(bound.ProviderName)
 	}
 
 	_, spendCap := a.getLimits().Get()
@@ -1745,10 +1788,14 @@ turn:
 			// Claude gets CLISystemNote as a real system prompt; every other agent gets it in its first prompt.
 			needsNote := sk == nil || sk.SkillKind() != "claude"
 			nt = a.newNativeTurn(sessionID, turnID, bound.ProviderName, hist, forker != nil && forker.CanFork(), needsNote)
-			if src, ok := a.toolSource().(tool.AgentServerSource); ok {
+			a.mu.Lock()
+			pol := a.policy
+			a.mu.Unlock()
+			if src, ok := a.toolSource().(tool.AgentServerSource); ok && (pol == nil || pol.MCP) {
 				nt.MCP = src.AgentServers()
 			}
-			if a.nativeServers != nil {
+			// yoakeland's own server for CLI agents carries the browser tool.
+			if a.nativeServers != nil && (pol == nil || pol.Browser) {
 				nt.MCP = append(nt.MCP, a.nativeServers(sessionID)...)
 			}
 			a.beginSteering(turnID, nt)
@@ -2050,7 +2097,7 @@ turn:
 				a.recordToolResult(turnID, tc, "", fmt.Sprintf("tool %s not recognized", tc.Name))
 				continue
 			}
-			mode := a.Mode()
+			mode := a.turnMode()
 			if !a.isToolAllowedInMode(tc.Name) {
 				a.recordToolResult(turnID, tc, "", a.toolUnavailableMessage(tc.Name))
 				continue
@@ -2356,13 +2403,13 @@ func (a *Agent) EditMessage(parentCtx context.Context, sessionID, turnID, messag
 	userMessageID := a.nextMessageIDLocked()
 	attachments := a.history[idx].Attachments // an edit rewrites the text, not what was attached
 	a.history = append(a.history[:idx:idx], Message{
-		ID:           userMessageID,
-		Role:         "user",
-		Content:      content,
-		AuthorName:   author.Name,
-		AuthorAvatar: author.Avatar,
-		Attachments:  attachments,
-		CreatedAt:    startTime,
+		ID:          userMessageID,
+		Role:        "user",
+		Content:     content,
+		AuthorName:  author.Name,
+		AuthorID:    author.ID,
+		Attachments: attachments,
+		CreatedAt:   startTime,
 	})
 	a.mu.Unlock()
 

@@ -106,6 +106,9 @@ func (s *StreamSet) send(evtType EventType, sessionID, turnID, toolCallID, paren
 
 	var firstErr error
 	for _, st := range streams {
+		if !st.CanSee(sessionID) {
+			continue
+		}
 		if err := st.sendEvent(evtType, sessionID, turnID, toolCallID, parentToolCallID, payload); err != nil {
 			s.Remove(st)
 			if firstErr == nil {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
 )
 
@@ -187,7 +188,7 @@ func classifyLimit(err error, rl protocol.ProviderRateLimits, now time.Time, loc
 // onLimitHit is called with the error of a turn that failed; it reports whether it was a usage limit
 // (and so handled: the caller shouldn't also report it as a plain turn error). origin is the origin of
 // the turn that failed, so a continue that hit the limit again counts its attempts.
-func onLimitHit(deps connDeps, pc *ProjectContext, sessionID, providerName string, err error, origin *protocol.Origin) bool {
+func onLimitHit(deps connDeps, pc *ProjectContext, sessionID, providerName string, err error, origin *protocol.Origin, who agent.TurnActor) bool {
 	if deps.sched == nil || err == nil {
 		return false
 	}
@@ -221,13 +222,14 @@ func onLimitHit(deps connDeps, pc *ProjectContext, sessionID, providerName strin
 		SessionID: sessionID, ProjectPath: pc.Root, Provider: providerName, AtMs: now.UnixMilli(),
 		ResetsAtMs: reset.UnixMilli(), Estimated: estimated, Attempt: attempt, Message: msg,
 		TooFar: reset.Sub(now) > limitMaxWait, GaveUp: attempt >= limitMaxAttempts,
+		UserID: who.UserID, Credential: who.Credential,
 	}
 	// A continue that was already running keeps going, whatever the setting is now: the person
 	// chose it for this chat.
 	auto := (deps.settings.GetLimitAction() == protocol.LimitActionContinue || wasAuto) && !hit.TooFar && !hit.GaveUp
 	deps.sched.SetHit(hit, auto)
 	if auto {
-		if err := armContinue(deps, hit); err != nil {
+		if err := armContinue(deps, hit, who); err != nil {
 			logError("limit: arming a continue for %s: %v", sessionID, err)
 			auto = false
 		}
@@ -238,17 +240,18 @@ func onLimitHit(deps connDeps, pc *ProjectContext, sessionID, providerName strin
 }
 
 // armContinue schedules the continue for a chat's limit hit, once: a chat with one waiting keeps it.
-func armContinue(deps connDeps, hit protocol.LimitHit) error {
+// It runs as who: the sender of limit_continue, or whoever's turn hit the limit.
+func armContinue(deps connDeps, hit protocol.LimitHit, who agent.TurnActor) error {
 	if _, waiting := deps.sched.AutoFor(hit.SessionID); waiting {
 		return nil
 	}
 	at := time.UnixMilli(hit.ResetsAtMs).Add(time.Duration(deps.sched.CountAuto()) * limitStagger)
-	_, err := deps.sched.Add(protocol.ScheduleTurnData{
+	_, err := deps.sched.AddAs(protocol.ScheduleTurnData{
 		SessionID: hit.SessionID, ProjectPath: hit.ProjectPath, Text: continueText,
 		Trigger: protocol.ScheduleTrigger{Kind: protocol.TriggerLimitReset, AtMs: at.UnixMilli()},
 		Origin:  &protocol.Origin{Kind: protocol.OriginScheduled, Label: protocol.OriginLabelLimit, WaitedMs: max(0, at.UnixMilli()-hit.AtMs)},
 		Attempt: hit.Attempt,
-	})
+	}, who.UserID, who.Credential)
 	return err
 }
 
@@ -284,8 +287,8 @@ func notifyLimit(deps connDeps, pc *ProjectContext, hit protocol.LimitHit, auto 
 }
 
 // turnFailed reports a failed turn: as a usage limit when it was one, else as a plain turn error.
-func turnFailed(deps connDeps, pc *ProjectContext, sessionID, providerName string, err error, origin *protocol.Origin) {
-	if onLimitHit(deps, pc, sessionID, providerName, err, origin) {
+func turnFailed(deps connDeps, pc *ProjectContext, sessionID, providerName string, err error, origin *protocol.Origin, who agent.TurnActor) {
+	if onLimitHit(deps, pc, sessionID, providerName, err, origin, who) {
 		return
 	}
 	deps.notify.turnFailed(pc, sessionID, err)
@@ -302,7 +305,7 @@ func rearmLimitHits(deps connDeps) {
 		if h.GaveUp || h.TooFar {
 			continue
 		}
-		if err := armContinue(deps, h); err != nil {
+		if err := armContinue(deps, h, agent.TurnActor{UserID: h.UserID, Credential: h.Credential}); err != nil {
 			logError("limit: re-arming %s: %v", h.SessionID, err)
 		}
 	}
@@ -310,8 +313,8 @@ func rearmLimitHits(deps connDeps) {
 
 // handleLimitEnvelope answers limit_continue, limit_dismiss and set_limit_action; it reports whether
 // env was one. The first two are allowed for a restricted paired device (they are like sending a
-// message); the setting is owner-only because it isn't in remoteAllowed.
-func handleLimitEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.Envelope) bool {
+// message); the setting is Full-only in the event table.
+func handleLimitEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) bool {
 	switch env.Type {
 	case protocol.EventLimitContinue, protocol.EventLimitDismiss, protocol.EventSetLimitAction:
 	default:
@@ -369,7 +372,7 @@ func handleLimitEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.E
 			}
 			deps.sched.SetHit(hit, true)
 		}
-		if err := armContinue(deps, hit); err != nil {
+		if err := armContinue(deps, hit, deps.actorOf(network, peerID)); err != nil {
 			fail(err.Error())
 		}
 	}

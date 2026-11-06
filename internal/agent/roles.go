@@ -92,7 +92,7 @@ func modelNameOf(p ModelProvider) string {
 func (a *Agent) turnBinding() RoleBinding {
 	a.mu.Lock()
 	main := RoleBinding{Provider: a.provider, ProviderName: a.providerName}
-	mode, roles := a.mode, a.roles
+	mode, roles := a.effectiveModeLocked(), a.roles
 	a.mu.Unlock()
 	main.Model = modelNameOf(main.Provider)
 	if _, native := main.Provider.(NativeAgent); native {

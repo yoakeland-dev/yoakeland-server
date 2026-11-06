@@ -120,6 +120,13 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 	if explore {
 		bound = a.roleOr(RoleExplore, bound)
 	}
+	// A role can resolve to a CLI agent, which runs its own tools: refuse it like the main turn.
+	a.mu.Lock()
+	pol := a.policy
+	a.mu.Unlock()
+	if _, native := bound.Provider.(NativeAgent); native && !pol.allowsCLI(bound.ProviderName) {
+		return subagentResult{errText: cliRefusal(bound.ProviderName).Error()}
+	}
 	child := a.newSubagent(tc.ID, bound, explore)
 	child.tally = tally
 	parentCtx := ctx
@@ -185,8 +192,9 @@ func (a *Agent) runSubagent(ctx context.Context, turnID string, author Author, b
 // it does.
 func (a *Agent) newSubagent(parentToolCallID string, bound RoleBinding, explore bool) *Agent {
 	a.mu.Lock()
-	mode, web, sessionID, roles, root := a.mode, a.webToolsEnabled, a.sessionID, a.roles, a.projectRoot
+	mode, web, sessionID, roles, root := a.effectiveModeLocked(), a.webToolsEnabled, a.sessionID, a.roles, a.projectRoot
 	shellOff, limits := a.shellDisabled, a.limits
+	pol, unsandboxed := a.policy, a.unsandboxed
 	src, skillSrc := a.source, a.skillSrc
 	a.mu.Unlock()
 	child := NewAgent(nil, bound.Provider, bound.ProviderName, a.toolList, a.permEngine, a.snapshotStore, nil, &ContextManager{
@@ -198,6 +206,7 @@ func (a *Agent) newSubagent(parentToolCallID string, bound RoleBinding, explore 
 	child.hooks = a.hooks
 	child.webToolsEnabled = web
 	child.shellDisabled, child.limits = shellOff, limits
+	child.policy, child.unsandboxed = pol, unsandboxed
 	child.roles, child.projectRoot = roles, root
 	child.source, child.skillSrc = src, skillSrc
 	if mode == ModePlan || explore {

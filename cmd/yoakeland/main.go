@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -224,6 +225,13 @@ func main() {
 		logFatal("failed to initialize server settings: %v", err)
 	}
 	reloadRoles(projects.roles, providerStore, settings)
+	peers.UserName = settings.UserName
+	projects.mu.Lock()
+	projects.sameUser = settings.SameUser
+	projects.mu.Unlock()
+	peers.Sees = func(network, credential, sessionID string) bool {
+		return connDeps{projects: projects, settings: settings}.mayViewChat(settings.Access(network, credential), sessionID)
+	}
 
 	// Deprecated launch flags hand their value over once, then the stored
 	// setting rules (runtime_dispatch.go).
@@ -260,10 +268,11 @@ func main() {
 	hub := newStatusHub(peers, stateDir)
 	projects.SetStatusHub(hub)
 	projects.SetDefaultSource(defaultProviderSource(settings, providerStore, hub))
-	uploads, err := NewUploadStore(stateDir, uploadRetention(settings.Runtime()))
+	uploads, err := newUploadStore(stateDir, settings.AvatarHashes, uploadRetention(settings.Runtime()))
 	if err != nil {
 		logFatal("failed to initialize upload store: %v", err)
 	}
+	settings.UseAvatarStore(uploads)
 	// Canonical like Hidden: attachments are compared with symlinks resolved.
 	if canon, err := normalizer.CanonicalRoot(uploads.dir); err == nil {
 		normalizer.Uploads = canon
@@ -649,11 +658,13 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	// A stranger presenting a wrong credential is what the audit log wants;
 	// one that just connects and goes away is not.
 	badCredential := false
+	var tried string
 	var tokenRec TokenRecord
 	if lookupToken != nil {
 		inner := lookupToken
 		lookupToken = func(token string) (string, TokenRecord, bool) {
 			name, rec, found := inner(token)
+			tried = token
 			badCredential = badCredential || !found
 			tokenRec = rec
 			return name, rec, found
@@ -681,7 +692,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	}
 	if !ok {
 		if badCredential {
-			deps.recordAuthFail(remoteIP(conn, network), network, "unknown credential")
+			deps.recordAuthFailTried(remoteIP(conn, network), network, "unknown credential", &tried)
 		}
 		return
 	}
@@ -694,8 +705,14 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
 			return
 		}
-		// An approval may have granted full access since the credential was looked up.
-		who.Restricted = deps.settings.TokenRestricted(who.TokenName)
+		// An approval may have changed the tier since the credential was looked up.
+		acc := deps.settings.Access(network, who.TokenName)
+		who.Restricted, who.Tier, who.UserID = !acc.Full(), acc.Tier, acc.UserID
+		deps.settings.TouchToken(who.TokenName, who.DeviceType, who.Name)
+		defer deps.settings.TouchToken(who.TokenName, "", "")
+	}
+	if network == "unix" {
+		deps.settings.SeedOwnerProfile(cleanName(who.Name), who.Avatar)
 	}
 
 	if network == "tcp" && who.TokenName != "" && deps.peers.AtCredentialLimit(who.TokenName) {
@@ -721,7 +738,7 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 
 	hbCtx, stopHeartbeat := context.WithCancel(ctx)
 	defer stopHeartbeat()
-	status := func() *protocol.ServerStatus { return serverStatus(deps) }
+	status := func() *protocol.ServerStatus { return statusForPeer(deps.peers, peer, serverStatus(deps)) }
 	go runHeartbeat(hbCtx, ipc, conn, &lastSeen, heartbeatInterval, heartbeatTimeout, status)
 	onActivity := func() { lastSeen.Store(time.Now().UnixNano()) }
 
@@ -731,11 +748,11 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	_ = ipc.SendEvent(protocol.EventModelRolesSet, "", "", "", protocol.ModelRolesSetData{Roles: deps.settings.GetModelRoles()})
 	_ = ipc.SendEvent(protocol.EventNotifyPrefs, "", "", "", deps.settings.GetNotifyPrefs())
 	sendRuntimeState(ipc, deps, network)
-	deps.status.SendPendingAsks(ipc)
+	deps.status.SendPendingAsks(peer)
 	for _, st := range deps.projects.GitStatuses() {
 		_ = ipc.SendEvent(protocol.EventGitStatus, "", "", "", st)
 	}
-	deps.status.SendTerminals(ipc)
+	deps.status.SendTerminals(peer)
 
 	if pending != nil {
 		onActivity()
@@ -922,7 +939,7 @@ func handshake(ipc *protocol.IPCStream, network string, lookupToken func(token s
 	// The token's name is only the initial name for a device that has none yet (it is what the
 	// person typed when pairing it); a device that already knows who it is keeps that identity.
 	// The credential's own name stays in TokenName for revocation and the audit log.
-	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, rec.Restricted()
+	who.TokenName, who.Email, who.Restricted = resolvedName, rec.Email, true // serveAccepted settles the tier once the credential is admitted
 	if who.Name == "" {
 		who.Name = resolvedName
 	}
@@ -1025,38 +1042,26 @@ func sessionWriteError(sessionID, verb string, err error) string {
 	return fmt.Sprintf("failed to %s session: %v", verb, err)
 }
 
-// resolveAuthor determines who to attribute a new user message (and any git
-// commits its tool calls make) to. A connection signed in with a token shows
-// the name and picture its device reports (falling back to the token's name),
-// but commits are signed with the credential's name and email, which the
-// device doesn't choose. Failing that, a client may self-report via
-// authorName/authorAvatar — the local unix socket has no credential to
-// attribute to (file permissions are its boundary), so this is the only way
-// a message from it is ever attributed, and without it the transcript has no
-// sender to render. A client (or event, like retry_message, which carries
-// neither field) that declares nothing is stored unattributed rather than
-// rejected. Shared by user_prompt, edit_message, and retry_message.
-func resolveAuthor(deps connDeps, peerID, authorName, authorAvatar string) agent.Author {
-	if name, avatar, credential, email, ok := deps.peers.Author(peerID); ok && credential != "" {
-		// A picture the device never managed to register (a lost set_peer_avatar) still shows if
-		// it sends one with the prompt; the name stays the credential's, which the device can't choose.
-		if avatar == "" && len(authorAvatar) <= maxAvatarLen {
-			avatar = authorAvatar
-		}
-		return agent.Author{Name: name, Avatar: avatar, Email: email, Credential: credential}
+// resolveAuthor determines who to attribute a new user message (and any git commits its tool calls
+// make) to: the person behind the sending connection, whatever the device calls itself. The local
+// socket is the owner. Their name, picture and email are the person's own; a device's name and
+// picture are labels for the device and never reach a message. The one thing taken from the client
+// is a name for an owner who has none yet, so a fresh install's first messages aren't anonymous.
+// Shared by user_prompt, steer_turn, edit_message and retry_message.
+func resolveAuthor(deps connDeps, peerID, authorName string) agent.Author {
+	userID, credential := ownerID, ""
+	if p, ok := deps.peers.Get(peerID); ok {
+		userID, credential = deps.accessFor(p.Network, peerID).UserID, p.TokenName
 	}
-	if authorName != "" || authorAvatar != "" {
-		avatar := authorAvatar
-		// Cosmetic, so an oversized one is dropped rather than failing the
-		// prompt — same rule the peer registry applies to `auth` (§2a). It's
-		// stored per message, so a huge data URL would also be duplicated
-		// across a whole session file.
-		if len(avatar) > maxAvatarLen {
-			avatar = ""
-		}
-		return agent.Author{Name: authorName, Avatar: avatar}
+	u, ok := deps.settings.ResolveUser(userID)
+	if !ok {
+		return agent.Author{}
 	}
-	return agent.Author{}
+	name := u.Name
+	if name == "" && u.ID == ownerID {
+		name = cleanName(authorName)
+	}
+	return agent.Author{ID: u.ID, Name: name, Avatar: u.Avatar, Email: u.Email, Credential: credential}
 }
 
 // recoverTurnPanic catches a panic from a turn goroutine (user_prompt/
@@ -1109,29 +1114,37 @@ func resolveTerminalSession(ipc *protocol.IPCStream, deps connDeps, env *protoco
 }
 
 // sendServerIdentity tells p who this server is and which tier p is on.
+// userInfo is the person behind acc, for server_identity; nil when there is none.
+func userInfo(deps connDeps, acc Access) *protocol.ProfileInfo {
+	if p, ok := deps.settings.Profile(acc.UserID); ok {
+		return &p
+	}
+	return nil
+}
+
 func sendServerIdentity(deps connDeps, p *Peer) {
+	acc := deps.accessFor(p.Network, p.ID)
 	_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{
 		Identity: deps.settings.GetIdentity(), Icon: deps.settings.GetIcon(), ServerID: deps.settings.GetServerID(), Version: version,
-		Restricted: deps.peers.IsRestricted(p.ID) && p.Network == "tcp",
+		Restricted: !acc.Full(), Tier: acc.Tier, Caps: acc.Caps.ToMap(deps.cliProviderNames()), User: userInfo(deps, acc),
 	})
 }
 
 func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) {
-	if remoteDenied(deps, network, peerID, env.Type) {
-		_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-			Message: fmt.Sprintf("%s isn't available from a paired device; do it on the computer running the server", env.Type),
-		})
+	acc := deps.accessFor(network, peerID)
+	if ok, why := checkEvent(deps, acc, env); !ok {
+		_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: why})
 		return
 	}
-	// A full-access device is the owner: it may open any folder. A limited one stays confined.
-	if network == "tcp" && deps.peers.IsRestricted(peerID) {
+	// A Full device is the owner: it may open any folder. Anyone below stays confined.
+	if network == "tcp" && !acc.Full() {
 		if err := scopeRemoteProject(deps, env); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 			return
 		}
 	}
 	deps.projects.chatSentinel(env)
-	if handleFileEnvelope(ipc, deps, env) || handleScheduleEnvelope(ipc, deps, env) || handleLimitEnvelope(ipc, deps, env) || handleArtifactEnvelope(ipc, deps, peerID, env) {
+	if handleFileEnvelope(ipc, deps, acc, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handlePeopleEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
 		return
 	}
 	switch env.Type {
@@ -1172,7 +1185,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		// §3.1's title-is-a-client-concern rule) finds a session to rename
 		// instead of racing the turn's own first write and being rejected as
 		// "not found". The turn appends the prompt to this file a moment later.
-		if err := pc.SessStore.Ensure(sessID); err != nil {
+		if err := deps.projects.ensureChat(pc.SessStore, sessID, acc.UserID); err != nil {
 			logError("session %s: could not create its session file: %v", sessID, err)
 		}
 		// Sending a message un-archives a chat: archiving is "hide this", and talking to it
@@ -1191,8 +1204,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
-		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
-		turnCtx := agent.WithAttachments(agent.WithAuthor(ctx, author), data.Attachments)
+		author := resolveAuthor(deps, peerID, data.AuthorName)
+		turnCtx := agent.WithAttachments(agent.WithAuthor(deps.turnContext(ctx, network, peerID), author), data.Attachments)
+		who := deps.actorOf(network, peerID)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
 		if data.AutoGenerateTitle != nil {
 			autoGenerateTitle = *data.AutoGenerateTitle
@@ -1204,7 +1218,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RunTurnWithTitleGeneration(turnCtx, sID, tID, prompt, autoGenerateTitle); err != nil {
 				logError("turn %s (session %s) failed: %v", tID, sID, err)
-				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil, who)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -1233,6 +1247,17 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if err != nil {
 				_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: err.Error()})
 				return
+			}
+			// Below Full a snapshot is restored only through the chat it was taken in, one the
+			// sender owns: a snapshot with no recorded chat (older ones) can't be tied to anyone.
+			if !acc.Full() {
+				snap, gErr := pc.SnapStore.GetSnapshot(data.SnapshotID)
+				if env.SessionID == "" || gErr != nil || snap.SessionID != env.SessionID {
+					_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+						Message: "restore_snapshot isn't allowed for this person: the snapshot isn't from this chat",
+					})
+					return
+				}
 			}
 			if rErr := pc.SnapStore.RestoreSnapshot(data.SnapshotID, pc.Root); rErr != nil {
 				deps.record(ipc, peerID, audit.Event{Kind: audit.SnapshotRestore, Project: pc.Root, Session: env.SessionID, Target: data.SnapshotID, Outcome: "error", Detail: map[string]any{"error": rErr.Error()}})
@@ -1311,7 +1336,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		// Accepted, the running turn records the message and says steer_accepted; refused,
 		// the client sends it as a prompt of its own, which waits its turn.
-		author := resolveAuthor(deps, peerID, data.AuthorName, data.AuthorAvatar)
+		author := resolveAuthor(deps, peerID, data.AuthorName)
 		if err := pc.Registry.Get(ipc, sessID).Steer(turnID, data.Prompt, author); err != nil {
 			_ = ipc.SendEvent(protocol.EventSteerRejected, sessID, turnID, "", protocol.SteerResultData{Prompt: data.Prompt, Reason: err.Error()})
 		}
@@ -1340,11 +1365,18 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if cfg.AuthMethod == "" {
 			cfg.AuthMethod = "manual"
 		}
+		if msg := registerProviderRefusal(deps, acc, cfg); msg != "" {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: msg})
+			return
+		}
 		if err := deps.providerStore.Register(cfg); err != nil {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("failed to register provider: %v", err),
 			})
 			return
+		}
+		if !acc.Full() {
+			deps.settings.SetProviderOwner(cfg.Name, acc.UserID)
 		}
 		// Never the key: what was registered, and where it points.
 		deps.record(ipc, peerID, audit.Event{Kind: audit.ProviderAdd, Target: cfg.Name, Outcome: "ok", Detail: map[string]any{
@@ -1462,6 +1494,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
+		if !providerAllowed(deps, acc, data.ProviderName) {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("set_provider to %q isn't allowed for this person: it is a CLI agent that runs under the owner's login", data.ProviderName),
+			})
+			return
+		}
 		sessID := env.SessionID
 		if sessID == "" {
 			sessID = "default"
@@ -1558,6 +1596,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		if !agent.ValidMode(data.Mode) {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
 				Message: fmt.Sprintf("unknown mode %q", data.Mode),
+			})
+			return
+		}
+		if !modeAllowed(acc, mode) {
+			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
+				Message: fmt.Sprintf("set_mode to %s isn't allowed for this person", mode),
 			})
 			return
 		}
@@ -1765,11 +1809,16 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListSessions:
 		var data protocol.ListSessionsData
 		_ = json.Unmarshal(env.Data, &data)
+		// Below Full (or the others_chats cap) the list holds only the sender's own chats.
+		var mine func(owner string) bool
+		if !acc.Local && !acc.Full() && !acc.Caps.OthersChats {
+			mine = func(owner string) bool { return deps.mayAct(acc, owner) }
+		}
 
 		if data.ProjectPath == protocol.ChatProject {
 			_ = ipc.SendEvent(protocol.EventSessionList, env.SessionID, env.TurnID, "", protocol.SessionListData{
 				ProjectPath: protocol.ChatProject,
-				Sessions:    deps.projects.ListChats(),
+				Sessions:    deps.projects.ListChatsWhere(mine),
 				SandboxTier: deps.projects.chatTier,
 			})
 			return
@@ -1809,6 +1858,10 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			if err != nil {
 				// Left out of the list, so the chat vanishes from every client: say why.
 				logWarn("list_sessions: skipping unreadable session %s in %s: %v", id, pc.Root, err)
+				continue
+			}
+			deps.projects.rememberOwner(id, stateOwner(state))
+			if mine != nil && !mine(stateOwner(state)) {
 				continue
 			}
 			summaries = append(summaries, sessionSummaryFrom(pc.Root, state))
@@ -1852,13 +1905,12 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			mode = string(ag.Mode())
 		} // a session with no persisted history yet isn't an error — it just has none
 		ctxData, spend := pc.Registry.SessionReport(data.SessionID, history)
-		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
+		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", deps.withProfiles(toHistoryMessages(history, branches), protocol.SessionHistoryData{
 			SessionID: data.SessionID,
-			Messages:  toHistoryMessages(history, branches),
 			Mode:      mode,
 			Context:   ctxData,
 			Spend:     spend,
-		})
+		}))
 		sendTodoList(ipc, data.SessionID, state)
 
 	case protocol.EventGetContextBreakdown:
@@ -1994,8 +2046,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
-		author := resolveAuthor(deps, peerID, "", "")
-		turnCtx := agent.WithAuthor(ctx, author)
+		author := resolveAuthor(deps, peerID, "")
+		turnCtx := agent.WithAuthor(deps.turnContext(ctx, network, peerID), author)
+		who := deps.actorOf(network, peerID)
 		autoGenerateTitle := deps.settings.GetAutoGenerateTitle()
 		if data.AutoGenerateTitle != nil {
 			autoGenerateTitle = *data.AutoGenerateTitle
@@ -2010,7 +2063,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.EditMessage(turnCtx, sID, tID, msgID, content, autoGenerateTitle); err != nil {
 				logError("edit_message turn %s (session %s): %v", tID, sID, err)
-				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil, who)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -2032,8 +2085,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		clearLimitOnSend(deps, data.SessionID)
 		ag := pc.Registry.Get(ipc, data.SessionID)
-		author := resolveAuthor(deps, peerID, "", "")
-		turnCtx := agent.WithAuthor(ctx, author)
+		author := resolveAuthor(deps, peerID, "")
+		turnCtx := agent.WithAuthor(deps.turnContext(ctx, network, peerID), author)
+		who := deps.actorOf(network, peerID)
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
@@ -2044,7 +2098,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			defer recoverTurnPanic(ipc, sID, tID)
 			if err := ag.RetryMessage(turnCtx, sID, tID, msgID); err != nil {
 				logError("retry_message turn %s (session %s): %v", tID, sID, err)
-				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil)
+				turnFailed(deps, pc, sID, ag.ProviderName(), err, nil, who)
 				_ = ipc.SendEvent(protocol.EventError, sID, tID, "", protocol.ErrorData{
 					Message: err.Error(),
 				})
@@ -2077,12 +2131,11 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			branches = state.Branches
 		}
 		ctxData, spend := pc.Registry.SessionReport(data.SessionID, history)
-		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", protocol.SessionHistoryData{
+		_ = ipc.SendEvent(protocol.EventSessionHistory, data.SessionID, env.TurnID, "", deps.withProfiles(toHistoryMessages(history, branches), protocol.SessionHistoryData{
 			SessionID: data.SessionID,
-			Messages:  toHistoryMessages(history, branches),
 			Context:   ctxData,
 			Spend:     spend,
-		})
+		}))
 
 	case protocol.EventSetSessionTitle:
 		var data protocol.SetSessionTitleData
@@ -2241,20 +2294,30 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		handleListAudit(ipc, deps, env)
 
 	case protocol.EventListProcesses:
+		procs := readProcessTree(os.Getpid())
+		if !acc.Full() { // a command line can carry a secret; only the owner sees them
+			for i := range procs {
+				procs[i].Command = ""
+			}
+		}
 		_ = ipc.SendEvent(protocol.EventProcessList, "", "", "", protocol.ProcessListData{
-			SampledAtMs: time.Now().UnixMilli(), Processes: readProcessTree(os.Getpid()),
+			SampledAtMs: time.Now().UnixMilli(), Processes: procs,
 		})
 
 	case protocol.EventSignalProcess:
-		handleSignalProcess(ipc, network, env)
+		handleSignalProcess(ipc, env)
 
 	case protocol.EventListProblems:
-		handleListProblems(ipc, deps, network, env)
+		handleListProblems(ipc, deps, env)
 	case protocol.EventReadLog:
-		handleReadLog(ipc, network)
+		handleReadLog(ipc)
 
 	case protocol.EventListNotifications:
-		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", protocol.NotificationListData{Notifications: deps.notify.List()})
+		var list any = protocol.NotificationListData{Notifications: deps.notify.List()}
+		if p, ok := deps.peers.Get(peerID); ok { // the notifications of chats this person may see
+			list, _ = deps.peers.forPeer(p, "", list)
+		}
+		_ = ipc.SendEvent(protocol.EventNotificationList, "", "", "", list)
 
 	case protocol.EventGetUsage:
 		var data protocol.GetUsageData
@@ -2281,12 +2344,25 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			}
 			// External scans read other tools' session files on this host (their folders and titles): the
 			// owner's view, so a limited remote device never gets them.
-			external := data.External && (network != "tcp" || !deps.peers.IsRestricted(peerID))
-			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), external)
+			external := data.External && deps.accessFor(network, peerID).Full()
+			// A Limited person sees the spend of their own chats; Trusted and Full see everyone's.
+			// Whoever isn't Full never sees what the CLIs' own transcripts hold.
+			var mine func(owner string) bool
+			who := ""
+			if a := deps.accessFor(network, peerID); !a.Local && !a.AtLeast(TierTrusted) && !a.Caps.OthersChats {
+				mine = func(owner string) bool { return deps.mayAct(a, owner) }
+				who = a.UserID
+			}
+			key := fmt.Sprint(deps.projects.stateDir, since.Unix(), external, who)
 			out := cachedUsageReport(key, func() protocol.UsageReportData {
-				return buildUsageReport(deps.projects.stateDir, kinds, since, external, price)
+				return buildUsageReportFor(deps.projects.stateDir, kinds, since, external, price, mine)
 			})
-			out.Accounts = usageAccounts(deps.providerStore)
+			// Account balances belong to the owner's API keys: Trusted and up only.
+			if a := deps.accessFor(network, peerID); a.Local || a.AtLeast(TierTrusted) {
+				out.Accounts = usageAccounts(deps.providerStore)
+			} else {
+				out.Accounts = []protocol.UsageAccount{}
+			}
 			out.RequestID = data.RequestID
 			_ = ipc.SendEvent(protocol.EventUsageReport, "", "", "", out)
 		}()
@@ -2294,18 +2370,22 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventDismissNotification:
 		var data protocol.DismissNotificationData
 		_ = json.Unmarshal(env.Data, &data)
-		deps.notify.Dismiss(data.ID)
+		if deps.mayTouchNotifications(acc, data.ID) {
+			deps.notify.Dismiss(data.ID)
+		}
 
 	case protocol.EventMarkNotificationsRead:
 		var data protocol.MarkNotificationsReadData
 		_ = json.Unmarshal(env.Data, &data)
-		deps.notify.MarkRead(data.IDs...)
+		deps.notify.MarkRead(slices.DeleteFunc(slices.Clone(data.IDs), func(id string) bool { return !deps.mayTouchNotifications(acc, id) })...)
 
 	case protocol.EventSetPresence:
 		var data protocol.SetPresenceData
 		if err := json.Unmarshal(env.Data, &data); err != nil {
 			return
 		}
+		// A person says which chats they are looking at; only chats they may see count.
+		data.SessionIDs = slices.DeleteFunc(slices.Clone(data.SessionIDs), func(id string) bool { return !deps.mayViewChat(acc, id) })
 		if deps.peers.SetPresence(peerID, data.SessionIDs, data.Focused, data.Visible) && data.Focused && data.Visible {
 			for _, id := range data.SessionIDs {
 				deps.notify.MarkSessionRead(id) // looking at a chat is reading it
@@ -2403,6 +2483,14 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListSnapshots:
 		var data protocol.ListSnapshotsData
 		_ = json.Unmarshal(env.Data, &data)
+		// Below Full the list is one chat's snapshots, a chat the sender owns (the table checked it).
+		onlyChat := ""
+		if !acc.Full() {
+			if onlyChat = env.SessionID; onlyChat == "" {
+				_ = ipc.SendEvent(protocol.EventError, "", env.TurnID, "", protocol.ErrorData{Message: "list_snapshots isn't allowed for this person without a chat"})
+				return
+			}
+		}
 
 		projectPath := data.ProjectPath
 		if projectPath == "" {
@@ -2435,6 +2523,9 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		summaries := make([]protocol.SnapshotSummary, 0, len(snaps))
 		for _, snap := range snaps {
+			if onlyChat != "" && snap.SessionID != onlyChat {
+				continue
+			}
 			files := make([]string, 0, len(snap.Files))
 			for rel := range snap.Files {
 				files = append(files, filepath.ToSlash(rel))
@@ -2761,12 +2852,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			})
 			return
 		}
-		// Any authenticated peer may disconnect any other: everyone past
-		// the handshake already shares the one trust boundary in this
-		// version (the unix socket's file perms, or the single shared TCP
-		// token) — there's no per-user identity yet to scope this more
-		// tightly against, so restricting it further would be security
-		// theater rather than a real boundary.
+		// Full only (the event table): kicking someone off is an owner power.
 		targetName, targetIP, _, _ := deps.peers.Identify(data.PeerID)
 		if !deps.peers.Disconnect(data.PeerID) {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -2777,8 +2863,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 
 	case protocol.EventSetPeerScope:
-		// Reaching here means the sender is on the local socket or a full-access credential:
-		// remoteDenied already refused a restricted device (set_peer_scope isn't in remoteAllowed).
+		// Reaching here means the sender is on the local socket or a Full credential: the event
+		// table refuses anyone below Full.
 		var data protocol.SetPeerScopeData
 		if err := json.Unmarshal(env.Data, &data); err != nil || data.PeerID == "" {
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
@@ -2787,6 +2873,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			return
 		}
 		target, ok := deps.peers.Get(data.PeerID)
+		before := deps.accessSnapshot()
 		switch {
 		case !ok:
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: fmt.Sprintf("unknown peer %q", data.PeerID)})
@@ -2795,12 +2882,8 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		case !deps.settings.SetTokenScope(target.TokenName, data.Full):
 			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{Message: "that credential no longer exists"})
 		default:
-			deps.peers.SetScope(target.TokenName, !data.Full)
-			for _, p := range deps.peers.All() {
-				if p.TokenName == target.TokenName {
-					sendServerIdentity(deps, p) // tell the device its new tier
-				}
-			}
+			deps.enforceAccessChange(before) // applies at once, tells each changed device its tier, and stops what a demotion no longer allows
+			deps.broadcastPeople()
 			deps.record(ipc, peerID, audit.Event{Kind: audit.PeerScope, Target: target.TokenName, Outcome: "ok", Detail: map[string]any{"full": data.Full}})
 		}
 		return
@@ -2916,7 +2999,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		_ = ipc.SendEvent(protocol.EventRemotePasswordSet, env.SessionID, env.TurnID, "", protocol.RemotePasswordSetData{})
 
 	case protocol.EventRestartServer:
-		// Local socket or full-access credential: remoteDenied already refused a limited device.
+		// The event table lets only the local socket and the right tiers get here.
 		var data protocol.RestartServerData
 		_ = json.Unmarshal(env.Data, &data) // no payload is fine: not forced
 		if active, _ := deps.projects.Stats(); active > 0 && !data.Force {
@@ -2932,95 +3015,6 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			}
 		}()
 
-	case protocol.EventApprovePairing:
-		// Local socket or full-access credential: remoteDenied already refused a limited device.
-		var data protocol.ApprovePairingData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Credential == "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed approve_pairing payload (credential is required)",
-			})
-			return
-		}
-		if data.Allow {
-			deps.settings.SetTokenScope(data.Credential, data.Full)
-		}
-		deps.pairings.answer(data.Credential, data.Allow)
-
-	case protocol.EventRegisterToken:
-		// Local socket or full-access credential: remoteDenied already refused a limited device.
-		var data protocol.RegisterTokenData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed register_token payload (name is required)",
-			})
-			return
-		}
-		token, err := generateAuthToken()
-		if err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to generate token: %v", err),
-			})
-			return
-		}
-		add := deps.settings.AddToken
-		if data.Pairing {
-			add = deps.settings.AddPairingToken
-		}
-		if err := add(data.Name, token, data.Email); err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: err.Error(),
-			})
-			return
-		}
-		if data.Pairing && data.Full {
-			deps.settings.SetTokenScope(data.Name, true)
-		}
-		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenAdd, Target: data.Name, Outcome: "ok", Detail: map[string]any{"full": data.Pairing && data.Full}}) // the name, never the token
-		// Best-effort: a client can still pair by pasting the CA separately
-		// (or doesn't need one at all, on an operator-supplied cert) if this
-		// fails, so a CA read error shouldn't fail token registration itself.
-		caPem, _ := deps.remote.CAPEM()
-		_ = ipc.SendEvent(protocol.EventTokenRegistered, env.SessionID, env.TurnID, "", protocol.TokenRegisteredData{
-			Name:  data.Name,
-			Token: token,
-			Email: data.Email,
-			CaPem: caPem,
-
-			RTCFingerprint: deps.remote.RTCFingerprint(),
-		})
-
-	case protocol.EventListTokens:
-		// Local socket or full-access credential: remoteDenied already refused a limited device.
-		summaries := deps.settings.ListTokenNames()
-		out := make([]protocol.TokenSummary, len(summaries))
-		for i, s := range summaries {
-			out[i] = protocol.TokenSummary{Name: s.Name, Email: s.Email, HasAvatar: s.HasAvatar, Restricted: s.Restricted}
-		}
-		_ = ipc.SendEvent(protocol.EventTokenList, env.SessionID, env.TurnID, "", protocol.TokenListData{Tokens: out})
-
-	case protocol.EventRemoveToken:
-		// Local socket or full-access credential: remoteDenied already refused a limited device.
-		var data protocol.RemoveTokenData
-		if err := json.Unmarshal(env.Data, &data); err != nil || data.Name == "" {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: "malformed remove_token payload (name is required)",
-			})
-			return
-		}
-		if _, err := deps.settings.RemoveToken(data.Name); err != nil {
-			_ = ipc.SendEvent(protocol.EventError, env.SessionID, env.TurnID, "", protocol.ErrorData{
-				Message: fmt.Sprintf("failed to remove token: %v", err),
-			})
-			return
-		}
-		// Revocation should actually end the session, not just block the next
-		// handshake — otherwise someone already connected on this credential
-		// stays connected until they happen to disconnect on their own.
-		dropped := deps.peers.DisconnectByToken(data.Name)
-		deps.record(ipc, peerID, audit.Event{Kind: audit.TokenRemove, Target: data.Name, Outcome: "ok", Detail: map[string]any{"disconnected": dropped}})
-		_ = ipc.SendEvent(protocol.EventTokenRemoved, env.SessionID, env.TurnID, "", protocol.TokenRemovedData{
-			Name: data.Name,
-		})
 	default:
 		// Not an event this server handles (a newer or older client, or a typo): say so, or the
 		// client waits for a reply that never comes. Explicit no-ops such as pong are cases above.

@@ -29,7 +29,11 @@ func startScheduler(ctx context.Context, deps connDeps) {
 	// subscribed to the session's agent as usual.
 	sink := protocol.NewIPCStream(strings.NewReader(""), io.Discard)
 	deps.sched.Changed = func() {
-		deps.peers.BroadcastEvent("", protocol.EventScheduleList, "", deps.sched.List(""))
+		// Everyone below Full sees only the schedules they armed.
+		all := deps.sched.List("")
+		for _, p := range deps.peers.All() {
+			_ = p.ipc.SendEvent(protocol.EventScheduleList, "", "", "", visibleSchedules(deps, all, deps.accessFor(p.Network, p.ID)))
+		}
 	}
 	deps.sched.Blocked = func(t protocol.ScheduledTurn) bool { return scheduleBlocked(deps, t) }
 	deps.sched.Run = func(t protocol.ScheduledTurn, finished func()) error {
@@ -39,11 +43,18 @@ func startScheduler(ctx context.Context, deps connDeps) {
 		}
 		ag := pc.Registry.Get(sink, t.SessionID)
 		restoreBinding(deps, pc, ag, t.SessionID)
-		if err := pc.SessStore.Ensure(t.SessionID); err != nil {
+		if err := deps.projects.ensureChat(pc.SessStore, t.SessionID, t.CreatorUserID); err != nil {
 			logError("session %s: could not create its session file: %v", t.SessionID, err)
 		}
 		turnID := fmt.Sprintf("%s-r%d-%d", t.ID, t.Runs+1, time.Now().UnixMilli())
-		turnCtx := agent.WithOrigin(agent.WithAuthor(ctx, agent.Author{}), t.Origin)
+		// It runs as whoever armed it, with the access they have now.
+		who := agent.TurnActor{UserID: t.CreatorUserID, Credential: t.CreatorCredential}
+		acc, live := deps.accessOfActor(who)
+		if !live {
+			logWarn("scheduled turn %s (session %s) was armed by a credential or person that no longer exists; cancelled", t.ID, t.SessionID)
+			return fmt.Errorf("%w: the person who armed it no longer has access", sched.ErrCancelled)
+		}
+		turnCtx := agent.WithOrigin(agent.WithAuthor(deps.turnContextFor(ctx, who, acc), deps.authorOfActor(who)), t.Origin)
 		if deps.turnWG != nil {
 			deps.turnWG.Add(1)
 		}
@@ -55,7 +66,7 @@ func startScheduler(ctx context.Context, deps connDeps) {
 			defer recoverTurnPanic(sink, t.SessionID, turnID)
 			if err := ag.RunTurnWithTitleGeneration(turnCtx, t.SessionID, turnID, t.Text, false); err != nil {
 				logError("scheduled turn %s (session %s) failed: %v", turnID, t.SessionID, err)
-				turnFailed(deps, pc, t.SessionID, ag.ProviderName(), err, &t.Origin)
+				turnFailed(deps, pc, t.SessionID, ag.ProviderName(), err, &t.Origin, who)
 			} else if sched.IsAuto(t) {
 				deps.sched.Resolve(t.SessionID) // the continue got through: the limit is over
 			}
@@ -100,9 +111,36 @@ func limitsSpent(rl protocol.ProviderRateLimits, now time.Time) bool {
 	return false
 }
 
-// handleScheduleEnvelope answers the schedule_* events; it reports whether env was one. They are
-// not in remoteAllowed, so a restricted paired device never gets here.
-func handleScheduleEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protocol.Envelope) bool {
+// visibleSchedules is the schedule list as acc may see it: everything for Full and the owner, else
+// only the entries they armed. An entry from before users belongs to the owner. The chats stopped
+// at a usage limit are listed only for the chats acc may see, and without whose credential started
+// the turn.
+func visibleSchedules(deps connDeps, list protocol.ScheduleListData, acc Access) protocol.ScheduleListData {
+	if acc.Full() {
+		return list
+	}
+	hits := make([]protocol.LimitHit, 0, len(list.LimitHits))
+	for _, h := range list.LimitHits {
+		if deps.mayViewChat(acc, h.SessionID) {
+			h.Credential = ""
+			hits = append(hits, h)
+		}
+	}
+	list.LimitHits = hits
+	mine := make([]protocol.ScheduledTurn, 0, len(list.Schedules))
+	for _, t := range list.Schedules {
+		if t.CreatorUserID != "" && t.CreatorUserID == acc.UserID {
+			mine = append(mine, t)
+		}
+	}
+	list.Schedules = mine
+	return list
+}
+
+// handleScheduleEnvelope answers the schedule_* events; it reports whether env was one. The event
+// table already refused anyone below Trusted; a Trusted sender may list and change only the
+// entries they armed, and only Full may pause the whole schedule.
+func handleScheduleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) bool {
 	switch env.Type {
 	case protocol.EventScheduleTurn, protocol.EventListScheduled, protocol.EventCancelScheduled, protocol.EventPauseScheduled:
 	default:
@@ -115,6 +153,7 @@ func handleScheduleEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protoco
 		fail("scheduled turns aren't available on this server")
 		return true
 	}
+	acc := deps.accessFor(network, peerID)
 	var err error
 	switch env.Type {
 	case protocol.EventScheduleTurn:
@@ -126,20 +165,34 @@ func handleScheduleEnvelope(ipc *protocol.IPCStream, deps connDeps, env *protoco
 		if d.SessionID == "" {
 			d.SessionID = env.SessionID
 		}
-		_, err = deps.sched.Add(d)
+		// The turn it starts is a message in that chat: only its owner may add one.
+		if !ownsChat(deps, acc, d.SessionID, d.ProjectPath) {
+			fail("schedule_turn isn't allowed for this person: it isn't their chat")
+			return true
+		}
+		who := deps.actorOf(network, peerID)
+		_, err = deps.sched.AddAs(d, who.UserID, who.Credential)
 	case protocol.EventListScheduled:
 		var d protocol.ListScheduledData
 		_ = json.Unmarshal(env.Data, &d)
-		_ = ipc.SendEvent(protocol.EventScheduleList, d.SessionID, env.TurnID, "", deps.sched.List(d.SessionID))
+		_ = ipc.SendEvent(protocol.EventScheduleList, d.SessionID, env.TurnID, "", visibleSchedules(deps, deps.sched.List(d.SessionID), acc))
 		return true
 	case protocol.EventCancelScheduled:
 		var d protocol.CancelScheduledData
 		if err = json.Unmarshal(env.Data, &d); err == nil {
+			if !ownsSchedule(deps, acc, d.ID) {
+				fail("cancel_scheduled isn't allowed for this person: it isn't theirs")
+				return true
+			}
 			err = deps.sched.Cancel(d.ID)
 		}
 	case protocol.EventPauseScheduled:
 		var d protocol.PauseScheduledData
 		if err = json.Unmarshal(env.Data, &d); err == nil {
+			if (d.All && !acc.Full()) || (!d.All && !ownsSchedule(deps, acc, d.ID)) {
+				fail("pause_scheduled isn't allowed for this person: it isn't theirs")
+				return true
+			}
 			err = deps.sched.Pause(d.ID, d.All, d.Paused)
 		}
 	}
@@ -186,4 +239,26 @@ func restoreBinding(deps connDeps, pc *ProjectContext, ag *agent.Agent, sessionI
 			logError("chat %s: restoring its provider: %v", sessionID, err)
 		}
 	}
+}
+
+// ownsSchedule reports whether acc may change the entry id: Full may change any, others their own.
+func ownsSchedule(deps connDeps, acc Access, id string) bool {
+	if acc.Full() {
+		return true
+	}
+	t, ok := deps.sched.Get(id)
+	return ok && t.CreatorUserID != "" && t.CreatorUserID == acc.UserID
+}
+
+// authorOfActor is the author a scheduled turn's messages carry: the person who armed it. An entry
+// from before users has none, as before.
+func (d connDeps) authorOfActor(who agent.TurnActor) agent.Author {
+	if who.UserID == "" {
+		return agent.Author{}
+	}
+	u, ok := d.settings.ResolveUser(who.UserID)
+	if !ok {
+		return agent.Author{}
+	}
+	return agent.Author{ID: u.ID, Name: u.Name, Avatar: u.Avatar, Email: u.Email, Credential: who.Credential}
 }

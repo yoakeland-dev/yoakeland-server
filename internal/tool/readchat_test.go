@@ -10,7 +10,7 @@ import (
 
 type fakeChats map[string][]tool.ChatTurn
 
-func (f fakeChats) ReadChat(id string) (string, []tool.ChatTurn, error) {
+func (f fakeChats) ReadChat(_ context.Context, id string) (string, []tool.ChatTurn, error) {
 	t, ok := f[id]
 	if !ok {
 		return "", nil, errors.New("missing")

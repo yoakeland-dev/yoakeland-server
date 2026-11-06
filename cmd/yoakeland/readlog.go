@@ -13,13 +13,7 @@ const readLogMax = 2 << 20 // bytes of yoakeland.log tail returned
 
 // handleReadLog answers read_log with the tail of the server log. Local
 // connections only: log lines can hold secrets, so they're redacted too.
-func handleReadLog(ipc *protocol.IPCStream, network string) {
-	if network == "tcp" {
-		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{
-			Message: "read_log isn't available from a paired device; read the log on the computer running the server",
-		})
-		return
-	}
+func handleReadLog(ipc *protocol.IPCStream) {
 	logMu.Lock()
 	r, _ := logFile.(*rotatingLog)
 	logMu.Unlock()

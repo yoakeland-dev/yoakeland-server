@@ -445,13 +445,17 @@ func TestBrowseFailsFastWhenHumanControls(t *testing.T) {
 
 // Watching is open to everyone; operating is not, whatever the peer sends.
 func TestScope(t *testing.T) {
+	watcher := Access{Tier: TierLimited, Caps: capsFromMap(map[string]any{CapBrowser: browserWatch})}
 	for _, ev := range []protocol.EventType{protocol.EventBrowserView, protocol.EventBrowserFrameAck} {
-		if !remoteAllowed[ev] {
-			t.Errorf("%s should be allowed to a restricted peer", ev)
+		if ok, _ := checkEvent(connDeps{}, watcher, &protocol.Envelope{Type: ev}); !ok {
+			t.Errorf("%s should be allowed to a restricted peer that may watch", ev)
+		}
+		if tierMay(TierLimited, ev) {
+			t.Errorf("%s should need the browser cap", ev)
 		}
 	}
 	for _, ev := range []protocol.EventType{protocol.EventBrowserControl, protocol.EventBrowserInput, protocol.EventBrowserNav, protocol.EventBrowserFrame, protocol.EventBrowserState} {
-		if remoteAllowed[ev] {
+		if ok, _ := checkEvent(connDeps{}, watcher, &protocol.Envelope{Type: ev}); ok {
 			t.Errorf("%s must not be allowed to a restricted peer", ev)
 		}
 	}
@@ -463,7 +467,16 @@ func TestScope(t *testing.T) {
 	phone, phoneEv := envPeer(t, peers, "tcp", true)
 	owner, ownerEv := envPeer(t, peers, "unix", false)
 	remoteFull, _ := envPeer(t, peers, "tcp", false)
-	deps := connDeps{peers: peers, browser: b}
+	cfg, err := NewServerSettings(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Users["watcher"] = User{ID: "watcher", Tier: TierLimited, Caps: map[string]any{CapBrowser: browserWatch}}
+	cfg.Users["boss"] = User{ID: "boss", Tier: TierFull}
+	cfg.Tokens["phone-cred"] = TokenRecord{UserID: "watcher"}
+	cfg.Tokens["full-cred"] = TokenRecord{UserID: "boss"}
+	phone.TokenName, remoteFull.TokenName = "phone-cred", "full-cred"
+	deps := connDeps{peers: peers, browser: b, settings: cfg}
 	for _, ev := range []protocol.EventType{protocol.EventBrowserControl, protocol.EventBrowserInput, protocol.EventBrowserNav} {
 		if !remoteDenied(deps, "tcp", phone.ID, ev) || remoteDenied(deps, "tcp", remoteFull.ID, ev) || remoteDenied(deps, "unix", owner.ID, ev) {
 			t.Errorf("%s: wrong gate", ev)
@@ -863,7 +876,7 @@ func TestSeatReclaimed(t *testing.T) {
 	peers.OnDemote = func(id string) { _ = s.setControl(id, false) }
 	_ = s.setControl(p.ID, true)
 	s.input1(p.ID, protocol.BrowserInputData{Kind: "mouse", Type: "down", Button: "left", X: &x, Y: &y})
-	peers.SetScope("tok", true)
+	peers.SyncAccess(func(string) (string, string, string) { return TierLimited, "u", "" })
 	if s.ctl.who != "" {
 		t.Errorf("seat kept by a demoted device: %+v", s.ctl)
 	}
@@ -873,7 +886,7 @@ func TestSeatReclaimed(t *testing.T) {
 	peers.OnDemote = nil
 	q := holder("tok2")
 	_ = s.setControl(q.ID, true)
-	peers.SetScope("tok2", true)
+	peers.SyncAccess(func(string) (string, string, string) { return TierLimited, "u", "" })
 	if st := s.stateFor(q); st.YouControl || st.Controller != "" {
 		t.Errorf("state still shows the demoted holder: %+v", st)
 	}

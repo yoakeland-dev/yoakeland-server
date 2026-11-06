@@ -41,6 +41,7 @@ const (
 	TokenAdd        = "token_add"        // a per-person token was minted
 	TokenRemove     = "token_remove"     // a per-person token was revoked
 	PeerScope       = "peer_scope"       // a device was promoted to full access or demoted
+	UserChange      = "user_change"      // a person's tier, capabilities, devices or the defaults changed, or they were merged or removed
 	PeerJoin        = "peer_join"        // a device connected
 	PeerLeave       = "peer_leave"       // a device disconnected
 	PeerKick        = "peer_kick"        // a device was disconnected by another
@@ -59,7 +60,7 @@ const (
 // Kinds lists every kind, in the order a UI shows them.
 var Kinds = []string{
 	PermDecision, PermAuto, ToolExec, ModeChange, RuleAdd, RuleRemove, LimitPause,
-	ProviderAdd, ProviderRemove, SettingsChange, RemoteAccess, RemotePassword, TokenAdd, TokenRemove, PeerScope,
+	ProviderAdd, ProviderRemove, SettingsChange, RemoteAccess, RemotePassword, TokenAdd, TokenRemove, PeerScope, UserChange,
 	PeerJoin, PeerLeave, PeerKick, AuthFail, SnapshotRestore, TerminalOpen, FileWrite, FsOp, SessionDelete, ProjectRemove,
 	MCPServer, SkillChange, ServerRestart,
 }

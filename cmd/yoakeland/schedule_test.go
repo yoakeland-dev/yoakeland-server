@@ -39,7 +39,11 @@ func TestScheduledTurnRunsWithOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := connDeps{projects: projects, peers: NewPeerRegistry(), sched: sched.New(t.TempDir()), turnWG: &sync.WaitGroup{}}
+	cfg, err := NewServerSettings(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := connDeps{projects: projects, peers: NewPeerRegistry(), sched: sched.New(t.TempDir()), settings: cfg, turnWG: &sync.WaitGroup{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startScheduler(ctx, deps)
@@ -50,7 +54,7 @@ func TestScheduledTurnRunsWithOrigin(t *testing.T) {
 		Trigger: protocol.ScheduleTrigger{Kind: protocol.TriggerNow},
 		Origin:  &protocol.Origin{Kind: protocol.OriginArtifact, ArtifactID: "a1"},
 	})
-	if !handleScheduleEnvelope(ipc, deps, &protocol.Envelope{Type: protocol.EventScheduleTurn, Data: raw}) {
+	if !handleScheduleEnvelope(ipc, deps, "unix", "", &protocol.Envelope{Type: protocol.EventScheduleTurn, Data: raw}) {
 		t.Fatal("schedule_turn was not handled")
 	}
 	deps.sched.Tick()
@@ -74,10 +78,10 @@ func TestScheduledTurnRunsWithOrigin(t *testing.T) {
 	}
 }
 
-func TestScheduleEventsAreOwnerOnly(t *testing.T) {
+func TestScheduleEventsNeedTrusted(t *testing.T) {
 	for _, e := range []protocol.EventType{protocol.EventScheduleTurn, protocol.EventListScheduled, protocol.EventCancelScheduled, protocol.EventPauseScheduled} {
-		if remoteAllowed[e] {
-			t.Errorf("%s is open to a restricted device", e)
+		if tierMay(TierLimited, e) || !tierMay(TierTrusted, e) {
+			t.Errorf("%s: limited may=%v trusted may=%v", e, tierMay(TierLimited, e), tierMay(TierTrusted, e))
 		}
 	}
 }
@@ -103,7 +107,7 @@ func TestArtifactSubmitSchedulesATurnAndLogsAreKept(t *testing.T) {
 	ipc := protocol.NewIPCStream(nil, io.Discard)
 	send := func(d protocol.ArtifactEventData) {
 		raw, _ := json.Marshal(d)
-		if !handleArtifactEnvelope(ipc, deps, "p1", &protocol.Envelope{Type: protocol.EventArtifactEvent, Data: raw}) {
+		if !handleArtifactEnvelope(ipc, deps, "unix", "p1", &protocol.Envelope{Type: protocol.EventArtifactEvent, Data: raw}) {
 			t.Fatal("not handled")
 		}
 	}
@@ -140,7 +144,7 @@ func TestArtifactEventRateAndAccess(t *testing.T) {
 	if ok != artifactEventsPerSec || !artifactAllow("rate-peer", now.Add(time.Second)) {
 		t.Fatalf("allowed %d in one second", ok)
 	}
-	if !remoteAllowed[protocol.EventArtifactEvent] {
+	if !tierMay(TierLimited, protocol.EventArtifactEvent) {
 		t.Error("a paired phone must be able to submit an artifact")
 	}
 }

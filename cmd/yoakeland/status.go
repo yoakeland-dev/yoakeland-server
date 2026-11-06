@@ -289,11 +289,11 @@ func (h *statusHub) pendingAsks() protocol.PendingAsksData {
 }
 
 // SendPendingAsks sends the full snapshot to one connection (on connect).
-func (h *statusHub) SendPendingAsks(ipc *protocol.IPCStream) {
+func (h *statusHub) SendPendingAsks(p *Peer) {
 	if h == nil {
 		return
 	}
-	_ = ipc.SendEvent(protocol.EventPendingAsks, "", "", "", h.pendingAsks())
+	h.peers.SendTo(p, protocol.EventPendingAsks, "", h.pendingAsks())
 }
 
 // BroadcastPendingAsks sends the snapshot to every peer (an ask was
@@ -307,11 +307,11 @@ func (h *statusHub) BroadcastPendingAsks() {
 
 // SendTerminals sends the server-wide terminal_index to one connection (on
 // connect).
-func (h *statusHub) SendTerminals(ipc *protocol.IPCStream) {
+func (h *statusHub) SendTerminals(p *Peer) {
 	if h == nil || h.terminals == nil {
 		return
 	}
-	_ = ipc.SendEvent(protocol.EventTerminalIndex, "", "", "", protocol.TerminalIndexData{Terminals: h.terminals()})
+	h.peers.SendTo(p, protocol.EventTerminalIndex, "", protocol.TerminalIndexData{Terminals: h.terminals()})
 }
 
 // BroadcastTerminals pushes terminal_index to every peer (a terminal

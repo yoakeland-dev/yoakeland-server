@@ -81,13 +81,7 @@ func readProc(pid int) (protocol.ProcessInfo, bool) {
 
 // handleSignalProcess answers signal_process. Local connections only: a TCP peer
 // may not signal processes on the server's machine.
-func handleSignalProcess(ipc *protocol.IPCStream, network string, env *protocol.Envelope) {
-	if network == "tcp" {
-		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{
-			Message: "signal_process isn't available from a paired device; do it on the computer running the server",
-		})
-		return
-	}
+func handleSignalProcess(ipc *protocol.IPCStream, env *protocol.Envelope) {
 	var data protocol.SignalProcessData
 	if err := json.Unmarshal(env.Data, &data); err != nil {
 		_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: "malformed signal_process payload"})

@@ -40,8 +40,8 @@ func artifactAllow(peerID string, now time.Time) bool {
 }
 
 // handleArtifactEnvelope answers artifact_event; it reports whether env was one. Allowed for a
-// restricted paired device: it is only chat input, like a typed message.
-func handleArtifactEnvelope(ipc *protocol.IPCStream, deps connDeps, peerID string, env *protocol.Envelope) bool {
+// Limited device: it is only chat input, like a typed message, and a submit runs as its sender.
+func handleArtifactEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) bool {
 	if env.Type != protocol.EventArtifactEvent {
 		return false
 	}
@@ -88,12 +88,13 @@ func handleArtifactEnvelope(ipc *protocol.IPCStream, deps connDeps, peerID strin
 		if over {
 			return true
 		}
-		_, err := deps.sched.Add(protocol.ScheduleTurnData{
+		who := deps.actorOf(network, peerID) // the page's submit runs as the person who used it
+		_, err := deps.sched.AddAs(protocol.ScheduleTurnData{
 			SessionID: d.SessionID, ProjectPath: d.ProjectPath,
 			Text:    fmt.Sprintf("[The user acted in the artifact %s you wrote. What the page sent:]\n%s", d.ArtifactID, body),
 			Trigger: protocol.ScheduleTrigger{Kind: protocol.TriggerNow},
 			Origin:  &protocol.Origin{Kind: protocol.OriginArtifact, ArtifactID: d.ArtifactID},
-		})
+		}, who.UserID, who.Credential)
 		if err != nil {
 			fail(err.Error())
 		}
