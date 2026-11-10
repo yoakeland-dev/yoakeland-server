@@ -16,6 +16,7 @@ import (
 	"yoakeland/internal/normalizer"
 	"yoakeland/internal/permission"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/skills"
 	"yoakeland/internal/snapshot"
 	"yoakeland/internal/tool"
 )
@@ -293,17 +294,100 @@ func TestCompactByChapters_FailingSummarizerGetsFallbackBriefs(t *testing.T) {
 
 func TestCompactByChapters_NothingToFoldFallsBack(t *testing.T) {
 	ag, bound := chapterAgent(t, &briefProvider{})
-	hist := rounds(1, "ok")
+	hist := append(rounds(1, "ok"), chaptersCompaction("k", "", 0, "", ch(1, "One", "r1u", "r1a")))
 	ag.history = append([]Message(nil), hist...)
-	// The latest round is always kept, so a one-round chat has nothing to fold.
 	if _, done, _ := ag.compactByChapters(context.Background(), "t", bound, hist, 1000, 100, 24000, "", false); done {
-		t.Fatal("folded the only round")
+		t.Fatal("folded something with nothing unfolded")
 	}
 	if len(ag.history) != len(hist) {
 		t.Fatal("recorded something")
 	}
+	// With chapters in place that is not a reason for a summary, which would
+	// wipe them; with none yet, it is.
+	if u, err := ag.compactConversation(context.Background(), "t", bound, hist, contextView(hist, ""), 1000, 100, 24000, "", false); err != nil || u.TotalTokens != 0 || len(ag.history) != len(hist) {
+		t.Fatalf("a summary or something else was recorded: %v %d", err, len(ag.history))
+	}
 }
 
+// The latest round alone is bigger than the budget: everything is folded into
+// chapters (earlier ones kept), the request rides in the index, and the next
+// check finds nothing to do instead of compacting every round.
+func TestMaybeCompact_HugeLatestRoundFoldsEverythingAndKeepsChapters(t *testing.T) {
+	ag, bound := chapterAgent(t, &briefProvider{})
+	h := rounds(3, "ok")
+	h[len(h)-1].Content = strings.Repeat("huge answer ", 40000) // the latest round, far over the budget
+	h = append(h[:4:4], append([]Message{chaptersCompaction("k0", "r2u", 0, "", ch(1, "Early", "r1u", "r1a"))}, h[4:]...)...)
+	ag.history = h
+	ag.maybeCompact(context.Background(), "t", bound, 0)
+	rec := ag.history[len(ag.history)-1]
+	if rec.Compaction == nil || rec.Compaction.Kind != CompactionChapters || rec.Compaction.KeepFrom != "" || rec.Compaction.Request != "question 3" {
+		t.Fatalf("recorded %+v", rec.Compaction)
+	}
+	fs := foldStateOf(ag.history)
+	if len(fs.chapters) < 2 || fs.chapters[0].Title != "Early" || fs.chapters[1].N != 2 {
+		t.Fatalf("earlier chapters lost: %+v", fs.chapters)
+	}
+	if v := contextView(ag.history, ""); len(v) != 1 || !strings.HasSuffix(v[0].Content, "verbatim:]\nquestion 3") {
+		t.Fatalf("view %d messages", len(v))
+	}
+	ag.history = append(ag.history, round(4, "ok")...)
+	n := len(ag.history)
+	ag.maybeCompact(context.Background(), "t", bound, 0)
+	if len(ag.history) != n {
+		t.Fatalf("the next round compacted again: %+v", ag.history[n].Compaction)
+	}
+}
+
+func TestCompactByChapters_CancelledMidBriefRecordsNothing(t *testing.T) {
+	ag, bound := chapterAgent(t, &briefProvider{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	hist := rounds(40, strings.Repeat("x", 2000))
+	ag.history = append([]Message(nil), hist...)
+	if _, done, err := ag.compactByChapters(ctx, "t", bound, hist, 100000, 0, 24000, "", true); done || err == nil {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	if len(ag.history) != len(hist) {
+		t.Fatal("recorded a compaction after cancel")
+	}
+}
+
+// Raw stored messages, not the clear stubs, are what a chapter is briefed from.
+func TestCompactByChapters_BriefsAndSizesUseStoredMessages(t *testing.T) {
+	ag, bound := chapterAgent(t, &briefProvider{})
+	hist := rounds(3, strings.Repeat("real output ", 500))
+	hist = append(hist, Message{ID: "cl", Role: "compaction", Compaction: &Compaction{Kind: CompactionClear, ClearBefore: "r3u"}})
+	ag.history = append([]Message(nil), hist...)
+	if _, done, _ := ag.compactByChapters(context.Background(), "t", bound, hist, 1000, 100, 24000, "", true); !done {
+		t.Fatal("nothing folded")
+	}
+	c := ag.history[len(ag.history)-1].Compaction.Chapters[0]
+	if c.Tokens < 1000 {
+		t.Fatalf("chapter sized from stubs: %d tokens", c.Tokens)
+	}
+}
+
+func TestSkills_SurviveAChaptersCompaction(t *testing.T) {
+	have := []skills.Skill{testSkill("review"), testSkill("polish")}
+	history := []Message{
+		{ID: "u1", Role: "user", Content: "please $review"},
+		{ID: "a1", Role: "assistant", ToolCalls: []ToolCall{skillCall("c1", "polish")}},
+		{ID: "t1", Role: "tool", ToolCallID: "c1", Content: "polish text"},
+		{ID: "u2", Role: "user", Content: "carry on with $review"},
+		chaptersCompaction("k", "u2", 0, "", ch(1, "Reviewing", "u1", "t1")),
+	}
+	carried := carriedSkills(history, have)
+	if strings.Join(carried, ",") != "review,polish" {
+		t.Fatalf("carried = %v", carried)
+	}
+	out := withNamedSkills(contextView(history, ""), have, carried, readBody)
+	if !strings.HasPrefix(out[0].Content, chapterIndexOpening) || !strings.Contains(out[0].Content, "BODY(review)") || !strings.Contains(out[0].Content, "BODY(polish)") {
+		t.Fatalf("the chapter index lost the skills: %q", out[0].Content)
+	}
+	if strings.Contains(out[1].Content, "BODY") {
+		t.Fatalf("the later mention repeats a carried skill: %q", out[1].Content)
+	}
+}
 func TestCompactByChapters_TitlesOnlyWhenBriefsAreTooBig(t *testing.T) {
 	cm := NewContextManager(64000, 100)
 	big := strings.Repeat("word ", 400) // 500 tokens

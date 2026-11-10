@@ -88,6 +88,9 @@ func (fs foldState) head() string {
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString(chapterIndexIntro)
+	// ponytail: every chapter keeps one title line in the index forever
+	// (TitlesOnly only drops briefs). Merge the oldest chapters into volumes
+	// when chats get long enough for the titles themselves to matter.
 	for i, c := range fs.chapters {
 		fmt.Fprintf(&sb, "\n\n## Chapter %d: %s\n", c.N, c.Title)
 		if i < fs.titlesOnly {
@@ -120,6 +123,19 @@ func renderRange(history []Message, fs foldState, from, to int) []Message {
 			m.RawContent = nil
 		}
 		out = append(out, m)
+	}
+	return out
+}
+
+// foldable is history[from:to] as stored, without compaction messages and
+// without RawContent, which a fold never replays.
+func foldable(history []Message, from, to int) []Message {
+	var out []Message
+	for _, m := range history[from:to] {
+		if m.Role != "compaction" {
+			m.RawContent = nil
+			out = append(out, m)
+		}
 	}
 	return out
 }
@@ -266,8 +282,17 @@ func (a *Agent) compactByChapters(ctx context.Context, turnID string, bound Role
 	keep := len(history)
 	if !manual {
 		keep = cm.tailStart(history, fs, budget/4)
+		// A tail that is still over half the budget (one huge latest round)
+		// would have the next round compact again, and an empty fold range
+		// would push the caller to a summary that wipes the chapters: fold
+		// everything instead; the request is kept verbatim in the index.
+		if cm.EstimateHistoryTokens(renderRange(history, fs, keep, len(history))) > budget/2 || len(foldable(history, fs.start, keep)) == 0 {
+			keep = len(history)
+		}
 	}
-	msgs := renderRange(history, fs, fs.start, keep)
+	// Briefs and sizes come from the stored messages, not the clear stubs:
+	// the writer needs what happened, and recall restores these.
+	msgs := foldable(history, fs.start, keep)
 	if len(msgs) == 0 {
 		return usage, false, nil
 	}

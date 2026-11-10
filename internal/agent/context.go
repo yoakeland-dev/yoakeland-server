@@ -658,13 +658,18 @@ func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBindi
 
 // compactConversation is what a compaction does once clearing isn't enough:
 // fold the older conversation into chapters (chapters.go) or, in the
-// "summary" style or when there is nothing to fold, replace all of it with one
-// summary. view is contextView(history), which holds used tokens.
+// "summary" style or when there is nothing to fold and no chapters yet, replace
+// all of it with one summary. view is contextView(history), which holds used tokens.
 func (a *Agent) compactConversation(ctx context.Context, turnID string, bound RoleBinding, history, view []Message, used, overhead, budget int, extra string, manual bool) (protocol.UsageData, error) {
 	if !defaultCompactSummary.Load() {
 		usage, done, err := a.compactByChapters(ctx, turnID, bound, history, used, overhead, budget, extra, manual)
 		if done || err != nil {
 			return usage, err
+		}
+		// A summary would wipe the chapters the model can recall from: with
+		// chapters in place and nothing new to fold, leave the context as it is.
+		if len(foldStateOf(history).chapters) > 0 {
+			return usage, nil
 		}
 	}
 	return a.compactBySummary(ctx, turnID, bound, view, used, overhead, extra, manual)
