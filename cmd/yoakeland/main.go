@@ -325,6 +325,7 @@ func main() {
 		browser:            browser,
 		sched:              sched.New(stateDir),
 		turnWG:             &sync.WaitGroup{},
+		forward:            newForwarder(),
 	}
 	rc.deps = deps
 	hub.status = func() *protocol.ServerStatus { return serverStatus(deps) }
@@ -981,6 +982,10 @@ type connDeps struct {
 	// observe a turn's on-disk side effects after serveConnection returns
 	// set it and Wait() on it, instead of racing that goroutine.
 	turnWG *sync.WaitGroup
+
+	// forward is model forwarding's state (forward.go); nil in tests that don't use it, and such
+	// a server refuses forwarded requests.
+	forward *forwarder
 }
 
 // serveConnection dispatches inbound envelopes from a single client
@@ -992,6 +997,9 @@ type connDeps struct {
 // if non-nil, is called after every successfully read envelope (server mode
 // uses it to feed the heartbeat's liveness check).
 func serveConnection(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, onActivity func()) {
+	// Forwarded requests this connection was having answered stop with it, and a request a device
+	// was relaying for this server ends.
+	defer deps.forward.connClosed(deps, ipc, peerID)
 	// A closed connection watches nothing: an idle shell it was the last viewer of is forgotten.
 	if deps.projects != nil {
 		defer deps.projects.DetachTerminals(ipc)
@@ -1126,7 +1134,7 @@ func sendServerIdentity(deps connDeps, p *Peer) {
 	acc := deps.accessFor(p.Network, p.ID)
 	_ = p.ipc.SendEvent(protocol.EventServerIdentity, "", "", "", protocol.ServerIdentityData{
 		Identity: deps.settings.GetIdentity(), Icon: deps.settings.GetIcon(), ServerID: deps.settings.GetServerID(), Version: version,
-		Restricted: !acc.Full(), Tier: acc.Tier, Caps: acc.Caps.ToMap(deps.cliProviderNames()), User: userInfo(deps, acc),
+		Features: []string{protocol.FeatureForwarding}, Restricted: !acc.Full(), Tier: acc.Tier, Caps: acc.Caps.ToMap(deps.cliProviderNames()), User: userInfo(deps, acc),
 	})
 }
 
@@ -1144,7 +1152,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 	}
 	deps.projects.chatSentinel(env)
-	if handleFileEnvelope(ipc, deps, acc, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handlePeopleEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) {
+	if handleFileEnvelope(ipc, deps, acc, env) || handleScheduleEnvelope(ipc, deps, network, peerID, env) || handleLimitEnvelope(ipc, deps, network, peerID, env) || handlePeopleEnvelope(ipc, deps, network, peerID, env) || handleArtifactEnvelope(ipc, deps, network, peerID, env) || handleForwardEnvelope(ctx, ipc, deps, network, peerID, env) {
 		return
 	}
 	switch env.Type {
@@ -1397,6 +1405,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 	case protocol.EventListProviders:
 		var summaries []protocol.ProviderSummary
 		for _, cfg := range deps.providerStore.List() {
+			full, _ := deps.providerStore.Get(cfg.Name) // List scrubs the key the fingerprint is made from
 			summaries = append(summaries, protocol.ProviderSummary{
 				Name:           cfg.Name,
 				Kind:           string(cfg.Kind),
@@ -1408,6 +1417,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 				Label:          cfg.Label,
 				ConfigDir:      cfg.ConfigDir,
 				EnvKeys:        cfg.EnvKeys(),
+				KeyID:          full.KeyID(),
 			})
 		}
 		_ = ipc.SendEvent(protocol.EventProviderList, env.SessionID, env.TurnID, "", protocol.ProviderListData{

@@ -1,0 +1,645 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"yoakeland/internal/agent"
+	"yoakeland/internal/protocol"
+	"yoakeland/internal/provider"
+	"yoakeland/internal/sched"
+	"yoakeland/internal/tool"
+)
+
+// pipeW is the write side of a test connection: every event the server sends it goes to fn, on the
+// sender's goroutine, which is how a test device stands between two servers.
+type pipeW struct {
+	mu sync.Mutex
+	fn func(protocol.Envelope)
+}
+
+func (w *pipeW) set(fn func(protocol.Envelope)) { w.mu.Lock(); w.fn = fn; w.mu.Unlock() }
+
+func (w *pipeW) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	fn := w.fn
+	w.mu.Unlock()
+	var env protocol.Envelope
+	if fn != nil && json.Unmarshal(bytes.TrimSpace(b), &env) == nil {
+		fn(env)
+	}
+	return len(b), nil
+}
+
+func addTestPeer(t *testing.T, deps connDeps, network string) (*Peer, *pipeW) {
+	t.Helper()
+	w := &pipeW{}
+	p := deps.peers.Add(protocol.NewIPCStream(strings.NewReader(""), w), nopCloser{}, network, peerIdentity{Name: "dev", DeviceType: "desktop"})
+	t.Cleanup(func() { deps.peers.Remove(p.ID) })
+	return p, w
+}
+
+// fakeModel is an OpenAI-compatible endpoint standing in for A's provider.
+type fakeModel struct {
+	srv     *httptest.Server
+	mu      sync.Mutex
+	bodies  []map[string]any
+	hits    atomic.Int32
+	gone    chan struct{} // one send per request whose client went away
+	handler func(n int, w http.ResponseWriter, r *http.Request)
+}
+
+func sse(w http.ResponseWriter, data string) {
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	w.(http.Flusher).Flush()
+}
+
+func newFakeModel(t *testing.T) *fakeModel {
+	m := &fakeModel{gone: make(chan struct{}, 8)}
+	m.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(m.hits.Add(1))
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		m.mu.Lock()
+		m.bodies = append(m.bodies, body)
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if m.handler != nil {
+			m.handler(n, w, r)
+			return
+		}
+		m.answer(w)
+	}))
+	t.Cleanup(m.srv.Close)
+	return m
+}
+
+func (m *fakeModel) answer(w http.ResponseWriter) {
+	sse(w, `{"choices":[{"delta":{"content":"he"}}]}`)
+	sse(w, `{"choices":[{"delta":{"content":"llo"},"finish_reason":"stop"}]}`)
+	sse(w, `{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`)
+	sse(w, `[DONE]`)
+}
+
+// hold sends one delta, then waits until released or the client goes away.
+func (m *fakeModel) hold(release <-chan struct{}) func(int, http.ResponseWriter, *http.Request) {
+	return func(_ int, w http.ResponseWriter, r *http.Request) {
+		sse(w, `{"choices":[{"delta":{"content":"he"}}]}`)
+		select {
+		case <-release:
+			sse(w, `{"choices":[{"delta":{"content":"llo"}}]}`)
+			sse(w, `[DONE]`)
+		case <-r.Context().Done():
+			m.gone <- struct{}{}
+		}
+	}
+}
+
+type fwdWorld struct {
+	a, b   connDeps
+	model  *fakeModel
+	aID    string
+	states chan protocol.ForwardStateData
+}
+
+func newFwdWorld(t *testing.T) *fwdWorld {
+	t.Helper()
+	w := &fwdWorld{a: newTestDeps(t), b: newTestDeps(t), model: newFakeModel(t), states: make(chan protocol.ForwardStateData, 16)}
+	w.a.forward, w.b.forward = newForwarder(), newForwarder()
+	w.aID = w.a.settings.GetServerID()
+	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "p", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai", BaseURL: w.model.srv.URL, APIKey: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	_, watch := addTestPeer(t, w.b, "unix")
+	watch.set(func(env protocol.Envelope) {
+		if env.Type == protocol.EventForwardState {
+			var d protocol.ForwardStateData
+			_ = json.Unmarshal(env.Data, &d)
+			w.states <- d
+		}
+	})
+	return w
+}
+
+type fwdDevice struct {
+	w            *fwdWorld
+	aPeer, bPeer *Peer
+}
+
+// newDevice connects one device to both servers and has it pass frames between them untouched.
+func (w *fwdWorld) newDevice(t *testing.T) *fwdDevice {
+	d := &fwdDevice{w: w}
+	var aw, bw *pipeW
+	d.aPeer, aw = addTestPeer(t, w.a, "unix")
+	d.bPeer, bw = addTestPeer(t, w.b, "unix")
+	ctx := context.Background()
+	bw.set(func(env protocol.Envelope) { // B to A
+		if env.Type == protocol.EventForwardRequest || env.Type == protocol.EventForwardCancel {
+			handleForwardEnvelope(ctx, d.aPeer.ipc, w.a, "unix", d.aPeer.ID, &env)
+		}
+	})
+	aw.set(func(env protocol.Envelope) { // A to B
+		if env.Type == protocol.EventForwardChunk || env.Type == protocol.EventForwardEnd {
+			handleForwardEnvelope(ctx, d.bPeer.ipc, w.b, "unix", d.bPeer.ID, &env)
+		}
+	})
+	return d
+}
+
+func (d *fwdDevice) offer(servers ...string) {
+	raw, _ := json.Marshal(protocol.RelayOfferData{Servers: servers})
+	handleForwardEnvelope(context.Background(), d.bPeer.ipc, d.w.b, "unix", d.bPeer.ID, &protocol.Envelope{Type: protocol.EventRelayOffer, Data: raw})
+}
+
+// lose is the device's connections ending, as serveConnection's exit does it.
+func (d *fwdDevice) lose() {
+	d.w.a.forward.connClosed(d.w.a, d.aPeer.ipc, d.aPeer.ID)
+	d.w.b.forward.connClosed(d.w.b, d.bPeer.ipc, d.bPeer.ID)
+}
+
+func (w *fwdWorld) provider(t *testing.T) *ForwardedProvider {
+	p, err := newForwardedProvider(w.b, "chat1", w.aID, "p", "gpt-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func collect(t *testing.T, chunks <-chan agent.ModelStreamChunk, errs <-chan error) (text string, usage int, err error) {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	for chunks != nil {
+		select {
+		case c, ok := <-chunks:
+			if !ok {
+				chunks = nil
+				break
+			}
+			switch c.Kind {
+			case agent.StreamChunkDelta:
+				text += c.Delta
+			case agent.StreamChunkUsage:
+				usage += c.Usage.TotalTokens
+			}
+		case <-timeout:
+			t.Fatal("stream didn't finish")
+		}
+	}
+	return text, usage, <-errs
+}
+
+// settled waits for forwarding to hold nothing on either server: no goroutine's entry may outlive its request.
+func (w *fwdWorld) settled(t *testing.T) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		w.a.forward.mu.Lock()
+		w.b.forward.mu.Lock()
+		n := len(w.a.forward.conns) + len(w.b.forward.calls)
+		w.b.forward.mu.Unlock()
+		w.a.forward.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("forwarding still holds a request")
+}
+
+func TestForwardEndToEnd(t *testing.T) {
+	w := newFwdWorld(t)
+	w.newDevice(t).offer(w.aID)
+	p := w.provider(t)
+	p.SetModelOptions(agent.ModelOptions{ReasoningEffort: "low"})
+	// More than one piece, with multi-byte characters at every offset.
+	system := strings.Repeat("é日", protocol.ForwardPieceSize)
+	chunks, errs := p.StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, system)
+	text, usage, err := collect(t, chunks, errs)
+	if err != nil || text != "hello" || usage != 10 {
+		t.Fatalf("got %q usage %d err %v", text, usage, err)
+	}
+	body := w.model.bodies[0]
+	msgs := body["messages"].([]any)
+	if body["model"] != "gpt-x" || msgs[0].(map[string]any)["content"] != system || body["reasoning_effort"] != "low" {
+		t.Fatalf("A's provider got a different request: model %v, effort %v, system intact %v", body["model"], body["reasoning_effort"], msgs[0].(map[string]any)["content"] == system)
+	}
+	w.settled(t)
+}
+
+func TestForwardTitle(t *testing.T) {
+	w := newFwdWorld(t)
+	w.newDevice(t).offer(w.aID)
+	title, err := w.provider(t).GenerateTitle(context.Background(), "hello there")
+	if err != nil || title != "hello" {
+		t.Fatalf("title %q err %v", title, err)
+	}
+	w.settled(t)
+}
+
+func TestForwardWireRoundTrip(t *testing.T) {
+	yes := true
+	msg := agent.Message{
+		ID: "m1", Role: "assistant", Content: "c", Reasoning: "r", ToolCallID: "tc",
+		ToolCalls: []agent.ToolCall{{ID: "t1", Name: "bash", Args: json.RawMessage(`{"cmd":"ls"}`), NativeToolInfo: protocol.NativeToolInfo{Native: true, Title: "x", Kind: "execute", Locations: []string{"/a"}}}},
+		Images:    []protocol.ImageData{{MimeType: "image/png", Data: "AAAA", Width: 2, Height: 3}},
+		Subagent:  []agent.Message{{Role: "user", Content: "inner"}}, Summary: "s", Ask: "a",
+		Actions: []protocol.QuickAction{{Label: "l", Prompt: "p"}}, AuthorName: "n", AuthorID: "u",
+		Attachments: []string{"/x"}, Provider: "p", Model: "m", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC), GenerationMs: 12,
+		Usage:      &protocol.UsageData{InputTokens: 1, OutputTokens: 2, TotalTokens: 3, CostUSD: 0.5, CostKnown: true, CachedInputTokens: 4, ContextTokens: 5},
+		RawContent: json.RawMessage(`[{"type":"thinking","signature":"sig"}]`), PrefixKey: "pk",
+		Compaction: &agent.Compaction{Kind: "summary", TokensBefore: 9, TokensAfter: 3},
+	}
+	in := forwardBody{
+		ProviderName: "p", Model: "m", Messages: []agent.Message{msg}, SystemPrompt: "sys",
+		Tools:   []tool.ToolDefinition{{Name: "t", Description: "d", Parameters: map[string]any{"type": "object", "required": []any{"a"}}}},
+		Hints:   agent.RequestHints{CacheKey: "k", AdvisorModel: "a", ServerWebSearch: true},
+		Options: agent.ModelOptions{ReasoningEffort: "high", ThinkingBudget: 5, FastMode: &yes, AutoCompact: &yes},
+	}
+	raw, _ := json.Marshal(in)
+	var out forwardBody
+	// Tiny pieces: every cut lands somewhere.
+	if err := json.Unmarshal([]byte(strings.Join(splitPieces(raw, 7), "")), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("body changed on the way:\n in %+v\nout %+v", in, out)
+	}
+
+	for _, c := range []agent.ModelStreamChunk{
+		{Kind: agent.StreamChunkDelta, Delta: "x"},
+		{Kind: agent.StreamChunkReasoning, Delta: "why"},
+		{Kind: agent.StreamChunkToolCall, ToolCall: &msg.ToolCalls[0]},
+		{Kind: agent.StreamChunkUsage, Usage: in.Messages[0].Usage},
+		{Kind: agent.StreamChunkFinish, FinishReason: "length"},
+		{Kind: agent.StreamChunkRawContent, Raw: json.RawMessage(`[{"a":1}]`)},
+		{Kind: agent.StreamChunkContext, Context: &agent.ContextSnapshot{ContextTokens: 1, WindowTokens: 2, Source: "provider"}},
+	} {
+		w, ok := toWireChunk(c)
+		raw, _ := json.Marshal(w)
+		var back protocol.ForwardChunk
+		if err := json.Unmarshal(raw, &back); err != nil || !ok {
+			t.Fatalf("%s: %v ok=%v", c.Kind, err, ok)
+		}
+		if got := fromWireChunk(back); !reflect.DeepEqual(got, c) {
+			t.Errorf("%s changed: %+v != %+v", c.Kind, got, c)
+		}
+	}
+}
+
+// capture records what a server wrote to a connection.
+type capture struct {
+	mu   sync.Mutex
+	envs []protocol.Envelope
+}
+
+func (c *capture) Write(b []byte) (int, error) {
+	var env protocol.Envelope
+	if json.Unmarshal(bytes.TrimSpace(b), &env) == nil {
+		c.mu.Lock()
+		c.envs = append(c.envs, env)
+		c.mu.Unlock()
+	}
+	return len(b), nil
+}
+
+func (c *capture) end(t *testing.T, id string) string {
+	t.Helper()
+	for i := 0; i < 500; i++ {
+		c.mu.Lock()
+		for _, e := range c.envs {
+			var d protocol.ForwardEndData
+			if e.Type == protocol.EventForwardEnd && json.Unmarshal(e.Data, &d) == nil && d.RequestID == id {
+				c.mu.Unlock()
+				return d.Error
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no forward_end for %s", id)
+	return ""
+}
+
+func TestForwardRefusals(t *testing.T) {
+	w := newFwdWorld(t)
+	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "cli", Kind: provider.ProviderKindCLIClaude}); err != nil {
+		t.Fatal(err)
+	}
+	body := func(name string) string {
+		raw, _ := json.Marshal(forwardBody{ProviderName: name, Model: "m", Messages: []agent.Message{{Role: "user", Content: "hi"}}})
+		return string(raw)
+	}
+	piece := func(id, server string, seq int, last bool, data string) *protocol.Envelope {
+		raw, _ := json.Marshal(protocol.ForwardRequestData{RequestID: id, ServerID: server, Seq: seq, Last: last, Data: data})
+		return &protocol.Envelope{Type: protocol.EventForwardRequest, Data: raw}
+	}
+	conn := func(network string) (*Peer, *capture) {
+		c := &capture{}
+		p := w.a.peers.Add(protocol.NewIPCStream(strings.NewReader(""), c), nopCloser{}, network, peerIdentity{Name: "x"})
+		t.Cleanup(func() { w.a.forward.connClosed(w.a, p.ipc, p.ID); w.a.peers.Remove(p.ID) })
+		return p, c
+	}
+	for _, tc := range []struct {
+		name, network, want string
+		env                 func() []*protocol.Envelope
+	}{
+		{"wrong server", "unix", "this server is not other", func() []*protocol.Envelope {
+			return []*protocol.Envelope{piece("r", "other", 0, true, body("p"))}
+		}},
+		{"too big", "unix", "over 64 MiB", func() []*protocol.Envelope {
+			big := strings.Repeat("a", 33<<20)
+			return []*protocol.Envelope{piece("r", w.aID, 0, false, big), piece("r", w.aID, 1, false, big)}
+		}},
+		{"out of order", "unix", "out of order", func() []*protocol.Envelope {
+			return []*protocol.Envelope{piece("r", w.aID, 1, true, body("p"))}
+		}},
+		{"unknown provider", "unix", "unknown provider", func() []*protocol.Envelope {
+			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("nope"))}
+		}},
+		{"not allowed", "tcp", "isn't allowed", func() []*protocol.Envelope {
+			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("cli"))}
+		}},
+		{"cli kind", "unix", "can't be used from another server", func() []*protocol.Envelope {
+			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("cli"))}
+		}},
+		{"too many in flight", "unix", "in flight", func() []*protocol.Envelope {
+			var out []*protocol.Envelope
+			for i := 0; i <= maxForwardInFlight; i++ {
+				out = append(out, piece(fmt.Sprint("r", i), w.aID, 0, false, "{"))
+			}
+			return out
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, c := conn(tc.network)
+			envs := tc.env()
+			for _, e := range envs {
+				handleForwardEnvelope(context.Background(), p.ipc, w.a, tc.network, p.ID, e)
+			}
+			var d protocol.ForwardRequestData
+			_ = json.Unmarshal(envs[len(envs)-1].Data, &d)
+			if got := c.end(t, d.RequestID); !strings.Contains(got, tc.want) {
+				t.Fatalf("refusal %q, want it to mention %q", got, tc.want)
+			}
+		})
+	}
+	if w.model.hits.Load() != 0 {
+		t.Fatal("a refused request reached the provider")
+	}
+}
+
+func TestForwardCancelFromB(t *testing.T) {
+	w := newFwdWorld(t)
+	w.model.handler = w.model.hold(nil)
+	w.newDevice(t).offer(w.aID)
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := w.provider(t).StreamTurn(ctx, []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
+	if c := <-chunks; c.Delta != "he" {
+		t.Fatalf("first chunk %+v", c)
+	}
+	cancel()
+	_, _, err := collect(t, chunks, errs)
+	if err == nil || err != context.Canceled {
+		t.Fatalf("err = %v, want cancelled", err)
+	}
+	select {
+	case <-w.model.gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("A's provider kept running after forward_cancel")
+	}
+	w.settled(t)
+}
+
+func TestForwardAConnectionClosing(t *testing.T) {
+	w := newFwdWorld(t)
+	w.model.handler = w.model.hold(nil)
+	d := w.newDevice(t)
+	d.offer(w.aID)
+	chunks, errs := w.provider(t).StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
+	<-chunks
+	w.a.forward.connClosed(w.a, d.aPeer.ipc, d.aPeer.ID)
+	_, _, err := collect(t, chunks, errs)
+	if err == nil {
+		t.Fatal("a request whose connection closed on A finished as an answer")
+	}
+	select {
+	case <-w.model.gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("A's provider kept running after its connection closed")
+	}
+	w.settled(t)
+}
+
+func TestForwardWaitsForADevice(t *testing.T) {
+	w := newFwdWorld(t)
+	chunks, errs := w.provider(t).StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
+	if s := <-w.states; s.State != protocol.ForwardWaiting || s.ServerID != w.aID {
+		t.Fatalf("state %+v", s)
+	}
+	// A device that offers some other server doesn't end the wait.
+	d := w.newDevice(t)
+	d.offer("elsewhere")
+	select {
+	case s := <-w.states:
+		t.Fatalf("unexpected state %+v", s)
+	case <-time.After(50 * time.Millisecond):
+	}
+	d.offer(w.aID)
+	text, _, err := collect(t, chunks, errs)
+	if err != nil || text != "hello" {
+		t.Fatalf("got %q err %v", text, err)
+	}
+	if s := <-w.states; s.State != protocol.ForwardRelaying {
+		t.Fatalf("state %+v", s)
+	}
+	w.settled(t)
+}
+
+func TestForwardGivesUpWaiting(t *testing.T) {
+	old := forwardWaitLimit
+	forwardWaitLimit = 50 * time.Millisecond
+	defer func() { forwardWaitLimit = old }()
+	w := newFwdWorld(t)
+	chunks, errs := w.provider(t).StreamTurn(context.Background(), nil, nil, "")
+	_, _, err := collect(t, chunks, errs)
+	if err == nil || !strings.Contains(err.Error(), "no device connected to both this server and "+w.aID+" came online") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestForwardCancelWhileWaiting(t *testing.T) {
+	w := newFwdWorld(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errs := w.provider(t).StreamTurn(ctx, nil, nil, "")
+	<-w.states
+	cancel()
+	for range chunks {
+	}
+	if err := <-errs; err != context.Canceled {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestForwardDeviceLostBeforeAndAfterFirstChunk(t *testing.T) {
+	t.Run("before: another device takes over", func(t *testing.T) {
+		w := newFwdWorld(t)
+		w.model.handler = func(n int, rw http.ResponseWriter, r *http.Request) {
+			if n == 1 { // the first request never answers
+				<-r.Context().Done()
+				w.model.gone <- struct{}{}
+				return
+			}
+			w.model.answer(rw)
+		}
+		first := w.newDevice(t)
+		first.offer(w.aID)
+		chunks, errs := w.provider(t).StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
+		for w.model.hits.Load() == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		first.lose()
+		<-w.states // waiting: nobody else is connected yet
+		w.newDevice(t).offer(w.aID)
+		text, _, err := collect(t, chunks, errs)
+		if err != nil || text != "hello" {
+			t.Fatalf("got %q err %v", text, err)
+		}
+		w.settled(t)
+	})
+	t.Run("after: the request fails and is not replayed", func(t *testing.T) {
+		w := newFwdWorld(t)
+		w.model.handler = w.model.hold(nil)
+		d := w.newDevice(t)
+		d.offer(w.aID)
+		chunks, errs := w.provider(t).StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
+		<-chunks
+		d.lose()
+		w.newDevice(t).offer(w.aID) // a replacement must not be given a half-streamed answer to redo
+		_, _, err := collect(t, chunks, errs)
+		want := "the device relaying to " + w.aID + " disconnected; send a message to continue"
+		if err == nil || err.Error() != want {
+			t.Fatalf("err = %v, want %q", err, want)
+		}
+		if w.model.hits.Load() != 1 {
+			t.Fatalf("the request was replayed (%d hits)", w.model.hits.Load())
+		}
+		w.settled(t)
+	})
+}
+
+func TestForwardIgnoresRepliesFromOtherDevices(t *testing.T) {
+	w := newFwdWorld(t)
+	f := w.b.forward
+	call := f.addCall("req", "dev1")
+	defer f.removeCall("req", call)
+	f.deliver("dev2", "req", fwdMsg{end: &protocol.ForwardEndData{RequestID: "req"}})
+	f.deliver("dev1", "unknown", fwdMsg{end: &protocol.ForwardEndData{RequestID: "unknown"}})
+	if len(call.msgs) != 0 {
+		t.Fatal("a reply from a device that wasn't given the request was accepted")
+	}
+	f.deliver("dev1", "req", fwdMsg{end: &protocol.ForwardEndData{RequestID: "req"}})
+	if len(call.msgs) != 1 {
+		t.Fatal("the reply from the right device was dropped")
+	}
+}
+
+func TestForwardOnlyDevicesThatMayReadTheChat(t *testing.T) {
+	w := newFwdWorld(t)
+	d := w.newDevice(t)
+	d.offer(w.aID)
+	d.bPeer.Network = "tcp" // canSee asks Sees about a TCP peer
+	w.b.peers.Sees = func(network, credential, sessionID string) bool { return false }
+	if p := w.b.forward.pick(w.b, "chat1", w.aID, ""); p != nil {
+		t.Fatal("a device that may not read the chat was picked")
+	}
+	w.b.peers.Sees = func(network, credential, sessionID string) bool { return true }
+	if p := w.b.forward.pick(w.b, "chat1", w.aID, ""); p == nil || p.ID != d.bPeer.ID {
+		t.Fatal("a device that may read the chat wasn't picked")
+	}
+}
+
+func TestForwardPrefersTheDeviceThatStartedTheTurn(t *testing.T) {
+	w := newFwdWorld(t)
+	first, second := w.newDevice(t), w.newDevice(t)
+	first.offer(w.aID)
+	second.offer(w.aID)
+	if p := w.b.forward.pick(w.b, "chat1", w.aID, first.bPeer.ID); p.ID != first.bPeer.ID {
+		t.Fatal("the preferred device wasn't picked")
+	}
+}
+
+func TestForwardViaBindingSurvivesRestoreBinding(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.forward = newForwarder()
+	deps.sched = sched.New(t.TempDir())
+	pc, err := deps.projects.Resolve("s1", "", deps.defaultProjectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ipc := protocol.NewIPCStream(strings.NewReader(""), io.Discard)
+	ag := pc.Registry.Get(ipc, "s1")
+	name := "via:srv-elsewhere:my:key"
+	if err := bindProvider(deps, pc, ag, "s1", name, "gpt-x"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := deps.sched.BindingFor("s1"); ag.ProviderName() != name || b.Provider != name || b.Model != "gpt-x" || !ag.SetModelOptions(agent.ModelOptions{}, 0, nil, nil) {
+		t.Fatalf("bound %q, remembered %+v", ag.ProviderName(), b)
+	}
+	// The server restarts: the schedule is read back and the chat has no provider yet.
+	deps.sched = sched.New(deps.sched.Dir())
+	ag.SetProvider(nil, "")
+	restoreBinding(deps, pc, ag, "s1")
+	if ag.ProviderName() != name || !ag.SetModelOptions(agent.ModelOptions{}, 0, nil, nil) {
+		t.Fatalf("restored %q", ag.ProviderName())
+	}
+	// Your own server's provider is used directly, not through a device.
+	if err := bindProvider(deps, pc, ag, "s1", "via:"+deps.settings.GetServerID()+":p", "m"); err == nil {
+		t.Fatal("bound a via: provider that lives on this server")
+	}
+	if !providerAllowed(deps, Access{Tier: TierLimited}, name) {
+		t.Fatal("a limited person can't pick a borrowed provider")
+	}
+}
+
+func TestForwardingWireNames(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.providerStore.Register(provider.ProviderConfig{Name: "k", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai", APIKey: "secret"})
+	envs := runDispatch(t, deps, envelopeJSON(t, protocol.EventListProviders, struct{}{}))
+	var got protocol.ProviderListData
+	var listed string
+	for _, e := range envs {
+		if e.Type == protocol.EventProviderList {
+			_ = json.Unmarshal(e.Data, &got)
+			listed = string(e.Data)
+		}
+	}
+	cfg, _ := deps.providerStore.Get("k")
+	if len(got.Providers) != 1 || got.Providers[0].KeyID != cfg.KeyID() || len(cfg.KeyID()) != 16 || strings.Contains(listed, "secret") {
+		t.Fatalf("providers %+v, own keyId %q, listed %s", got, cfg.KeyID(), listed)
+	}
+	if err := registerProviderRefusal(deps, Access{Tier: TierFull}, provider.ProviderConfig{Name: "via:x:y", Kind: provider.ProviderKindAPIKey}); err == "" {
+		t.Fatal("registered a provider named like a borrowed one")
+	}
+	var id protocol.ServerIdentityData
+	p, w := addTestPeer(t, deps, "unix")
+	w.set(func(e protocol.Envelope) {
+		if e.Type == protocol.EventServerIdentity {
+			_ = json.Unmarshal(e.Data, &id)
+		}
+	})
+	sendServerIdentity(deps, p)
+	if !reflect.DeepEqual(id.Features, []string{"forwarding"}) {
+		t.Fatalf("features %v", id.Features)
+	}
+}

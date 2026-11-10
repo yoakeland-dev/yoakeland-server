@@ -138,6 +138,6 @@ func truncateTail(s string, n int) string {
 // GenerateTitle implements agent.TitleGenerator through OneShot, so a CLI agent's chats get a
 // real title instead of the start of the first prompt.
 func (p *CLISubprocessProvider) GenerateTitle(ctx context.Context, prompt string) (string, error) {
-	text, _, err := p.OneShot(ctx, titleSystemPrompt, prompt)
+	text, _, err := p.OneShot(ctx, TitleSystemPrompt, prompt)
 	return text, err
 }

@@ -337,16 +337,16 @@ const maxChatTitleRunes = 60
 // ModelOptions tunes a turn's request shape (see SetModelOptionsData on the
 // wire). Fields are provider-specific; a zero value means "don't change".
 type ModelOptions struct {
-	ReasoningEffort string
-	ThinkingBudget  int
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
 	// FastMode is nil when the request doesn't say; only providers whose
 	// models have a fast mode look at it.
-	FastMode *bool
+	FastMode *bool `json:"fastMode,omitempty"`
 	// AutoCompactTokens and AutoCompact are the session's own say over when a
 	// coding agent compacts itself (set_model_options); nil = not said.
 	// Providers that don't compact on their own terms ignore them.
-	AutoCompactTokens *int
-	AutoCompact       *bool
+	AutoCompactTokens *int  `json:"autoCompactTokens,omitempty"`
+	AutoCompact       *bool `json:"autoCompact,omitempty"`
 }
 
 // ModelOptionsSetter is implemented by providers whose request shape can be

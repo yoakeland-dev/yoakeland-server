@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -84,6 +86,16 @@ type ProviderConfig struct {
 	ConfigDir string `json:"configDir,omitempty"`
 	// Env is extra environment for a custom ACP agent. Values never go to clients.
 	Env map[string]string `json:"env,omitempty"`
+}
+
+// KeyID is a short fingerprint of an API key's identity (backend, endpoint and key), so a client can
+// see that two servers hold the same one without either sending it. Empty for a CLI agent.
+func (c ProviderConfig) KeyID() string {
+	if c.Kind != ProviderKindAPIKey {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(c.HTTPProvider + "\x00" + c.BaseURL + "\x00" + c.APIKey))
+	return hex.EncodeToString(sum[:8])
 }
 
 type providerFileModel struct {

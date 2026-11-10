@@ -401,6 +401,8 @@ type ProviderSummary struct {
 	ConfigDir      string   `json:"configDir,omitempty"`
 	// EnvKeys are the names of the agent's custom environment; the values never leave the server.
 	EnvKeys []string `json:"envKeys,omitempty"`
+	// KeyID tells a client the same API key on two servers without revealing it (api_key only).
+	KeyID string `json:"keyId,omitempty"`
 }
 
 type ProviderListData struct {
@@ -1435,6 +1437,9 @@ type ServerIdentityData struct {
 	// unavailable. Pushed again when the tier changes. Omitted for full access. Kept for old
 	// clients: Tier says which tier.
 	Restricted bool `json:"restricted,omitempty"`
+	// Features names the optional protocols this server speaks ("forwarding"). A client only
+	// uses one with a server that lists it.
+	Features []string `json:"features,omitempty"`
 	// Tier is this connection's tier ("limited", "trusted" or "full"; the local socket is full),
 	// and Caps its effective capabilities by name (SPEC.md "Tiers and permissions"). Both are
 	// pushed again when they change.

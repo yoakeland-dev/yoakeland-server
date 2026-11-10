@@ -207,7 +207,8 @@ func (p *AnthropicProvider) post(ctx context.Context, body []byte, betas []strin
 	})
 }
 
-const titleSystemPrompt = "Summarize the user's message as a short chat title (plain text, no quotes, at most 8 words)."
+// TitleSystemPrompt asks for a chat title; a forwarded provider sends it as an ordinary request.
+const TitleSystemPrompt = "Summarize the user's message as a short chat title (plain text, no quotes, at most 8 words)."
 
 // GenerateTitle implements agent.TitleGenerator with a small, non-streaming
 // request on the same model as the session, separate from any in-flight
@@ -215,7 +216,7 @@ const titleSystemPrompt = "Summarize the user's message as a short chat title (p
 func (p *AnthropicProvider) GenerateTitle(ctx context.Context, prompt string) (string, error) {
 	reqBody := anthropicRequest{
 		Model:     p.Model,
-		System:    titleSystemPrompt,
+		System:    TitleSystemPrompt,
 		Messages:  []anthropicMessage{{Role: "user", Content: prompt}},
 		Stream:    false,
 		MaxTokens: 32,

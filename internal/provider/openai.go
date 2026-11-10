@@ -175,7 +175,7 @@ func (p *OpenAICompatibleProvider) GenerateTitle(ctx context.Context, prompt str
 	reqBody := openAIRequest{
 		Model: p.Model,
 		Messages: []openAIMessage{
-			{Role: "system", Content: titleSystemPrompt},
+			{Role: "system", Content: TitleSystemPrompt},
 			{Role: "user", Content: prompt},
 		},
 		Stream: false,
