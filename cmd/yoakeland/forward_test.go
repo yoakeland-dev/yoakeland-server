@@ -142,13 +142,16 @@ func newFwdWorld(t *testing.T) *fwdWorld {
 type fwdDevice struct {
 	w            *fwdWorld
 	aPeer, bPeer *Peer
+	aw           *pipeW
 }
 
 // newDevice connects one device to both servers and has it pass frames between them untouched.
 func (w *fwdWorld) newDevice(t *testing.T) *fwdDevice {
 	d := &fwdDevice{w: w}
-	var aw, bw *pipeW
+	var bw *pipeW
+	var aw *pipeW
 	d.aPeer, aw = addTestPeer(t, w.a, "unix")
+	d.aw = aw
 	d.bPeer, bw = addTestPeer(t, w.b, "unix")
 	ctx := context.Background()
 	bw.set(func(env protocol.Envelope) { // B to A
@@ -177,6 +180,7 @@ func (d *fwdDevice) offer(servers ...string) {
 
 // lose is the device's connections ending, as serveConnection's exit does it.
 func (d *fwdDevice) lose() {
+	d.aw.set(nil) // a dead device carries nothing more from A, not even A's "cancelled"
 	d.w.a.forward.connClosed(d.w.a, d.aPeer.ipc, d.aPeer.ID)
 	d.w.b.forward.connClosed(d.w.b, d.bPeer.ipc, d.bPeer.ID)
 }
