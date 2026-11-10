@@ -121,6 +121,7 @@ type fwdConn struct{ reqs map[string]*fwdReq }
 
 // fwdReq is a request on A: pieces being collected, then (cancel set) a provider call running.
 type fwdReq struct {
+	from   string // the server the request came from, as the device stamped it on piece 0
 	buf    []byte
 	next   int
 	cancel context.CancelFunc
@@ -208,6 +209,9 @@ func (f *forwarder) connClosed(deps connDeps, ipc *protocol.IPCStream, peerID st
 // handleForwardEnvelope answers the forwarding events. A device may send any of them, so each
 // handler narrows to what the connection is entitled to.
 func handleForwardEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, env *protocol.Envelope) bool {
+	if handleGrantEnvelope(ipc, deps, network, peerID, env) {
+		return true
+	}
 	switch env.Type {
 	case protocol.EventRelayOffer, protocol.EventForwardRequest, protocol.EventForwardCancel, protocol.EventForwardChunk, protocol.EventForwardEnd:
 	default:
@@ -286,6 +290,7 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 		return
 	}
 	var body []byte
+	var from string
 	var rctx context.Context
 	why := func() string {
 		f.mu.Lock()
@@ -304,7 +309,7 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 		case r != nil && (r.cancel != nil || d.Seq != r.next):
 			return "forward_request pieces out of order"
 		case r == nil:
-			r = &fwdReq{}
+			r = &fwdReq{from: d.From}
 			c.reqs[d.RequestID] = r
 		}
 		if len(r.buf)+len(d.Data) > protocol.MaxForwardBody {
@@ -315,7 +320,7 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 		if d.Last {
 			var cancel context.CancelFunc
 			rctx, cancel = context.WithCancel(ctx)
-			body, r.buf, r.cancel = r.buf, nil, cancel
+			body, from, r.buf, r.cancel = r.buf, r.from, nil, cancel
 		}
 		return ""
 	}()
@@ -329,7 +334,7 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 	if deps.turnWG != nil {
 		deps.turnWG.Add(1)
 	}
-	go f.answer(rctx, ipc, deps, network, peerID, d.RequestID, body)
+	go f.answer(rctx, ipc, deps, network, peerID, d.RequestID, from, body)
 }
 
 // drop forgets request id on ipc and stops it if it is running.
@@ -353,7 +358,7 @@ func (f *forwarder) drop(ipc *protocol.IPCStream, id string) {
 
 // answer runs the request on A's own provider as the person behind the relaying connection and
 // streams the result back, then closes the request. ctx ends it: forward_cancel, or the connection.
-func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID, id string, raw []byte) {
+func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID, id, from string, raw []byte) {
 	if deps.turnWG != nil {
 		defer deps.turnWG.Done()
 	}
@@ -387,13 +392,18 @@ func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps co
 		return
 	}
 	cfg, ok := deps.providerStore.Get(b.ProviderName)
+	acc := deps.accessFor(network, peerID)
 	switch {
 	case !ok:
 		errText = fmt.Sprintf("unknown provider %q", b.ProviderName)
-	case !providerAllowed(deps, deps.accessFor(network, peerID), b.ProviderName):
+	case !providerAllowed(deps, acc, b.ProviderName):
 		errText = fmt.Sprintf("provider %q isn't allowed for this person", b.ProviderName)
 	case !forwardableKind(cfg.Kind):
 		errText = fmt.Sprintf("provider %q can't be used from another server", b.ProviderName)
+	// Lending is the person's own choice, made on this server: a server they are only a guest on
+	// can't spend their keys by asking.
+	case !deps.settings.ForwardGranted(acc.UserID, from, b.ProviderName):
+		errText = fmt.Sprintf("%s isn't lent to that server. Pick it in the model picker there to allow it.", b.ProviderName)
 	}
 	if errText != "" {
 		return
@@ -597,8 +607,14 @@ func (p *ForwardedProvider) announce(state string) {
 func (p *ForwardedProvider) run(ctx context.Context, body []byte, out chan<- agent.ModelStreamChunk) error {
 	f := p.deps.forward
 	prefer, _ := ctx.Value(relayPreferKey{}).(string)
-	limit := time.NewTimer(forwardWaitLimit)
-	defer limit.Stop()
+	// Each wait gets the whole limit: the timer starts when a wait does.
+	var timer *time.Timer
+	var limit <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	waiting, sent := false, false
 	for {
 		changed := f.changes()
@@ -606,19 +622,22 @@ func (p *ForwardedProvider) run(ctx context.Context, body []byte, out chan<- age
 		if dev == nil {
 			if !waiting {
 				waiting = true
+				timer = time.NewTimer(forwardWaitLimit)
+				limit = timer.C
 				p.announce(protocol.ForwardWaiting)
 			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-limit.C:
-				return fmt.Errorf("no device connected to both this server and %s came online", p.serverID)
+			case <-limit:
+				return errors.New("no device connected to both this server and the one that has this provider came online")
 			case <-changed:
 			}
 			continue
 		}
 		if waiting {
 			waiting = false
+			timer.Stop()
 			p.announce(protocol.ForwardRelaying)
 		}
 		retry, err := p.relay(ctx, dev, body, out, &sent)
@@ -691,5 +710,5 @@ func (p *ForwardedProvider) relay(ctx context.Context, dev *Peer, body []byte, o
 }
 
 func (p *ForwardedProvider) lostErr() error {
-	return fmt.Errorf("the device relaying to %s disconnected; send a message to continue", p.serverID)
+	return errors.New("the device relaying to the server that has this provider disconnected; send a message to continue")
 }

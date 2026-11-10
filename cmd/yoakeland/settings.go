@@ -104,6 +104,9 @@ type ServerSettings struct {
 	// ProviderOwners remembers who added each provider a non-Full person registered, so they
 	// may change only their own.
 	ProviderOwners map[string]string `json:"providerOwners,omitempty"`
+	// ForwardGrants are the providers each person lends to other servers (forward_grants.go),
+	// by user id and then borrowing server id.
+	ForwardGrants map[string]map[string]forwardLoan `json:"forwardGrants,omitempty"`
 
 	// avatars holds the pictures people's avatars name; nil keeps them as data URLs.
 	avatars *UploadStore

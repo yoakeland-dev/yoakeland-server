@@ -303,13 +303,25 @@ A chat on server B can run on a provider that lives on server A. B's agent loop,
 | Event | Direction | Data |
 |---|---|---|
 | `relay_offer` | device → any server | `{servers: ["<serverId>", ...]}` the other servers this device is connected to right now. A full replacement, sent after connecting and on every change. Forgotten when the connection closes. |
-| `forward_request` | B → device, device → A | `{requestId, serverId, seq, last, data}` |
+| `forward_request` | B → device, device → A | `{requestId, serverId, from?, seq, last, data}` |
 | `forward_cancel` | B → device, device → A | `{requestId}` |
 | `forward_chunk` | A → device, device → B | `{requestId, chunk}` |
 | `forward_end` | A → device, device → B | `{requestId, error?}` |
-| `forward_state` | B → the chat's watchers | `{serverId, state: "waiting" \| "relaying"}`, envelope `sessionId` set |
+| `forward_grant` | device → A | `{serverId, serverName?, providerName}` |
+| `forward_revoke` | device → A | `{serverId, providerName}` |
+| `list_forward_grants` | device → A | none |
+| `forward_grants` | A → the person's connections | `{grants: [{serverId, serverName?, providerName}]}` |
+| `forward_state` | B → the chat's watchers | `{serverId, state: "waiting" \| "relaying"}`, envelope `sessionId` set; only to connections that may see that chat |
 
-All five inbound ones are open to any connection; the handlers narrow. `requestId` is minted by B (16 random bytes, hex). `serverId` is A's.
+The inbound ones are open to any connection; the handlers narrow. `requestId` is minted by B (16 random bytes, hex). `serverId` is A's.
+
+**Lending is a grant.** Without it, a server the person is only a guest on (B) could send their device a `forward_request` naming their own server A and any provider there, and A would run it: B would spend the person's keys without their choosing anything. So the person says, on A, which providers each other server may use as them:
+- `forward_grant` `{serverId, serverName?, providerName}`: this person lets server `serverId` use `providerName` here as them. `serverName` is only a label (at most 64 characters kept). `error` unless the provider exists, this connection may use it (the same check as `set_provider`) and its kind may be forwarded. Idempotent. At most 256 grants per person.
+- `forward_revoke` `{serverId, providerName}`: takes it back. Idempotent.
+- `list_forward_grants`: no data.
+- All three are answered with `forward_grants`, the sender's own grants only, sorted by `serverName` then `providerName`. After a grant or revoke it is also sent to that person's other connections.
+- Grants are kept in `server.json` under the person's user id (the owner's, on the local socket, is `owner`). Removing a provider drops its grants; merging people joins theirs, removing a person drops theirs. Granting and revoking are audited (`forward_grant`, `forward_revoke`: `target` the provider, `detail`: serverId, serverName).
+- `forward_request.from` is the id of the server the request came from, **stamped by the device** (it overwrites whatever B wrote; B need not set it). A reads it from the piece with `seq` 0 and runs the request only if a grant exists for (the connection's person, `from`, the body's `providerName`); otherwise `forward_end` with `error` `<providerName> isn't lent to that server. Pick it in the model picker there to allow it.`
 
 **Request.** `forward_request` carries the request body as JSON text cut into pieces of at most 256 KiB (never inside a character), `seq` counting from 0, `last: true` on the final piece. Envelope `sessionId` is the chat on B's side; the pieces A answers have none. The body:
 
@@ -327,8 +339,8 @@ All five inbound ones are open to any connection; the handlers narrow. `requestI
 
 **As B.** `set_provider` with a `via:` name builds a forwarded provider; turns started by the server itself (scheduled, after a restart) rebuild it from the stored binding. Titles, side questions and compaction briefs go through it as ordinary requests. Usage is priced on B from the model name.
 - *Choosing a device:* a connection that sent a `relay_offer` naming A and may read the chat (the chat owner's own devices); the one that started the turn is preferred.
-- *No device:* B sends `forward_state` `waiting` to the chat and waits for an offer, up to 30 minutes or until the turn is cancelled, then `forward_state` `relaying`. After 30 minutes the turn fails with `no device connected to both this server and <serverId> came online`.
-- *Device lost:* before any chunk reached the turn, B picks another device or waits as above. After, the turn fails with `the device relaying to <serverId> disconnected; send a message to continue`; a half-streamed answer is never replayed.
+- *No device:* B sends `forward_state` `waiting` to the chat and waits for an offer, up to 30 minutes (each wait gets the whole 30) or until the turn is cancelled, then `forward_state` `relaying`. After 30 minutes the turn fails with `no device connected to both this server and the one that has this provider came online`.
+- *Device lost:* before any chunk reached the turn, B picks another device or waits as above. After, the turn fails with `the device relaying to the server that has this provider disconnected; send a message to continue`; a half-streamed answer is never replayed.
 - `forward_chunk` and `forward_end` count only from the connection the request was given to; anything else is dropped and logged. Cancelling the turn sends `forward_cancel` and returns at once.
 
 ### Settings mutations broadcast to every peer, not just the sender
@@ -2568,6 +2580,7 @@ Separate from any project, because most of what it records has none (credentials
 | `limit_pause` | a turn paused at a soft round/cost limit, and the answer | `outcome` `asked`, then `continue`/`stop` with the answering device |
 | `provider_add` / `provider_remove` | a provider was registered (by hand or OAuth) or removed | `target` the name; `detail`: kind, base URL, auth method. **Never the key** |
 | `provider_forward` | another server's chat used one of this server's providers through a device *(v2.37)* | `target` the provider name; outcome `ok`, `error` or `cancelled`; `detail`: model, inputTokens, outputTokens. Never the conversation |
+| `forward_grant` / `forward_revoke` | a person lent a provider to another server, or took it back *(v2.37)* | `target` the provider; `detail`: serverId, serverName |
 | `settings_change` | runtime settings, the default provider, a project's web tools | `detail.keys`: which settings, never their values |
 | `remote_access` | `set_remote_access` | `detail.enabled`, `addr` |
 | `remote_password` / `token_add` / `token_remove` | the shared password was replaced; a per-person token was minted or revoked | the fact and the token's **name**, never a password or token |

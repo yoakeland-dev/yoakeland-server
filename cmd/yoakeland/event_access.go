@@ -62,6 +62,7 @@ var eventAccess = map[protocol.EventType]eventReq{
 	// model forwarding: a device relays between two servers; the handlers narrow (forward.go)
 	protocol.EventRelayOffer: anyone, protocol.EventForwardRequest: anyone, protocol.EventForwardCancel: anyone,
 	protocol.EventForwardChunk: anyone, protocol.EventForwardEnd: anyone,
+	protocol.EventForwardGrant: anyone, protocol.EventForwardRevoke: anyone, protocol.EventListForwardGrants: anyone, // a person's own grants: the handler
 
 	// presence and housekeeping
 	protocol.EventSetPresence: anyone, protocol.EventSetPeerName: anyone, protocol.EventSetPeerAvatar: anyone, protocol.EventSetProfile: anyone, protocol.EventGetAvatar: anyone,

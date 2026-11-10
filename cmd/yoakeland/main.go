@@ -1811,6 +1811,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 		}
 		deps.record(ipc, peerID, audit.Event{Kind: audit.ProviderRemove, Target: data.Name, Outcome: "ok"})
 		deps.status.ForgetRateLimits(data.Name)
+		deps.settings.dropForwardProvider(data.Name)
 		reloadRoles(deps.projects.roles, deps.providerStore, deps.settings)
 		removed := protocol.ProviderRemovedData{Name: data.Name}
 		_ = ipc.SendEvent(protocol.EventProviderRemoved, env.SessionID, env.TurnID, "", removed)

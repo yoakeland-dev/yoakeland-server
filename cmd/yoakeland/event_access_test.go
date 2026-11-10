@@ -57,7 +57,7 @@ var outboundEvents = map[string]bool{
 	"terminal_exited": true, "terminal_closed": true, "terminal_error": true, "terminal_list": true,
 	"terminal_index": true, "tree_list": true, "file_content": true, "file_written": true, "fs_op_done": true,
 	"files_changed": true, "git_changes": true, "file_diff": true, "media_info": true, "media_chunk": true,
-	"usage_report": true, "people": true, "profile_updated": true, "forward_state": true,
+	"usage_report": true, "people": true, "profile_updated": true, "forward_state": true, "forward_grants": true,
 	// the pairing exchange runs before a connection is a peer (pairpake.go)
 	"pake_reply": true, "pake_confirm": true, "pake_result": true,
 }

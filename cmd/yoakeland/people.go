@@ -323,10 +323,12 @@ func (s *ServerSettings) MergeUsers(from, into string) error {
 		}
 	}
 	// Anyone already merged into from now stands for t.
+	s.moveGrantsLocked(from, t.ID)
 	for id, u := range s.Users {
 		if u.AliasOf == from {
 			u.AliasOf = t.ID
 			s.Users[id] = u
+			s.moveGrantsLocked(id, t.ID)
 		}
 	}
 	return s.save()
@@ -378,6 +380,7 @@ func (s *ServerSettings) RemoveUser(id string) (revoked []string, err error) {
 	}
 	for uid := range gone {
 		delete(s.Users, uid)
+		delete(s.ForwardGrants, uid)
 	}
 	slices.Sort(revoked)
 	return revoked, s.save()

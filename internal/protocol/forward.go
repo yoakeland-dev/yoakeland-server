@@ -16,6 +16,14 @@ const (
 	EventForwardChunk EventType = "forward_chunk"
 	// EventForwardEnd closes a request, with the provider's error if it failed.
 	EventForwardEnd EventType = "forward_end"
+	// EventForwardGrant: a person lets another server use one of their providers here, as them.
+	EventForwardGrant EventType = "forward_grant"
+	// EventForwardRevoke takes such a grant back.
+	EventForwardRevoke EventType = "forward_revoke"
+	// EventListForwardGrants asks for the sender's grants; every one of the three is answered with EventForwardGrants.
+	EventListForwardGrants EventType = "list_forward_grants"
+	// EventForwardGrants is the sender's grants, in full.
+	EventForwardGrants EventType = "forward_grants"
 	// EventForwardState tells a chat's watchers what a forwarded turn is waiting for.
 	EventForwardState EventType = "forward_state"
 )
@@ -47,9 +55,12 @@ type RelayOfferData struct {
 type ForwardRequestData struct {
 	RequestID string `json:"requestId"`
 	ServerID  string `json:"serverId"`
-	Seq       int    `json:"seq"`
-	Last      bool   `json:"last"`
-	Data      string `json:"data"`
+	// From is the server the request came from, stamped by the device (whatever B put there is
+	// overwritten). A runs the request only if its person lent the provider to that server.
+	From string `json:"from,omitempty"`
+	Seq  int    `json:"seq"`
+	Last bool   `json:"last"`
+	Data string `json:"data"`
 }
 
 type ForwardCancelData struct {
@@ -95,4 +106,22 @@ type ForwardContext struct {
 	ContextTokens int    `json:"contextTokens,omitempty"`
 	WindowTokens  int    `json:"windowTokens,omitempty"`
 	Source        string `json:"source,omitempty"`
+}
+
+// ForwardGrantData lets server ServerID use ProviderName on this server as the sender. ServerName
+// is only a label to show in lists.
+type ForwardGrantData struct {
+	ServerID     string `json:"serverId"`
+	ServerName   string `json:"serverName,omitempty"`
+	ProviderName string `json:"providerName"`
+}
+
+type ForwardRevokeData struct {
+	ServerID     string `json:"serverId"`
+	ProviderName string `json:"providerName"`
+}
+
+// ForwardGrantsData is one person's grants, sorted by server name then provider name.
+type ForwardGrantsData struct {
+	Grants []ForwardGrantData `json:"grants"`
 }
