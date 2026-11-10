@@ -10,6 +10,7 @@ import (
 	"time"
 	"yoakeland/internal/agent"
 	"yoakeland/internal/protocol"
+	"yoakeland/internal/tool"
 )
 
 // Live: drives the real claude binary through the provider (skipped unless YK_LIVE=1).
@@ -283,4 +284,52 @@ func TestLiveClaudeCompact(t *testing.T) {
 		t.Fatalf("expected a manual compaction with its summary, got %+v", c)
 	}
 	t.Logf("compaction: before=%d after=%d summary=%q", c.Before, c.After, c.Summary[:min(len(c.Summary), 120)])
+}
+
+// Live: the real claude binary as a tool-calling model (ClaudeModel), two rounds with one fake tool.
+func TestLiveClaudeModelToolRound(t *testing.T) {
+	if os.Getenv("YK_LIVE") == "" {
+		t.Skip("YK_LIVE not set")
+	}
+	m := &ClaudeModel{Model: "haiku", SessionKey: t.Name()}
+	t.Cleanup(func() {
+		claudeModels.mu.Lock()
+		s := claudeModels.live[m.SessionKey]
+		claudeModels.mu.Unlock()
+		if s != nil {
+			s.close()
+		}
+	})
+	tools := []tool.ToolDefinition{{Name: "get_secret", Description: "Returns the secret word.", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}}
+	round := func(hist []agent.Message) (text string, calls []agent.ToolCall) {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		chunks, errs := m.StreamTurn(ctx, hist, tools, "Be brief.")
+		for c := range chunks {
+			switch c.Kind {
+			case agent.StreamChunkDelta:
+				text += c.Delta
+			case agent.StreamChunkToolCall:
+				calls = append(calls, *c.ToolCall)
+			case agent.StreamChunkUsage:
+				t.Logf("usage: %+v", c.Usage)
+			}
+		}
+		if err := <-errs; err != nil {
+			t.Fatalf("round: %v", err)
+		}
+		return
+	}
+	h1 := []agent.Message{{Role: "user", Content: "Call the get_secret tool, then tell me the word it returned."}}
+	text, calls := round(h1)
+	if len(calls) != 1 || calls[0].Name != "get_secret" {
+		t.Fatalf("round 1: %q %+v", text, calls)
+	}
+	h2 := append(h1, agent.Message{Role: "assistant", Content: text, ToolCalls: []agent.ToolCall{{ID: calls[0].ID, Name: calls[0].Name, Args: calls[0].Args}}},
+		agent.Message{Role: "tool", ToolCallID: calls[0].ID, Content: "PINEAPPLE"})
+	text2, calls2 := round(h2)
+	t.Logf("round 1 text %q; answer %q", text, text2)
+	if len(calls2) != 0 || !strings.Contains(strings.ToUpper(text2), "PINEAPPLE") {
+		t.Fatalf("round 2: %q %+v", text2, calls2)
+	}
 }

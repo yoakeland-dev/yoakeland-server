@@ -96,16 +96,18 @@ type claudeLine struct {
 			Text     string `json:"text"`
 			Thinking string `json:"thinking"`
 		} `json:"delta"`
+		Usage claudeUsage `json:"usage"` // message_delta: the message's final counts
 	} `json:"event"`
+	// system init: the tools the model has and how each MCP server came up.
+	Tools      []string `json:"tools"`
+	MCPServers []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	} `json:"mcp_servers"`
 	Message struct {
 		Content    claudeContent `json:"content"`
 		StopReason string        `json:"stop_reason"`
-		Usage      struct {
-			InputTokens              int `json:"input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			OutputTokens             int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage      claudeUsage   `json:"usage"`
 	} `json:"message"`
 	Error         string          `json:"error"`
 	ToolUseResult json.RawMessage `json:"tool_use_result"`
@@ -131,12 +133,16 @@ type claudeLine struct {
 	} `json:"modelUsage"`
 	// Usage sums every request of the turn (cache reads once per step), so it
 	// is spend, not context size: that is the last assistant message's usage.
-	Usage struct {
-		InputTokens              int `json:"input_tokens"`
-		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-		OutputTokens             int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage claudeUsage `json:"usage"`
+}
+
+// claudeUsage is the token counts of one request (an assistant message, a message_delta) or,
+// on the result line, of the whole turn.
+type claudeUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
 }
 
 // claudeSession is one live `claude` process. Its reader hands each line to
@@ -545,13 +551,7 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 		s.mu.Unlock()
 	}
 
-	userLine := func(text string) map[string]any {
-		return map[string]any{
-			"type":               "user",
-			"message":            map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": text}}},
-			"parent_tool_use_id": nil,
-		}
-	}
+	userLine := claudeUserLine
 	s.write(userLine(nt.Prompt))
 	// A plain user line while the turn runs is folded into it at the agent's next
 	// model call, and one result still ends the whole exchange. (priority "now"
@@ -630,6 +630,15 @@ func (p *CLISubprocessProvider) runClaudeOnce(ctx context.Context, nt *agent.Nat
 		return fmt.Errorf("claude: %s", strings.TrimSpace(res.Result))
 	}
 	return nil
+}
+
+// claudeUserLine is one user message for stdin.
+func claudeUserLine(text string) map[string]any {
+	return map[string]any{
+		"type":               "user",
+		"message":            map[string]any{"role": "user", "content": []map[string]string{{"type": "text", "text": text}}},
+		"parent_tool_use_id": nil,
+	}
 }
 
 // claudeContextTokens is how much the context held after a request: all the

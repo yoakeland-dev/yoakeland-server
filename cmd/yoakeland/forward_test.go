@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -352,6 +353,9 @@ func TestForwardRefusals(t *testing.T) {
 	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "cli", Kind: provider.ProviderKindCLIClaude}); err != nil {
 		t.Fatal(err)
 	}
+	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "codex", Kind: provider.ProviderKindCLICodex}); err != nil {
+		t.Fatal(err)
+	}
 	body := func(name string) string {
 		raw, _ := json.Marshal(forwardBody{ProviderName: name, Model: "m", Messages: []agent.Message{{Role: "user", Content: "hi"}}})
 		return string(raw)
@@ -386,8 +390,11 @@ func TestForwardRefusals(t *testing.T) {
 		{"not allowed", "tcp", "isn't allowed", func() []*protocol.Envelope {
 			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("cli"))}
 		}},
-		{"cli kind", "unix", "can't be used from another server", func() []*protocol.Envelope {
+		{"cli kind", "unix", "isn't lent to that server", func() []*protocol.Envelope {
 			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("cli"))}
+		}},
+		{"codex kind", "unix", "can't be used from another server", func() []*protocol.Envelope {
+			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("codex"))}
 		}},
 		{"too many in flight", "unix", "in flight", func() []*protocol.Envelope {
 			var out []*protocol.Envelope
@@ -728,12 +735,13 @@ func TestForwardGrantEvents(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.providerStore.Register(provider.ProviderConfig{Name: "p", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai", APIKey: "k"})
 	deps.providerStore.Register(provider.ProviderConfig{Name: "cli", Kind: provider.ProviderKindCLIClaude})
+	deps.providerStore.Register(provider.ProviderConfig{Name: "codex", Kind: provider.ProviderKindCLICodex})
 
 	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "nope"}); !strings.Contains(e, "unknown provider") {
 		t.Fatalf("unknown provider: %q", e)
 	}
-	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "cli"}); !strings.Contains(e, "can't be used from another server") {
-		t.Fatalf("cli kind: %q", e)
+	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "codex"}); !strings.Contains(e, "can't be used from another server") {
+		t.Fatalf("codex kind: %q", e)
 	}
 	// A person who may not use the provider can't lend it: a limited TCP person and a CLI agent.
 	tcp := deps.peers.Add(protocol.NewIPCStream(strings.NewReader(""), &capture{}), nopCloser{}, "tcp", peerIdentity{Name: "t"})
@@ -773,6 +781,13 @@ func TestForwardGrantEvents(t *testing.T) {
 	deps.settings.dropForwardProvider("p")
 	if g, _ = grants(t, deps, "unix", "", protocol.EventListForwardGrants, struct{}{}); len(g.Grants) != 0 {
 		t.Fatalf("grants of a removed provider kept: %+v", g)
+	}
+	// A Claude Code kind can be lent now; the other CLI kinds can't (checked above for codex).
+	if _, e2 := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "cli"}); e2 != "" {
+		t.Fatalf("cli kind: %q", e2)
+	}
+	if !deps.settings.ForwardGranted(ownerID, "s1", "cli") {
+		t.Fatal("the cli grant didn't stick")
 	}
 }
 
@@ -826,4 +841,91 @@ func TestForwardStateOnlyForThoseWhoSeeTheChat(t *testing.T) {
 	for range chunks {
 	}
 	<-errs
+}
+
+// A lent Claude Code login end to end: B's provider asks through a device, A runs a (fake) claude
+// as a plain model. The second request continues the first, so it must reach the same process, and
+// the session key is the relaying person's id, the borrowing server and B's chat.
+func TestForwardClaudeCodeLogin(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+while read -r line; do
+  case "$line" in *'"type":"user"'*)
+    printf '%s\n' '{"type":"system","subtype":"init","tools":["mcp__y__echo"],"mcp_servers":[{"name":"y","status":"connected"}]}'
+    printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"pid '$$'"}}}'
+    printf '%s\n' '{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":3,"output_tokens":2}}}'
+    printf '%s\n' '{"type":"stream_event","event":{"type":"message_stop"}}'
+    printf '%s\n' '{"type":"result","subtype":"success","result":"x","total_cost_usd":0.5}'
+  ;; esac
+done
+`
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("YOAKELAND_STRICT_PATH", "1")
+	var keys []string
+	old := claudeModelFor
+	claudeModelFor = func(cfg provider.ProviderConfig, model, key string) provider.Provider {
+		keys = append(keys, key)
+		return old(cfg, model, key)
+	}
+	t.Cleanup(func() { claudeModelFor = old })
+
+	w := newFwdWorld(t)
+	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "cc", Kind: provider.ProviderKindCLIClaude}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.a.settings.GrantForward(ownerID, w.bID, "B", "cc"); err != nil {
+		t.Fatal(err)
+	}
+	w.newDevice(t).offer(w.aID)
+	p, err := newForwardedProvider(w.b, "chat1", w.aID, "cc", "haiku")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(provider.CloseAllNativeSessions)
+	ctx := agent.WithRequestHints(context.Background(), agent.RequestHints{CacheKey: "chat1"})
+	tools := []tool.ToolDefinition{{Name: "echo", Description: "e", Parameters: map[string]any{"type": "object"}}}
+	ask := func(h []agent.Message) (string, protocol.UsageData) {
+		chunks, errs := p.StreamTurn(ctx, h, tools, "sys")
+		var text string
+		var u protocol.UsageData
+		timeout := time.After(15 * time.Second)
+		for chunks != nil {
+			select {
+			case c, ok := <-chunks:
+				if !ok {
+					chunks = nil
+					break
+				}
+				if c.Kind == agent.StreamChunkDelta {
+					text += c.Delta
+				}
+				if c.Kind == agent.StreamChunkUsage {
+					u = *c.Usage
+				}
+			case <-timeout:
+				t.Fatal("no answer")
+			}
+		}
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		return text, u
+	}
+	h1 := []agent.Message{{Role: "user", Content: "one"}}
+	t1, u := ask(h1)
+	if !strings.HasPrefix(t1, "pid ") || u.CostUSD != 0.5 || !u.CostKnown {
+		t.Fatalf("first answer %q usage %+v", t1, u)
+	}
+	t2, _ := ask(append(h1, agent.Message{Role: "assistant", Content: t1}, agent.Message{Role: "user", Content: "two"}))
+	if t2 != t1 {
+		t.Fatalf("second request ran in another process: %q vs %q", t1, t2)
+	}
+	want := ownerID + "\x00" + w.bID + "\x00chat1"
+	if len(keys) != 2 || keys[0] != want || keys[1] != want {
+		t.Fatalf("session keys %q, want %q", keys, want)
+	}
+	w.settled(t)
 }

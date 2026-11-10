@@ -620,3 +620,6 @@ func (a *Agent) ResolvePlanApproval(by ...string) bool {
 	}
 	return false
 }
+
+// RenderTranscript is renderTranscript for providers that seed a fresh CLI session from history.
+func RenderTranscript(history []Message) string { return renderTranscript(history) }

@@ -39,9 +39,12 @@ const (
 var forwardWaitLimit = 30 * time.Minute
 
 // forwardableKind is the one place that says which kinds of provider may be used from another
-// server. A CLI agent runs its own tools on its own machine, so it stays out until phase 3.
+// server. A CLI agent runs its own tools on its own machine, so it only goes where it can be run
+// as a plain model with its own tools off (provider.ClaudeModel): Claude Code. The others stay on
+// their own server.
 func forwardableKind(k provider.ProviderKind) bool {
-	return k == provider.ProviderKindAPIKey
+	cli, isCLI := provider.CLIKindOf(k)
+	return k == provider.ProviderKindAPIKey || (isCLI && cli == provider.CLIKindClaude)
 }
 
 // parseVia splits the name B gives a borrowed provider, via:<serverId>:<name>.
@@ -274,6 +277,11 @@ func sendForwardEnd(ipc *protocol.IPCStream, requestID, errText string) {
 
 // ---- As A ----
 
+// claudeModelFor is how answer runs a lent Claude Code login; a var so the test can set the process starter.
+var claudeModelFor = func(cfg provider.ProviderConfig, model, key string) provider.Provider {
+	return provider.NewClaudeModel(cfg, model, key)
+}
+
 // accept collects one piece of a request and, on the last, starts answering it. Every refusal is a
 // forward_end with the reason, and drops what the request had collected.
 func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID string, d protocol.ForwardRequestData) {
@@ -408,10 +416,24 @@ func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps co
 	if errText != "" {
 		return
 	}
-	built, err := provider.BuildProvider(cfg, b.Model, "")
-	if err != nil {
-		errText = fmt.Sprintf("failed to activate provider %q: %v", b.ProviderName, err)
-		return
+	var built provider.Provider
+	if cli, _ := provider.CLIKindOf(cfg.Kind); cli == provider.CLIKindClaude {
+		// One Claude Code process per person, borrowing server and chat, so another device of the
+		// same person can relay the next round and two servers never share a process. The id is
+		// A's own (acc.UserID), not anything the request says. Without a chat key there is no
+		// session to keep, and a request that needs one is refused.
+		key := ""
+		if b.Hints.CacheKey != "" {
+			key = strings.Join([]string{acc.UserID, from, b.Hints.CacheKey}, "\x00")
+		}
+		built = claudeModelFor(cfg, b.Model, key)
+	} else {
+		p, err := provider.BuildProvider(cfg, b.Model, "")
+		if err != nil {
+			errText = fmt.Sprintf("failed to activate provider %q: %v", b.ProviderName, err)
+			return
+		}
+		built = p
 	}
 	if s, ok := built.(agent.ModelOptionsSetter); ok {
 		s.SetModelOptions(b.Options)
