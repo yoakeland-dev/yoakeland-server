@@ -26,7 +26,7 @@ func applyProcessLimits(pricing *provider.PricingCache) func(protocol.RuntimeSet
 			TerminalHistoryBytes: rs.TerminalHistoryKB << 10,
 		})
 		provider.SetPoolLimits(time.Duration(rs.PoolIdleMinutes)*time.Minute, rs.PoolMaxLive)
-		agent.SetCompactDefaults(rs.AutoCompactTokens, rs.CompactInstructions)
+		agent.SetCompactDefaults(rs.AutoCompactTokens, rs.CompactInstructions, rs.CompactionStyle)
 		pricing.SetRefreshInterval(time.Duration(rs.PricingRefreshHours) * time.Hour)
 	}
 }

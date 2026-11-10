@@ -49,13 +49,16 @@ type ContextManager struct {
 var (
 	defaultCompactTokens       atomic.Int64
 	defaultCompactInstructions atomic.Value // string
+	defaultCompactSummary      atomic.Bool  // compactionStyle "summary"
 )
 
 // SetCompactDefaults applies the server's compaction settings to every
-// session, live ones included.
-func SetCompactDefaults(tokens int, instructions string) {
+// session, live ones included. style is the compactionStyle setting: only
+// "summary" selects the single summary, anything else folds into chapters.
+func SetCompactDefaults(tokens int, instructions, style string) {
 	defaultCompactTokens.Store(int64(tokens))
 	defaultCompactInstructions.Store(instructions)
+	defaultCompactSummary.Store(style == "summary")
 }
 
 // CompactTokensDefault is the server's autoCompactTokens setting (0 = not set),
@@ -301,8 +304,9 @@ func (cm *ContextManager) TruncateToolOutput(raw string) string {
 
 // Compaction kinds (SPEC.md §4g).
 const (
-	CompactionClear   = "clear"
-	CompactionSummary = "summary"
+	CompactionClear    = "clear"
+	CompactionSummary  = "summary"
+	CompactionChapters = "chapters"
 )
 
 // Compaction is what a "compaction" history message did. Compaction is
@@ -317,6 +321,14 @@ type Compaction struct {
 	ClearBefore  string `json:"clearBefore,omitempty"`
 	TokensBefore int    `json:"tokensBefore"`
 	TokensAfter  int    `json:"tokensAfter"`
+
+	// Kind "chapters" (chapters.go). Everything the view needs is recorded
+	// here, chosen once when the compaction was made: the budget at the time
+	// decided them, and the view must not depend on the budget now.
+	Chapters   []Chapter `json:"chapters,omitempty"`   // the chapters THIS compaction made
+	KeepFrom   string    `json:"keepFrom,omitempty"`   // first message left unfolded; "" = everything was folded
+	TitlesOnly int       `json:"titlesOnly,omitempty"` // chapters 1..TitlesOnly show only their title in the index
+	Request    string    `json:"request,omitempty"`    // latest user message, when it was folded
 }
 
 const summaryOpening = "[The conversation so far was summarized to save context. Summary:]\n"
@@ -325,46 +337,18 @@ const summaryOpening = "[The conversation so far was summarized to save context.
 // prefixKey (see requestPrefixKey):
 //   - the latest summary compaction replaces everything before it with one
 //     user message holding the summary;
+//   - chapters compactions replace the messages before their KeepFrom with
+//     the chapter index, a user message listing each chapter's brief;
 //   - clear compactions after it stub old tool results;
 //   - RawContent (thinking blocks, server tool results) survives only on
 //     the trailing run of assistant messages generated under prefixKey and
 //     after the last compaction — Anthropic rejects a thinking block whose
 //     conversation prefix changed, and only lets blocks go from the front.
 func contextView(history []Message, prefixKey string) []Message {
-	skillResults := skillResultIDs(history)
-	start, clearIdx, lastCompaction := 0, -1, -1
-	summary := ""
-	for i, m := range history {
-		if m.Role != "compaction" || m.Compaction == nil {
-			continue
-		}
-		lastCompaction = i
-		switch m.Compaction.Kind {
-		case CompactionSummary:
-			start, summary, clearIdx = i+1, m.Content, -1
-		case CompactionClear:
-			if j, ok := indexOfMessage(history, m.Compaction.ClearBefore); ok && j > clearIdx {
-				clearIdx = j
-			}
-		}
-	}
-
-	out := make([]Message, 0, len(history)-start+1)
-	if summary != "" {
-		out = append(out, Message{Role: "user", Content: summaryOpening + summary})
-	}
-	for i := start; i < len(history); i++ {
-		m := history[i]
-		if m.Role == "compaction" {
-			continue
-		}
-		if i < clearIdx && !(m.Role == "tool" && skillResults[m.ToolCallID]) {
-			m = stubbed(m)
-		}
-		if i < lastCompaction {
-			m.RawContent = nil
-		}
-		out = append(out, m)
+	fs := foldStateOf(history)
+	out := renderRange(history, fs, fs.start, len(history))
+	if head := fs.head(); head != "" {
+		out = append([]Message{{Role: "user", Content: head}}, out...)
 	}
 
 	out = pairToolCalls(out)
@@ -540,20 +524,8 @@ func (cm *ContextManager) contextTokens(history, view []Message, overhead int) (
 // the message to clear before and the tokens that frees, or ok=false when
 // there's nothing left to clear.
 func (cm *ContextManager) planClear(history []Message, used, budget int) (clearBefore string, saved int, ok bool) {
-	start, cleared := 0, -1
-	for i, m := range history {
-		if m.Role != "compaction" || m.Compaction == nil {
-			continue
-		}
-		switch m.Compaction.Kind {
-		case CompactionSummary:
-			start, cleared = i+1, -1
-		case CompactionClear:
-			if j, found := indexOfMessage(history, m.Compaction.ClearBefore); found && j > cleared {
-				cleared = j
-			}
-		}
-	}
+	fs := foldStateOf(history)
+	start, cleared := fs.start, fs.clearIdx
 	keepFrom := len(history)
 	for i := len(history) - 1; i >= start; i-- {
 		if history[i].Role == "assistant" {
@@ -579,6 +551,14 @@ func (cm *ContextManager) planClear(history []Message, used, budget int) (clearB
 // transcriptForSummary flattens a context view into plain text for the
 // summarizer, with long tool results trimmed.
 func transcriptForSummary(view []Message) string {
+	return writeTranscript(view,
+		func(s string) string { return truncateRunes(s, 500) },
+		func(s string) string { return truncateRunes(s, 2000) })
+}
+
+// writeTranscript writes view as plain text, passing each tool call's
+// arguments through cutArgs and each tool result through cutResult.
+func writeTranscript(view []Message, cutArgs, cutResult func(string) string) string {
 	var sb strings.Builder
 	for _, m := range view {
 		switch m.Role {
@@ -589,10 +569,10 @@ func transcriptForSummary(view []Message) string {
 				fmt.Fprintf(&sb, "Assistant: %s\n\n", m.Content)
 			}
 			for _, tc := range m.ToolCalls {
-				fmt.Fprintf(&sb, "Tool call %s %s\n", tc.Name, truncateRunes(string(tc.Args), 500))
+				fmt.Fprintf(&sb, "Tool call %s %s\n", tc.Name, cutArgs(string(tc.Args)))
 			}
 		case "tool":
-			fmt.Fprintf(&sb, "Tool result: %s\n\n", truncateRunes(m.Content, 2000))
+			fmt.Fprintf(&sb, "Tool result: %s\n\n", cutResult(m.Content))
 			if len(m.Images) > 0 {
 				// The summarizer sees text only, so say the picture was there
 				// and what it was of, or the summary loses it entirely.
@@ -626,11 +606,13 @@ Be specific and dense: exact names, paths and values, no preamble, no advice.`
 // follows the base prompt and says it can't override it, so a careless
 // "keep it short" narrows the emphasis instead of dropping what the agent
 // needs to continue.
-func withInstructions(extra string) string {
+func withInstructions(extra string) string { return withGuidance(compactionBasePrompt, extra) }
+
+func withGuidance(base, extra string) string {
 	if extra == "" {
-		return compactionBasePrompt
+		return base
 	}
-	return compactionBasePrompt + "\n\nThe user added this guidance for the summary. Follow it for what to emphasize, but it does not replace anything above: still keep every request, decision, changed file and the remaining work.\n<guidance>\n" + extra + "\n</guidance>"
+	return base + "\n\nThe user added this guidance for the summary. Follow it for what to emphasize, but it does not replace anything above: still keep every request, decision, changed file and the remaining work.\n<guidance>\n" + extra + "\n</guidance>"
 }
 
 // minSummaryTokens is how short a summary of used tokens can get before it
@@ -667,11 +649,25 @@ func (a *Agent) maybeCompact(ctx context.Context, turnID string, bound RoleBindi
 		return protocol.UsageData{}
 	}
 
-	usage, err := a.compactBySummary(ctx, turnID, bound, view, used, overhead, "", false)
+	usage, err := a.compactConversation(ctx, turnID, bound, history, view, used, overhead, budget, "", false)
 	if err != nil {
 		log.Printf("session %s: compaction failed (%v); keeping the full context and trying again next round", a.CurrentSessionID(), err)
 	}
 	return usage
+}
+
+// compactConversation is what a compaction does once clearing isn't enough:
+// fold the older conversation into chapters (chapters.go) or, in the
+// "summary" style or when there is nothing to fold, replace all of it with one
+// summary. view is contextView(history), which holds used tokens.
+func (a *Agent) compactConversation(ctx context.Context, turnID string, bound RoleBinding, history, view []Message, used, overhead, budget int, extra string, manual bool) (protocol.UsageData, error) {
+	if !defaultCompactSummary.Load() {
+		usage, done, err := a.compactByChapters(ctx, turnID, bound, history, used, overhead, budget, extra, manual)
+		if done || err != nil {
+			return usage, err
+		}
+	}
+	return a.compactBySummary(ctx, turnID, bound, view, used, overhead, extra, manual)
 }
 
 // compactBySummary records a summary compaction of view, which holds used
@@ -729,7 +725,8 @@ func (a *Agent) Compact(ctx context.Context, sessionID, turnID, extra string) er
 	}
 	overhead := a.requestOverhead()
 	used, _ := a.contextManager.contextTokens(history, view, overhead)
-	usage, err := a.compactBySummary(ctx, turnID, bound, view, used, overhead, extra, true)
+	budget := a.contextManager.compactionBudget(a.contextManager.Window(bound.Model, history))
+	usage, err := a.compactConversation(ctx, turnID, bound, history, view, used, overhead, budget, extra, true)
 	if a.usageStore != nil {
 		if usage.CostUnknown {
 			a.usageStore.MarkCostUnknown(sessionID)
@@ -804,6 +801,8 @@ func (a *Agent) recordCompaction(turnID string, m Message, manual bool) {
 		TokensBefore: m.Compaction.TokensBefore,
 		TokensAfter:  m.Compaction.TokensAfter,
 		Summary:      m.Content,
+		Chapters:     m.Compaction.Chapters,
+		TitlesOnly:   m.Compaction.TitlesOnly,
 		Manual:       manual,
 	})
 }

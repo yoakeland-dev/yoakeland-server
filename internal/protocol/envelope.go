@@ -555,7 +555,8 @@ type ModelRolesSetData struct {
 
 // ContextCompactedData announces a compaction the agent just recorded in a
 // session's history (SPEC.md §4g). Kind is "clear" (old tool results
-// replaced by stubs) or "summary" (everything before it summarized).
+// replaced by stubs), "summary" (everything before it summarized) or
+// "chapters" (older messages folded into titled chapters with briefs).
 type ContextCompactedData struct {
 	MessageID    string `json:"messageId"`
 	Kind         string `json:"kind"`
@@ -564,9 +565,26 @@ type ContextCompactedData struct {
 	// Summary is what the model now sees in place of the conversation so
 	// far, for kind "summary".
 	Summary string `json:"summary,omitempty"`
+	// Chapters are the chapters this compaction made, for kind "chapters";
+	// TitlesOnly is how many of the oldest chapters the index now shows by
+	// title alone.
+	Chapters   []ChapterInfo `json:"chapters,omitempty"`
+	TitlesOnly int           `json:"titlesOnly,omitempty"`
 	// Manual is true for a compact_context request, false for the session
 	// compacting itself.
 	Manual bool `json:"manual,omitempty"`
+}
+
+// ChapterInfo is one chapter of a conversation folded by a "chapters"
+// compaction (SPEC.md §4g): the messages From..To (ids, inclusive) the model
+// now sees as a title and a brief, and can reopen with the recall tool.
+type ChapterInfo struct {
+	N      int    `json:"n"` // 1-based, in the order the model's index lists them
+	Title  string `json:"title"`
+	Brief  string `json:"brief"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Tokens int    `json:"tokens"` // estimate of the folded messages
 }
 
 // GetContextBreakdownData asks for a session's context split by category
@@ -1084,6 +1102,9 @@ type CompactionInfo struct {
 	Kind         string `json:"kind"`
 	TokensBefore int    `json:"tokensBefore"`
 	TokensAfter  int    `json:"tokensAfter"`
+	// Chapters and TitlesOnly: see ContextCompactedData.
+	Chapters   []ChapterInfo `json:"chapters,omitempty"`
+	TitlesOnly int           `json:"titlesOnly,omitempty"`
 }
 
 // SessionHistoryData is the response to get_session_history: the session's
@@ -1508,6 +1529,11 @@ type RuntimeSettings struct {
 	// CompactInstructions is added to the summarizer's prompt for every
 	// summary compaction, automatic or manual.
 	CompactInstructions string `json:"compactInstructions"`
+	// CompactionStyle picks what a compaction does once clearing old tool
+	// results is not enough: "" or "chapters" folds the older conversation
+	// into chapters the model can reopen with the recall tool, "summary"
+	// replaces it with one summary. Anything else is stored as "".
+	CompactionStyle string `json:"compactionStyle"`
 }
 
 // SetRuntimeSettingsData is a partial update: a JSON object holding only the

@@ -64,6 +64,9 @@ func normalizeRuntimeSettings(rs protocol.RuntimeSettings) protocol.RuntimeSetti
 	if len(rs.CompactInstructions) > 4000 {
 		rs.CompactInstructions = strings.ToValidUTF8(rs.CompactInstructions[:4000], "")
 	}
+	if rs.CompactionStyle != "summary" && rs.CompactionStyle != "chapters" {
+		rs.CompactionStyle = ""
+	}
 	return rs
 }
 
