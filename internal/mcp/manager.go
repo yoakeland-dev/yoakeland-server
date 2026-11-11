@@ -70,7 +70,8 @@ type entry struct {
 	resources []ResourceInfo
 	resTool   *resourceTool
 	truncated int
-	failures  int
+	failures  int       // failed starts and early exits since it last stayed up a minute
+	upAt      time.Time // when the current client started
 	retryAt   time.Time
 	challenge *errNeedsAuth
 	settled   chan struct{} // closed when the connect attempt in flight ends
@@ -341,7 +342,7 @@ func (m *Manager) finish(e *entry, settled chan struct{}, c *Client, err error, 
 	var auth *errNeedsAuth
 	switch {
 	case err == nil:
-		e.client, e.info, e.state, e.err, e.diag, e.failures, e.stale = c, c.Info(), StateReady, "", "", 0, false
+		e.client, e.info, e.state, e.err, e.diag, e.stale, e.upAt = c, c.Info(), StateReady, "", "", false, time.Now()
 		e.challenge = nil
 		m.setTools(e, infos, res)
 		e.listedAt = time.Now()
@@ -350,11 +351,7 @@ func (m *Manager) finish(e *entry, settled chan struct{}, c *Client, err error, 
 		e.state, e.err, e.challenge = StateNeedsAuth, "this server needs sign-in", auth
 		e.client, e.tools, e.resTool = nil, nil, nil
 	default:
-		e.state, e.err = StateFailed, err.Error()
-		e.failures++
-		back := time.Duration(min(1<<min(e.failures, 6), 600)) * 15 * time.Second / 2 // 15s, 30s, ... capped near 10 min
-		e.retryAt = time.Now().Add(back)
-		e.client, e.tools, e.resTool = nil, nil, nil
+		m.failLocked(e, err.Error(), backoff(e.failures))
 	}
 	m.mu.Unlock()
 	m.notify()
@@ -431,6 +428,20 @@ func (m *Manager) setTools(e *entry, infos []ToolInfo, res []ResourceInfo) {
 	}
 }
 
+// failLocked is the one way an entry becomes StateFailed: it drops the client and tools and sets
+// when the next start may be tried. m.mu is held.
+func (m *Manager) failLocked(e *entry, msg string, retryIn time.Duration) {
+	e.state, e.err = StateFailed, msg
+	e.failures++
+	e.retryAt = time.Now().Add(retryIn)
+	e.client, e.tools, e.resTool = nil, nil, nil
+}
+
+// backoff is the wait before the next start after this many failures: 15s, 30s, ... capped at 8 min.
+func backoff(failures int) time.Duration {
+	return time.Duration(1<<min(failures+1, 6)) * 15 * time.Second / 2
+}
+
 // watch notices a server that went away on its own.
 func (m *Manager) watch(e *entry, c *Client) {
 	<-c.Done()
@@ -439,13 +450,18 @@ func (m *Manager) watch(e *entry, c *Client) {
 		m.mu.Unlock()
 		return
 	}
-	e.state, e.client, e.tools, e.resTool = StateFailed, nil, nil, nil
-	e.err = "the server went away"
+	msg := "the server went away"
 	if d := c.Diag(); d != "" {
 		e.diag = d
-		e.err += ": " + firstLine(d)
+		msg += ": " + firstLine(d)
 	}
-	e.retryAt = time.Now().Add(2 * time.Second)
+	// A server that stayed up a while gets a quick restart; one that dies soon after starting is a
+	// crash loop and backs off like a failed start.
+	retry := backoff(e.failures)
+	if time.Since(e.upAt) >= time.Minute {
+		e.failures, retry = 0, 2*time.Second
+	}
+	m.failLocked(e, msg, retry)
 	m.mu.Unlock()
 	m.notify()
 }

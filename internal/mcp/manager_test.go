@@ -558,3 +558,35 @@ func TestToolBudgetDropsTheLargest(t *testing.T) {
 		t.Fatal("the small tool must survive the budget")
 	}
 }
+
+// A server that dies right after starting is a crash loop: it backs off like a failed start
+// instead of being restarted every two seconds.
+func TestManagerBacksOffAServerThatDiesEarly(t *testing.T) {
+	m, store, _, _ := newTestManager(t)
+	if err := store.Save("fake", "", stdioConfig("legacy", nil)); err != nil {
+		t.Fatal(err)
+	}
+	prepare(t, m)
+	m.mu.Lock()
+	e := m.entries["fake"]
+	c := e.client
+	m.mu.Unlock()
+	if c == nil {
+		t.Fatal("the server never started")
+	}
+	c.Close()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		m.mu.Lock()
+		state, wait := e.state, time.Until(e.retryAt)
+		m.mu.Unlock()
+		if state == StateFailed {
+			if wait < 10*time.Second {
+				t.Fatalf("an early exit retries in %v, want the start backoff", wait)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("state = %v after the server went away", state)
+		}
+	}
+}
