@@ -205,13 +205,22 @@ func handleScheduleEnvelope(ipc *protocol.IPCStream, deps connDeps, network, pee
 // bindProvider builds the named provider for a chat's agent and remembers the choice, so a turn the
 // server starts itself after a restart can use it again (restoreBinding).
 func bindProvider(deps connDeps, pc *ProjectContext, ag *agent.Agent, sessionID, providerName, model string) error {
-	cfg, ok := deps.providerStore.Get(providerName)
-	if !ok {
-		return fmt.Errorf("unknown provider %q", providerName)
-	}
-	built, err := provider.BuildProvider(cfg, model, pc.Root)
-	if err != nil {
-		return fmt.Errorf("failed to activate provider %q: %v", providerName, err)
+	var built provider.Provider
+	var cfg provider.ProviderConfig
+	var err error
+	// A provider that lives on another server (via:<serverId>:<name>) is reached through a device.
+	if serverID, name, via := parseVia(providerName); via {
+		if built, err = newForwardedProvider(deps, sessionID, serverID, name, model); err != nil {
+			return fmt.Errorf("failed to activate provider %q: %v", providerName, err)
+		}
+	} else {
+		var ok bool
+		if cfg, ok = deps.providerStore.Get(providerName); !ok {
+			return fmt.Errorf("unknown provider %q", providerName)
+		}
+		if built, err = provider.BuildProvider(cfg, model, pc.Root); err != nil {
+			return fmt.Errorf("failed to activate provider %q: %v", providerName, err)
+		}
 	}
 	if cli, ok := built.(*provider.CLISubprocessProvider); ok && deps.status != nil {
 		kind := string(cfg.Kind)

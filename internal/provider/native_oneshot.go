@@ -84,7 +84,7 @@ func (p *CLISubprocessProvider) claudeOneShot(ctx context.Context, model, system
 	case parsed && res.IsError:
 		return "", usage, fmt.Errorf("claude: %s", text)
 	case waitErr != nil:
-		return "", usage, fmt.Errorf("claude: %w%s", waitErr, stderrTail(proc))
+		return "", usage, withStderr(fmt.Errorf("claude: %w", waitErr), proc)
 	case text == "":
 		return "", usage, errors.New("claude: no answer")
 	}
@@ -128,6 +128,32 @@ func stderrTail(proc *nativeProc) string {
 	return ""
 }
 
+// stderrErr is a failure with the end of a CLI's stderr attached. That is for this machine's own
+// eyes: WithoutStderr leaves it out of what goes to another server.
+type stderrErr struct {
+	err  error
+	tail string
+}
+
+func (e *stderrErr) Error() string { return e.err.Error() + ": " + e.tail }
+func (e *stderrErr) Unwrap() error { return e.err }
+
+func withStderr(err error, proc *nativeProc) error {
+	if tail := strings.TrimPrefix(stderrTail(proc), ": "); tail != "" {
+		return &stderrErr{err, tail}
+	}
+	return err
+}
+
+// WithoutStderr is err's text with any CLI stderr attached to it taken out.
+func WithoutStderr(err error) string {
+	var se *stderrErr
+	if errors.As(err, &se) {
+		return strings.Replace(err.Error(), se.Error(), se.err.Error(), 1)
+	}
+	return err.Error()
+}
+
 func truncateTail(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -138,6 +164,6 @@ func truncateTail(s string, n int) string {
 // GenerateTitle implements agent.TitleGenerator through OneShot, so a CLI agent's chats get a
 // real title instead of the start of the first prompt.
 func (p *CLISubprocessProvider) GenerateTitle(ctx context.Context, prompt string) (string, error) {
-	text, _, err := p.OneShot(ctx, titleSystemPrompt, prompt)
+	text, _, err := p.OneShot(ctx, TitleSystemPrompt, prompt)
 	return text, err
 }

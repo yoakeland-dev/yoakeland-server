@@ -292,6 +292,66 @@ A device paired as "me" is capped at `limited` unless the sender asks otherwise.
 
 **Migrating a 0.1.7 `server.json`.** On load, idempotently: every credential without a person gets one (Limited if it was a pairing token without `scope: full`, else Full), except the original `default` token, which is the owner's. A history message from before `authorId` is placed by its author name, or else by its picture (an emoji places no one), and a placed message's own data-URL picture is dropped from the reply because `profiles` carries it once.
 
+### Model forwarding *(v2.37)*
+
+A chat on server B can run on a provider that lives on server A. B's agent loop, tools, files and history stay on B; only the model request goes to A, relayed by a **device** (a client) connected to both. No credential moves. A does the request with its own provider as the person the relaying connection is signed in as on A. The device is a pipe: it passes the frames below on unchanged and never parses `data` or `chunk`. Servers never dial each other and nothing is stored on B or on the device.
+
+- **Feature.** A server that speaks this lists `"forwarding"` in `server_identity.features`. A device only offers and relays between servers that both list it.
+- **`keyId`.** `provider_list` entries for `api_key` providers carry `keyId`: the first 16 hex characters of `sha256(httpProvider \0 baseUrl \0 apiKey)`. It is how a device recognises the same key on two servers. Never the key.
+- **`via:` names.** On B a provider from A is named `via:<serverId>:<name>` (`serverId` is A's, `name` is A's name for it). `set_provider`, `provider_set`, `session_history` messages and the stored binding carry that string. A provider can't be registered with a name starting `via:`. A provider B has itself is used locally: `set_provider` with a `via:` name for B's own `serverId` is an `error`. Any chat owner may pick a `via:` provider (nothing runs on B under their login); A decides what the person may use.
+
+| Event | Direction | Data |
+|---|---|---|
+| `relay_offer` | device → any server | `{servers: ["<serverId>", ...]}` the other servers this device is connected to right now. A full replacement, sent after connecting and on every change. Forgotten when the connection closes. |
+| `forward_request` | B → device, device → A | `{requestId, serverId, from?, fromKey?, seq, last, data}` |
+| `forward_cancel` | B → device, device → A | `{requestId}` |
+| `forward_chunk` | A → device, device → B | `{requestId, chunk}` |
+| `forward_end` | A → device, device → B | `{requestId, error?}` |
+| `forward_grant` | device → A | `{serverId, serverKey, serverName?, providerName}` |
+| `forward_revoke` | device → A | `{serverId, providerName}` |
+| `list_forward_grants` | device → A | none |
+| `forward_grants` | A → the person's connections | `{grants: [{serverId, serverKeys, serverName?, providerName}]}` |
+| `forward_state` | B → the chat's watchers | `{serverId, state: "waiting" \| "relaying"}`, envelope `sessionId` set; only to connections that may see that chat |
+
+The inbound ones are open to any connection; the handlers narrow. `requestId` is minted by B (16 random bytes, hex). `serverId` is A's.
+
+**Lending is a grant.** Without it, a server the person is only a guest on (B) could send their device a `forward_request` naming their own server A and any provider there, and A would run it: B would spend the person's keys without their choosing anything. So the person says, on A, which providers each other server may use as them:
+- `forward_grant` `{serverId, serverKey, serverName?, providerName}`: this person lets server `serverId`, reached by `serverKey` (below), use `providerName` here as them. Each grant adds its `serverKey` to that server's keys (at most 16, oldest dropped). `serverName` is only a label (at most 64 characters kept). `error` unless the provider exists, this connection may use it (the same check as `set_provider`) and its kind may be forwarded. Idempotent. At most 256 grants per person.
+- `forward_revoke` `{serverId, providerName}`: takes it back. Idempotent.
+- `list_forward_grants`: no data.
+- All three are answered with `forward_grants`, also when refused, the sender's own grants only, sorted by `serverName` then `providerName`. After a grant or revoke it is also sent to that person's other connections.
+- Grants are kept in `server.json` under the person's user id (the owner's, on the local socket, is `owner`). Removing a provider drops its grants; merging people joins theirs, removing a person drops theirs. Granting and revoking are audited (`forward_grant`, `forward_revoke`: `target` the provider, `detail`: serverId, serverName).
+- `forward_request.from` is the id of the server the request came from and `fromKey` what the device itself verified about its connection to it, both **stamped by the device** (they overwrite whatever B wrote; B need not set them). A server's id is only what it says about itself; the key is `ca:<sha256 of the pinned CA certificate>`, `dtls:<pinned DTLS fingerprint>` or `host:<name>` for a certificate the system trusts, and `local` for this machine's socket. A reads both from the piece with `seq` 0 and buffers nothing unless the connection's person lent something to (`from`, `fromKey`); it runs the request only if a grant exists for (that person, `from`, a key of `fromKey`, the body's `providerName`). Otherwise `forward_end` with `error` `that provider isn't lent to this server. Pick it in the model picker here to allow it.`, the same whether or not the provider exists.
+- Revoking a grant stops the requests already running under it.
+
+**Request.** `forward_request` carries the request body as JSON text cut into pieces of at most 256 KiB (never inside a character), `seq` counting from 0, `last: true` on the final piece. Envelope `sessionId` is the chat on B's side; the pieces A answers have none. The body:
+
+```json
+{"providerName": "my-anthropic", "model": "claude-sonnet-5",
+ "messages": [], "tools": [], "systemPrompt": "",
+ "hints": {"cacheKey": "", "advisorModel": "", "serverWebSearch": false},
+ "options": {"reasoningEffort": "", "thinkingBudget": 0, "fastMode": null, "autoCompactTokens": null, "autoCompact": null}}
+```
+`messages` is the chat's messages exactly as `session_history` stores them (`rawContent`, `prefixKey` and `images` included, so a provider can replay its own thinking blocks), `tools` the tool definitions (`{name, description, parameters}`), `hints` and `options` the request hints and the session's model options (every field optional, zero values omitted).
+
+**As A.** It reassembles by `requestId` per connection and refuses, with a `forward_end` carrying `error`: a `seq` out of order, a body over 64 MiB, more than 8 requests in flight on the connection or for the person, more than 128 MiB of one person's bodies being collected at once, a `serverId` that isn't its own, an unknown provider, a provider the connection's person may not use (the same check as `set_provider`), and a provider kind that may not be forwarded (`api_key` and `cli_claude` may; the other CLI agents run their own tools on their own machine). Otherwise it builds the provider, applies `options`, runs the request with `hints`, sends each chunk as `forward_chunk`, then `forward_end` (with `error` if the provider failed: the provider's message, with URLs and the provider's host taken out and without a CLI's stderr; the whole error is in A's log). `forward_cancel`, or the connection closing, stops the provider. Each request is audited as `provider_forward` (provider, model, token counts, outcome; never the conversation). A's per-session spend caps do not see forwarded use.
+
+**Chunk.** `{kind, delta?, toolCall?, usage?, finishReason?, raw?, context?}`: `kind` is `delta`, `reasoning`, `tool_call`, `usage`, `finish`, `raw_content` or `context`; `toolCall` is `{id, name, args}`, `usage` a `usage` object as in `turn_completed`, `raw` the provider's content blocks, `context` `{contextTokens, windowTokens, source}`.
+
+**As B.** `set_provider` with a `via:` name builds a forwarded provider; turns started by the server itself (scheduled, after a restart) rebuild it from the stored binding. Titles, side questions and compaction briefs go through it as ordinary requests. Usage is priced on B from the model name.
+- *Choosing a device:* a connection that sent a `relay_offer` naming A and is signed in as the chat's owner, never anyone else who may read the chat: the request runs on A as the device's person. The one that started the turn is preferred.
+- *No device:* B sends `forward_state` `waiting` to the chat and waits for an offer, up to 30 minutes (each wait gets the whole 30) or until the turn is cancelled, then `forward_state` `relaying`. After 30 minutes the turn fails with `no device connected to both this server and the one that has this provider came online`.
+- *Device lost:* before any chunk reached the turn, B picks another device or waits as above. After, the turn fails with `the device relaying to the server that has this provider disconnected; send a message to continue`; a half-streamed answer is never replayed.
+- `forward_chunk` and `forward_end` count only from the connection the request was given to; anything else is dropped and logged. Cancelling the turn sends `forward_cancel` and returns at once.
+
+**Lending a Claude Code login.** A `cli_claude` provider can be lent like a key, but Claude Code is an agent, so A runs it as a plain tool-calling model with its own tools off and B's tools offered over MCP (`provider.ClaudeModel`). B and the wire need nothing new: a request is answered like any API model's, with `tool_call` chunks (plain tool names, the model's tool-use ids, never `native`) or an answer.
+- *What runs where.* On A, per (the relaying person's id on A, `from`, `hints.cacheKey`), one `claude -p` stream-json process, kept alive and reaped after 30 idle minutes, in an empty scratch directory removed with it: `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` (A's own hooks, plugins, skills and CLAUDE.md stay out), `--settings {"disableAllHooks":true}`, `--disable-slash-commands`, the request's system prompt (plus a sentence that the tools are named `mcp__y__<name>`), `--allowedTools mcp__y`, the account's folder and environment, the model and effort from the request. The tools are served by a loopback MCP server (`y`, one token per process) that lists the request's definitions. A `tools/call` runs nothing: it is held open until a later request supplies the result for its tool-use id. B does the real work and the real permission checks.
+- *Rounds.* A round streams text and reasoning; at the end of the model's message it sends the tool calls, `usage` and `context`, and ends the request (`forward_end`) while the process and the held calls stay. The next request, whose messages continue the last with the tool results, answers them and goes on. A request that is the same conversation plus one new user message after a finished answer goes to the same process. Anything else (an edit, a retry, a branch, a compaction on B, a different tool set, system prompt, model or effort, a process that died or was reaped, a cancelled round) starts a fresh process seeded with a transcript of the conversation, so the work done so far isn't lost but the model's own context is rebuilt from text.
+- *Cancel.* `forward_cancel` or the relaying connection closing sends the CLI an interrupt, fails the held calls and drops the process; the next request starts fresh.
+- *Errors* (the request ends with `forward_end.error`): the CLI reports the tool server failed or no tools, or any tool of its own; it exits; it asks to use anything but the offered tools (denied); it gives up on a held call. A request with tools but no `hints.cacheKey` is refused, since there is no process to keep. A request with no tools (a title, a side question, a compaction brief) uses a throwaway one-off CLI call and leaves the process alone.
+- *What B sees.* Text, reasoning, tool calls, `usage` and `context` like any model. `usage` has the tokens of each model request (cache reads and writes counted in `inputTokens`), and `costKnown: true` on every chunk so B does not price the tokens at API rates; `costUsd` is the CLI's own figure, which is 0 on rounds that end in tool calls and carries the whole turn's total on the round that finishes it. It is what the CLI reports for a subscription (an API-equivalent figure), not a charge. Images in tool results are passed on when they are base64 with a MIME type, otherwise replaced by a text note.
+- *Limits.* A tool call that B takes longer than 24 hours to answer is lost. A long agentic turn sends the whole conversation through the device on every round. The system prompt is a command-line argument (about 128 KiB at most on Linux). A phone that sleeps stops relaying and the held calls wait.
+
 ### Settings mutations broadcast to every peer, not just the sender
 
 A `set_*` request's confirmation event (`mode_set`, `web_tools_enabled_set`, `provider_set`, `model_options_set`, `provider_registered`, `provider_removed`, `favorite_models_set`) is sent **both** back to the requesting connection *and*, via the same `peers.BroadcastEvent` mechanism `session_updated`/`session_deleted`/`project_list` already use (§3.2), to every other live peer — server-wide, not filtered by whether that peer has the affected session/project open (the client is expected to ignore an event for a `sessionId`/`projectPath` it doesn't currently care about, the same way it already does for `session_updated`). This is what makes a mode change, provider swap, or web-tools toggle made on one device visible on another device watching the same session or project live, without polling.
@@ -539,7 +599,7 @@ Registers (or overwrites) a named provider **credential** — not a model choice
 
 #### `list_providers`
 Requests the current provider/credential roster. Takes no data (`{}` is fine).
-- Response: `provider_list`, with every `apiKey` scrubbed.
+- Response: `provider_list`, with every `apiKey` scrubbed. *(v2.37)* An `api_key` entry carries `keyId` (see "Model forwarding").
 
 #### `list_models`
 Requests the models available through one registered provider's own credential — the frontend should call this to populate a model picker per provider, never hardcode a model list.
@@ -571,6 +631,7 @@ Hot-swaps the provider **and model** a session uses, effective on that session's
 ```
 - `model` should be one of the `id`s from that provider's `list_models` response. Omit it only for a `cli_*` kind, which falls back to that agent's own default model.
 - **`projectPath`** *(optional)*: resolves this session against the project its turns will actually run in, binding the session if it wasn't bound yet — the same rules as `user_prompt` above (§4b). Send it when configuring a session that hasn't been prompted yet: a client normally picks a model for a brand-new chat *before* its first message, and since each project keeps its own session registry (§4b), a provider set against the server's default-project fallback lands on a registry that session's turn will never use. The turn then runs unconfigured and comes back `finishReason: "no_provider"`, contradicting a provider the client could see selected.
+- *(v2.37)* `providerName` may be `via:<serverId>:<name>`, a provider that lives on another server and is reached through a device (see "Model forwarding").
 - Response: `provider_set` on success (echoing back the `model` that was set), `error` if `providerName` isn't registered or fails to build (e.g. a `cli_claude` provider on a machine without `claude` on `PATH`).
 
 #### `set_model_options`
@@ -2021,6 +2082,7 @@ Pushed to a peer right after it connects, and to every peer whenever `set_server
 {"type": "server_identity", "data": {"identity": "aveline's living room", "icon": {"name": "ghost", "hue": 210}, "serverId": "a1b2c3d4e5f6...", "version": "0.1.1", "tier": "limited", "caps": {"files_edit": true}, "user": {"id": "u-1a2b", "name": "Sam", "avatar": "🦊"}}}
 ```
 - `tier`, `caps`, `user` *(v2.36)*: this connection's tier, effective caps and person. `restricted` stays for old clients, true below Full.
+- `features` *(v2.37)*: the optional protocols this server speaks, today `["forwarding"]` (see "Model forwarding"). Absent on an older server.
 - `icon`: how to draw this server's avatar, chosen by an operator via `set_server_identity` and the same on every client; omitted until one is picked. Without `icon.name` draw initials; without `icon.hue` derive a colour from `serverId`.
 - `version`: the release this binary was built from, or `dev` for a local build. A client compares it with the latest release to flag an out-of-date server; a missing value (older server) counts as out of date, a non-numeric one never does.
 - `identity`: a mutable display name — *UI Action*: show this as the server's display name (e.g. in a connection list or title bar) rather than a raw address.
@@ -2536,6 +2598,8 @@ Separate from any project, because most of what it records has none (credentials
 | `rule_add` / `rule_remove` | a permission rule was stored from an answer or the rules UI, or deleted | `detail.ruleId`, `scope`, `source`, `modes` |
 | `limit_pause` | a turn paused at a soft round/cost limit, and the answer | `outcome` `asked`, then `continue`/`stop` with the answering device |
 | `provider_add` / `provider_remove` | a provider was registered (by hand or OAuth) or removed | `target` the name; `detail`: kind, base URL, auth method. **Never the key** |
+| `provider_forward` | another server's chat used one of this server's providers through a device *(v2.37)* | `target` the provider name; outcome `ok`, `error` or `cancelled`; `detail`: model, inputTokens, outputTokens. Never the conversation |
+| `forward_grant` / `forward_revoke` | a person lent a provider to another server, or took it back *(v2.37)* | `target` the provider; `detail`: serverId, serverName |
 | `settings_change` | runtime settings, the default provider, a project's web tools | `detail.keys`: which settings, never their values |
 | `remote_access` | `set_remote_access` | `detail.enabled`, `addr` |
 | `remote_password` / `token_add` / `token_remove` | the shared password was replaced; a per-person token was minted or revoked | the fact and the token's **name**, never a password or token |

@@ -59,6 +59,11 @@ var eventAccess = map[protocol.EventType]eventReq{
 	protocol.EventUploadBegin: anyone, protocol.EventUploadChunk: anyone, protocol.EventImportChatFiles: own, // the files of a chat: its owner's
 	protocol.EventWriteFile: needCap(CapFilesEdit), protocol.EventFsOp: needCap(CapFilesEdit),
 
+	// model forwarding: a device relays between two servers; the handlers narrow (forward.go)
+	protocol.EventRelayOffer: anyone, protocol.EventForwardRequest: anyone, protocol.EventForwardCancel: anyone,
+	protocol.EventForwardChunk: anyone, protocol.EventForwardEnd: anyone,
+	protocol.EventForwardGrant: anyone, protocol.EventForwardRevoke: anyone, protocol.EventListForwardGrants: anyone, // a person's own grants: the handler
+
 	// presence and housekeeping
 	protocol.EventSetPresence: anyone, protocol.EventSetPeerName: anyone, protocol.EventSetPeerAvatar: anyone, protocol.EventSetProfile: anyone, protocol.EventGetAvatar: anyone,
 	protocol.EventSetNotifyPrefs: anyone, protocol.EventListNotifications: anyone, protocol.EventDismissNotification: anyone,
@@ -160,7 +165,9 @@ func modeAllowed(acc Access, mode agent.Mode) bool {
 // providerAllowed reports whether acc may bind a chat to the provider registered as name: any
 // API-key provider, or a CLI agent listed in its cli cap. An unknown name is left to the handler.
 func providerAllowed(deps connDeps, acc Access, name string) bool {
-	if acc.Full() || deps.providerStore == nil {
+	// A provider borrowed from another server runs nothing here under the owner's login; the
+	// server that has it decides what this person may use (forward.go).
+	if _, _, via := parseVia(name); via || acc.Full() || deps.providerStore == nil {
 		return true
 	}
 	cfg, ok := deps.providerStore.Get(name)
@@ -177,6 +184,9 @@ func providerAllowed(deps connDeps, acc Access, name string) bool {
 // API-key providers and change only the ones they added: a CLI agent or a custom command would run
 // on this computer as the owner, which only Full may set up.
 func registerProviderRefusal(deps connDeps, acc Access, cfg provider.ProviderConfig) string {
+	if strings.HasPrefix(cfg.Name, viaPrefix) {
+		return `a provider's name can't start with "via:": that is how a provider borrowed from another server is named`
+	}
 	if acc.Full() {
 		return ""
 	}

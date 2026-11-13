@@ -59,12 +59,12 @@ func (r *Roles) Get(role Role) (RoleBinding, bool) {
 type RequestHints struct {
 	// CacheKey is stable for a session, so a provider that routes by it
 	// (OpenAI's prompt_cache_key) lands consecutive requests on a warm cache.
-	CacheKey string
+	CacheKey string `json:"cacheKey,omitempty"`
 	// AdvisorModel is the model for Anthropic's advisor tool; "" for none.
-	AdvisorModel string
+	AdvisorModel string `json:"advisorModel,omitempty"`
 	// ServerWebSearch lets a provider attach its own server-side web search
 	// (Anthropic's, OpenRouter's). Set only when the web_search rule allows it.
-	ServerWebSearch bool
+	ServerWebSearch bool `json:"serverWebSearch,omitempty"`
 }
 
 type requestHintsKey struct{}

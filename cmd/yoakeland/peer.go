@@ -44,6 +44,8 @@ type Peer struct {
 	Network     string // "unix" or "tcp"
 	// BrowserHost: offered its browser panel to the agent (browser_host).
 	BrowserHost bool
+	// relayTo is the servers this device said it can reach (relay_offer), read under the registry lock.
+	relayTo []string
 
 	// Presence is the last set_presence heartbeat (see PeerRegistry.Viewing).
 	// Not in PeerInfo: it changes too often to broadcast.

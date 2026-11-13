@@ -67,7 +67,7 @@ func (d connDeps) actorOf(network, peerID string) agent.TurnActor {
 // turnContext marks ctx with the sender of a turn and the policy their access gives it. Every path
 // that starts a turn on a sender's behalf goes through here.
 func (d connDeps) turnContext(ctx context.Context, network, peerID string) context.Context {
-	return d.turnContextFor(ctx, d.actorOf(network, peerID), d.accessFor(network, peerID))
+	return withPreferredRelay(d.turnContextFor(ctx, d.actorOf(network, peerID), d.accessFor(network, peerID)), peerID)
 }
 
 func (d connDeps) turnContextFor(ctx context.Context, who agent.TurnActor, acc Access) context.Context {
