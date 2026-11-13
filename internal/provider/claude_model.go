@@ -200,7 +200,7 @@ func (m *ClaudeModel) round(ctx context.Context, history []agent.Message, tools 
 		default:
 			err = errors.New("claude exited without finishing the round")
 			if tail := s.proc.stderr(); tail != "" {
-				err = fmt.Errorf("%w: %s", err, lastLines(tail, 5))
+				err = &stderrErr{err, lastLines(tail, 5)}
 			}
 		}
 	case <-ctx.Done():
@@ -362,7 +362,8 @@ func (m *ClaudeModel) launch(sig string, tools []tool.ToolDefinition, system str
 	// the OS's per-argument limit (128 KiB on Linux) needs --system-prompt-file.
 	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
 		"--include-partial-messages", "--tools", "", "--mcp-config", cfgPath, "--strict-mcp-config",
-		"--setting-sources", "", "--system-prompt", system, "--system-prompt-snapshot", "off",
+		"--setting-sources", "", "--settings", `{"disableAllHooks":true}`, "--disable-slash-commands",
+		"--system-prompt", system, "--system-prompt-snapshot", "off",
 		"--permission-prompt-tool", "stdio", "--allowedTools", "mcp__" + claudeModelServer}
 	if m.Model != "" {
 		args = append(args, "--model", m.Model)
@@ -680,17 +681,26 @@ func (r *modelRound) handle(ln claudeLine) {
 			return
 		}
 		status, hasTools := "missing", false
+		var own []string
 		for _, sv := range ln.MCPServers {
 			if sv.Name == claudeModelServer {
 				status = sv.Status
 			}
 		}
 		for _, t := range ln.Tools {
-			hasTools = hasTools || strings.HasPrefix(t, claudeModelPrefix)
+			if strings.HasPrefix(t, claudeModelPrefix) {
+				hasTools = true
+			} else {
+				own = append(own, t)
+			}
 		}
 		// Without its server the CLI goes on with no tools and the model invents calls as text.
 		if status != "connected" || !hasTools {
 			r.s.fail(fmt.Errorf("claude couldn't use the offered tools (tool server %s, tools offered: %v)", status, hasTools))
+		}
+		// A tool of its own would run on this machine, as the person who lent the login.
+		if len(own) > 0 {
+			r.s.fail(fmt.Errorf("claude started with tools of its own (%s); it is only run with the offered tools", strings.Join(own, ", ")))
 		}
 	case "stream_event":
 		if !topLevel {

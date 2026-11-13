@@ -58,9 +58,13 @@ type ForwardRequestData struct {
 	// From is the server the request came from, stamped by the device (whatever B put there is
 	// overwritten). A runs the request only if its person lent the provider to that server.
 	From string `json:"from,omitempty"`
-	Seq  int    `json:"seq"`
-	Last bool   `json:"last"`
-	Data string `json:"data"`
+	// FromKey is what the device itself verified about its connection to From (the CA it pinned,
+	// the DTLS fingerprint, the TLS host name), also stamped by the device. A server can claim any
+	// id but can't fake this, so a grant holds the keys it was made for and A matches both.
+	FromKey string `json:"fromKey,omitempty"`
+	Seq     int    `json:"seq"`
+	Last    bool   `json:"last"`
+	Data    string `json:"data"`
 }
 
 type ForwardCancelData struct {
@@ -109,11 +113,15 @@ type ForwardContext struct {
 }
 
 // ForwardGrantData lets server ServerID use ProviderName on this server as the sender. ServerName
-// is only a label to show in lists.
+// is only a label to show in lists. ServerKey (sent with a grant) is the granting device's key
+// for that server, as in ForwardRequestData.FromKey; ServerKeys (in a list) are every key it was
+// granted for.
 type ForwardGrantData struct {
-	ServerID     string `json:"serverId"`
-	ServerName   string `json:"serverName,omitempty"`
-	ProviderName string `json:"providerName"`
+	ServerID     string   `json:"serverId"`
+	ServerName   string   `json:"serverName,omitempty"`
+	ProviderName string   `json:"providerName"`
+	ServerKey    string   `json:"serverKey,omitempty"`
+	ServerKeys   []string `json:"serverKeys,omitempty"`
 }
 
 type ForwardRevokeData struct {

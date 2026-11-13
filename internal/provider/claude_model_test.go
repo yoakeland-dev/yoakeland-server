@@ -125,6 +125,8 @@ func (f *liveFake) cli(t *testing.T, plan func(prompt string) cliPlan) func(int,
 				init["mcp_servers"] = []map[string]string{{"name": "y", "status": "failed"}}
 			case "notools":
 				init["tools"] = []string{}
+			case "builtin":
+				init["tools"] = []string{"mcp__y__echo", "Bash"}
 			}
 			line(out, init)
 			if p.bash {
@@ -323,7 +325,7 @@ func TestClaudeModelLaunchAndToolList(t *testing.T) {
 		}
 	}
 	want := `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --tools  --mcp-config ` + cfgArg +
-		` --strict-mcp-config --setting-sources  --system-prompt ` + sys + ` --system-prompt-snapshot off --permission-prompt-tool stdio --allowedTools mcp__y --model haiku`
+		` --strict-mcp-config --setting-sources  --settings {"disableAllHooks":true} --disable-slash-commands --system-prompt ` + sys + ` --system-prompt-snapshot off --permission-prompt-tool stdio --allowedTools mcp__y --model haiku`
 	if args != want {
 		t.Fatalf("args:\n%s\nwant\n%s", args, want)
 	}
@@ -549,7 +551,7 @@ func TestClaudeModelProcessExitsMidRound(t *testing.T) {
 }
 
 func TestClaudeModelFailedToolServerIsFatal(t *testing.T) {
-	for _, bad := range []string{"failed", "notools"} {
+	for _, bad := range []string{"failed", "notools", "builtin"} {
 		h := newHarness(t, func(string) cliPlan { return cliPlan{badInit: bad} })
 		r := h.run(context.Background(), []agent.Message{user("hi")})
 		if r.err == nil || !strings.Contains(r.err.Error(), "offered tools") {
@@ -677,4 +679,15 @@ func TestClaudeFreshPrompt(t *testing.T) {
 		t.Fatal(p)
 	}
 	var _ = bufio.NewScanner
+}
+
+// A CLI's stderr stays on the machine that ran it: what goes to another server leaves it out.
+func TestWithoutStderr(t *testing.T) {
+	err := fmt.Errorf("forwarded: %w", &stderrErr{errors.New("claude exited without finishing the round"), "secret path /home/me"})
+	if got := WithoutStderr(err); got != "forwarded: claude exited without finishing the round" {
+		t.Fatalf("%q", got)
+	}
+	if !strings.Contains(err.Error(), "secret path") {
+		t.Fatal("the local error lost its stderr")
+	}
 }

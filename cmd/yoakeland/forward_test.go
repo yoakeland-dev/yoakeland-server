@@ -109,6 +109,9 @@ func (m *fakeModel) hold(release <-chan struct{}) func(int, http.ResponseWriter,
 	}
 }
 
+// bKey is what the test device verified about its connection to B.
+const bKey = "ca:b"
+
 type fwdWorld struct {
 	a, b   connDeps
 	model  *fakeModel
@@ -123,9 +126,10 @@ func newFwdWorld(t *testing.T) *fwdWorld {
 	w.a.forward, w.b.forward = newForwarder(), newForwarder()
 	w.aID, w.bID = w.a.settings.GetServerID(), w.b.settings.GetServerID()
 	// The owner lent p to B, as they would from B's model picker.
-	if err := w.a.settings.GrantForward(ownerID, w.bID, "B", "p"); err != nil {
+	if err := w.a.settings.GrantForward(ownerID, w.bID, bKey, "B", "p"); err != nil {
 		t.Fatal(err)
 	}
+	w.b.projects.rememberOwner("chat1", ownerID)
 	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "p", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai", BaseURL: w.model.srv.URL, APIKey: "k"}); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +163,7 @@ func (w *fwdWorld) newDevice(t *testing.T) *fwdDevice {
 		if env.Type == protocol.EventForwardRequest { // the device says where it came from, whatever B wrote
 			var rd protocol.ForwardRequestData
 			_ = json.Unmarshal(env.Data, &rd)
-			rd.From = w.bID
+			rd.From, rd.FromKey = w.bID, bKey
 			env.Data, _ = json.Marshal(rd)
 		}
 		if env.Type == protocol.EventForwardRequest || env.Type == protocol.EventForwardCancel {
@@ -356,12 +360,16 @@ func TestForwardRefusals(t *testing.T) {
 	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "codex", Kind: provider.ProviderKindCLICodex}); err != nil {
 		t.Fatal(err)
 	}
+	// Lent by hand: the grant event itself refuses codex.
+	if err := w.a.settings.GrantForward(ownerID, w.bID, bKey, "B", "codex"); err != nil {
+		t.Fatal(err)
+	}
 	body := func(name string) string {
 		raw, _ := json.Marshal(forwardBody{ProviderName: name, Model: "m", Messages: []agent.Message{{Role: "user", Content: "hi"}}})
 		return string(raw)
 	}
 	piece := func(id, server string, seq int, last bool, data string) *protocol.Envelope {
-		raw, _ := json.Marshal(protocol.ForwardRequestData{RequestID: id, ServerID: server, From: w.bID, Seq: seq, Last: last, Data: data})
+		raw, _ := json.Marshal(protocol.ForwardRequestData{RequestID: id, ServerID: server, From: w.bID, FromKey: bKey, Seq: seq, Last: last, Data: data})
 		return &protocol.Envelope{Type: protocol.EventForwardRequest, Data: raw}
 	}
 	conn := func(network string) (*Peer, *capture) {
@@ -384,13 +392,13 @@ func TestForwardRefusals(t *testing.T) {
 		{"out of order", "unix", "out of order", func() []*protocol.Envelope {
 			return []*protocol.Envelope{piece("r", w.aID, 1, true, body("p"))}
 		}},
-		{"unknown provider", "unix", "unknown provider", func() []*protocol.Envelope {
+		{"unknown provider", "unix", notLent, func() []*protocol.Envelope {
 			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("nope"))}
 		}},
-		{"not allowed", "tcp", "isn't allowed", func() []*protocol.Envelope {
+		{"nothing lent", "tcp", notLent, func() []*protocol.Envelope {
 			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("cli"))}
 		}},
-		{"cli kind", "unix", "isn't lent to that server", func() []*protocol.Envelope {
+		{"cli kind", "unix", notLent, func() []*protocol.Envelope {
 			return []*protocol.Envelope{piece("r", w.aID, 0, true, body("cli"))}
 		}},
 		{"codex kind", "unix", "can't be used from another server", func() []*protocol.Envelope {
@@ -577,18 +585,26 @@ func TestForwardIgnoresRepliesFromOtherDevices(t *testing.T) {
 	}
 }
 
-func TestForwardOnlyDevicesThatMayReadTheChat(t *testing.T) {
+// The request runs on A as whoever the device is there, so only the chat owner's own devices relay
+// it: a Full person who may read a Limited person's chat mustn't spend their grant on it.
+func TestForwardOnlyTheChatOwnersDevices(t *testing.T) {
 	w := newFwdWorld(t)
-	d := w.newDevice(t)
-	d.offer(w.aID)
-	d.bPeer.Network = "tcp" // canSee asks Sees about a TCP peer
-	w.b.peers.Sees = func(network, credential, sessionID string) bool { return false }
-	if p := w.b.forward.pick(w.b, "chat1", w.aID, ""); p != nil {
-		t.Fatal("a device that may not read the chat was picked")
+	limited, full := addPerson(t, w.b, TierLimited), addPerson(t, w.b, TierFull)
+	w.b.projects.rememberOwner("theirs", limited.UserID)
+	offer := func(p *Peer) {
+		raw, _ := json.Marshal(protocol.RelayOfferData{Servers: []string{w.aID}})
+		handleForwardEnvelope(context.Background(), p.ipc, w.b, "tcp", p.ID, &protocol.Envelope{Type: protocol.EventRelayOffer, Data: raw})
 	}
-	w.b.peers.Sees = func(network, credential, sessionID string) bool { return true }
-	if p := w.b.forward.pick(w.b, "chat1", w.aID, ""); p == nil || p.ID != d.bPeer.ID {
-		t.Fatal("a device that may read the chat wasn't picked")
+	offer(full)
+	if p := w.b.forward.pick(w.b, "theirs", w.aID, full.ID); p != nil {
+		t.Fatal("someone else's device relayed the chat")
+	}
+	if p := w.b.forward.pick(w.b, "unknown-chat", w.aID, ""); p != nil {
+		t.Fatal("a chat with no known owner was relayed")
+	}
+	offer(limited)
+	if p := w.b.forward.pick(w.b, "theirs", w.aID, full.ID); p == nil || p.ID != limited.ID {
+		t.Fatal("the owner's device wasn't picked")
 	}
 }
 
@@ -670,11 +686,16 @@ func TestForwardingWireNames(t *testing.T) {
 // request sends one whole forward_request to A from a connection and returns A's forward_end error text.
 func (w *fwdWorld) request(t *testing.T, from, provider string) (errText string, hits int32) {
 	t.Helper()
+	return w.requestKeyed(t, from, bKey, provider)
+}
+
+func (w *fwdWorld) requestKeyed(t *testing.T, from, fromKey, provider string) (errText string, hits int32) {
+	t.Helper()
 	c := &capture{}
 	p := w.a.peers.Add(protocol.NewIPCStream(strings.NewReader(""), c), nopCloser{}, "unix", peerIdentity{Name: "x"})
 	defer func() { w.a.forward.connClosed(w.a, p.ipc, p.ID); w.a.peers.Remove(p.ID) }()
 	raw, _ := json.Marshal(forwardBody{ProviderName: provider, Model: "m", Messages: []agent.Message{{Role: "user", Content: "hi"}}})
-	d, _ := json.Marshal(protocol.ForwardRequestData{RequestID: "r", ServerID: w.aID, From: from, Last: true, Data: string(raw)})
+	d, _ := json.Marshal(protocol.ForwardRequestData{RequestID: "r", ServerID: w.aID, From: from, FromKey: fromKey, Last: true, Data: string(raw)})
 	before := w.model.hits.Load()
 	handleForwardEnvelope(context.Background(), p.ipc, w.a, "unix", p.ID, &protocol.Envelope{Type: protocol.EventForwardRequest, Data: d})
 	e := c.end(t, "r")
@@ -683,9 +704,20 @@ func (w *fwdWorld) request(t *testing.T, from, provider string) (errText string,
 
 func TestForwardNeedsAGrant(t *testing.T) {
 	w := newFwdWorld(t)
-	refused := "p isn't lent to that server. Pick it in the model picker there to allow it."
+	refused := notLent
 	if e, hits := w.request(t, w.bID, "p"); e != "" || hits != 1 {
 		t.Fatalf("granted request: err %q hits %d", e, hits)
+	}
+	// A server that claims B's id isn't B: the device reached it by something else.
+	if e, hits := w.requestKeyed(t, w.bID, "ca:impostor", "p"); e != refused || hits != 0 {
+		t.Fatalf("B's id from another server: err %q hits %d", e, hits)
+	}
+	if e, hits := w.requestKeyed(t, w.bID, "", "p"); e != refused || hits != 0 {
+		t.Fatalf("no key: err %q hits %d", e, hits)
+	}
+	// Whether a provider exists is no business of a server it isn't lent to.
+	if e, _ := w.request(t, w.bID, "nope"); e != refused {
+		t.Fatalf("unknown provider: %q", e)
 	}
 	if e, hits := w.request(t, "", "p"); e != refused || hits != 0 {
 		t.Fatalf("no from: err %q hits %d", e, hits)
@@ -696,7 +728,7 @@ func TestForwardNeedsAGrant(t *testing.T) {
 	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "q", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai", BaseURL: w.model.srv.URL, APIKey: "k2"}); err != nil {
 		t.Fatal(err)
 	}
-	if e, _ := w.request(t, w.bID, "q"); e != "q isn't lent to that server. Pick it in the model picker there to allow it." {
+	if e, _ := w.request(t, w.bID, "q"); e != refused {
 		t.Fatalf("another provider of the same person: %q", e)
 	}
 	if err := w.a.settings.RevokeForward(ownerID, w.bID, "p"); err != nil {
@@ -737,26 +769,26 @@ func TestForwardGrantEvents(t *testing.T) {
 	deps.providerStore.Register(provider.ProviderConfig{Name: "cli", Kind: provider.ProviderKindCLIClaude})
 	deps.providerStore.Register(provider.ProviderConfig{Name: "codex", Kind: provider.ProviderKindCLICodex})
 
-	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "nope"}); !strings.Contains(e, "unknown provider") {
+	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "k", ProviderName: "nope"}); !strings.Contains(e, "unknown provider") {
 		t.Fatalf("unknown provider: %q", e)
 	}
-	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "codex"}); !strings.Contains(e, "can't be used from another server") {
+	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "k", ProviderName: "codex"}); !strings.Contains(e, "can't be used from another server") {
 		t.Fatalf("codex kind: %q", e)
 	}
 	// A person who may not use the provider can't lend it: a limited TCP person and a CLI agent.
 	tcp := deps.peers.Add(protocol.NewIPCStream(strings.NewReader(""), &capture{}), nopCloser{}, "tcp", peerIdentity{Name: "t"})
 	defer deps.peers.Remove(tcp.ID)
-	if _, e := grants(t, deps, "tcp", tcp.ID, protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "cli"}); !strings.Contains(e, "isn't allowed") {
+	if _, e := grants(t, deps, "tcp", tcp.ID, protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "k", ProviderName: "cli"}); !strings.Contains(e, "isn't allowed") {
 		t.Fatalf("not allowed: %q", e)
 	}
 
 	long := strings.Repeat("n", 200)
-	g, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s2", ServerName: "Zed", ProviderName: "p"})
+	g, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s2", ServerKey: "k", ServerName: "Zed", ProviderName: "p"})
 	if e != "" || len(g.Grants) != 1 {
 		t.Fatalf("grant: %q %+v", e, g)
 	}
-	grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s2", ServerName: "Zed", ProviderName: "p"}) // idempotent
-	g, _ = grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerName: long, ProviderName: "p"})
+	grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s2", ServerKey: "k", ServerName: "Zed", ProviderName: "p"}) // idempotent
+	g, _ = grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "k", ServerName: long, ProviderName: "p"})
 	if n := len([]rune(g.Grants[1].ServerName)); len(g.Grants) != 2 || n == 0 || n > maxServerNameRunes || g.Grants[0].ServerName != "Zed" {
 		t.Fatalf("grants (sorted by server name, label capped): %+v", g)
 	}
@@ -769,7 +801,7 @@ func TestForwardGrantEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !again.ForwardGranted(ownerID, "s2", "p") {
+	if !again.ForwardGranted(ownerID, "s2", "k", "p") {
 		t.Fatal("grant lost on reload")
 	}
 	g, _ = grants(t, deps, "unix", "", protocol.EventForwardRevoke, protocol.ForwardRevokeData{ServerID: "s2", ProviderName: "p"})
@@ -783,10 +815,10 @@ func TestForwardGrantEvents(t *testing.T) {
 		t.Fatalf("grants of a removed provider kept: %+v", g)
 	}
 	// A Claude Code kind can be lent now; the other CLI kinds can't (checked above for codex).
-	if _, e2 := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "cli"}); e2 != "" {
+	if _, e2 := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "k", ProviderName: "cli"}); e2 != "" {
 		t.Fatalf("cli kind: %q", e2)
 	}
-	if !deps.settings.ForwardGranted(ownerID, "s1", "cli") {
+	if !deps.settings.ForwardGranted(ownerID, "s1", "k", "cli") {
 		t.Fatal("the cli grant didn't stick")
 	}
 }
@@ -802,12 +834,12 @@ func TestForwardGrantsFollowPeople(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.GrantForward(a.ID, "s1", "One", "p")
-	s.GrantForward(b.ID, "s1", "One", "q")
+	s.GrantForward(a.ID, "s1", "k", "One", "p")
+	s.GrantForward(b.ID, "s1", "k", "One", "q")
 	if err := s.MergeUsers(a.ID, b.ID); err != nil {
 		t.Fatal(err)
 	}
-	if !s.ForwardGranted(b.ID, "s1", "p") || !s.ForwardGranted(b.ID, "s1", "q") || s.ForwardGranted(a.ID, "s1", "p") {
+	if !s.ForwardGranted(b.ID, "s1", "k", "p") || !s.ForwardGranted(b.ID, "s1", "k", "q") || s.ForwardGranted(a.ID, "s1", "k", "p") {
 		t.Fatal("a merge didn't move the grants to the person kept")
 	}
 	if _, err := s.RemoveUser(b.ID); err != nil {
@@ -876,7 +908,7 @@ done
 	if err := w.a.providerStore.Register(provider.ProviderConfig{Name: "cc", Kind: provider.ProviderKindCLIClaude}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.a.settings.GrantForward(ownerID, w.bID, "B", "cc"); err != nil {
+	if err := w.a.settings.GrantForward(ownerID, w.bID, bKey, "B", "cc"); err != nil {
 		t.Fatal(err)
 	}
 	w.newDevice(t).offer(w.aID)
@@ -928,4 +960,89 @@ done
 		t.Fatalf("session keys %q, want %q", keys, want)
 	}
 	w.settled(t)
+}
+
+// A holds nothing for someone who lent nothing to the asking server, and a person's requests are
+// counted across all their connections, not per connection.
+func TestForwardBufferLimitsArePerPerson(t *testing.T) {
+	w := newFwdWorld(t)
+	piece := func(p *Peer, network, id string) {
+		raw, _ := json.Marshal(protocol.ForwardRequestData{RequestID: id, ServerID: w.aID, From: w.bID, FromKey: bKey, Data: strings.Repeat("a", 1<<20)})
+		handleForwardEnvelope(context.Background(), p.ipc, w.a, network, p.ID, &protocol.Envelope{Type: protocol.EventForwardRequest, Data: raw})
+	}
+	conn := func(network string) (*Peer, *capture) {
+		c := &capture{}
+		p := w.a.peers.Add(protocol.NewIPCStream(strings.NewReader(""), c), nopCloser{}, network, peerIdentity{Name: "x"})
+		t.Cleanup(func() { w.a.forward.connClosed(w.a, p.ipc, p.ID); w.a.peers.Remove(p.ID) })
+		return p, c
+	}
+	stranger, sc := conn("tcp")
+	piece(stranger, "tcp", "s")
+	if e := sc.end(t, "s"); e != notLent {
+		t.Fatalf("stranger's first piece: %q", e)
+	}
+	w.a.forward.mu.Lock()
+	held := len(w.a.forward.conns)
+	w.a.forward.mu.Unlock()
+	if held != 0 {
+		t.Fatal("a stranger's piece was held")
+	}
+	one, _ := conn("unix")
+	for i := range maxForwardInFlight {
+		piece(one, "unix", fmt.Sprint("r", i))
+	}
+	two, c2 := conn("unix")
+	piece(two, "unix", "more")
+	if e := c2.end(t, "more"); !strings.Contains(e, "for this person") {
+		t.Fatalf("the owner's ninth request on a second connection: %q", e)
+	}
+}
+
+// Taking a grant back stops what is already running under it.
+func TestForwardRevokeStopsRunningRequests(t *testing.T) {
+	w := newFwdWorld(t)
+	w.model.handler = w.model.hold(nil)
+	w.newDevice(t).offer(w.aID)
+	chunks, errs := w.provider(t).StreamTurn(context.Background(), []agent.Message{{Role: "user", Content: "hi"}}, nil, "")
+	if c := <-chunks; c.Delta != "he" {
+		t.Fatalf("first chunk %+v", c)
+	}
+	if _, e := grants(t, w.a, "unix", "", protocol.EventForwardRevoke, protocol.ForwardRevokeData{ServerID: w.bID, ProviderName: "p"}); e != "" {
+		t.Fatal(e)
+	}
+	if _, _, err := collect(t, chunks, errs); err == nil {
+		t.Fatal("a revoked request finished as an answer")
+	}
+	select {
+	case <-w.model.gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("A's provider kept running after the grant was revoked")
+	}
+	w.settled(t)
+}
+
+// B hears the provider's own words, not A's provider address.
+func TestForwardErrorsLeaveOutTheProviderAddress(t *testing.T) {
+	cfg := provider.ProviderConfig{BaseURL: "https://llm.internal:8443/v1"}
+	got := forwardErrText(cfg, fmt.Errorf(`Post "https://llm.internal:8443/v1/chat/completions": dial tcp: lookup llm.internal: no such host`))
+	if strings.Contains(got, "llm.internal") || !strings.Contains(got, "no such host") {
+		t.Fatalf("scrubbed to %q", got)
+	}
+}
+
+// A refused grant is answered with the list too, so a device shows what the lender has, and a grant
+// is kept with the key the device reached the server by.
+func TestForwardGrantRefusalSendsTheList(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.providerStore.Register(provider.ProviderConfig{Name: "p", Kind: provider.ProviderKindAPIKey, HTTPProvider: "openai", APIKey: "k"})
+	if _, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "ca:1", ProviderName: "p"}); e != "" {
+		t.Fatal(e)
+	}
+	g, e := grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ServerKey: "ca:1", ProviderName: "nope"})
+	if e == "" || len(g.Grants) != 1 || !reflect.DeepEqual(g.Grants[0].ServerKeys, []string{"ca:1"}) {
+		t.Fatalf("refused grant answered with %+v, error %q", g, e)
+	}
+	if g, e = grants(t, deps, "unix", "", protocol.EventForwardGrant, protocol.ForwardGrantData{ServerID: "s1", ProviderName: "p"}); e == "" || len(g.Grants) != 1 {
+		t.Fatalf("a grant with no key: %+v, error %q", g, e)
+	}
 }

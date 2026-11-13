@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -28,7 +30,10 @@ import (
 // As A: answerForward. As B: ForwardedProvider, which asks a device to carry the request.
 
 const (
-	maxForwardInFlight = 8   // requests a connection may have open at once on A
+	maxForwardInFlight = 8 // requests a connection, and a person, may have open at once on A
+	// maxForwardBuffered is what one person's requests may hold in memory on A while their pieces
+	// arrive: two whole bodies.
+	maxForwardBuffered = 2 * protocol.MaxForwardBody
 	maxForwardIDLen    = 128 // longer request ids are refused: they are map keys
 	maxRelayServers    = 64  // servers one relay_offer may name
 	forwardMsgBuffer   = 256 // chunks B holds for a turn that reads slower than the device sends
@@ -124,10 +129,13 @@ type fwdConn struct{ reqs map[string]*fwdReq }
 
 // fwdReq is a request on A: pieces being collected, then (cancel set) a provider call running.
 type fwdReq struct {
-	from   string // the server the request came from, as the device stamped it on piece 0
-	buf    []byte
-	next   int
-	cancel context.CancelFunc
+	user     string // the person on A it runs as
+	from     string // the server the request came from, as the device stamped it on piece 0
+	fromKey  string // and what the device verified about that server
+	provider string // known once the body is read
+	buf      []byte
+	next     int
+	cancel   context.CancelFunc
 }
 
 // fwdCall is a request B gave a device. msgs is what the device sent back for it.
@@ -168,17 +176,17 @@ func (r *PeerRegistry) SetRelayOffer(id string, servers []string) bool {
 	return ok
 }
 
-// relayPeers are the connections that offered to reach serverID and may read the chat sessionID.
-func (r *PeerRegistry) relayPeers(sessionID, serverID string) []*Peer {
+// relayPeers are the connections that offered to reach serverID.
+func (r *PeerRegistry) relayPeers(serverID string) []*Peer {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	var out []*Peer
 	for _, p := range r.peers {
 		if slices.Contains(p.relayTo, serverID) {
 			out = append(out, p)
 		}
 	}
-	r.mu.Unlock()
-	return slices.DeleteFunc(out, func(p *Peer) bool { return !r.canSee(p, sessionID) })
+	return out
 }
 
 // connClosed lets go of everything the connection ipc held: the requests it was having answered
@@ -297,9 +305,16 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 		refuse("this server is not " + d.ServerID)
 		return
 	}
+	acc := deps.accessFor(network, peerID)
+	// Nothing is held for someone who lent nothing to that server: which provider is only known
+	// once the whole body is in, and that much memory isn't a stranger's to take.
+	if d.Seq == 0 && !deps.settings.ForwardGranted(acc.UserID, d.From, d.FromKey, "") {
+		refuse(notLent)
+		return
+	}
 	var body []byte
-	var from string
 	var rctx context.Context
+	var req *fwdReq
 	why := func() string {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -309,26 +324,32 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 			f.conns[ipc] = c
 		}
 		r := c.reqs[d.RequestID]
+		reqs, held := f.heldByLocked(acc.UserID)
 		switch {
 		case r == nil && d.Seq != 0:
 			return "forward_request pieces out of order"
 		case r == nil && len(c.reqs) >= maxForwardInFlight:
 			return fmt.Sprintf("more than %d forwarded requests in flight on this connection", maxForwardInFlight)
+		case r == nil && reqs >= maxForwardInFlight:
+			return fmt.Sprintf("more than %d forwarded requests in flight for this person", maxForwardInFlight)
 		case r != nil && (r.cancel != nil || d.Seq != r.next):
 			return "forward_request pieces out of order"
 		case r == nil:
-			r = &fwdReq{from: d.From}
+			r = &fwdReq{user: acc.UserID, from: d.From, fromKey: d.FromKey}
 			c.reqs[d.RequestID] = r
 		}
 		if len(r.buf)+len(d.Data) > protocol.MaxForwardBody {
 			return "forwarded request body is over 64 MiB"
+		}
+		if held+len(d.Data) > maxForwardBuffered {
+			return "too many forwarded requests arriving at once for this person; try again"
 		}
 		r.buf = append(r.buf, d.Data...)
 		r.next++
 		if d.Last {
 			var cancel context.CancelFunc
 			rctx, cancel = context.WithCancel(ctx)
-			body, from, r.buf, r.cancel = r.buf, r.from, nil, cancel
+			body, r.buf, r.cancel, req = r.buf, nil, cancel, r
 		}
 		return ""
 	}()
@@ -342,8 +363,41 @@ func (f *forwarder) accept(ctx context.Context, ipc *protocol.IPCStream, deps co
 	if deps.turnWG != nil {
 		deps.turnWG.Add(1)
 	}
-	go f.answer(rctx, ipc, deps, network, peerID, d.RequestID, from, body)
+	go f.answer(rctx, ipc, deps, network, peerID, d.RequestID, req, body)
 }
+
+// heldByLocked counts user's requests on A and the bytes their unfinished bodies hold. f.mu is held.
+func (f *forwarder) heldByLocked(user string) (reqs, bytes int) {
+	for _, c := range f.conns {
+		for _, r := range c.reqs {
+			if r.user == user {
+				reqs, bytes = reqs+1, bytes+len(r.buf)
+			}
+		}
+	}
+	return reqs, bytes
+}
+
+// revoked stops what A is running for user on behalf of serverID with provider: the grant it
+// started under is gone.
+func (f *forwarder) revoked(deps connDeps, user, serverID, provider string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.conns {
+		for _, r := range c.reqs {
+			if r.cancel != nil && r.from == serverID && r.provider == provider && deps.settings.SameUser(r.user, user) {
+				r.cancel()
+			}
+		}
+	}
+}
+
+// notLent is the one answer for a provider that isn't lent to the asking server, whether or not it
+// exists: a server can't learn what is here by asking.
+const notLent = "that provider isn't lent to this server. Pick it in the model picker here to allow it."
 
 // drop forgets request id on ipc and stops it if it is running.
 func (f *forwarder) drop(ipc *protocol.IPCStream, id string) {
@@ -366,7 +420,7 @@ func (f *forwarder) drop(ipc *protocol.IPCStream, id string) {
 
 // answer runs the request on A's own provider as the person behind the relaying connection and
 // streams the result back, then closes the request. ctx ends it: forward_cancel, or the connection.
-func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID, id, from string, raw []byte) {
+func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps connDeps, network, peerID, id string, req *fwdReq, raw []byte) {
 	if deps.turnWG != nil {
 		defer deps.turnWG.Done()
 	}
@@ -399,19 +453,24 @@ func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps co
 		errText = "malformed forwarded request"
 		return
 	}
+	from := req.from
+	f.mu.Lock()
+	req.provider = b.ProviderName // from here a revoke stops it
+	f.mu.Unlock()
 	cfg, ok := deps.providerStore.Get(b.ProviderName)
 	acc := deps.accessFor(network, peerID)
 	switch {
+	// Lending is the person's own choice, made on this server: a server they are only a guest on
+	// can't spend their keys by asking, nor by claiming another server's id. Checked first, so the
+	// answer is the same whether or not the provider exists.
+	case !deps.settings.ForwardGranted(acc.UserID, from, req.fromKey, b.ProviderName):
+		errText = notLent
 	case !ok:
 		errText = fmt.Sprintf("unknown provider %q", b.ProviderName)
 	case !providerAllowed(deps, acc, b.ProviderName):
 		errText = fmt.Sprintf("provider %q isn't allowed for this person", b.ProviderName)
 	case !forwardableKind(cfg.Kind):
 		errText = fmt.Sprintf("provider %q can't be used from another server", b.ProviderName)
-	// Lending is the person's own choice, made on this server: a server they are only a guest on
-	// can't spend their keys by asking.
-	case !deps.settings.ForwardGranted(acc.UserID, from, b.ProviderName):
-		errText = fmt.Sprintf("%s isn't lent to that server. Pick it in the model picker there to allow it.", b.ProviderName)
 	}
 	if errText != "" {
 		return
@@ -430,7 +489,8 @@ func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps co
 	} else {
 		p, err := provider.BuildProvider(cfg, b.Model, "")
 		if err != nil {
-			errText = fmt.Sprintf("failed to activate provider %q: %v", b.ProviderName, err)
+			logWarn("forwarded request %s: activating %q: %v", id, b.ProviderName, err)
+			errText = fmt.Sprintf("failed to activate provider %q: %s", b.ProviderName, forwardErrText(cfg, err))
 			return
 		}
 		built = p
@@ -454,8 +514,23 @@ func (f *forwarder) answer(ctx context.Context, ipc *protocol.IPCStream, deps co
 		}
 	}
 	if err := <-errs; err != nil {
-		errText = err.Error()
+		logWarn("forwarded request %s on %q failed: %v", id, b.ProviderName, err)
+		errText = forwardErrText(cfg, err)
 	}
+}
+
+var urlInText = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'<>]+`)
+
+// forwardErrText is what the other server is told about a failure here: the provider's own words
+// (B reads them, to spot a usage limit), without this server's provider address or a CLI's
+// stderr. The whole error is in this server's log.
+func forwardErrText(cfg provider.ProviderConfig, err error) string {
+	s := urlInText.ReplaceAllString(provider.WithoutStderr(err), "<url>")
+	if u, perr := url.Parse(cfg.BaseURL); perr == nil && u.Hostname() != "" {
+		s = strings.ReplaceAll(s, u.Host, "<host>")
+		s = strings.ReplaceAll(s, u.Hostname(), "<host>")
+	}
+	return s
 }
 
 // ---- As B ----
@@ -575,8 +650,16 @@ func newRequestID() string {
 
 // pick chooses the device for a request: the preferred one if it qualifies, else the most
 // recently connected.
+//
+// Only the chat owner's own devices: the request runs on A as whoever the device is signed in as
+// there, so a device of anyone else who may read the chat (a Full person, say) would spend their
+// grant on someone else's chat.
 func (f *forwarder) pick(deps connDeps, sessionID, serverID, prefer string) *Peer {
-	ps := deps.peers.relayPeers(sessionID, serverID)
+	owner, known := deps.projects.ownerOfSession(sessionID)
+	ps := slices.DeleteFunc(deps.peers.relayPeers(serverID), func(p *Peer) bool {
+		acc := deps.accessFor(p.Network, p.ID)
+		return !known || acc.UserID == "" || !deps.settings.SameUser(acc.UserID, owner)
+	})
 	if i := slices.IndexFunc(ps, func(p *Peer) bool { return p.ID == prefer }); i >= 0 {
 		return ps[i]
 	}

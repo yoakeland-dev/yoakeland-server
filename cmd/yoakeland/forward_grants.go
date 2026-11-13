@@ -19,18 +19,25 @@ import (
 const (
 	maxGrantsPerPerson = 256
 	maxServerNameRunes = 80
+	maxKeysPerLoan     = 16  // devices reach a server by different transports; the oldest key goes first
+	maxServerKeyLen    = 320 // "host:" and a DNS name is the longest
 )
 
 // forwardLoan is what one person lends to one other server.
 type forwardLoan struct {
 	Name      string   `json:"name,omitempty"` // the server's name when it was granted, a label only
 	Providers []string `json:"providers"`
+	// Keys are what the granting devices verified about their connection to the server
+	// (ForwardRequestData.FromKey). A request must come with one of them: the id alone is only
+	// what a server says about itself.
+	Keys []string `json:"keys,omitempty"`
 }
 
 var errTooManyGrants = errors.New("too many forwarding grants")
 
-// GrantForward lets serverID use provider as userID. Idempotent; the label is refreshed.
-func (s *ServerSettings) GrantForward(userID, serverID, serverName, provider string) error {
+// GrantForward lets serverID, reached by serverKey, use provider as userID. Idempotent; the label
+// is refreshed and the key added to the server's.
+func (s *ServerSettings) GrantForward(userID, serverID, serverKey, serverName, provider string) error {
 	if r := []rune(strings.TrimSpace(cleanName(serverName))); len(r) > maxServerNameRunes {
 		serverName = string(r[:maxServerNameRunes])
 	} else {
@@ -51,6 +58,12 @@ func (s *ServerSettings) GrantForward(userID, serverID, serverName, provider str
 	}
 	if serverName != "" {
 		loan.Name = serverName
+	}
+	if !slices.Contains(loan.Keys, serverKey) {
+		loan.Keys = append(slices.Clone(loan.Keys), serverKey)
+		if len(loan.Keys) > maxKeysPerLoan {
+			loan.Keys = loan.Keys[len(loan.Keys)-maxKeysPerLoan:]
+		}
 	}
 	if s.ForwardGrants == nil {
 		s.ForwardGrants = map[string]map[string]forwardLoan{}
@@ -82,11 +95,16 @@ func (s *ServerSettings) RevokeForward(userID, serverID, provider string) error 
 	return s.save()
 }
 
-// ForwardGranted reports whether userID lent provider to serverID.
-func (s *ServerSettings) ForwardGranted(userID, serverID, provider string) bool {
+// ForwardGranted reports whether userID lent provider to serverID reached by serverKey. An empty
+// provider asks whether anything at all is lent there.
+func (s *ServerSettings) ForwardGranted(userID, serverID, serverKey, provider string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return slices.Contains(s.ForwardGrants[userID][serverID].Providers, provider)
+	loan, ok := s.ForwardGrants[userID][serverID]
+	if !ok || serverKey == "" || !slices.Contains(loan.Keys, serverKey) {
+		return false
+	}
+	return provider == "" || slices.Contains(loan.Providers, provider)
 }
 
 // ListForwardGrants lists userID's grants, sorted by server name then provider name.
@@ -96,7 +114,7 @@ func (s *ServerSettings) ListForwardGrants(userID string) []protocol.ForwardGran
 	out := []protocol.ForwardGrantData{}
 	for sid, loan := range s.ForwardGrants[userID] {
 		for _, p := range loan.Providers {
-			out = append(out, protocol.ForwardGrantData{ServerID: sid, ServerName: loan.Name, ProviderName: p})
+			out = append(out, protocol.ForwardGrantData{ServerID: sid, ServerName: loan.Name, ProviderName: p, ServerKeys: slices.Clone(loan.Keys)})
 		}
 	}
 	slices.SortFunc(out, func(a, b protocol.ForwardGrantData) int {
@@ -146,6 +164,11 @@ func (s *ServerSettings) moveGrantsLocked(from, into string) {
 				have.Providers = append(have.Providers, p)
 			}
 		}
+		for _, k := range loan.Keys {
+			if !slices.Contains(have.Keys, k) {
+				have.Keys = append(have.Keys, k)
+			}
+		}
 		if s.ForwardGrants[into] == nil {
 			s.ForwardGrants[into] = map[string]forwardLoan{}
 		}
@@ -167,41 +190,43 @@ func handleGrantEnvelope(ipc *protocol.IPCStream, deps connDeps, network, peerID
 	}
 	acc := deps.accessFor(network, peerID)
 	changed := false
+	// A refusal is answered with the list too, so a device that showed the change early can put it back.
 	switch env.Type {
 	case protocol.EventForwardGrant:
 		var d protocol.ForwardGrantData
-		if json.Unmarshal(env.Data, &d) != nil || d.ServerID == "" || len(d.ServerID) > maxForwardIDLen || d.ProviderName == "" {
+		if json.Unmarshal(env.Data, &d) != nil || d.ServerID == "" || len(d.ServerID) > maxForwardIDLen || d.ProviderName == "" ||
+			d.ServerKey == "" || len(d.ServerKey) > maxServerKeyLen {
 			fail("malformed forward_grant payload")
-			return true
+			break
 		}
 		cfg, ok := deps.providerStore.Get(d.ProviderName)
 		switch {
 		case !ok:
 			fail(fmt.Sprintf("unknown provider %q", d.ProviderName))
-			return true
 		case !providerAllowed(deps, acc, d.ProviderName):
 			fail(fmt.Sprintf("provider %q isn't allowed for this person", d.ProviderName))
-			return true
 		case !forwardableKind(cfg.Kind):
 			fail(fmt.Sprintf("provider %q can't be used from another server", d.ProviderName))
-			return true
+		default:
+			if err := deps.settings.GrantForward(acc.UserID, d.ServerID, d.ServerKey, d.ServerName, d.ProviderName); err != nil {
+				fail(err.Error())
+				break
+			}
+			deps.record(ipc, peerID, audit.Event{Kind: audit.ForwardGrant, Target: d.ProviderName, Outcome: "ok", Detail: map[string]any{"serverId": d.ServerID, "serverName": d.ServerName}})
+			changed = true
 		}
-		if err := deps.settings.GrantForward(acc.UserID, d.ServerID, d.ServerName, d.ProviderName); err != nil {
-			fail(err.Error())
-			return true
-		}
-		deps.record(ipc, peerID, audit.Event{Kind: audit.ForwardGrant, Target: d.ProviderName, Outcome: "ok", Detail: map[string]any{"serverId": d.ServerID, "serverName": d.ServerName}})
-		changed = true
 	case protocol.EventForwardRevoke:
 		var d protocol.ForwardRevokeData
 		if json.Unmarshal(env.Data, &d) != nil || d.ServerID == "" || d.ProviderName == "" {
 			fail("malformed forward_revoke payload")
-			return true
+			break
 		}
 		if err := deps.settings.RevokeForward(acc.UserID, d.ServerID, d.ProviderName); err != nil {
 			fail(err.Error())
-			return true
+			break
 		}
+		// What the server is already running on it stops too.
+		deps.forward.revoked(deps, acc.UserID, d.ServerID, d.ProviderName)
 		deps.record(ipc, peerID, audit.Event{Kind: audit.ForwardRevoke, Target: d.ProviderName, Outcome: "ok", Detail: map[string]any{"serverId": d.ServerID}})
 		changed = true
 	}
