@@ -262,12 +262,12 @@ func TestAddUsage_CostUnknownAndSnapshots(t *testing.T) {
 }
 
 func TestReport_ServerSettingAndSessionOverrides(t *testing.T) {
-	t.Cleanup(func() { SetContextWindowLookup(nil); SetCompactDefaults(0, "") })
+	t.Cleanup(func() { SetContextWindowLookup(nil); SetCompactDefaults(0, "", "") })
 	SetContextWindowLookup(func(string) int { return 1_000_000 })
 	history := []Message{{Role: "user", Content: "hi"}}
 	cm := NewContextManager(64000, 100)
 
-	SetCompactDefaults(400_000, "")
+	SetCompactDefaults(400_000, "", "")
 	if r := cm.Report(history, "m", 0); r.BudgetTokens != 400_000 {
 		t.Fatalf("server setting: %+v", r)
 	}

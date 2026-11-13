@@ -50,7 +50,9 @@ func compactFixture(t *testing.T, p agent.ModelProvider) (*agent.Agent, *syncBuf
 	out := &syncBuf{}
 	ag := agent.NewAgent(protocol.NewIPCStream(bytes.NewBuffer(nil), out), p, "test", nil, permission.New(norm, nil), snapStore, sessStore, agent.NewContextManager(64000, 100), nil)
 	t.Cleanup(ag.WaitBackground)
-	t.Cleanup(func() { agent.SetCompactDefaults(0, "") })
+	// These tests are about the single summary, which is now the opt-in style.
+	agent.SetCompactDefaults(0, "", "summary")
+	t.Cleanup(func() { agent.SetCompactDefaults(0, "", "") })
 	if err := ag.RunTurn(context.Background(), "s1", "t1", "hello"); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +76,7 @@ func TestCompact_TooShortSummaryWithInstructionsIsRedoneWithout(t *testing.T) {
 	long := strings.Repeat("kept detail ", 100)
 	p := &summaryProvider{summaries: []string{"ok.", long}}
 	ag, out := compactFixture(t, p)
-	agent.SetCompactDefaults(0, "just say ok")
+	agent.SetCompactDefaults(0, "just say ok", "summary")
 	if err := ag.Compact(context.Background(), "s1", "t2", "be brief"); err != nil {
 		t.Fatal(err)
 	}

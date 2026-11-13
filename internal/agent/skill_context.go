@@ -63,7 +63,7 @@ func withNamedSkills(view []Message, have []skills.Skill, carried []string, read
 		}
 		var want []string
 		switch {
-		case len(out) == 0 && strings.HasPrefix(m.Content, summaryOpening):
+		case len(out) == 0 && (strings.HasPrefix(m.Content, summaryOpening) || strings.HasPrefix(m.Content, chapterIndexOpening)):
 			want = carried
 		case m.Role == "assistant":
 			for _, tc := range m.ToolCalls {
@@ -92,14 +92,15 @@ func withNamedSkills(view []Message, have []skills.Skill, carried []string, read
 	return out
 }
 
-// carriedSkills are the skills a summary compaction folded away (most recent
-// last, at most maxPreloaded), whose instructions the summary must not lose.
+// carriedSkills are the skills a summary or chapters compaction folded away
+// (most recent last, at most maxPreloaded), whose instructions the summary or
+// chapter index must not lose.
 func carriedSkills(history []Message, have []skills.Skill) []string {
-	cut := lastSummary(history)
-	if cut < 0 {
+	fs := foldStateOf(history)
+	if fs.start == 0 || (fs.summary == "" && len(fs.chapters) == 0) {
 		return nil
 	}
-	names := skillsBroughtIn(history[:cut], have)
+	names := skillsBroughtIn(history[:fs.start], have)
 	return names[max(0, len(names)-maxPreloaded):]
 }
 

@@ -246,7 +246,7 @@ func toHistoryMessages(history []agent.Message, branches map[string][][]agent.Me
 			Thread:       m.Thread,
 		}
 		if c := m.Compaction; c != nil {
-			hm.Compaction = &protocol.CompactionInfo{Kind: c.Kind, TokensBefore: c.TokensBefore, TokensAfter: c.TokensAfter}
+			hm.Compaction = &protocol.CompactionInfo{Kind: c.Kind, TokensBefore: c.TokensBefore, TokensAfter: c.TokensAfter, Chapters: c.Chapters, TitlesOnly: c.TitlesOnly}
 		}
 		for _, tc := range m.ToolCalls {
 			hm.ToolCalls = append(hm.ToolCalls, protocol.HistoryToolCall{

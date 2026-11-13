@@ -428,3 +428,11 @@ func TestProcessLimitsReachTheirPackages(t *testing.T) {
 		t.Fatalf("pool limits = %+v", st)
 	}
 }
+
+func TestNormalizeRuntimeSettings_CompactionStyle(t *testing.T) {
+	for in, want := range map[string]string{"": "", "chapters": "chapters", "summary": "summary", "bogus": ""} {
+		if got := normalizeRuntimeSettings(protocol.RuntimeSettings{CompactionStyle: in}).CompactionStyle; got != want {
+			t.Errorf("compactionStyle %q normalised to %q, want %q", in, got, want)
+		}
+	}
+}

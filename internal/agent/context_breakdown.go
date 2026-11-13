@@ -96,7 +96,7 @@ func (cm *ContextManager) estimateShares(view []Message, systemPrompt string, to
 				sh[protocol.CtxReasoning] += cm.EstimateTokens(m.Reasoning)
 			}
 		case "user":
-			if strings.HasPrefix(m.Content, summaryOpening) {
+			if strings.HasPrefix(m.Content, summaryOpening) || strings.HasPrefix(m.Content, chapterIndexOpening) {
 				sh[protocol.CtxSummary] += content
 			} else {
 				sh[protocol.CtxUser] += content

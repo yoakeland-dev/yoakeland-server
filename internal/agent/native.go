@@ -223,7 +223,7 @@ func (a *Agent) newNativeTurn(sessionID, turnID, providerName string, history []
 	nt.FreshPrompt = msg
 	if last > 0 {
 		nt.FreshPrompt = "Earlier in this conversation (you don't have this in your context, it's a transcript):\n\n" +
-			renderTranscript(contextView(history[:last], "")) + "\n---\n\n" + msg
+			renderTranscript(withoutRecall(contextView(history[:last], ""))) + "\n---\n\n" + msg
 	}
 	if a.chat {
 		nt.FreshPrompt = NativeChatInstruction + nt.FreshPrompt

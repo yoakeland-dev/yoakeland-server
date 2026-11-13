@@ -419,6 +419,8 @@ var readOnlyTools = map[string]bool{
 	// Not a mutation itself: its subagent runs read-only in these modes too
 	// (see newSubagent).
 	SubagentToolName: true,
+	// Reopens messages of this chat that compaction folded; changes nothing.
+	RecallToolName: true,
 }
 
 // planExtraTools is unioned into readOnlyTools for ModePlan only — its own
@@ -715,6 +717,11 @@ func NewAgent(
 	toolDefs = append(toolDefs, subagentDefinition)
 	toolDefsReadOnly = append(toolDefsReadOnly, subagentDefinition)
 	toolDefsPlan = append(toolDefsPlan, subagentDefinition)
+	// recall is in every mode's list; activeToolDefs offers it only once the
+	// conversation has chapters.
+	toolDefs = append(toolDefs, recallDefinition)
+	toolDefsReadOnly = append(toolDefsReadOnly, recallDefinition)
+	toolDefsPlan = append(toolDefsPlan, recallDefinition)
 	if ctxMgr == nil {
 		ctxMgr = NewContextManager(64000, 4000)
 	}
@@ -1074,12 +1081,14 @@ func (a *Agent) activeToolDefs() []tool.ToolDefinition {
 
 	// The skill tool is only worth its definition when there is a skill to load.
 	hideSkill := a.tools[tool.SkillToolName] != nil && !a.skillsAvailable()
-	if webEnabled && !shellOff && !hideSkill && vision && pol == nil {
+	// Likewise recall, which has nothing to open before a compaction folds chapters.
+	hideRecall := !a.hasChapters()
+	if webEnabled && !shellOff && !hideSkill && !hideRecall && vision && pol == nil {
 		return a.withSkillNames(a.withSourceDefs(base, mode, pol))
 	}
 	filtered := make([]tool.ToolDefinition, 0, len(base))
 	for _, def := range base {
-		if (!webEnabled && webToolNames[def.Name]) || (shellOff && isShellTool(def.Name)) || (hideSkill && def.Name == tool.SkillToolName) || pol.blocks(def.Name, unsandboxed) {
+		if (!webEnabled && webToolNames[def.Name]) || (shellOff && isShellTool(def.Name)) || (hideSkill && def.Name == tool.SkillToolName) || (hideRecall && def.Name == RecallToolName) || pol.blocks(def.Name, unsandboxed) {
 			continue
 		}
 		filtered = append(filtered, a.defForVision(def, vision))
@@ -1162,7 +1171,7 @@ func (a *Agent) isToolAllowedInMode(name string) bool {
 	if shellOff && isShellTool(name) {
 		return false
 	}
-	if _, fixed := a.tools[name]; !fixed && name != SubagentToolName {
+	if _, fixed := a.tools[name]; !fixed && name != SubagentToolName && name != RecallToolName {
 		// A tool from the source: offered in read-only and plan modes only when
 		// its server calls it read-only.
 		if pol != nil && !pol.MCP {
@@ -1807,6 +1816,9 @@ turn:
 				addUsage(&totalUsage, u)
 				totalUsage.CostUSD += u.CostUSD
 			}
+			// A compaction just made may have added chapters, and with them recall.
+			toolDefs = a.activeToolDefs()
+			prefixKey = requestPrefixKey(bound.Model, systemPrompt, toolDefs)
 			a.mu.Lock()
 			activeContext = contextView(a.history, prefixKey)
 			carried := carriedSkills(a.history, haveSkills)
@@ -2090,6 +2102,13 @@ turn:
 			}
 			if turnCtx.Err() != nil {
 				a.recordToolResult(turnID, tc, "", "cancelled before it ran")
+				continue
+			}
+			if tc.Name == RecallToolName && a.isToolAllowedInMode(tc.Name) {
+				// Capped by recall itself, not by TruncateToolOutput, which would
+				// cut the middle out of the chapter the model asked to read.
+				out, errText := a.runRecall(bound.Model, tc.Args)
+				a.recordToolResult(turnID, tc, out, errText)
 				continue
 			}
 			toolImpl, exists := a.lookupTool(tc.Name)
