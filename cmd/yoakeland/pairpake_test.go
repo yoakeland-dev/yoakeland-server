@@ -32,8 +32,8 @@ import (
 // startPINServer is a real remote listener (TLS and WebRTC) with a PIN to pair with.
 func startPINServer(t *testing.T) (connDeps, *remoteControl, string) {
 	t.Helper()
-	authFailDelay = 0
-	t.Cleanup(func() { authFailDelay = time.Second })
+	authFailDelay.Store(0)
+	t.Cleanup(func() { authFailDelay.Store(int64(time.Second)) })
 	deps := newTestDeps(t)
 	deps.pairings = newPairingGate()
 	deps.pins = newPinRegistry()

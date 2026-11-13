@@ -630,7 +630,9 @@ func acceptLoop(ctx context.Context, ln net.Listener, network string, deps connD
 // up idle or 10MB-frame connections, or guess passwords at line rate.
 const maxPreAuth = 32
 
-var authFailDelay = time.Second // var for tests
+// authFailDelay is atomic because tests change it while a finished test's connection handlers may
+// still be reading it.
+var authFailDelay = func() *atomic.Int64 { a := new(atomic.Int64); a.Store(int64(time.Second)); return a }()
 
 // pairLinger is how long a finished PIN pairing waits for the client to close the connection.
 const pairLinger = 5 * time.Second
@@ -674,14 +676,14 @@ func serveAccepted(ctx context.Context, conn net.Conn, network string, deps conn
 	who, pending, ok := handshake(ipc, network, lookupToken)
 	if network == "tcp" {
 		if !ok && who.pake == nil {
-			time.Sleep(authFailDelay)
+			time.Sleep(time.Duration(authFailDelay.Load()))
 		}
 		<-preAuthSlots
 		_ = conn.SetReadDeadline(time.Time{})
 	}
 	if who.pake != nil {
 		if err := deps.pairWithPIN(ipc, conn, who); err != nil {
-			time.Sleep(authFailDelay) // after the slot is free, so it slows a guesser without holding one
+			time.Sleep(time.Duration(authFailDelay.Load())) // after the slot is free, so it slows a guesser without holding one
 			_ = ipc.SendEvent(protocol.EventError, "", "", "", protocol.ErrorData{Message: err.Error(), Fatal: true})
 			deps.recordAuthFail(remoteIP(conn, network), network, "pairing failed")
 		}
