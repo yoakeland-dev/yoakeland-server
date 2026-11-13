@@ -17,15 +17,47 @@ import (
 const (
 	artifactEventsPerSec  = 20
 	maxSubmitsPerArtifact = 1
-	maxArtifactIDLen      = 120
+	// ponytail: a chat's submits are counted until it is deleted or the server restarts; a chat
+	// that really answers more pages than this needs the count stored with the session.
+	maxSubmittedArtifactsPerChat = 100
+	maxArtifactIDLen             = 120
 )
 
 var artifactGate = struct {
 	sync.Mutex
 	window  map[string]int // peer -> events in the current second
 	second  map[string]int64
-	submits map[string]int // session+artifact -> submits so far
-}{window: map[string]int{}, second: map[string]int64{}, submits: map[string]int{}}
+	submits map[string]map[string]int // session -> artifact -> submits so far
+}{window: map[string]int{}, second: map[string]int64{}, submits: map[string]map[string]int{}}
+
+// artifactSubmitAllow counts one submit and reports whether it may start a turn: once per artifact,
+// from a bounded number of artifacts per chat, so a client inventing ids gets neither unlimited
+// turns nor unlimited memory.
+func artifactSubmitAllow(sessionID, artifactID string) bool {
+	g := &artifactGate
+	g.Lock()
+	defer g.Unlock()
+	byArtifact := g.submits[sessionID]
+	if _, seen := byArtifact[artifactID]; !seen && len(byArtifact) >= maxSubmittedArtifactsPerChat {
+		return false
+	}
+	if byArtifact == nil {
+		byArtifact = map[string]int{}
+		g.submits[sessionID] = byArtifact
+	}
+	if byArtifact[artifactID] >= maxSubmitsPerArtifact {
+		return false
+	}
+	byArtifact[artifactID]++
+	return true
+}
+
+// artifactForget drops what is counted for a deleted chat.
+func artifactForget(sessionID string) {
+	artifactGate.Lock()
+	delete(artifactGate.submits, sessionID)
+	artifactGate.Unlock()
+}
 
 // artifactAllow counts one event from peer and reports whether it is within the rate.
 func artifactAllow(peerID string, now time.Time) bool {
@@ -80,12 +112,7 @@ func handleArtifactEnvelope(ipc *protocol.IPCStream, deps connDeps, network, pee
 			fail("artifact submits aren't available on this server")
 			return true
 		}
-		key := d.SessionID + "\x00" + d.ArtifactID
-		artifactGate.Lock()
-		artifactGate.submits[key]++
-		over := artifactGate.submits[key] > maxSubmitsPerArtifact
-		artifactGate.Unlock()
-		if over {
+		if !artifactSubmitAllow(d.SessionID, d.ArtifactID) {
 			return true
 		}
 		who := deps.actorOf(network, peerID) // the page's submit runs as the person who used it

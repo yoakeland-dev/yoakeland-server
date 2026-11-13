@@ -217,6 +217,11 @@ func ownsChat(deps connDeps, acc Access, sessionID, projectPath string) bool {
 	case !found && reservedChatIDs[sessionID]:
 		return false // "default" is what handlers fall back to; until the owner makes it, it is theirs
 	case !found:
+		// Not at the path the sender named. Its owner is remembered by id alone, so a chat that
+		// lives in another project must not be claimed by naming it with the wrong one.
+		if elsewhere, exists := deps.projects.ownerOfSession(sessionID); exists {
+			return deps.mayAct(acc, elsewhere)
+		}
 		deps.projects.rememberOwner(sessionID, acc.UserID)
 		return true
 	}

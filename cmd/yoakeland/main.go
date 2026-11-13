@@ -2233,6 +2233,7 @@ func handleEnvelope(ctx context.Context, ipc *protocol.IPCStream, deps connDeps,
 			deps.sched.Forget(data.SessionID)
 		}
 		artifact.Default.Forget(data.SessionID)
+		artifactForget(data.SessionID)
 		pc.Terminals.CloseSession(data.SessionID)
 		provider.CloseNativeSessions(agent.NativeSessionKey(data.SessionID, pc.Root))
 		if err := pc.SessStore.Delete(data.SessionID); err != nil {
