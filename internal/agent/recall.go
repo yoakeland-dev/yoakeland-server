@@ -43,7 +43,34 @@ func (a *Agent) runRecall(model string, args json.RawMessage) (output, errText s
 	history := append([]Message(nil), a.history...)
 	a.mu.Unlock()
 	budget := a.contextManager.compactionBudget(a.contextManager.Window(model, history))
-	return a.contextManager.recall(history, args, max(budget/4, 4000))
+	// One cap for all the recalls of a round, so parallel calls can't together
+	// outgrow what the next compaction would leave unfolded.
+	total := max(budget/4, 4000)
+	left := total - a.contextManager.recalledThisRound(history)
+	if left < 500 {
+		return "", "recall already returned the most it can in one round; read that first, then recall again"
+	}
+	return a.contextManager.recall(history, args, left)
+}
+
+// recalledThisRound is the size of the recall results after the last
+// assistant message, which belong to the round now running.
+func (cm *ContextManager) recalledThisRound(history []Message) int {
+	calls := map[string]bool{}
+	for _, m := range history {
+		for _, tc := range m.ToolCalls {
+			if tc.Name == RecallToolName {
+				calls[tc.ID] = true
+			}
+		}
+	}
+	n := 0
+	for i := len(history) - 1; i >= 0 && history[i].Role != "assistant"; i-- {
+		if history[i].Role == "tool" && calls[history[i].ToolCallID] {
+			n += cm.EstimateTokens(history[i].Content)
+		}
+	}
+	return n
 }
 
 // recall searches and opens the chapters of history. capTokens bounds the

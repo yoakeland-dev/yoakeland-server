@@ -25,9 +25,28 @@ const chapterIndexOpening = "[Earlier parts of this conversation are folded into
 
 const chapterIndexIntro = chapterIndexOpening +
 	"Each chapter's brief is below. Nothing was lost: the full messages are stored. " +
-	"Call the recall tool with keywords to search every folded chapter and open the best match in full, " +
+	chapterRecallHint
+
+// chapterRecallHint is the index's advice on reopening chapters. Agents with no
+// recall tool (CLI agents, side questions) get chapterNoRecallHint instead.
+const chapterRecallHint = "Call the recall tool with keywords to search every folded chapter and open the best match in full, " +
 	"or with a chapter number to open that one. Use it whenever a brief is not enough " +
 	"(exact code, command output, wording) instead of guessing or redoing work.]"
+
+const chapterNoRecallHint = "You cannot reopen them here: if a brief is not enough, " +
+	"say what detail is missing instead of guessing.]"
+
+// withoutRecall rewrites the chapter index at the head of view for a reader
+// that has no recall tool.
+func withoutRecall(view []Message) []Message {
+	if len(view) > 0 && strings.Contains(view[0].Content, chapterRecallHint) {
+		view[0].Content = strings.Replace(view[0].Content, chapterRecallHint, chapterNoRecallHint, 1)
+	}
+	return view
+}
+
+// requestCap is how much of the request the index repeats, as a share of the budget.
+func requestCap(budget int) int { return budget / 8 }
 
 const chapterBriefPrompt = `You write the brief for one chapter of a coding agent's session. The chapter's full messages stay stored and searchable, so this is an index entry, not a replacement: say what happened so the agent knows what is in here and when to open it.
 First line: a title of at most 8 words, no trailing punctuation.
@@ -44,6 +63,7 @@ type foldState struct {
 	chapters   []Chapter
 	titlesOnly int
 	request    string
+	requestAt  int // index of the compaction that recorded request
 }
 
 func foldStateOf(history []Message) foldState {
@@ -67,7 +87,13 @@ func foldStateOf(history []Message) foldState {
 				fs.start = j
 			}
 			fs.chapters = append(fs.chapters[:len(fs.chapters):len(fs.chapters)], c.Chapters...)
-			fs.titlesOnly, fs.request = c.TitlesOnly, c.Request
+			fs.titlesOnly, fs.request, fs.requestAt = c.TitlesOnly, c.Request, i
+		}
+	}
+	// A request is only the one being worked on until the user says something new.
+	for i := fs.requestAt + 1; fs.request != "" && i < len(history); i++ {
+		if history[i].Role == "user" {
+			fs.request = ""
 		}
 	}
 	return fs
@@ -285,9 +311,14 @@ func (a *Agent) compactByChapters(ctx context.Context, turnID string, bound Role
 		// A tail that is still over half the budget (one huge latest round)
 		// would have the next round compact again, and an empty fold range
 		// would push the caller to a summary that wipes the chapters: fold
-		// everything instead; the request is kept verbatim in the index.
+		// everything instead, except the latest round when it holds tool
+		// results the model has not read yet (those are capped where they are
+		// made, recall's per round). The request rides in the index, capped.
 		if cm.EstimateHistoryTokens(renderRange(history, fs, keep, len(history))) > budget/2 || len(foldable(history, fs.start, keep)) == 0 {
 			keep = len(history)
+			if r := cm.tailStart(history, fs, 0); r < len(history) && r > fs.start && hasToolResult(history[r:]) {
+				keep = r
+			}
 		}
 	}
 	// Briefs and sizes come from the stored messages, not the clear stubs:
@@ -321,14 +352,17 @@ func (a *Agent) compactByChapters(ctx context.Context, turnID string, bound Role
 	if keep < len(history) {
 		c.KeepFrom = history[keep].ID
 	}
-	// The request is shown in the index only when the user's latest message
-	// is no longer in the unfolded part.
-	for i := len(history) - 1; i >= 0; i-- {
-		if history[i].Role == "user" {
-			if i < keep {
-				c.Request = history[i].Content
+	// While a turn runs (an automatic compaction), its request is shown in the
+	// index when the user's latest message is no longer in the unfolded part.
+	// A manual compaction runs between turns: that message was answered.
+	if !manual {
+		for i := len(history) - 1; i >= 0; i-- {
+			if history[i].Role == "user" {
+				if i < keep {
+					c.Request = cm.capRequest(history[i].Content, requestCap(budget), chapterOf(history, fs.chapters, chapters, i))
+				}
+				break
 			}
-			break
 		}
 	}
 	trial := append(history[:len(history):len(history)], Message{Role: "compaction", Compaction: c})
@@ -342,4 +376,38 @@ func (a *Agent) compactByChapters(ctx context.Context, turnID string, bound Role
 		Compaction: c,
 	}, manual)
 	return usage, true, nil
+}
+
+func hasToolResult(msgs []Message) bool {
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			return true
+		}
+	}
+	return false
+}
+
+// chapterOf is the number of the chapter holding history[i], 0 if none does.
+func chapterOf(history []Message, old, added []Chapter, i int) int {
+	for _, c := range append(old[:len(old):len(old)], added...) {
+		from, ok1 := indexOfMessage(history, c.From)
+		to, ok2 := indexOfMessage(history, c.To)
+		if ok1 && ok2 && from <= i && i <= to {
+			return c.N
+		}
+	}
+	return 0
+}
+
+// capRequest keeps the head and tail of a request over capTokens and says where
+// the whole of it can be read.
+func (cm *ContextManager) capRequest(s string, capTokens, chapter int) string {
+	if cm.EstimateTokens(s) <= capTokens {
+		return s
+	}
+	where := "it is stored in full"
+	if chapter > 0 {
+		where = fmt.Sprintf("recall chapter %d for the full text", chapter)
+	}
+	return headTail(s, capTokens*4) + "\n[request shortened; " + where + "]"
 }

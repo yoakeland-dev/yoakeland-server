@@ -270,10 +270,11 @@ func TestCompactByChapters_ManualFoldsEverythingAndKeepsTheRequest(t *testing.T)
 		t.Fatal("nothing folded")
 	}
 	c := ag.history[len(ag.history)-1].Compaction
-	if c.KeepFrom != "" || c.Request != "question 2" {
+	// Manual compaction runs between turns: question 2 was answered.
+	if c.KeepFrom != "" || c.Request != "" {
 		t.Fatalf("KeepFrom %q Request %q", c.KeepFrom, c.Request)
 	}
-	if v := contextView(ag.history, ""); len(v) != 1 || !strings.HasSuffix(v[0].Content, "verbatim:]\nquestion 2") {
+	if v := contextView(ag.history, ""); len(v) != 1 || strings.Contains(v[0].Content, "verbatim") {
 		t.Fatalf("view %+v", v)
 	}
 }
@@ -640,5 +641,90 @@ func TestBreakdown_ChapterIndexCountsAsSummary(t *testing.T) {
 	by := catMap(cm.Breakdown(h, "", "sys", oneTool, false).Categories)
 	if by[protocol.CtxSummary].Tokens < 400 || by[protocol.CtxUser].Tokens > 20 {
 		t.Fatalf("%+v", by)
+	}
+}
+
+// A pasted request is repeated in the index only in part, so a fold always
+// leaves room and the next round does not compact again.
+func TestMaybeCompact_HugeRequestIsCappedInTheIndex(t *testing.T) {
+	ag, bound := chapterAgent(t, &briefProvider{})
+	h := rounds(3, "ok")
+	h = append(h, Message{ID: "paste", Role: "user", Content: strings.Repeat("pasted log line\n", 17000)}) // ~68k tokens, over the 64k budget
+	ag.history = h
+	ag.maybeCompact(context.Background(), "t", bound, 0)
+	rec := ag.history[len(ag.history)-1]
+	if rec.Compaction == nil || rec.Compaction.Kind != CompactionChapters {
+		t.Fatalf("recorded %+v", rec)
+	}
+	if got := ag.contextManager.EstimateTokens(rec.Compaction.Request); got > 64000/8+200 || !strings.Contains(rec.Compaction.Request, "recall chapter") {
+		t.Fatalf("request holds %d tokens: %.100s", got, rec.Compaction.Request)
+	}
+	ag.history = append(ag.history, round(5, "ok")...)
+	n := len(ag.history)
+	ag.maybeCompact(context.Background(), "t", bound, 0)
+	if len(ag.history) != n {
+		t.Fatal("the next round compacted again")
+	}
+}
+
+// The latest round's tool results are not folded before the model has read them.
+func TestMaybeCompact_LatestRoundWithToolResultsStaysUnfolded(t *testing.T) {
+	ag, bound := chapterAgent(t, &briefProvider{})
+	h := rounds(3, "ok")
+	h = append(h,
+		Message{ID: "u4", Role: "user", Content: "look it up"},
+		Message{ID: "c4", Role: "assistant", ToolCalls: []ToolCall{{ID: "x4", Name: "bash", Args: json.RawMessage(`{}`)}}},
+		Message{ID: "t4", Role: "tool", ToolCallID: "x4", Content: strings.Repeat("result line\n", 22000)}) // ~66k tokens
+	ag.history = h
+	ag.maybeCompact(context.Background(), "t", bound, 0)
+	rec := ag.history[len(ag.history)-1]
+	if rec.Compaction == nil || rec.Compaction.Kind != CompactionChapters || rec.Compaction.KeepFrom != "c4" {
+		t.Fatalf("recorded %+v", rec.Compaction)
+	}
+	if rec.Compaction.Request != "look it up" {
+		t.Fatalf("request %q", rec.Compaction.Request)
+	}
+}
+
+// Parallel recalls in one round share one cap.
+func TestRunRecall_OneCapForTheRound(t *testing.T) {
+	ag, _ := chapterAgent(t, &briefProvider{})
+	big := strings.Repeat("line of output\n", 4000)
+	h := rounds(3, big)
+	h = append(h, chaptersCompaction("k", "", 0, "", ch(1, "A", "r1u", "r1a"), ch(2, "B", "r2u", "r2a"), ch(3, "C", "r3u", "r3a")),
+		Message{ID: "ask", Role: "assistant", ToolCalls: []ToolCall{{ID: "a", Name: "recall"}, {ID: "b", Name: "recall"}, {ID: "c", Name: "recall"}}})
+	ag.history = h
+	total, calls := 0, 0
+	for i, id := range []string{"a", "b", "c"} {
+		out, errText := ag.runRecall("m", json.RawMessage(fmt.Sprintf(`{"chapter":%d}`, i+1)))
+		ag.history = append(ag.history, Message{ID: "r" + id, Role: "tool", ToolCallID: id, Content: out + errText})
+		total += ag.contextManager.EstimateTokens(out)
+		if out != "" {
+			calls++
+		}
+	}
+	budget := ag.contextManager.compactionBudget(ag.contextManager.Window("m", ag.history))
+	if total > max(budget/4, 4000)+300 || calls == 0 {
+		t.Fatalf("%d recalls returned %d tokens, cap %d", calls, total, max(budget/4, 4000))
+	}
+}
+
+func TestChapterView_RequestEndsWithTheTurn(t *testing.T) {
+	h := rounds(2, "ok")
+	h = append(h, chaptersCompaction("k", "", 0, "do the thing", ch(1, "One", "r1u", "r2a")))
+	if v := contextView(h, ""); !strings.Contains(v[0].Content, "do the thing") {
+		t.Fatal("request missing while its turn runs")
+	}
+	h = append(h, Message{ID: "next", Role: "user", Content: "something else"})
+	if v := contextView(h, ""); strings.Contains(v[0].Content, "do the thing") {
+		t.Fatal("answered request still in the index")
+	}
+}
+
+func TestWithoutRecall_RewritesTheIndexHint(t *testing.T) {
+	h := append(rounds(1, "ok"), chaptersCompaction("k", "", 0, "", ch(1, "One", "r1u", "r1a")))
+	v := withoutRecall(contextView(h, ""))
+	if strings.Contains(v[0].Content, "recall") && !strings.Contains(v[0].Content, "cannot reopen") || strings.Contains(v[0].Content, "Call the recall tool") {
+		t.Fatalf("index %q", v[0].Content)
 	}
 }

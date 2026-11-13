@@ -118,7 +118,7 @@ func (a *Agent) SideQuestion(ctx context.Context, sessionID, requestID, anchorID
 
 	var p strings.Builder
 	p.WriteString("<transcript>\n")
-	p.WriteString(transcriptForSummary(contextView(history, "")))
+	p.WriteString(transcriptForSummary(withoutRecall(contextView(history, ""))))
 	p.WriteString("</transcript>\n")
 	if len(thread) > 0 {
 		p.WriteString("\nThis side thread so far:\n")
